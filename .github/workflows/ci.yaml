@@ -219,7 +219,19 @@ jobs:
           echo "| blaze | $ANVIL |" >> $GITHUB_STEP_SUMMARY
 
   # =========================================================================
-  # Step 2: Build & Lint copilot-shell
+  # Step 2: Validate component version metadata
+  # =========================================================================
+  check-component-versions:
+    name: Check component versions
+    runs-on: anolisa-k8s-general-ci-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check component version metadata
+        run: python3 scripts/check-component-versions.py
+
+  # =========================================================================
+  # Step 3: Build & Lint copilot-shell
   # =========================================================================
   build-copilot-shell:
     name: Build copilot-shell
@@ -753,9 +765,6 @@ jobs:
           workspaces: |
             src/tokenless
             src/tokenless/benchmark
-
-      - name: Check component contract
-        run: make -C src/tokenless check-component-contract
 
       - name: Check formatting
         run: |
