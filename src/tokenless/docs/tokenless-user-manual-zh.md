@@ -53,6 +53,33 @@ make setup    # 编译 + 安装二进制 + 注册全部适配器
 
 构建依赖：Rust ≥ 1.89（edition 2024）、just、Git、nodejs+npm（编译 OpenClaw TS 插件）。运行时依赖：python3、jq、bash（RPM Requires）。详见 [附录 · 安装路径](#安装路径)。
 
+### 二进制发布包（无需构建工具链）
+
+预构建的发布 tarball 内置 `install.sh`，可在目标机器上直接部署，无需安装 Rust、Cargo 或 Node.js。仅支持 Linux（x86_64 / aarch64）。
+
+```bash
+# 构建 tarball（在 Linux 构建机上）
+cd anolisa/src/tokenless
+make release
+# => dist/tokenless-<VERSION>-<ARCH>.tar.gz
+
+# 在目标机器上部署
+tar xzf tokenless-<VERSION>-<ARCH>.tar.gz
+cd tokenless-<VERSION>
+sudo ./install.sh              # 安装到 /usr/local（默认）
+sudo PREFIX=/usr ./install.sh  # 安装到 /usr
+```
+
+安装器部署内容：
+- `bin/tokenless` 和 `libexec/anolisa/tokenless/{rtk,toon}`，并在 `bin/` 创建符号链接
+- 适配器资源：`share/anolisa/adapters/tokenless/`
+- 组件契约：`share/anolisa/components/tokenless/component.toml`
+- Cosh extension：`share/anolisa/extensions/tokenless/`（hooks、commands、cosh-extension.json）
+
+**注意：** `PREFIX` 必须为绝对路径。安装器采用覆盖式部署——每次运行会替换整个适配器资源目录和 cosh extension。如需非破坏性或分阶段安装，请使用源码构建的 `make install`。
+
+如果 cosh 默认不扫描 `$PREFIX/share/anolisa/extensions`（系统扫描路径为 `/usr/share/anolisa/extensions`），使用非标准 PREFIX 时可能需要手动配置 cosh 的 extension 扫描路径。
+
 ---
 
 ## CLI 使用
