@@ -14,6 +14,7 @@ pub mod adapter;
 pub mod osbase;
 pub mod register;
 pub mod system;
+pub mod telemetry;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -86,7 +87,7 @@ pub enum ComponentCommands {
     /// List available components from the component index
     #[command(visible_alias = "ls")]
     List(tier1::list::ListArgs),
-    /// Install a component from a configured backend (raw today; rpm/npm planned)
+    /// Install a component from a configured raw or RPM backend
     Install(tier1::install::InstallArgs),
     /// Uninstall a component
     Uninstall(tier1::uninstall::UninstallArgs),
@@ -106,7 +107,7 @@ pub enum ComponentCommands {
     Repair(tier1::repair::RepairArgs),
     /// Drop a component's ANOLISA state record without any package operation
     Forget(tier1::forget::ForgetArgs),
-    /// Record an already-installed system RPM as rpm-observed (system scope)
+    /// Record an already-installed system RPM as adopted (system scope)
     Adopt(tier1::adopt::AdoptArgs),
     /// Manage component-to-framework adapters
     Adapter(adapter::AdapterArgs),
@@ -127,6 +128,8 @@ pub enum ManagementCommands {
     Osbase(osbase::OsbaseArgs),
     /// System helper daemon management
     System(system::SystemArgs),
+    /// Manage telemetry collection and reporting
+    Telemetry(telemetry::TelemetryArgs),
 }
 
 /// Build the top-level [`clap::Command`] with grouped help rendering.
@@ -223,6 +226,7 @@ pub fn dispatch(cli: Cli, ctx: &CliContext) -> Result<(), CliError> {
             ManagementCommands::Bug(args) => tier1::bug::handle(args, ctx),
             ManagementCommands::Osbase(args) => osbase::handle(args, ctx),
             ManagementCommands::System(args) => system::handle(args, ctx),
+            ManagementCommands::Telemetry(args) => telemetry::handle(args, ctx),
         },
     }
 }
@@ -407,7 +411,7 @@ fn command_policy(command: &Commands) -> CommandPolicy {
             // system-mode one, so an explicit system-mode dry-run can preview
             // the plan without root (matching `repair`).
             ComponentCommands::Upgrade(_) => system_only("upgrade", true),
-            ComponentCommands::Repair(_) => system_only("repair", true),
+            ComponentCommands::Repair(_) => mode_scoped("repair", true),
             ComponentCommands::Forget(_) => mode_scoped("forget", true),
             ComponentCommands::Adopt(_) => system_only("adopt", false),
             ComponentCommands::Adapter(args) => {
@@ -427,6 +431,25 @@ fn command_policy(command: &Commands) -> CommandPolicy {
             ManagementCommands::System(args) => {
                 CommandPolicy::new("system", system_command_scope(args))
             }
+            ManagementCommands::Telemetry(args) => {
+                CommandPolicy::new("telemetry", telemetry_command_scope(args))
+            }
+        },
+    }
+}
+
+fn telemetry_command_scope(args: &telemetry::TelemetryArgs) -> CommandScope {
+    match &args.command {
+        telemetry::TelemetryCommands::Status { .. } => CommandScope::ReadOnly,
+        // enable / disable / link / unlink / upload / init mutate system state
+        // and need root; an explicit dry-run may preview without root.
+        telemetry::TelemetryCommands::Enable
+        | telemetry::TelemetryCommands::Disable
+        | telemetry::TelemetryCommands::Link
+        | telemetry::TelemetryCommands::Unlink
+        | telemetry::TelemetryCommands::Upload { .. }
+        | telemetry::TelemetryCommands::Init => CommandScope::ModeScopedMutation {
+            dry_run_without_root: true,
         },
     }
 }
@@ -584,6 +607,27 @@ mod tests {
 
         validate_global_args_with_euid(&ctx, mode_scoped("install", true), 1000, true)
             .expect("non-root system dry-run should reach preview-capable handlers");
+    }
+
+    #[test]
+    fn repair_policy_covers_user_and_system_owned_scopes() {
+        let command = Commands::Component(ComponentCommands::Repair(tier1::repair::RepairArgs {
+            component: "cosh".to_string(),
+        }));
+        let policy = command_policy(&command);
+
+        validate_global_args_with_euid(&user_ctx(), policy, 1000, true)
+            .expect("non-root user repair should reach its owned state");
+        validate_global_args_with_euid(&ctx_with_prefix(PathBuf::from("/")), policy, 0, true)
+            .expect("root system repair should reach its owned state");
+        let err = validate_global_args_with_euid(
+            &ctx_with_prefix(PathBuf::from("/")),
+            policy,
+            1000,
+            true,
+        )
+        .expect_err("real system repair still requires root");
+        assert_eq!(err.code(), "PERMISSION_DENIED");
     }
 
     #[test]

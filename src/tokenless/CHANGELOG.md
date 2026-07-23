@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- fix Claude Code PostToolUse hook to *replace* the model-visible tool result via `hookSpecificOutput.updatedToolOutput` (Claude Code >= 2.1.121) instead of appending the compressed payload through the additive `additionalContext`, which duplicated the original output — `additionalContext` now carries only additive env-attribution diagnostics, empty schema fields (e.g. Bash `stderr`/`interrupted`/`isImage`) are restored on the replacement, older or undetectable Claude Code versions fail open by disabling compression, and non-beneficial compressions now pass through unchanged for every agent; adds `tests/test-posttooluse-replacement.sh` covering replacement semantics (closes #1645)
+
+## 0.7.1
+
+- fix RPM tarball to exclude generated `.anolisa/component.toml`, ensuring rpmbuild always regenerates the adapter contract from the authoritative `.toml.in` template — previously stale checked-in copies shipped outdated contracts missing claude-code, codex, and cosh adapter declarations (closes #1470)
+- synchronize adapter contracts: declare every shipped driver (qoder, claude-code, codex, cosh, qwencode) in `component.toml.in` and add CI check (`check-component-contract`) to keep them in sync
+- raise test coverage from 75% to 90%: ~170 new unit tests across all four crates covering compression edge cases, stash round-trip, schema migration, SLS writer, and CLI dispatch
+- harden test isolation: replace unsafe env-var mutations with RAII `TempDbGuard` / `EnvGuard` to prevent tests from touching real `~/.tokenless` state; enforce `--test-threads=1` in Makefile (Rust 2024 `set_var` is unsafe)
+
+
 ## 0.7.0
 
 - add MCP `tokenless_retrieve` stdio server (`tokenless mcp serve`) so MCP-connected agents can recover truncated payloads on demand — the MCP analogue of the `tokenless retrieve` CLI, closing the stash MCP gap vs Headroom CCR's `headroom_retrieve`

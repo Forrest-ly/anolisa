@@ -12,6 +12,7 @@ use cosh_types::audit::Outcome;
 use crate::auth::{
     apply_auth_credentials, builtin_auth_providers, is_auth_error, wait_for_auth_response,
 };
+use crate::compaction::CompactionRuntime;
 use crate::config::{self, CoreConfig};
 use crate::context::ContextBuilder;
 use crate::hook::{HookDecision, HookNotification, HookSystem};
@@ -28,6 +29,12 @@ pub struct CoshCore {
     pub tools: ToolRegistry,
     pub session_id: String,
     pub messages: Vec<Message>,
+    /// Compaction runtime state: the active projection over the transcript
+    /// prefix and the provider usage accounting that prices it.
+    ///
+    /// `messages` always stays the complete transcript; the provider only
+    /// sees the projected effective context.
+    pub compaction: CompactionRuntime,
     pub model: String,
     pub shell_context: Option<ShellContext>,
     pub extra_params: Option<serde_json::Value>,
@@ -59,6 +66,7 @@ impl CoshCore {
             tools,
             session_id: uuid::Uuid::new_v4().to_string(),
             messages: Vec::new(),
+            compaction: CompactionRuntime::default(),
             model,
             shell_context: None,
             extra_params: None,
@@ -72,10 +80,7 @@ impl CoshCore {
     }
 
     pub fn tool_names(&self) -> Vec<String> {
-        let mut names = self.tools.names();
-        names.push("ask_user_question".to_string());
-        names.sort();
-        names
+        self.tools.names()
     }
 
     pub fn emit<W: Write>(&self, writer: &mut W, msg: &OutputMessage) {
@@ -114,6 +119,29 @@ impl CoshCore {
             .as_ref()
             .map(|ctx| ctx.cwd.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    /// Conservative runtime-prefix (`P`) estimate for budget computations.
+    ///
+    /// Skill summaries need async loading, so they are covered by the fixed
+    /// reserve inside [`crate::compaction::estimate_prefix_tokens`] instead
+    /// of being rendered here.
+    pub(crate) fn estimate_prefix_tokens(&self) -> u64 {
+        let system_prompt = ContextBuilder::build_system_prompt(
+            &self.cwd(),
+            &self.tool_names(),
+            &[],
+            &self.config.agent.approval_mode,
+            self.config.ai.output_language.as_deref(),
+        );
+        let declarations = serde_json::to_string(&self.tools.declarations()).unwrap_or_default();
+        crate::compaction::estimate_prefix_tokens(&system_prompt, &declarations)
+    }
+
+    /// Current effective-context size in tokens under the active projection.
+    pub(crate) fn effective_history_tokens(&self, prefix_tokens: u64) -> u64 {
+        self.compaction
+            .effective_history_tokens(&self.messages, prefix_tokens)
     }
 
     fn classify_tool(&self, tool_name: &str, _params: &serde_json::Value) -> Outcome {
@@ -163,6 +191,8 @@ impl CoshCore {
         W: Write,
         R: AsyncBufReadExt + Unpin,
     {
+        let content = crate::redaction::redact_text(content);
+
         // Generate a unique run_id for this agent run.
         let run_id = uuid::Uuid::new_v4().to_string();
         self.hook_system.set_run_id(run_id);
@@ -171,7 +201,7 @@ impl CoshCore {
         let cwd_str = self.cwd().to_string_lossy().to_string();
         let prompt_result = self
             .hook_system
-            .fire_user_prompt_submit(&self.session_id, &cwd_str, content)
+            .fire_user_prompt_submit(&self.session_id, &cwd_str, &content)
             .await;
 
         if let HookDecision::Block(reason) = &prompt_result.decision {
@@ -256,7 +286,7 @@ impl CoshCore {
             self.emit_hook_notifications(writer, &prompt_result.notifications, None);
         }
 
-        self.messages.push(Message::user(content));
+        self.messages.push(Message::user(&content));
 
         // Inject additional context from hooks
         if let Some(ref ctx) = prompt_result.additional_context {
@@ -270,7 +300,9 @@ impl CoshCore {
             model: self.model.clone(),
             max_tokens: 4096,
             temperature: None,
-            include_usage: false,
+            // Usage reporting feeds compaction thresholds; the stream adapter
+            // guarantees Usage is delivered before MessageEnd.
+            include_usage: true,
             extra_params: self.extra_params.clone(),
         };
 
@@ -281,19 +313,44 @@ impl CoshCore {
             &self.config.agent.approval_mode,
             self.config.ai.output_language.as_deref(),
         );
+        // Runtime prefix estimate (P): system prompt + serialized tool
+        // declarations + the compaction module's reserve for hook context
+        // injected mid-run.
+        let prefix_tokens = crate::compaction::estimate_prefix_tokens(
+            &system_prompt,
+            &serde_json::to_string(&tool_decls).unwrap_or_default(),
+        );
 
         let max_turns = self.config.agent.max_turns;
 
         for _turn in 0..max_turns {
+            // ─── Context preflight (every provider call, incl. tool loop) ───
+            // The loop top is always a complete model/tool exchange boundary
+            // with no pending approval or user question, so an emergency
+            // compaction here can never split an unfinished interaction.
+            crate::compaction::run_context_preflight(
+                &mut self.compaction,
+                &self.messages,
+                self.provider.as_ref(),
+                &self.model,
+                &self.config,
+                prefix_tokens,
+                writer,
+            )
+            .await?;
+
+            let mut provider_messages = self.compaction.effective_messages(&self.messages);
+            crate::redaction::redact_messages(&mut provider_messages);
+
             // ─── Hook: BeforeModel ───
             let before_model_result = self
                 .hook_system
-                .fire_before_model(&self.session_id, &cwd_str, &self.model, &self.messages)
+                .fire_before_model(&self.session_id, &cwd_str, &self.model, &provider_messages)
                 .await;
             self.emit_hook_notifications(writer, &before_model_result.notifications, None);
 
             let mut msgs_with_system = vec![Message::system(&system_prompt)];
-            msgs_with_system.extend(self.messages.clone());
+            msgs_with_system.extend(provider_messages);
 
             // ─── SLS: API request timing ───
             self.metrics.api_requests += 1;
@@ -423,6 +480,9 @@ impl CoshCore {
                         total_tokens,
                     } => {
                         usage_info = Some((prompt_tokens, completion_tokens, total_tokens));
+                        // Explicit hand-off: provider usage feeds compaction
+                        // thresholds through the runtime's accounting API.
+                        self.compaction.note_provider_usage(prompt_tokens as u64);
                         // ─── SLS: token usage ───
                         self.metrics.tokens_input += prompt_tokens as u64;
                         self.metrics.tokens_output += completion_tokens as u64;
@@ -485,20 +545,22 @@ impl CoshCore {
             }
 
             if tool_calls.is_empty() {
-                if let Some(synthetic) = parse_cosh_question_text(&text_buf) {
-                    let result = self
-                        .handle_ask_user("synthetic-ask", &synthetic, reader, writer)
-                        .await;
-                    if result.is_error {
+                if self.tools.supports_ask_user_question() {
+                    if let Some(synthetic) = parse_cosh_question_text(&text_buf) {
+                        let result = self
+                            .handle_ask_user("synthetic-ask", &synthetic, reader, writer)
+                            .await;
+                        if result.is_error {
+                            self.messages.push(Message::assistant(&text_buf));
+                            return Ok(());
+                        }
                         self.messages.push(Message::assistant(&text_buf));
-                        return Ok(());
+                        self.messages.push(Message::user(&format!(
+                            "User answered the question: {}",
+                            result.output
+                        )));
+                        continue;
                     }
-                    self.messages.push(Message::assistant(&text_buf));
-                    self.messages.push(Message::user(&format!(
-                        "User answered the question: {}",
-                        result.output
-                    )));
-                    continue;
                 }
 
                 // ─── Hook: Stop ───
@@ -550,7 +612,7 @@ impl CoshCore {
                 let params: serde_json::Value =
                     serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
 
-                if tc.name == "ask_user_question" {
+                if tc.name == "ask_user_question" && self.tools.supports_ask_user_question() {
                     let result = self.handle_ask_user(&tc.id, &params, reader, writer).await;
                     self.messages.push(Message::tool_result(
                         &tc.id,

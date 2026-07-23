@@ -26,6 +26,8 @@ pub(super) enum SlashCommand<'a> {
     Unknown(&'a str),
     Extensions(Option<&'a str>, Option<&'a str>),
     Skills(Option<&'a str>, Option<&'a str>),
+    Session(&'a str),
+    Recommendations(Option<&'a str>, Option<&'a str>, Option<&'a str>),
 }
 
 impl<'a> SlashCommand<'a> {
@@ -69,6 +71,17 @@ impl<'a> SlashCommand<'a> {
                 let arg = parts.next();
                 Some(Self::Skills(sub, arg))
             }
+            "/session" => Some(Self::Session(
+                input.strip_prefix("/session").unwrap_or_default().trim(),
+            )),
+            "/resume" => Some(Self::Session(
+                input.strip_prefix("/resume").unwrap_or_default().trim(),
+            )),
+            "/recommendations" => Some(Self::Recommendations(
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            )),
             "/agent" | "/cancel" | "/clear" | "/copy" | "/details" | "/explain" | "/select"
             | "/send-to-shell" | "/shell" => None,
             "/" => Some(Self::Noop),
@@ -124,6 +137,30 @@ mod tests {
     }
 
     #[test]
+    fn session_commands_and_resume_alias_share_parser_path() {
+        match SlashCommand::parse("/session resume abc") {
+            Some(SlashCommand::Session(arguments)) => assert_eq!(arguments, "resume abc"),
+            _ => panic!("/session did not parse as a session command"),
+        }
+        match SlashCommand::parse("/resume abc") {
+            Some(SlashCommand::Session(arguments)) => assert_eq!(arguments, "abc"),
+            _ => panic!("/resume did not parse as a session command"),
+        }
+    }
+
+    #[test]
+    fn recommendations_preserves_subcommand_and_rejectable_extra_arguments() {
+        match SlashCommand::parse("/recommendations on unexpected extra") {
+            Some(SlashCommand::Recommendations(sub, arg, extra)) => {
+                assert_eq!(sub, Some("on"));
+                assert_eq!(arg, Some("unexpected"));
+                assert_eq!(extra, Some("extra"));
+            }
+            _ => panic!("recommendations command did not parse"),
+        }
+    }
+
+    #[test]
     fn hidden_and_contextual_commands_are_not_public_hints() {
         assert!(slash_hints("/co").iter().any(|hint| hint.name == "/config"));
         for prefix in ["/ag", "/ca", "/de", "/au", "/se", "/co", "/send", "/debug"] {
@@ -131,7 +168,7 @@ mod tests {
             assert!(
                 hints.iter().all(|hint| matches!(
                     hint.name,
-                    "/config" | "/mode" | "/hooks" | "/extensions" | "/skills"
+                    "/config" | "/session" | "/mode" | "/hooks" | "/extensions" | "/skills"
                 )),
                 "{prefix} returned non-public hints: {:?}",
                 hints.iter().map(|hint| hint.name).collect::<Vec<_>>()

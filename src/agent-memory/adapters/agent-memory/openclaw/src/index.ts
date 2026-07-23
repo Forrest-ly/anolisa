@@ -94,7 +94,13 @@ export default definePluginEntry({
           const rawText = await client.callTool("memory_search", {
             query: userMessage,
             top_k: 5,
-            mode: "hybrid",
+          // Use BM25 mode for auto-recall: memories are synchronously indexed
+          // immediately after observe (PR #1520), so BM25 finds them without delay.
+          // User prompts typically contain keyword matches with stored memories
+          // (e.g., "I decided" matching "decision" memories), making BM25 sufficient.
+          // Hybrid mode adds complexity without benefit when no embedding provider
+          // is configured.
+            mode: "bm25",
           });
 
           // Parse to verify we have hits; skip injection on empty results.
@@ -102,9 +108,17 @@ export default definePluginEntry({
           try {
             hits = JSON.parse(rawText);
           } catch {
+            api.logger.warn?.(
+              `agent-memory: auto-recall memory_search returned non-JSON response (len=${rawText.length})`,
+            );
             return;
           }
-          if (!Array.isArray(hits) || hits.length === 0) return;
+          if (!Array.isArray(hits) || hits.length === 0) {
+            api.logger.info?.(
+              `agent-memory: auto-recall found 0 results for prompt (query len=${userMessage.length})`,
+            );
+            return;
+          }
 
           const wrapped = wrapMemoryResultsForPrompt(rawText);
           if (!wrapped) return;

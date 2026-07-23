@@ -44,8 +44,10 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use anolisa_core::domain::{Installation, ManagementRelation, ProviderBinding};
 use anolisa_core::self_update;
-use anolisa_core::state::{InstalledObject, InstalledState, ObjectKind, Ownership};
+use anolisa_core::state::ObjectKind;
+use anolisa_core::state_store::StateStore;
 use anolisa_platform::fs_layout::FsLayout;
 use anolisa_platform::pkg_query::{PackageQuery, PackageQueryError, PackageVersion, rpm_evr_cmp};
 use anolisa_platform::rpm_query::RpmPackageQuery;
@@ -91,6 +93,7 @@ const PROFILES_SUBDIR: &str = "profiles";
 // items against the same vocabulary the check produces.
 pub(crate) const ACTION_UPDATE: &str = "update";
 pub(crate) const ACTION_NOOP: &str = "noop";
+pub(crate) const ACTION_RECONCILE: &str = "reconcile";
 pub(crate) const ACTION_INSTALL: &str = "install";
 pub(crate) const ACTION_UNSUPPORTED: &str = "unsupported";
 pub(crate) const ACTION_UNSUPPORTED_RPM: &str = "unsupported_in_rpm_upgrade";
@@ -113,10 +116,10 @@ pub(crate) struct UpdateCheckReport {
     /// narrow: a missing default is an *install*, not an upgrade, so it does not
     /// set this — see [`action_required`](Self::action_required).
     upgrade_available: bool,
-    /// True when there is anything to do: an upgrade **or** a missing default to
-    /// install. This is the signal machine callers should gate on when driving
-    /// `anolisa upgrade`; `upgrade_available` alone would report
-    /// "nothing to upgrade" on a fresh image that is only missing defaults.
+    /// True when there is anything to do: an upgrade, a missing default to
+    /// install, or RPM state to reconcile. This is the signal machine callers
+    /// should gate on when driving `anolisa upgrade`; `upgrade_available` alone
+    /// intentionally covers only package version updates.
     action_required: bool,
     pub(crate) cli: CliCheck,
     pub(crate) components: Vec<ComponentCheck>,
@@ -162,6 +165,10 @@ pub(crate) struct ComponentCheck {
     /// absent from ANOLISA state. It is intentionally not part of JSON/cache.
     #[serde(skip)]
     pub(crate) absent_from_state: bool,
+    /// Internal planner hint: the RPM package was resolved for a legacy state
+    /// row whose package metadata needs to be backfilled by `upgrade`.
+    #[serde(skip)]
+    pub(crate) backfill_rpm_metadata: bool,
 }
 
 /// Aggregate counts used by the summary line, MOTD, and exit signalling.
@@ -169,6 +176,10 @@ pub(crate) struct ComponentCheck {
 struct CheckSummary {
     /// Upgrades found (CLI plus components).
     updates: usize,
+    /// Legacy RPM rows whose resolved package metadata needs reconciliation.
+    /// Defaults to zero when reading caches written before this field existed.
+    #[serde(default)]
+    reconciliations: usize,
     /// Profile default components absent from state.
     missing_defaults: usize,
     /// Items outside the RPM upgrade scope (raw-managed, non-RPM CLI).
@@ -205,7 +216,7 @@ impl TargetProfile {
 /// Read-only inputs for [`run_update_check`]; injected so tests drive the whole
 /// report without a live rpmdb/dnf.
 struct CheckInputs<'a> {
-    installed: &'a InstalledState,
+    installed: &'a StateStore,
     query: &'a dyn PackageQuery,
     /// Path of the running executable, used to find its owning RPM.
     cli_exe_path: &'a str,
@@ -316,7 +327,7 @@ pub(crate) fn compute_update_check_report(
         },
     )?;
     let query = RpmPackageQuery::system_with_repo(repo);
-    let installed = common::load_installed_state(ctx, CHECK_COMMAND)?;
+    let installed = common::load_state_store(ctx, CHECK_COMMAND)?;
 
     let exe = self_update::resolve_current_exe().map_err(|err| CliError::Runtime {
         command: CHECK_COMMAND.to_string(),
@@ -380,13 +391,15 @@ fn run_update_check(inputs: CheckInputs<'_>) -> UpdateCheckReport {
     let cli = build_cli_check(inputs.query, inputs.cli_exe_path, inputs.arch, &mut summary);
 
     let mut components = Vec::new();
-    for obj in &inputs.installed.objects {
-        if obj.kind != ObjectKind::Component {
+    for installation in &inputs.installed.installations {
+        if installation.kind != ObjectKind::Component {
             continue;
         }
         components.push(check_component(
             inputs.query,
-            obj,
+            inputs.component_index,
+            inputs.rpm_backend,
+            installation,
             inputs.arch,
             &mut summary,
         ));
@@ -399,11 +412,7 @@ fn run_update_check(inputs: CheckInputs<'_>) -> UpdateCheckReport {
     // adopted) is evaluated for upgrades instead of falsely reported as missing.
     if let Some(profile) = &inputs.target {
         for name in &profile.default_components {
-            if inputs
-                .installed
-                .find_object(ObjectKind::Component, name)
-                .is_some()
-            {
+            if inputs.installed.find(ObjectKind::Component, name).is_some() {
                 continue;
             }
             components.push(check_default_component(
@@ -418,7 +427,8 @@ fn run_update_check(inputs: CheckInputs<'_>) -> UpdateCheckReport {
     }
 
     let upgrade_available = summary.updates > 0;
-    let action_required = upgrade_available || summary.missing_defaults > 0;
+    let action_required =
+        upgrade_available || summary.reconciliations > 0 || summary.missing_defaults > 0;
     UpdateCheckReport {
         target: inputs.target_name,
         backend: "rpm".to_string(),
@@ -526,46 +536,66 @@ fn build_cli_check(
 /// Evaluate one installed component against the RPM upgrade scope.
 fn check_component(
     query: &dyn PackageQuery,
-    obj: &InstalledObject,
+    component_index: Option<&ComponentIndex>,
+    rpm_backend: Option<&BackendConfig>,
+    installation: &Installation,
     arch: &str,
     summary: &mut CheckSummary,
 ) -> ComponentCheck {
-    let component = obj.name.clone();
-    let ownership = obj.effective_ownership();
+    let component = installation.name.clone();
 
-    // Raw-managed components are explicitly out of the RPM upgrade path. Nothing
-    // is queried, touched, or migrated — only reported.
-    if ownership == Ownership::RawManaged {
-        summary.unsupported += 1;
-        return ComponentCheck {
-            component,
-            package: obj.raw_package.clone(),
-            ownership: Some(ownership.label().to_string()),
-            installed: Some(obj.version.clone()),
-            available: None,
-            action: ACTION_UNSUPPORTED_RPM.to_string(),
-            error: None,
-            absent_from_state: false,
-        };
-    }
+    // Owned components are explicitly out of the RPM upgrade path. Nothing is
+    // queried, touched, or migrated — only reported.
+    let (identity, relation, last_observed) = match &installation.binding {
+        ProviderBinding::Owned { artifact } => {
+            summary.unsupported += 1;
+            return ComponentCheck {
+                component,
+                package: artifact.raw_package.clone(),
+                ownership: Some("owned".to_string()),
+                installed: Some(artifact.version.clone()),
+                available: None,
+                action: ACTION_UNSUPPORTED_RPM.to_string(),
+                error: None,
+                absent_from_state: false,
+                backfill_rpm_metadata: false,
+            };
+        }
+        ProviderBinding::Delegated {
+            package,
+            relation,
+            last_observed,
+            ..
+        } => (package, relation, last_observed),
+    };
 
-    let ownership_label = ownership.label().to_string();
-    let package = match obj
-        .rpm_metadata
+    let ownership_label = relation.label().to_string();
+    // Recorded version for error rows, where rpmdb could not be consulted:
+    // the observation cache is the best (stale) display value available.
+    let recorded_version = last_observed
         .as_ref()
-        .map(|m| m.package_name.clone())
+        .map(|obs| obs.evr.clone().unwrap_or_else(|| obs.version.clone()));
+    let (package, backfill_rpm_metadata) = match identity
+        .resolved_name()
+        .map(str::trim)
         .filter(|p| !p.is_empty())
     {
-        Some(package) => package,
+        Some(package) => (package.to_string(), false),
         None => {
-            summary.errors += 1;
-            return component_error(
-                component,
-                None,
-                ownership_label,
-                Some(obj.version.clone()),
-                "component is recorded as RPM-backed but has no package metadata; run `anolisa repair` to refresh it".to_string(),
-            );
+            match resolve_legacy_component_package(query, component_index, rpm_backend, &component)
+            {
+                Ok(package) => (package, true),
+                Err(reason) => {
+                    summary.errors += 1;
+                    return component_error(
+                        component,
+                        None,
+                        ownership_label,
+                        recorded_version,
+                        reason,
+                    );
+                }
+            }
         }
     };
 
@@ -579,7 +609,7 @@ fn check_component(
                 component,
                 Some(package),
                 ownership_label,
-                Some(obj.version.clone()),
+                recorded_version.clone(),
                 "package recorded in ANOLISA state is not present in rpmdb; run `anolisa forget` or reinstall".to_string(),
             );
         }
@@ -589,7 +619,7 @@ fn check_component(
                 component,
                 Some(package),
                 ownership_label,
-                Some(obj.version.clone()),
+                recorded_version.clone(),
                 "rpmdb reports multiple installed versions for this package".to_string(),
             );
         }
@@ -599,7 +629,7 @@ fn check_component(
                 component,
                 Some(package),
                 ownership_label,
-                Some(obj.version.clone()),
+                recorded_version.clone(),
                 "rpm/dnf not found; cannot query the installed version".to_string(),
             );
         }
@@ -609,7 +639,7 @@ fn check_component(
                 component,
                 Some(package),
                 ownership_label,
-                Some(obj.version.clone()),
+                recorded_version.clone(),
                 format!("rpm query failed: {err}"),
             );
         }
@@ -628,18 +658,28 @@ fn check_component(
                 action: ACTION_UPDATE.to_string(),
                 error: None,
                 absent_from_state: false,
+                backfill_rpm_metadata,
             }
         }
-        Ok(None) => ComponentCheck {
-            component,
-            package: Some(package),
-            ownership: Some(ownership_label),
-            installed: Some(installed_evr),
-            available: None,
-            action: ACTION_NOOP.to_string(),
-            error: None,
-            absent_from_state: false,
-        },
+        Ok(None) => {
+            let action = if backfill_rpm_metadata {
+                summary.reconciliations += 1;
+                ACTION_RECONCILE
+            } else {
+                ACTION_NOOP
+            };
+            ComponentCheck {
+                component,
+                package: Some(package),
+                ownership: Some(ownership_label),
+                installed: Some(installed_evr),
+                available: None,
+                action: action.to_string(),
+                error: None,
+                absent_from_state: false,
+                backfill_rpm_metadata,
+            }
+        }
         Err(err) => {
             summary.errors += 1;
             component_error(
@@ -695,6 +735,7 @@ fn check_default_component(
                         action: ACTION_ERROR.to_string(),
                         error: Some(reason),
                         absent_from_state: true,
+                        backfill_rpm_metadata: false,
                     };
                 }
             };
@@ -716,6 +757,7 @@ fn check_default_component(
                             "cannot query installed version of resolved package for default component '{name}': {err}"
                         )),
                         absent_from_state: true,
+                        backfill_rpm_metadata: false,
                     };
                 }
             }
@@ -729,6 +771,7 @@ fn check_default_component(
                 action: ACTION_INSTALL.to_string(),
                 error: None,
                 absent_from_state: true,
+                backfill_rpm_metadata: false,
             }
         }
         // Could not determine presence (query failure, ambiguous providers).
@@ -746,6 +789,7 @@ fn check_default_component(
                 action: ACTION_ERROR.to_string(),
                 error: Some(reason),
                 absent_from_state: true,
+                backfill_rpm_metadata: false,
             }
         }
     }
@@ -785,6 +829,37 @@ fn resolve_default_install_package(
         }
         Err(err) => Err(format!(
             "cannot resolve RPM package for default component '{name}': {err}"
+        )),
+    }
+}
+
+fn resolve_legacy_component_package(
+    query: &dyn PackageQuery,
+    index: Option<&ComponentIndex>,
+    rpm_backend: Option<&BackendConfig>,
+    name: &str,
+) -> Result<String, String> {
+    let resolver = ComponentResolver::new(index, rpm_backend, Some(query));
+    match resolver.resolve(
+        name,
+        BackendKind::Rpm,
+        ResolutionUse::RepairLegacy,
+        ResolveOptions::default(),
+    ) {
+        Ok(ResolutionSet::Unique(target)) => Ok(target.package),
+        Ok(ResolutionSet::None) => Err(format!(
+            "component '{name}' is recorded as RPM-backed without package metadata, and no RPM package could be resolved; run `anolisa repair {name}`"
+        )),
+        Ok(ResolutionSet::Ambiguous(targets)) => Err(format!(
+            "component '{name}' is recorded as RPM-backed without package metadata, and multiple RPM packages were resolved ({}); run `anolisa repair {name}`",
+            targets
+                .iter()
+                .map(|target| target.package.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        Err(err) => Err(format!(
+            "cannot resolve the RPM package for legacy component '{name}': {err}"
         )),
     }
 }
@@ -894,7 +969,7 @@ fn check_present_default(
     arch: &str,
     summary: &mut CheckSummary,
 ) -> ComponentCheck {
-    let ownership_label = Ownership::RpmObserved.label().to_string();
+    let ownership_label = ManagementRelation::Observed.label().to_string();
     let installed = match query.query_installed(package) {
         Ok(Some(info)) => info.version,
         // The probe just resolved `package` as an installed provider, so an
@@ -938,6 +1013,7 @@ fn check_present_default(
                 action: ACTION_UPDATE.to_string(),
                 error: None,
                 absent_from_state: true,
+                backfill_rpm_metadata: false,
             }
         }
         Ok(None) => ComponentCheck {
@@ -949,6 +1025,7 @@ fn check_present_default(
             action: ACTION_NOOP.to_string(),
             error: None,
             absent_from_state: true,
+            backfill_rpm_metadata: false,
         },
         Err(err) => {
             summary.errors += 1;
@@ -1028,6 +1105,7 @@ fn component_error(
         action: ACTION_ERROR.to_string(),
         error: Some(reason),
         absent_from_state: false,
+        backfill_rpm_metadata: false,
     }
 }
 
