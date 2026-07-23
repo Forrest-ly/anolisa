@@ -482,8 +482,10 @@ release-install-script:
 	@echo 'find "$$SHARE_DIR" -type f \( -name '\''*.py'\'' -o -name '\''*.sh'\'' \) -exec chmod 0755 {} +' >> dist/tokenless-$(VERSION)/install.sh
 	@echo '' >> dist/tokenless-$(VERSION)/install.sh
 	@echo '# --- Component contract ---' >> dist/tokenless-$(VERSION)/install.sh
-	@echo 'install -d -m 0755 "$$COMPONENTS_DIR"' >> dist/tokenless-$(VERSION)/install.sh
-	@echo 'install -m 0644 "$$SCRIPT_DIR/share/component.toml" "$$COMPONENTS_DIR/"' >> dist/tokenless-$(VERSION)/install.sh
+	@echo 'if [ -f "$$SCRIPT_DIR/share/component.toml" ]; then' >> dist/tokenless-$(VERSION)/install.sh
+	@echo '    install -d -m 0755 "$$COMPONENTS_DIR"' >> dist/tokenless-$(VERSION)/install.sh
+	@echo '    install -m 0644 "$$SCRIPT_DIR/share/component.toml" "$$COMPONENTS_DIR/"' >> dist/tokenless-$(VERSION)/install.sh
+	@echo 'fi' >> dist/tokenless-$(VERSION)/install.sh
 	@echo '' >> dist/tokenless-$(VERSION)/install.sh
 	@echo '# --- Cosh extension ---' >> dist/tokenless-$(VERSION)/install.sh
 	@echo 'if [ -d "$$COSH_EXT_DIR" ]; then' >> dist/tokenless-$(VERSION)/install.sh
