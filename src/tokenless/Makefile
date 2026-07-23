@@ -340,8 +340,8 @@ release:
 	find dist/tokenless-$(VERSION)/share/adapters/tokenless \
 	    -type f \( -name '*.py' -o -name '*.sh' \) -exec chmod 0755 {} +
 	install -m 0644 $(COMPONENT_CONTRACT) dist/tokenless-$(VERSION)/share/component.toml
-	install -m 0644 docs/tokenless-user-manual-en.md dist/tokenless-$(VERSION)/docs/
-	install -m 0644 docs/tokenless-user-manual-zh.md dist/tokenless-$(VERSION)/docs/
+	install -m 0644 ../../docs/user-guide/en/token-saving/tokenless/user-manual.md dist/tokenless-$(VERSION)/docs/tokenless-user-manual-en.md
+	install -m 0644 ../../docs/user-guide/zh/token-saving/tokenless/user-manual.md dist/tokenless-$(VERSION)/docs/tokenless-user-manual-zh.md
 	install -m 0644 docs/response-compression.md dist/tokenless-$(VERSION)/docs/
 	install -m 0644 LICENSE dist/tokenless-$(VERSION)/
 	$(MAKE) --no-print-directory release-install-script
