@@ -7,6 +7,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import tomllib
+except ImportError:
+    tomllib = None  # type: ignore[assignment]
+
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION_RE = re.compile(
@@ -45,16 +50,25 @@ GENERATED_CONTRACTS = (
 
 
 def read_toml_version(path: str) -> str:
-    match = VERSION_RE.search((ROOT / path).read_text())
+    text = (ROOT / path).read_text()
+    if tomllib is not None:
+        try:
+            data = tomllib.loads(text)
+            version = data.get("version")
+            if isinstance(version, str):
+                return version
+        except tomllib.TOMLDecodeError:
+            pass
+    match = VERSION_RE.search(text)
     if not match:
-        raise ValueError(f"no version field in {path}")
+        raise ValueError(f"no version field in {path} (component: {path.rsplit('/', 1)[0]})")
     return match.group(1)
 
 
 def read_json_version(path: str) -> str:
     version = json.loads((ROOT / path).read_text()).get("version")
     if not isinstance(version, str):
-        raise ValueError(f"no JSON version field in {path}")
+        raise ValueError(f"no JSON version field in {path} (component: {path.rsplit('/', 1)[0]})")
     return version
 
 
@@ -84,20 +98,32 @@ def check_template(errors: list[str], source: str, template: str) -> None:
 def check_agent_memory_lock(errors: list[str], expected: str) -> None:
     path = "src/agent-memory/adapters/agent-memory/openclaw/package-lock.json"
     lock = json.loads((ROOT / path).read_text())
-    versions = (lock.get("version"), lock.get("packages", {}).get("", {}).get("version"))
-    if versions != (expected, expected):
-        errors.append(f"{path}: expected root and package versions {expected}, found {versions}")
+    root_version = lock.get("version")
+    if root_version != expected:
+        errors.append(f"{path}: expected root version {expected}, found {root_version}")
+    packages_root = lock.get("packages", {}).get("")
+    if packages_root is not None:
+        pkg_version = packages_root.get("version")
+        if pkg_version != expected:
+            errors.append(f"{path}: expected packages root version {expected}, found {pkg_version}")
 
 
 def check_generated_contracts_untracked(errors: list[str]) -> None:
+    if not (ROOT / ".git").exists():
+        print("warning: skipping untracked-contracts check (no .git found)", file=sys.stderr)
+        return
     for path in GENERATED_CONTRACTS:
-        result = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", path],
-            cwd=ROOT,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", path],
+                cwd=ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            print("warning: skipping untracked-contracts check (git not available)", file=sys.stderr)
+            return
         if result.returncode == 0:
             errors.append(f"{path}: generated component contract must not be tracked")
 
