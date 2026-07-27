@@ -1368,15 +1368,19 @@ mod tests {
         install_mode: InstallMode,
         prefix: Option<PathBuf>,
     ) -> CliContext {
-        CliContext {
+        let root = prefix
+            .as_deref()
+            .expect("stateful uninstall tests require an isolated prefix");
+        crate::test_support::context_for_root(
+            root,
             install_mode,
-            prefix,
-            json,
-            dry_run,
-            verbose: false,
-            quiet: true,
-            no_color: true,
-        }
+            prefix.clone(),
+            crate::test_support::TestContextOptions {
+                json,
+                dry_run,
+                ..Default::default()
+            },
+        )
     }
 
     fn legacy_state_for_layout(layout: &FsLayout) -> InstalledState {
@@ -2025,6 +2029,7 @@ mod tests {
             bundle_digest: None,
             driver_schema: 1,
             status: ClaimStatus::Enabled,
+            notices: Vec::new(),
             resources: Vec::new(),
             driver_payload: DriverPayload::OpenClaw(OpenClawClaim {
                 state_dir_resource: "state".to_string(),

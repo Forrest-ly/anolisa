@@ -381,15 +381,15 @@ mod tests {
     use crate::context::InstallMode;
 
     fn ctx(prefix: PathBuf, install_mode: InstallMode, dry_run: bool) -> CliContext {
-        CliContext {
+        crate::test_support::context_for_root(
+            &prefix,
             install_mode,
-            prefix: Some(prefix),
-            json: false,
-            dry_run,
-            verbose: false,
-            quiet: true,
-            no_color: true,
-        }
+            Some(prefix.clone()),
+            crate::test_support::TestContextOptions {
+                dry_run,
+                ..Default::default()
+            },
+        )
     }
 
     /// An adopted rpm-observed component object (legacy v4 shape; loading it
@@ -468,6 +468,7 @@ mod tests {
             bundle_digest: None,
             driver_schema: 1,
             status: ClaimStatus::Enabled,
+            notices: Vec::new(),
             resources: Vec::new(),
             driver_payload: DriverPayload::OpenClaw(OpenClawClaim {
                 state_dir_resource: "state".to_string(),

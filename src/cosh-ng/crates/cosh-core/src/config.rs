@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,9 @@ pub struct CoreConfig {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// Trusted MCP client connections loaded from system or user configuration.
+    #[serde(default)]
+    pub mcp: McpConfig,
     #[serde(default)]
     pub session: SessionConfig,
     #[serde(default)]
@@ -68,6 +71,9 @@ pub struct AgentConfig {
     pub session_token_limit: u64,
     #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls_per_turn: u32,
+    /// Tools that bypass approval for this agent configuration.
+    #[serde(default)]
+    pub allowed_tools: HashSet<String>,
 }
 
 impl Default for AgentConfig {
@@ -77,6 +83,7 @@ impl Default for AgentConfig {
             max_turns: default_max_turns(),
             session_token_limit: default_session_token_limit(),
             max_tool_calls_per_turn: default_max_tool_calls(),
+            allowed_tools: HashSet::new(),
         }
     }
 }
@@ -137,6 +144,74 @@ pub struct SkillsConfig {
     pub custom_paths: Vec<String>,
 }
 
+/// Configuration for locally managed MCP client connections.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct McpConfig {
+    /// Server definitions keyed by a stable, user-visible server name.
+    #[serde(default)]
+    pub servers: HashMap<String, McpServerConfig>,
+}
+
+/// A trusted MCP server that cosh-core may start locally or contact over HTTP.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerConfig {
+    /// Executable for a locally managed stdio server, launched without a shell.
+    #[serde(default)]
+    pub command: String,
+    /// Streamable HTTP endpoint. Mutually exclusive with `command`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Arguments passed to the configured executable.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Explicit environment variables available to the child process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Optional static bearer token for an HTTP server.
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    /// OAuth settings for a Streamable HTTP server. Tokens are stored separately.
+    #[serde(default)]
+    pub oauth: McpOAuthConfig,
+    /// Startup and request timeout in milliseconds.
+    #[serde(default = "default_mcp_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Server startup and tool discovery timeout in milliseconds.
+    #[serde(default = "default_mcp_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+    /// `None` exposes every server tool; an empty list exposes none.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+/// Non-secret OAuth settings for a Streamable HTTP MCP server.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct McpOAuthConfig {
+    /// Pre-registered public client identifier. When absent, dynamic registration is used.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Requested OAuth scopes when the server does not advertise them.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// OAuth resource indicator. Defaults to the MCP endpoint.
+    #[serde(default)]
+    pub resource: Option<String>,
+    /// Authorization-server metadata URL, bypassing protected-resource discovery.
+    #[serde(default)]
+    pub auth_server_metadata_url: Option<String>,
+    /// Local callback port. An ephemeral port is used when omitted.
+    #[serde(default)]
+    pub callback_port: Option<u16>,
+}
+
+fn default_mcp_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_mcp_startup_timeout_ms() -> u64 {
+    30_000
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionConfig {
     #[serde(default = "default_true")]
@@ -178,7 +253,9 @@ pub struct CompactionConfig {
     /// Best-effort post-compaction fraction of the usable history budget.
     #[serde(default = "default_target_ratio")]
     pub target_ratio: f64,
-    /// Minimum number of recent complete Agent runs kept verbatim.
+    /// Minimum recent complete Agent runs kept verbatim by automatic and
+    /// emergency compaction; at least one is always retained. Explicit manual
+    /// compaction may summarize the latest complete run.
     #[serde(default = "default_preserve_recent_runs")]
     pub preserve_recent_runs: usize,
     /// Explicit user override for the model context window, in tokens.
@@ -308,6 +385,7 @@ struct PartialCoreConfig {
     agent: Option<PartialAgentConfig>,
     hooks: Option<PartialHooksConfig>,
     skills: Option<PartialSkillsConfig>,
+    mcp: Option<McpConfig>,
     session: Option<PartialSessionConfig>,
     logging: Option<PartialLoggingConfig>,
 }
@@ -328,6 +406,7 @@ struct PartialAgentConfig {
     max_turns: Option<u32>,
     session_token_limit: Option<u64>,
     max_tool_calls_per_turn: Option<u32>,
+    allowed_tools: Option<HashSet<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -444,6 +523,9 @@ fn apply_user_layer(config: &mut CoreConfig, layer: &PartialCoreConfig) {
                 .insert(provider_id.clone(), provider.clone());
         }
     }
+    if let Some(ref mcp) = layer.mcp {
+        config.mcp.servers.extend(mcp.servers.clone());
+    }
     apply_common_layers(config, layer);
 }
 
@@ -462,6 +544,12 @@ fn apply_project_layer(config: &mut CoreConfig, layer: &PartialCoreConfig, path:
             );
         }
         apply_ai_preferences(&mut config.ai, ai);
+    }
+    if layer.mcp.is_some() {
+        eprintln!(
+            "[cosh-core] Warning: ignoring MCP servers from project config {}",
+            path.display()
+        );
     }
     apply_common_layers(config, layer);
 }
@@ -508,6 +596,9 @@ fn apply_agent_layer(config: &mut AgentConfig, layer: &PartialAgentConfig) {
     }
     if let Some(value) = layer.max_tool_calls_per_turn {
         config.max_tool_calls_per_turn = value;
+    }
+    if let Some(ref value) = layer.allowed_tools {
+        config.allowed_tools = value.clone();
     }
 }
 
@@ -797,6 +888,22 @@ pub fn persist_config(config: &CoreConfig) -> Result<(), String> {
     persist_config_to_dir(config, &dir)
 }
 
+/// Matches only the `[ai]` table header and its dotted children (`[ai.providers.x]`),
+/// not lookalike sections such as `[aider]` or `[ai_drivers]`.
+/// Trailing whitespace or an inline comment after the closing bracket is accepted.
+fn is_ai_section_header(line: &str) -> bool {
+    let t = line.trim();
+    let Some(end) = t.find(']') else {
+        return false;
+    };
+    let rest = t[end + 1..].trim_start();
+    if !(rest.is_empty() || rest.starts_with('#')) {
+        return false;
+    }
+    let header = &t[..end + 1];
+    header == "[ai]" || header.starts_with("[ai.")
+}
+
 fn persist_config_to_dir(config: &CoreConfig, dir: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create config dir: {e}"))?;
 
@@ -807,11 +914,11 @@ fn persist_config_to_dir(config: &CoreConfig, dir: &std::path::Path) -> Result<(
     let mut preserved = String::new();
     let mut in_ai_section = false;
     for line in existing.lines() {
-        if line.trim().starts_with("[ai") {
+        if is_ai_section_header(line) {
             in_ai_section = true;
             continue;
         }
-        if in_ai_section && line.trim().starts_with('[') && !line.trim().starts_with("[ai") {
+        if in_ai_section && line.trim().starts_with('[') && !is_ai_section_header(line) {
             in_ai_section = false;
         }
         if !in_ai_section {
@@ -1072,6 +1179,44 @@ max_tool_calls_per_turn = 20
         assert_eq!(compaction.preserve_recent_runs, 9);
         // The user-layer field the project layer omitted is preserved.
         assert!(compaction.auto);
+    }
+
+    #[test]
+    fn parse_stdio_mcp_config() {
+        let toml_str = r#"
+[mcp.servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+timeout_ms = 5000
+allowed_tools = ["read_file", "list_directory"]
+
+[mcp.servers.filesystem.env]
+API_KEY = "${FILESYSTEM_API_KEY}"
+"#;
+
+        let config: CoreConfig = toml::from_str(toml_str).unwrap();
+        let server = config.mcp.servers.get("filesystem").unwrap();
+        assert_eq!(server.command, "npx");
+        assert_eq!(server.timeout_ms, 5000);
+        assert_eq!(server.startup_timeout_ms, 30_000);
+        assert_eq!(server.allowed_tools.as_ref().unwrap().len(), 2);
+        assert_eq!(server.env["API_KEY"], "${FILESYSTEM_API_KEY}");
+    }
+
+    #[test]
+    fn parse_streamable_http_mcp_config() {
+        let toml_str = r#"
+[mcp.servers.remote]
+url = "https://mcp.example.com/mcp"
+bearer_token = "${MCP_TOKEN}"
+allowed_tools = ["search"]
+"#;
+
+        let config: CoreConfig = toml::from_str(toml_str).unwrap();
+        let server = config.mcp.servers.get("remote").unwrap();
+        assert_eq!(server.command, "");
+        assert_eq!(server.url.as_deref(), Some("https://mcp.example.com/mcp"));
+        assert_eq!(server.bearer_token.as_deref(), Some("${MCP_TOKEN}"));
     }
 
     #[test]
@@ -1336,6 +1481,33 @@ auth_source = "ecs_ram_role"
     }
 
     #[test]
+    fn project_mcp_config_is_ignored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let user_path = tmp.path().join("user-config.toml");
+        let project_path = tmp.path().join("project-config.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[mcp.servers.user]
+command = "user-server"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project_path,
+            r#"
+[mcp.servers.untrusted]
+command = "project-server"
+"#,
+        )
+        .unwrap();
+
+        let config = CoreConfig::load_from_paths(None, Some(&user_path), Some(&project_path));
+        assert!(config.mcp.servers.contains_key("user"));
+        assert!(!config.mcp.servers.contains_key("untrusted"));
+    }
+
+    #[test]
     fn user_provider_overrides_system_provider_atomically() {
         let tmp = tempfile::TempDir::new().unwrap();
         let system_path = tmp.path().join("system-config.toml");
@@ -1465,5 +1637,141 @@ api_key = "sk-user"
         assert!(content.contains("api_key = \"sk-user\""));
         assert!(!content.contains("system-provider"));
         assert!(!content.contains("sk-system"));
+    }
+
+    #[test]
+    fn persist_preserves_non_ai_sections_whose_names_start_with_ai() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let user_dir = tmp.path().join("home-config");
+        let user_path = user_dir.join("config.toml");
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        std::fs::write(
+            &user_path,
+            r#"[ai]
+active_provider = "old"
+
+[ai.providers.old]
+type = "openai_compat"
+base_url = "https://old.example/v1"
+api_key = "sk-old"
+model = "old-model"
+
+[aider]
+model = "claude-3-5-sonnet"
+edit_format = "diff"
+
+[aide]
+theme = "dark"
+
+[ai_drivers]
+enabled = true
+
+[agent]
+approval_mode = "balanced"
+"#,
+        )
+        .unwrap();
+
+        let mut config = CoreConfig::load_from_paths(None, Some(&user_path), None);
+        config.user_ai.active_provider = Some("new-provider".to_string());
+        config.user_ai.providers.clear();
+        let provider = ProviderConfig {
+            provider_type: Some("openai_compat".to_string()),
+            base_url: Some("https://new.example/v1".to_string()),
+            api_key: Some("sk-new".to_string()),
+            model: Some("new-model".to_string()),
+            ..Default::default()
+        };
+        config
+            .user_ai
+            .providers
+            .insert("new-provider".to_string(), provider);
+
+        persist_config_to_dir(&config, &user_dir).unwrap();
+
+        let content = std::fs::read_to_string(&user_path).unwrap();
+
+        // Non-ai sections with ai-prefixed names must survive.
+        assert!(content.contains("[aider]"));
+        assert!(content.contains("model = \"claude-3-5-sonnet\""));
+        assert!(content.contains("edit_format = \"diff\""));
+        assert!(content.contains("[aide]"));
+        assert!(content.contains("theme = \"dark\""));
+        assert!(content.contains("[ai_drivers]"));
+        assert!(content.contains("enabled = true"));
+        assert!(content.contains("[agent]"));
+        assert!(content.contains("approval_mode = \"balanced\""));
+
+        // Old ai content must be gone, new content present exactly once.
+        assert!(!content.contains("sk-old"));
+        assert!(!content.contains("old-model"));
+        assert!(!content.contains("[ai.providers.old]"));
+        assert!(content.contains("active_provider = \"new-provider\""));
+        assert!(content.contains("[ai.providers.new-provider]"));
+        assert!(content.contains("api_key = \"sk-new\""));
+        assert_eq!(content.matches("[ai]").count(), 1);
+        assert_eq!(content.matches("[ai.providers.").count(), 1);
+    }
+
+    #[test]
+    fn persist_replaces_ai_headers_with_inline_comments_without_duplication() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let user_dir = tmp.path().join("home-config");
+        let user_path = user_dir.join("config.toml");
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        std::fs::write(
+            &user_path,
+            r#"[ai] # valid inline comment
+active_provider = "old"
+
+[ai.providers.old] # legacy provider
+type = "openai_compat"
+api_key = "sk-old"
+
+[aider]
+model = "claude-3-5-sonnet"
+
+[agent]
+approval_mode = "balanced"
+"#,
+        )
+        .unwrap();
+
+        let mut config = CoreConfig::load_from_paths(None, Some(&user_path), None);
+        config.user_ai.active_provider = Some("new-provider".to_string());
+        config.user_ai.providers.clear();
+        let provider = ProviderConfig {
+            provider_type: Some("openai_compat".to_string()),
+            api_key: Some("sk-new".to_string()),
+            ..Default::default()
+        };
+        config
+            .user_ai
+            .providers
+            .insert("new-provider".to_string(), provider);
+
+        persist_config_to_dir(&config, &user_dir).unwrap();
+
+        let content = std::fs::read_to_string(&user_path).unwrap();
+
+        // No duplicate [ai] table; old content fully replaced.
+        assert_eq!(content.matches("[ai]").count(), 1);
+        assert!(!content.contains("sk-old"));
+        assert!(!content.contains("[ai.providers.old]"));
+        assert!(content.contains("active_provider = \"new-provider\""));
+        assert!(content.contains("[ai.providers.new-provider]"));
+
+        // Non-ai sections survive.
+        assert!(content.contains("[aider]"));
+        assert!(content.contains("model = \"claude-3-5-sonnet\""));
+        assert!(content.contains("[agent]"));
+
+        // Persisted output must be valid TOML that re-parses cleanly.
+        let parsed: CoreConfig = toml::from_str(&content).unwrap();
+        assert_eq!(parsed.ai.active_provider.as_deref(), Some("new-provider"));
+        assert!(parsed.ai.providers.contains_key("new-provider"));
+        assert_eq!(parsed.ai.providers.len(), 1);
     }
 }

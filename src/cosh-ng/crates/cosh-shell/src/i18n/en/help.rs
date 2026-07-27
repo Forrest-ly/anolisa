@@ -5,17 +5,18 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
         MessageId::HelpTitle => "Slash commands",
         MessageId::HelpFooter => "Mode: {mode}. Strategy: {strategy}.",
         MessageId::HelpGroupConfig => "Config",
+        MessageId::HelpGroupHealth => "Health",
         MessageId::HelpGroupModes => "Modes",
         MessageId::HelpGroupHooks => "Hooks",
         MessageId::HelpSummaryHelp => "show command reference",
         MessageId::HelpSummaryAuth => "configure AI provider credentials",
         MessageId::HelpSummaryConfig => "configure UI language",
         MessageId::HelpSummaryRecommendations => {
-            "manage recommendations; analysis sends bounded activity to the provider, and local clear does not control provider retention"
+            "manage personalized prompt recommendations only (failure insights: /mode analysis); analysis sends bounded activity to the provider, and local clear does not control provider retention"
         }
         MessageId::HelpSummaryModeApproval => "change approval mode",
         MessageId::HelpSummaryModeAnalysis => {
-            "choose suggested mode, automatic analysis, or no proactive assistance"
+            "choose suggested mode, automatic analysis, or no proactive assistance; controls passive suggestions and failure insights after failed commands"
         }
         MessageId::HelpSummaryAgent => "start an explicit Agent request",
         MessageId::HelpSummaryExplain => "analyze the last failed command",
@@ -23,6 +24,7 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
         MessageId::HelpSummaryDetails => "inspect approval/activity details",
         MessageId::HelpSummaryAudit => "show audit entry points",
         MessageId::HelpSummaryHooks => "show hook status",
+        MessageId::HelpSummaryHealth => "run an on-demand health check",
         MessageId::HelpSummarySelect => "show a displayed recommendation",
         MessageId::HelpSummaryCopy => "copy a displayed recommendation",
         MessageId::HelpSummaryDebug => "show session debug details",
@@ -39,6 +41,10 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
         MessageId::SlashUnknownBody => "Unknown slash command: {command}",
         MessageId::SlashUnknownSuggestionBody => "Did you mean {command}?",
         MessageId::SlashUnknownFooter => "Use /help to see available commands.",
+        MessageId::SlashInvalidArgumentsTitle => "Invalid slash arguments",
+        MessageId::SlashQuotedArgumentsUnsupported => {
+            "Quoted arguments are not supported. Use /mode approval trust confirm instead."
+        }
         MessageId::SlashInfoAuditTitle => "Audit",
         MessageId::SlashInfoAuditApprovalsBody => {
             "Approval decisions are available with Details actions."
