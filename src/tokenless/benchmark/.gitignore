@@ -1,0 +1,6 @@
+# Build artifacts of the standalone benchmark workspace.
+target/
+# Run-time outputs of run-benchmarks.sh — regenerated on every run and
+# machine-specific, so they must never be committed.
+benchmark_identity.json
+benchmark_output_*.log
