@@ -131,6 +131,13 @@ fn process_session(store: &TrajectoryStore, session: &DiscoveredSession) -> Resu
     }
 
     let mut trajectory = atif::convert_qoder_events(&events, &session.source)?;
+    if trajectory.steps.is_empty() {
+        let _ = store.set_file_state(&file_path, file_size, file_mtime_ns);
+        anyhow::bail!(
+            "no ATIF steps extracted for source {}; converter support may be missing",
+            session.source
+        );
+    }
     // The discovered id (filename UUID, subagent-composite when nested) is the
     // canonical per-file identity; keep the ATIF document aligned with the
     // primary-key column so both always agree.
@@ -141,6 +148,9 @@ fn process_session(store: &TrajectoryStore, session: &DiscoveredSession) -> Resu
     extra.extend(private);
 
     let atif_json = serde_json::to_string(&trajectory.to_json_value()?)?;
+    // Derived preview columns reuse the same extractor as the legacy-row
+    // backfill so both code paths always agree.
+    let (first_user_message, last_user_message) = store::extract_user_message_previews(&atif_json);
     let record = TrajectoryRecord {
         session_id: session.session_id.clone(),
         schema_version: trajectory.schema_version.clone(),
@@ -163,6 +173,8 @@ fn process_session(store: &TrajectoryStore, session: &DiscoveredSession) -> Resu
             .iter()
             .rev()
             .find_map(|s| s.timestamp.clone()),
+        first_user_message,
+        last_user_message,
         atif_json,
         project: session.project.clone(),
         source: session.source.clone(),
@@ -276,5 +288,29 @@ mod tests {
         // The first immediate scan must have ingested the session.
         let store = TrajectoryStore::new_with_path(&config.db_path).unwrap();
         assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_scan_once_skips_empty_steps_session() {
+        let base = tmp_dir("empty-steps");
+        let projects = base.join("projects");
+        let proj = projects.join("-data-empty");
+        std::fs::create_dir_all(&proj).unwrap();
+        // JSONL with only metadata — no user/assistant events → 0 ATIF steps.
+        std::fs::write(
+            proj.join(format!("{UUID_A}.jsonl")),
+            "{\"type\":\"runtime-config\",\"sessionId\":\"empty-1\",\"model\":\"test\"}\n{\"type\":\"session_meta\",\"foo\":\"bar\"}\n",
+        )
+        .unwrap();
+
+        let store = TrajectoryStore::new_with_path(&base.join("t.db")).unwrap();
+        let config = CollectorConfig {
+            scan_interval_secs: 1,
+            scan_dirs: Some(vec![projects]),
+            db_path: base.join("t.db"),
+        };
+
+        scan_once(&store, &config);
+        assert_eq!(store.count().unwrap(), 0);
     }
 }

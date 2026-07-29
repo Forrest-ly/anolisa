@@ -6,11 +6,13 @@
 
 use std::path::PathBuf;
 
-use anolisa_core::ObjectKind;
 use anolisa_core::adapter::manager::{AdapterManager, VisibleRoot};
-use anolisa_core::domain::InstallationScope;
+use anolisa_core::domain::{
+    Installation, InstallationScope, NativePm, PackageIdentity, ProviderBinding,
+};
 use anolisa_core::facts::{JournalEvidence, JournalInventory};
 use anolisa_core::state_store::StateStore;
+use anolisa_core::{ComponentManifest, ObjectKind};
 use anolisa_platform::fs_layout::FsLayout;
 
 use crate::color::Palette;
@@ -393,6 +395,42 @@ pub fn installed_component_manifest_path(
     )
 }
 
+/// Legacy manifest directory eligible for cleanup after a record mutation.
+pub(crate) fn legacy_component_manifest_dir_for_installation(
+    layout: &FsLayout,
+    installation: &Installation,
+    command: &str,
+) -> Result<Option<PathBuf>, CliError> {
+    Ok(legacy_cosh_ng_manifest_path(layout, installation, command)?
+        .and_then(|path| path.parent().map(PathBuf::from)))
+}
+
+fn legacy_cosh_ng_manifest_path(
+    layout: &FsLayout,
+    installation: &Installation,
+    command: &str,
+) -> Result<Option<PathBuf>, CliError> {
+    if installation.name != "cosh-ng"
+        || !matches!(
+            &installation.binding,
+            ProviderBinding::Delegated {
+                pm: NativePm::Rpm,
+                package: PackageIdentity::Resolved { name },
+                ..
+            } if name == "cosh-ng"
+        )
+    {
+        return Ok(None);
+    }
+
+    let legacy = installed_component_manifest_path(layout, "cosh", command)?;
+    let matches_legacy_identity = legacy.is_file()
+        && ComponentManifest::from_file(&legacy).is_ok_and(|manifest| {
+            manifest.component.name == "cosh" && manifest.rpm_package() == Some("cosh-ng")
+        });
+    Ok(matches_legacy_identity.then_some(legacy))
+}
+
 /// Directory for the component manifest saved as part of an installed
 /// component's local state.
 pub fn installed_component_manifest_dir(
@@ -423,7 +461,7 @@ fn validate_component_path_segment(component: &str, command: &str) -> Result<(),
 }
 
 /// Wire-friendly status label for a v5
-/// [`Installation`](anolisa_core::domain::Installation), same vocabulary as
+/// [`Installation`], same vocabulary as
 /// [`installation_status_str`] vocabulary: a delegated adopted/observed row
 /// reports its management relation (the legacy state collapsed both into one
 /// `adopted` status), any other row reports its lifecycle health.
@@ -733,6 +771,158 @@ pub fn migrate_v3_symlinks(store: &mut StateStore, layout: &FsLayout) -> usize {
     }
 
     migrated
+}
+
+/// Enrich owned-file rows written before permission and capability metadata
+/// was persisted in v5 state.
+///
+/// The exact installed component manifest is the authority: explicit file
+/// modes and capability targets are expanded against the active layout, then
+/// copied only onto matching ANOLISA-owned rows. This is intentionally
+/// in-memory and best-effort so read-only commands never rewrite state and a
+/// missing or damaged manifest cannot invent a contract.
+///
+/// Returns the number of metadata fields populated.
+pub fn hydrate_owned_file_contracts(store: &mut StateStore, layout: &FsLayout) -> usize {
+    use std::collections::HashMap;
+
+    use anolisa_core::expand_layout_placeholders;
+    use anolisa_core::manifest::FileKind;
+    use anolisa_core::path_safety::validate_owned_path;
+    use anolisa_core::state::FileOwner;
+
+    #[derive(Default)]
+    struct FileContract {
+        mode: Option<String>,
+        capabilities: Vec<String>,
+    }
+
+    fn normalized_mode(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        let octal = trimmed.strip_prefix("0o").unwrap_or(trimmed);
+        let mode = u32::from_str_radix(octal, 8).ok()?;
+        (mode <= 0o7777).then(|| format!("{mode:04o}"))
+    }
+
+    let env = anolisa_env::EnvService::detect();
+    let install_mode = match layout.mode {
+        anolisa_platform::fs_layout::InstallMode::System => "system",
+        anolisa_platform::fs_layout::InstallMode::User => "user",
+    };
+    let capability_probe_supported =
+        anolisa_core::capability_for_install_mode(install_mode, &env).supported();
+
+    let mut hydrated = 0;
+    for installation in &mut store.installations {
+        if installation.kind != ObjectKind::Component {
+            continue;
+        }
+        let component = installation.name.clone();
+        if validate_component_path_segment(&component, "hydrate").is_err() {
+            continue;
+        }
+        let manifest_path = layout
+            .state_dir
+            .join(INSTALLED_COMPONENT_MANIFESTS_SUBDIR)
+            .join(&component)
+            .join(INSTALLED_COMPONENT_MANIFEST_FILE);
+        let manifest = match ComponentManifest::from_file(&manifest_path) {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
+        };
+
+        let mut contracts: HashMap<PathBuf, FileContract> = HashMap::new();
+        let mut directory_modes = Vec::new();
+        for spec in &manifest.install.files {
+            if spec.kind == FileKind::Symlink {
+                continue;
+            }
+            let Some(raw_mode) = spec.mode.as_deref() else {
+                continue;
+            };
+            let Some(mode) = normalized_mode(raw_mode) else {
+                continue;
+            };
+            let Some(template) = spec.install_path() else {
+                continue;
+            };
+            let Ok(dest) =
+                expand_layout_placeholders(template, layout, &[("component", &component)])
+            else {
+                continue;
+            };
+            if validate_owned_path(layout, &dest).is_err() {
+                continue;
+            }
+            if spec
+                .source
+                .as_deref()
+                .is_some_and(|source| source.ends_with('/'))
+            {
+                directory_modes.push((dest, mode));
+            } else {
+                contracts.entry(dest).or_default().mode = Some(mode);
+            }
+        }
+        for spec in &manifest.install.capabilities {
+            // Older state cannot prove that a best-effort capability was
+            // successfully applied. Required assignments are safe to infer
+            // only on hosts where the install backend is actionable.
+            if !capability_probe_supported || spec.optional || spec.caps.is_empty() {
+                continue;
+            }
+            let Some(template) = spec.path.as_deref() else {
+                continue;
+            };
+            let Ok(path) =
+                expand_layout_placeholders(template, layout, &[("component", &component)])
+            else {
+                continue;
+            };
+            if validate_owned_path(layout, &path).is_err() {
+                continue;
+            }
+            let contract = contracts.entry(path).or_default();
+            contract.capabilities.extend(spec.caps.iter().cloned());
+            contract
+                .capabilities
+                .sort_by_key(|cap| cap.to_ascii_lowercase());
+            contract
+                .capabilities
+                .dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        }
+
+        let ProviderBinding::Owned { artifact } = &mut installation.binding else {
+            continue;
+        };
+        for file in &mut artifact.files {
+            if file.owner != FileOwner::Anolisa || file.kind == anolisa_core::OwnedFileKind::Symlink
+            {
+                continue;
+            }
+            if let Some(contract) = contracts.get(&file.path) {
+                if file.mode.is_none()
+                    && let Some(mode) = &contract.mode
+                {
+                    file.mode = Some(mode.clone());
+                    hydrated += 1;
+                }
+                if file.capabilities.is_empty() && !contract.capabilities.is_empty() {
+                    file.capabilities = contract.capabilities.clone();
+                    hydrated += 1;
+                }
+            }
+            if file.mode.is_none()
+                && let Some((_, mode)) = directory_modes
+                    .iter()
+                    .find(|(directory, _)| file.path.starts_with(directory))
+            {
+                file.mode = Some(mode.clone());
+                hydrated += 1;
+            }
+        }
+    }
+    hydrated
 }
 
 #[cfg(test)]
@@ -1378,6 +1568,8 @@ type = "symlink"
                 sha256: Some(sha),
                 kind: OwnedFileKind::File,
                 referent: None,
+                mode: None,
+                capabilities: Vec::new(),
             };
             let mut store = seed_v3_store(&layout, vec![sample_object("tokenless", vec![owned])]);
 
@@ -1427,6 +1619,8 @@ type = "symlink"
                 sha256: None,
                 kind: OwnedFileKind::File,
                 referent: None,
+                mode: None,
+                capabilities: Vec::new(),
             };
             let mut store = seed_v3_store(&layout, vec![sample_object("tokenless", vec![owned])]);
 
@@ -1479,6 +1673,8 @@ type = "symlink"
                 sha256: None,
                 kind: OwnedFileKind::File,
                 referent: None,
+                mode: None,
+                capabilities: Vec::new(),
             };
             let mut store = seed_v3_store(&layout, vec![sample_object("tokenless", vec![owned])]);
 
@@ -1527,6 +1723,8 @@ type = "symlink"
                 sha256: Some("deadbeefdeadbeef".to_string()),
                 kind: OwnedFileKind::File,
                 referent: None,
+                mode: None,
+                capabilities: Vec::new(),
             };
             let mut store = seed_v3_store(&layout, vec![sample_object("tokenless", vec![owned])]);
 
@@ -1550,6 +1748,8 @@ type = "symlink"
                 sha256: None,
                 kind: OwnedFileKind::File,
                 referent: None,
+                mode: None,
+                capabilities: Vec::new(),
             };
             let mut store = seed_v3_store(&layout, vec![sample_object("tokenless", vec![owned])]);
 
@@ -1573,6 +1773,8 @@ type = "symlink"
                 sha256: None,
                 kind: OwnedFileKind::File,
                 referent: None,
+                mode: None,
+                capabilities: Vec::new(),
             };
             let mut store =
                 seed_v3_store(&layout, vec![sample_object("../../../etc", vec![owned])]);
@@ -1625,6 +1827,8 @@ type = "symlink"
                 sha256: Some(sha),
                 kind: OwnedFileKind::File,
                 referent: None,
+                mode: None,
+                capabilities: Vec::new(),
             };
             // Round-trip through a *v5* file: save the migrated store, then
             // reload it — the reload is a native v5 load.

@@ -20,12 +20,22 @@ use crate::hook::{HookDecision, HookNotification, HookSystem};
 use crate::loop_detect::LoopDetector;
 use crate::metrics::TurnMetrics;
 use crate::protocol::{InputMessage, OutputMessage, ShellContext, ShellControlRequest};
-use crate::provider::{ContentGenerator, GenerateConfig, GenerateEvent, Message};
+use crate::provider::{
+    ContentGenerator, GenerateConfig, GenerateEvent, Message, MAX_TOOL_CALL_INDEX,
+};
+use crate::tool::ask_user_question;
 use crate::tool::{ToolContext, ToolKind, ToolRegistry, ToolResult};
 use crate::truncator::OutputTruncator;
 
+use self::tool_execution::{
+    hash_bytes, hash_json, invalid_arguments_exhausted_error, invalid_arguments_message,
+    json_shape, parse_in_band_question, parse_tool_arguments, InBandQuestion,
+    InvalidArgumentStreak, MAX_INVALID_ARGUMENT_ATTEMPTS,
+};
+
 mod auth;
 mod extensions;
+mod tool_execution;
 
 pub struct CoshCore {
     pub config: CoreConfig,
@@ -186,8 +196,6 @@ impl CoshCore {
         W: Write,
         R: AsyncBufReadExt + Unpin,
     {
-        let content = crate::redaction::redact_text(content);
-
         self.bind_current_extension_snapshot();
         let _generation_pin = self.extension_generation.pin();
         // Generate a unique run_id for this agent run.
@@ -198,7 +206,7 @@ impl CoshCore {
         let cwd_str = self.cwd().to_string_lossy().to_string();
         let prompt_result = self
             .hook_system
-            .fire_user_prompt_submit(&self.session_id, &cwd_str, &content)
+            .fire_user_prompt_submit(&self.session_id, &cwd_str, content)
             .await;
         self.audit.record_hook_decision(
             CoreAuditScope::run(&run_id),
@@ -305,7 +313,7 @@ impl CoshCore {
             self.emit_hook_notifications(writer, &prompt_result.notifications, None);
         }
 
-        self.messages.push(Message::user(&content));
+        self.messages.push(Message::user(content));
 
         // Inject additional context from hooks
         if let Some(ref ctx) = prompt_result.additional_context {
@@ -342,6 +350,10 @@ impl CoshCore {
         );
 
         let max_turns = self.config.agent.max_turns;
+        // Spans the whole message, not one turn: the model re-issues a rejected
+        // tool call on the *next* turn, so a per-turn counter would never see two
+        // attempts in a row.
+        let mut invalid_arguments = InvalidArgumentStreak::default();
 
         for _turn in 0..max_turns {
             // ─── Context preflight (every provider call, incl. tool loop) ───
@@ -362,13 +374,19 @@ impl CoshCore {
             let turn_id = uuid::Uuid::new_v4().to_string();
             let turn_scope = CoreAuditScope::turn(&run_id, &turn_id);
             self.audit.record_turn_started(turn_scope);
-            let mut provider_messages = self.compaction.effective_messages(&self.messages);
-            crate::redaction::redact_messages(&mut provider_messages);
+            // Runtime context stays lossless; observers and stores redact their own copies.
+            let provider_messages = self.compaction.effective_messages(&self.messages);
 
             // ─── Hook: BeforeModel ───
             let before_model_result = self
                 .hook_system
-                .fire_before_model(&self.session_id, &cwd_str, &self.model, &provider_messages)
+                .fire_before_model(
+                    &self.session_id,
+                    &cwd_str,
+                    &self.model,
+                    &provider_messages,
+                    &tool_decls,
+                )
                 .await;
             self.emit_hook_notifications(writer, &before_model_result.notifications, None);
             self.audit.record_hook_decision(
@@ -377,6 +395,14 @@ impl CoshCore {
                 AuditOutcomeStatus::Success,
                 "observed",
             );
+
+            // A BeforeModel hook's rewritten declarations apply to this provider
+            // call only — `tool_decls` and the ToolRegistry stay authoritative
+            // for the next turn.
+            let turn_tool_decls = before_model_result
+                .updated_tools
+                .as_deref()
+                .unwrap_or(&tool_decls);
 
             let mut msgs_with_system = vec![Message::system(&system_prompt)];
             msgs_with_system.extend(provider_messages);
@@ -402,7 +428,7 @@ impl CoshCore {
 
             let stream_result = self
                 .provider
-                .generate(&msgs_with_system, &tool_decls, &generate_config)
+                .generate(&msgs_with_system, turn_tool_decls, &generate_config)
                 .await;
 
             let mut stream = match stream_result {
@@ -458,10 +484,24 @@ impl CoshCore {
             let mut suppress_stream_text = false;
             let mut tool_call_seen = false;
             let mut message_end_seen = false;
+            // Only the in-band question route may hide assistant text. With the
+            // question tool disabled the marker can never become a question, so
+            // suppressing the text would drop the reply with nothing to replace it.
+            let in_band_questions_enabled = self.tools.supports_ask_user_question();
 
             self.emit(writer, &OutputMessage::stream_message_start());
 
             while let Some(event) = stream.next().await {
+                // Tool indices size `tool_calls` below, so an out-of-range index
+                // would let one malformed frame allocate billions of slots. Fail
+                // the stream instead of trusting or silently dropping it.
+                let event = match event.tool_call_index() {
+                    Some(index) if index > MAX_TOOL_CALL_INDEX => GenerateEvent::Error(format!(
+                        "provider reported tool call index {index}, above the supported \
+                         maximum of {MAX_TOOL_CALL_INDEX}"
+                    )),
+                    _ => event,
+                };
                 match event {
                     GenerateEvent::ThinkingDelta(delta) => {
                         if !thinking_block_started {
@@ -485,7 +525,7 @@ impl CoshCore {
                         }
                         text_buf.push_str(&delta);
                         if !suppress_stream_text && !tool_call_seen {
-                            if text_buf.contains("COSH_QUESTION:") {
+                            if in_band_questions_enabled && text_buf.contains("COSH_QUESTION:") {
                                 suppress_stream_text = true;
                             } else {
                                 self.emit(
@@ -515,6 +555,7 @@ impl CoshCore {
                         tool_calls[idx].name = name.clone();
                         tool_calls[idx].block_index = block_index;
                         tool_calls[idx].block_closed = false;
+                        tool_calls[idx].start_seen = true;
                         self.emit(
                             writer,
                             &OutputMessage::stream_tool_use_start(block_index, &id, &name),
@@ -535,10 +576,12 @@ impl CoshCore {
                             &OutputMessage::stream_tool_use_delta(bi, &arguments_delta),
                         );
                         tool_calls[idx].arguments.push_str(&arguments_delta);
+                        tool_calls[idx].delta_count += 1;
                     }
                     GenerateEvent::ToolCallEnd { index } => {
                         let idx = index as usize;
                         if idx < tool_calls.len() {
+                            tool_calls[idx].end_seen = true;
                             let bi = tool_calls[idx].block_index;
                             self.emit(writer, &OutputMessage::stream_block_stop(bi));
                             tool_calls[idx].block_closed = true;
@@ -672,7 +715,7 @@ impl CoshCore {
             }
             let emit_visible_text = tool_calls.is_empty()
                 && !text_buf.is_empty()
-                && !text_buf.contains("COSH_QUESTION:");
+                && !(in_band_questions_enabled && text_buf.contains("COSH_QUESTION:"));
             let _ = block_index;
             self.emit(writer, &OutputMessage::stream_message_stop());
 
@@ -685,30 +728,49 @@ impl CoshCore {
 
             if tool_calls.is_empty() {
                 if self.tools.supports_ask_user_question() {
-                    if let Some(synthetic) = parse_cosh_question_text(&text_buf) {
-                        let result = self
-                            .handle_ask_user("synthetic-ask", &synthetic, reader, writer)
-                            .await;
-                        if result.is_error {
+                    match parse_in_band_question(&text_buf) {
+                        InBandQuestion::Valid(synthetic) => {
+                            let result = self.handle_ask_user(&synthetic, reader, writer).await;
+                            if result.is_error {
+                                self.messages.push(Message::assistant(&text_buf));
+                                self.audit.record_turn_terminal(
+                                    turn_scope,
+                                    AuditOutcomeStatus::Failed,
+                                    Some("question_failed"),
+                                );
+                                return Ok(());
+                            }
+                            self.messages.push(Message::assistant(&text_buf));
+                            self.messages.push(Message::user(&format!(
+                                "User answered the question: {}",
+                                result.output
+                            )));
+                            self.audit.record_turn_terminal(
+                                turn_scope,
+                                AuditOutcomeStatus::Success,
+                                Some("question_answered"),
+                            );
+                            continue;
+                        }
+                        // The marker already suppressed the visible text, so a
+                        // rejected payload must fail the turn loudly instead of
+                        // ending it as an ordinary answer the user never saw.
+                        InBandQuestion::Invalid(error) => {
+                            tracing::warn!(
+                                provider_type = %resolved_provider.provider_type,
+                                validation_error_code = error.code(),
+                                text_bytes = text_buf.len(),
+                                "rejected in-band COSH_QUESTION payload"
+                            );
                             self.messages.push(Message::assistant(&text_buf));
                             self.audit.record_turn_terminal(
                                 turn_scope,
                                 AuditOutcomeStatus::Failed,
-                                Some("question_failed"),
+                                Some("question_invalid"),
                             );
-                            return Ok(());
+                            return Err(tool_execution::in_band_question_error(error));
                         }
-                        self.messages.push(Message::assistant(&text_buf));
-                        self.messages.push(Message::user(&format!(
-                            "User answered the question: {}",
-                            result.output
-                        )));
-                        self.audit.record_turn_terminal(
-                            turn_scope,
-                            AuditOutcomeStatus::Success,
-                            Some("question_answered"),
-                        );
-                        continue;
+                        InBandQuestion::Absent => {}
                     }
                 }
 
@@ -784,51 +846,131 @@ impl CoshCore {
             };
 
             let mut interrupted = false;
+            // Set once a tool call ends the run. The error is returned only after
+            // this batch is fully answered.
+            let mut fatal_error: Option<String> = None;
 
             for tc in &tool_calls {
                 if tc.name.is_empty() {
                     continue;
                 }
 
-                let params: serde_json::Value =
-                    serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
-                let tool_data = AuditToolData {
-                    tool_kind: self
-                        .tools
-                        .get(&tc.name)
-                        .map(|tool| format!("{:?}", tool.kind()).to_ascii_lowercase())
-                        .unwrap_or_else(|| "virtual".to_string()),
-                    input_shape: Some(json_shape(&params).to_string()),
-                    input_hash: Some(hash_json(&params)),
-                    ..AuditToolData::default()
-                };
-                let tool_scope = CoreAuditScope::tool(&run_id, &turn_id, &tc.id);
-                self.audit
-                    .record_tool_requested(tool_scope, &tc.name, &tool_data);
-
-                if tc.name == "ask_user_question" && self.tools.supports_ask_user_question() {
-                    self.audit
-                        .record_tool_execution_started(tool_scope, &tc.name, &tool_data)?;
-                    let tool_start = Instant::now();
-                    let result = self.handle_ask_user(&tc.id, &params, reader, writer).await;
-                    self.audit.record_tool_terminal(
-                        tool_scope,
-                        &tc.name,
-                        &tool_data,
-                        result.is_error,
-                        tool_start.elapsed().as_millis() as u64,
-                        result.output.len() as u64,
+                // Every id in the assistant message needs exactly one tool result,
+                // or the next provider request violates tool-message pairing — and
+                // headless persists and reuses the session even when a turn fails.
+                if fatal_error.is_some() {
+                    self.skip_unexecuted_tool_call(
+                        CoreAuditScope::tool(&run_id, &turn_id, &tc.id),
+                        writer,
+                        tc,
                     );
-                    self.messages.push(Message::tool_result(
-                        &tc.id,
-                        &result.output,
-                        result.is_error,
-                    ));
+                    continue;
+                }
+
+                let tool_kind = self
+                    .tools
+                    .get(&tc.name)
+                    .map(|tool| format!("{:?}", tool.kind()).to_ascii_lowercase())
+                    .unwrap_or_else(|| "virtual".to_string());
+                let tool_scope = CoreAuditScope::tool(&run_id, &turn_id, &tc.id);
+
+                if tc.name == ask_user_question::TOOL_NAME
+                    && self.tools.supports_ask_user_question()
+                {
+                    let dispatched = self
+                        .dispatch_ask_user_tool_call(
+                            tool_scope,
+                            tc,
+                            &resolved_provider.provider_type,
+                            &tool_kind,
+                            reader,
+                            writer,
+                        )
+                        .await?;
+                    if let Some(result) = dispatched {
+                        self.messages.push(Message::tool_result(
+                            &tc.id,
+                            &result.output,
+                            result.is_error,
+                        ));
+                    }
                     if interrupted {
                         return Ok(());
                     }
                     continue;
                 }
+
+                let parsed_params = parse_tool_arguments(&tc.arguments);
+                let tool_data = AuditToolData {
+                    tool_kind,
+                    input_shape: Some(match &parsed_params {
+                        Ok(params) => json_shape(params).to_string(),
+                        Err(error) => error.audit_shape().to_string(),
+                    }),
+                    input_hash: Some(match &parsed_params {
+                        Ok(params) => hash_json(params),
+                        Err(_) => hash_bytes(tc.arguments.as_bytes()),
+                    }),
+                    ..AuditToolData::default()
+                };
+                self.audit
+                    .record_tool_requested(tool_scope, &tc.name, &tool_data);
+
+                let params = match parsed_params {
+                    Ok(params) => {
+                        invalid_arguments.clear();
+                        params
+                    }
+                    Err(parse_error) => {
+                        // Executing a tool with `null` parameters used to look like
+                        // a call with every field absent; fail the call instead so
+                        // the model can re-issue it.
+                        let attempt =
+                            invalid_arguments.record(&tc.name, parse_error.code(), &turn_id);
+                        tracing::warn!(
+                            provider_type = %resolved_provider.provider_type,
+                            tool_call_id = %tc.id,
+                            tool_name = %tc.name,
+                            start_seen = tc.start_seen,
+                            delta_count = tc.delta_count,
+                            end_seen = tc.end_seen,
+                            argument_bytes = tc.arguments.len(),
+                            json_parse_status = parse_error.json_parse_status(),
+                            validation_error_code = parse_error.code(),
+                            attempt,
+                            "rejected malformed tool arguments"
+                        );
+                        let result = self.reject_tool_arguments(
+                            tool_scope,
+                            &tc.name,
+                            &tc.id,
+                            &tool_data,
+                            invalid_arguments_message(
+                                &tc.name,
+                                &parse_error,
+                                attempt,
+                                MAX_INVALID_ARGUMENT_ATTEMPTS,
+                            ),
+                        );
+                        // Closes the pending tool in the UI before the run ends, so
+                        // the last thing on screen is the failure, not a tool that
+                        // looks like it is still generating arguments.
+                        self.emit_provider_native_tool_result(writer, &tc.id, &result);
+                        if attempt >= MAX_INVALID_ARGUMENT_ATTEMPTS {
+                            self.audit.record_turn_terminal(
+                                turn_scope,
+                                AuditOutcomeStatus::Failed,
+                                Some("invalid_tool_arguments_exhausted"),
+                            );
+                            // Recorded, not returned: the assistant message already
+                            // declared every call in this batch, and the loop must
+                            // still answer the rest before the run ends.
+                            fatal_error =
+                                Some(invalid_arguments_exhausted_error(&tc.name, &parse_error));
+                        }
+                        continue;
+                    }
+                };
 
                 if self
                     .tools
@@ -1266,6 +1408,11 @@ impl CoshCore {
                     return Ok(());
                 }
             }
+            // The turn was already audited as failed at the rejection; every call in
+            // the batch now has a result, so the run can end on a paired history.
+            if let Some(error) = fatal_error {
+                return Err(error);
+            }
             self.audit
                 .record_turn_terminal(turn_scope, AuditOutcomeStatus::Success, None);
         }
@@ -1308,72 +1455,6 @@ impl CoshCore {
         ToolResult {
             output,
             is_error: result.is_error,
-        }
-    }
-
-    async fn handle_ask_user<W, R>(
-        &self,
-        _tool_use_id: &str,
-        params: &serde_json::Value,
-        reader: &mut tokio::io::Lines<R>,
-        writer: &mut W,
-    ) -> ToolResult
-    where
-        W: Write,
-        R: AsyncBufReadExt + Unpin,
-    {
-        let question = params
-            .get("question")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Agent needs your input")
-            .to_string();
-        let options: Vec<crate::protocol::AskUserOption> = params
-            .get("options")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| {
-                        let label = item
-                            .get("label")
-                            .and_then(|l| l.as_str())
-                            .or_else(|| item.as_str())?;
-                        Some(crate::protocol::AskUserOption {
-                            label: label.to_string(),
-                            description: item
-                                .get("description")
-                                .and_then(|d| d.as_str())
-                                .map(|s| s.to_string()),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let allow_free_text = params
-            .get("allow_free_text")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        let multi_select = params
-            .get("multi_select")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let request_id = self.next_request_id();
-        self.emit(
-            writer,
-            &OutputMessage::ControlRequest {
-                request_id: request_id.clone(),
-                request: crate::protocol::CoreControlRequest::AskUser {
-                    question,
-                    options,
-                    allow_free_text,
-                    multi_select,
-                },
-            },
-        );
-
-        match self.wait_for_answer(&request_id, reader).await {
-            Some(answer) => ToolResult::success(answer),
-            None => ToolResult::error("User did not answer (interrupted or disconnected)"),
         }
     }
 
@@ -1708,30 +1789,6 @@ fn approval_audit_outcome(approval: &ApprovalResult) -> (AuditOutcomeStatus, &'s
     }
 }
 
-fn json_shape(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
-
-fn hash_json(value: &serde_json::Value) -> String {
-    use sha2::{Digest, Sha256};
-
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
-}
-
 #[derive(Default, Clone)]
 struct PendingToolCall {
     id: String,
@@ -1739,12 +1796,12 @@ struct PendingToolCall {
     arguments: String,
     block_index: u32,
     block_closed: bool,
-}
-
-fn parse_cosh_question_text(text: &str) -> Option<serde_json::Value> {
-    let marker = "COSH_QUESTION:";
-    let json_text = text.split_once(marker)?.1.trim().lines().next()?.trim();
-    serde_json::from_str(json_text).ok()
+    /// Stream-shape facts kept for bounded diagnostics when arguments are
+    /// rejected: they distinguish "provider never sent arguments" from
+    /// "arguments arrived but were malformed".
+    start_seen: bool,
+    delta_count: u32,
+    end_seen: bool,
 }
 
 #[cfg(test)]

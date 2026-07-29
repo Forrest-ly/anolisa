@@ -25,7 +25,7 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"auth-inline","
 
 /// A dotted Provider ID must be rejected on the spot instead of at the final `configure`.
 #[test]
-fn raw_cli_auth_dotted_provider_id_stays_on_provider_id_field() {
+fn raw_cli_auth_dotted_provider_id_can_be_corrected() {
     let home = temp_shell_home("auth-dotted-provider-id");
     let bin_dir = home.join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
@@ -49,21 +49,33 @@ fn raw_cli_auth_dotted_provider_id_stays_on_provider_id_field() {
             ("cosh-osc$", b"/auth\n".as_slice()),
             ("Left/Right move | Enter send", b"\n".as_slice()),
             ("Type answer | Enter send", b"qwen3.7-max\n".as_slice()),
-            ("Provider ID allows letters", b"".as_slice()),
+            ("Provider ID allows letters", b"\x7f".as_slice()),
+            ("> qwen3.7-ma", b"\x7f".as_slice()),
+            ("> qwen3.7-m", b"\x7f".as_slice()),
+            ("> qwen3.7-", b"\x7f".as_slice()),
+            ("> qwen3.7", b"\x7f".as_slice()),
+            ("> qwen3.", b"\x7f".as_slice()),
+            ("> qwen3", b"\x7f".as_slice()),
+            ("> qwen", b"\x7f".as_slice()),
+            ("> qwe", b"\x7f".as_slice()),
+            ("> qw", b"\x7f".as_slice()),
+            ("> q", b"\x7fqwen-prod\n".as_slice()),
+            ("Enter Base URL", b"\x03".as_slice()),
+            ("Auth cancelled", b"".as_slice()),
         ],
     );
     let requests = fs::read_to_string(&registry_log).unwrap_or_default();
     let _ = fs::remove_dir_all(&home);
 
     let compact = compact_terminal_words(&output);
-    // The rejected field keeps the focus: Base URL is never reached.
+    // The rejected field stays editable and accepts a corrected value.
     assert!(
         compact.contains("Enter Provider ID"),
         "expected Provider ID prompt: {output}"
     );
     assert!(
-        !compact.contains("Enter Base URL"),
-        "flow advanced past Provider ID: {output}"
+        compact.contains("Enter Base URL"),
+        "corrected Provider ID did not advance: {output}"
     );
     assert!(
         compact.contains("Provider ID allows letters, digits, '-' and '_' only (no '.')"),
@@ -73,6 +85,10 @@ fn raw_cli_auth_dotted_provider_id_stays_on_provider_id_field() {
     assert!(
         compact.contains("Config name (not model name; letters, digits, '-' and '_' only)"),
         "expected character rule in hint: {output}"
+    );
+    assert!(
+        compact.contains("Auth cancelled"),
+        "Ctrl+C did not cancel the corrected flow: {output}"
     );
     // Nothing reached cosh-core: no configure round-trip, no late failure panel.
     assert!(
@@ -399,6 +415,110 @@ fn raw_cli_auth_prepare_failure_falls_back_to_the_existing_menu() {
     assert!(!compact.contains("SysOM"), "{output}");
     assert!(!compact.contains("Auth unavailable"), "{output}");
     assert_eq!(action_count(&requests, "prepare"), 1, "{requests}");
+}
+
+/// #1760: ESC anywhere in the form used to abandon `/auth` outright, so one mistyped field cost
+/// every field before it. It now walks back one prompt at a time and only cancels at the picker.
+#[test]
+fn raw_cli_auth_esc_walks_back_through_the_form_before_cancelling() {
+    let (output, requests) = run_auth_menu_flow(
+        "auth-esc-back",
+        SAVED_NONE,
+        MANUAL_PREPARE,
+        &[
+            ("cosh-osc$", b"/auth\n".as_slice()),
+            ("Authentication Required", b"\x1b[C\n".as_slice()),
+            ("Enter Provider ID", b"qwen-prod\n".as_slice()),
+            ("Enter Base URL", b"https://example.invalid/v1\n".as_slice()),
+            // ESC on API Key returns to Base URL, which still carries the value just submitted.
+            ("Enter API Key", b"\x1b".as_slice()),
+            ("Enter Base URL", b"\x1b".as_slice()),
+            ("Enter Provider ID", b"\x1b".as_slice()),
+            // Back at the picker a further ESC is the one that ends the flow.
+            ("Authentication Required", b"\x1b".as_slice()),
+            ("Auth cancelled", b"".as_slice()),
+        ],
+    );
+
+    let compact = compact_terminal_words(&output);
+    // Each re-rendered prompt offers the value already submitted for it, not an empty field.
+    assert!(
+        compact.contains("> https://example.invalid/v1"),
+        "stepping back lost the submitted Base URL: {output}"
+    );
+    assert!(
+        compact.contains("> qwen-prod"),
+        "stepping back lost the submitted Provider ID: {output}"
+    );
+    // The picker reopens on the template the form belonged to.
+    assert!(compact.contains("> [2] OpenAI Compatible"), "{output}");
+    // Only the last ESC cancels; the three before it are back-navigation.
+    assert_eq!(
+        count_occurrences(&compact, "Auth cancelled"),
+        1,
+        "an intermediate ESC cancelled the flow: {output}"
+    );
+    assert_eq!(action_count(&requests, "configure"), 0, "{requests}");
+}
+
+/// Teaching ESC to step back must not take away the interrupt: Ctrl+C still abandons the form in
+/// one keystroke, from a field the user is several prompts into.
+#[test]
+fn raw_cli_auth_ctrl_c_mid_form_abandons_the_flow() {
+    let (output, requests) = run_auth_menu_flow(
+        "auth-ctrl-c-abort",
+        SAVED_NONE,
+        MANUAL_PREPARE,
+        &[
+            ("cosh-osc$", b"/auth\n".as_slice()),
+            ("Authentication Required", b"\x1b[C\n".as_slice()),
+            ("Enter Provider ID", b"qwen-prod\n".as_slice()),
+            ("Enter Base URL", b"\x03".as_slice()),
+            ("Auth cancelled", b"".as_slice()),
+        ],
+    );
+
+    let compact = compact_terminal_words(&output);
+    assert!(compact.contains("Auth cancelled"), "{output}");
+    // A single Ctrl+C is enough: the form is gone, not one prompt further back.
+    assert!(
+        !compact.contains("Enter API Key"),
+        "Ctrl+C stepped through the form instead of abandoning it: {output}"
+    );
+    assert_eq!(action_count(&requests, "configure"), 0, "{requests}");
+}
+
+/// An edit steps back to the action menu it came from, never onto Provider ID: that field names
+/// the config being edited, so an edit of it could not take effect.
+#[test]
+fn raw_cli_auth_esc_on_an_edit_returns_to_the_provider_action_menu() {
+    let (output, requests) = run_auth_menu_flow(
+        "auth-esc-back-edit",
+        SAVED_DASHSCOPE,
+        MANUAL_PREPARE,
+        &[
+            ("cosh-osc$", b"/auth\n".as_slice()),
+            ("+ Add new provider", b"\n".as_slice()),
+            ("Edit configuration", b"\n".as_slice()),
+            // API Key is the first field an edit may change, so ESC leaves the form entirely.
+            ("Edit API Key", b"\x1b".as_slice()),
+            ("Edit configuration", b"\x1b".as_slice()),
+            ("Auth cancelled", b"".as_slice()),
+        ],
+    );
+
+    let compact = compact_terminal_words(&output);
+    // The action menu is rendered twice: on the way in, and again after ESC.
+    assert_eq!(
+        count_occurrences(&compact, "Edit configuration"),
+        2,
+        "ESC did not return to the provider action menu: {output}"
+    );
+    assert!(
+        !compact.contains("Provider ID"),
+        "an edit stepped back onto the Provider ID field: {output}"
+    );
+    assert_eq!(action_count(&requests, "configure"), 0, "{requests}");
 }
 
 /// Manual Aliyun AK/SK stays available off ECS, with the secret fields still masked.

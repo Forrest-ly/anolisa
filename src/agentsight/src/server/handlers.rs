@@ -74,6 +74,18 @@ pub async fn auth_login(
 pub async fn auth_status(data: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok().json(json!({
         "auth_enabled": data.auth.enabled,
+        "mode": "linux",
+        "capabilities": [
+            "agent_observability",
+            "sessions",
+            "token_savings",
+            "optimization",
+            "skills",
+            "security",
+            "atif",
+            "settings",
+            "agent_health"
+        ],
     }))
 }
 
@@ -1082,7 +1094,7 @@ mod tests {
             security_observability: super::super::SecurityObservabilityConfig { timeout_ms: 0 },
             auth,
             optimize: None,
-            trajectory_store: None,
+            trajectory_store: Arc::new(RwLock::new(None)),
         });
         let app = awtest::init_service(App::new().app_data(data).service(latest_grader)).await;
 
@@ -1288,7 +1300,7 @@ mod tests {
             security_observability: super::super::SecurityObservabilityConfig { timeout_ms: 0 },
             auth,
             optimize: None,
-            trajectory_store: None,
+            trajectory_store: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1417,7 +1429,7 @@ mod tests {
             security_observability: super::super::SecurityObservabilityConfig { timeout_ms },
             auth,
             optimize: None,
-            trajectory_store: None,
+            trajectory_store: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1516,7 +1528,7 @@ mod tests {
             security_observability: super::super::SecurityObservabilityConfig { timeout_ms: 0 },
             auth,
             optimize: None,
-            trajectory_store: None,
+            trajectory_store: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1654,7 +1666,7 @@ mod tests {
             security_observability: super::super::SecurityObservabilityConfig { timeout_ms: 0 },
             auth,
             optimize: None,
-            trajectory_store: None,
+            trajectory_store: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1677,7 +1689,7 @@ mod tests {
             security_observability: super::super::SecurityObservabilityConfig { timeout_ms: 0 },
             auth,
             optimize: None,
-            trajectory_store: None,
+            trajectory_store: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1705,6 +1717,8 @@ mod tests {
             total_completion_tokens: Some(20),
             start_time: Some("2026-07-25T10:00:00Z".to_string()),
             end_time: Some("2026-07-25T10:00:05Z".to_string()),
+            first_user_message: Some("修个 bug".to_string()),
+            last_user_message: Some("跑下测试".to_string()),
             atif_json: format!(
                 "{{\"schema_version\":\"ATIF-v1.7\",\"session_id\":\"{session_id}\"}}"
             ),
@@ -1736,7 +1750,7 @@ mod tests {
             security_observability: super::super::SecurityObservabilityConfig { timeout_ms: 0 },
             auth,
             optimize: None,
-            trajectory_store: store,
+            trajectory_store: Arc::new(RwLock::new(store)),
         })
     }
 
@@ -2043,7 +2057,7 @@ mod tests {
                     },
                     auth,
                     optimize: None,
-                    trajectory_store: None,
+                    trajectory_store: Arc::new(RwLock::new(None)),
                 }))
                 .service(metrics),
         )
@@ -2392,6 +2406,25 @@ mod tests {
             );
             let body = service_response_json(response).await;
             assert!(body.is_object(), "{uri} should return a JSON document");
+            // The export must speak the shared ATIF schema, same as the
+            // collector-ingested trajectories served by /api/trajectories.
+            assert_eq!(
+                body["schema_version"],
+                agentsight_atif::ATIF_SCHEMA_VERSION,
+                "{uri} should export the shared ATIF schema version"
+            );
+            assert!(
+                body["session_id"].is_string(),
+                "{uri} should carry the queried id as session_id"
+            );
+            assert!(
+                body["steps"].as_array().is_some_and(|s| !s.is_empty()),
+                "{uri} should export at least one step"
+            );
+            // Round-trip through the shared validator: catches field drift and
+            // non-contiguous step_ids that a plain is_object() check would miss.
+            agentsight_atif::validate_trajectory_str(&body.to_string())
+                .unwrap_or_else(|e| panic!("{uri} export failed ATIF validation: {e}"));
         }
 
         for (uri, message) in [
@@ -2474,7 +2507,7 @@ mod tests {
                     },
                     auth,
                     optimize: None,
-                    trajectory_store: None,
+                    trajectory_store: Arc::new(RwLock::new(None)),
                 }))
                 .service(list_sessions)
                 .service(list_agent_names)
@@ -2739,7 +2772,7 @@ pub async fn restart_agent_health(
 
 /// GET /api/export/atif/trace/{trace_id}
 ///
-/// Exports a single trace as an ATIF v1.6 trajectory document.
+/// Exports a single trace as an ATIF trajectory document (shared v1.7 schema).
 #[get("/export/atif/trace/{trace_id}")]
 pub async fn export_atif_trace(
     data: web::Data<AppState>,
@@ -2778,7 +2811,7 @@ pub async fn export_atif_trace(
 
 /// GET /api/export/atif/session/{session_id}
 ///
-/// Exports a full session (all traces) as an ATIF v1.6 trajectory document.
+/// Exports a full session (all traces) as an ATIF trajectory document (v1.7).
 #[get("/export/atif/session/{session_id}")]
 pub async fn export_atif_session(
     data: web::Data<AppState>,
@@ -2817,7 +2850,7 @@ pub async fn export_atif_session(
 
 /// GET /api/export/atif/conversation/{conversation_id}
 ///
-/// Exports all LLM calls for a conversation as an ATIF v1.6 trajectory document.
+/// Exports all LLM calls for a conversation as an ATIF trajectory document (v1.7).
 #[get("/export/atif/conversation/{conversation_id}")]
 pub async fn export_atif_conversation(
     data: web::Data<AppState>,
@@ -3229,7 +3262,7 @@ pub async fn list_trajectories(
     data: web::Data<AppState>,
     query: web::Query<TrajectoryQuery>,
 ) -> impl Responder {
-    let Some(ref tstore) = data.trajectory_store else {
+    let Some(tstore) = data.trajectory_store() else {
         return HttpResponse::Ok().json(Vec::<serde_json::Value>::new());
     };
     // Normalize: <= 0 falls back to default; cap at hard upper bound to
@@ -3258,7 +3291,7 @@ pub async fn list_trajectories(
 /// dropdowns. Must be registered before `/trajectories/{session_id}`.
 #[get("/trajectories/filters")]
 pub async fn trajectory_filters(data: web::Data<AppState>) -> impl Responder {
-    let Some(ref tstore) = data.trajectory_store else {
+    let Some(tstore) = data.trajectory_store() else {
         return HttpResponse::Ok().json(serde_json::json!({
             "projects": [], "sources": [], "agent_names": []
         }));
@@ -3273,29 +3306,56 @@ pub async fn trajectory_filters(data: web::Data<AppState>) -> impl Responder {
 
 /// GET /api/trajectories/{session_id}
 ///
-/// Returns the stored ATIF v1.7 JSON document for one trajectory (raw string
-/// passthrough, no re-parsing).
+/// Returns the stored ATIF v1.7 JSON document for one trajectory. When the
+/// session has subagent rows (`<session_id>:subagent:%`), they are embedded
+/// into the document's `subagent_trajectories` array so the frontend can
+/// navigate them via breadcrumb.
 #[get("/trajectories/{session_id}")]
 pub async fn get_trajectory_detail(
     data: web::Data<AppState>,
     path: web::Path<String>,
 ) -> impl Responder {
-    let Some(ref tstore) = data.trajectory_store else {
+    let Some(tstore) = data.trajectory_store() else {
         return HttpResponse::NotFound().json(
             serde_json::json!({"error": "not_found", "message": "Trajectory store not available"}),
         );
     };
     let session_id = path.into_inner();
     match tstore.get_atif_json(&session_id) {
-        Ok(Some(atif_json)) => HttpResponse::Ok()
-            .content_type("application/json")
-            .body(atif_json),
+        Ok(Some(atif_json)) => {
+            // Inject subagent_trajectories if any exist.
+            let enriched = match tstore.get_subagent_atif_jsons(&session_id) {
+                Ok(subs) if !subs.is_empty() => inject_subagents(&atif_json, &subs),
+                _ => atif_json,
+            };
+            HttpResponse::Ok()
+                .content_type("application/json")
+                .body(enriched)
+        }
         Ok(None) => HttpResponse::NotFound()
             .json(serde_json::json!({"error": "not_found", "message": "Trajectory not found"})),
         Err(e) => {
             HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
         }
     }
+}
+
+/// Parse the parent ATIF JSON, embed subagent documents into
+/// `subagent_trajectories`, and re-serialize.
+fn inject_subagents(parent_json: &str, sub_jsons: &[String]) -> String {
+    let mut doc: serde_json::Value = match serde_json::from_str(parent_json) {
+        Ok(v) => v,
+        Err(_) => return parent_json.to_string(),
+    };
+    let subs: Vec<serde_json::Value> = sub_jsons
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect();
+    if subs.is_empty() {
+        return parent_json.to_string();
+    }
+    doc["subagent_trajectories"] = serde_json::Value::Array(subs);
+    serde_json::to_string(&doc).unwrap_or_else(|_| parent_json.to_string())
 }
 
 // ─── Skill Metrics endpoints ─────────────────────────────────────────────────

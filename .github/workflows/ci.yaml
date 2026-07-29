@@ -654,7 +654,7 @@ jobs:
         run: |
           cd src/agentsight
           cargo llvm-cov --workspace --cobertura --output-path coverage.xml \
-            --ignore-filename-regex '(\.skel\.rs|target/debug/build|target/release/build|src/probes/|crates/agentsight-opt/src/bin/analyze\.rs|crates/agentsight-opt/src/llm/client\.rs|crates/agentsight-opt/src/(perf|cost)/llm\.rs|src/server/optimize\.rs)'
+            --ignore-filename-regex '(\.skel\.rs|target/debug/build|target/release/build|src/probes/|src/bin/|crates/agentsight-opt/src/bin/analyze\.rs|crates/agentsight-opt/src/llm/client\.rs|crates/agentsight-opt/src/(perf|cost)/llm\.rs|src/server/optimize\.rs|src/local/)'
 
       - name: Generate coverage summary
         if: always()
@@ -847,6 +847,41 @@ jobs:
           cd src/tokenless
           python3 tests/test_compress_response_hook.py
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: extractions/setup-just@v2
+
+      - name: npm packaging smoke test (native Linux)
+        # rtk v0.43.0 declares rust-version = "1.91", above the 1.89.0 pin
+        # used by the workspace MSRV checks earlier in this job. Only this
+        # packaging step builds rtk, so it runs on its own 1.91 toolchain
+        # via RUSTUP_TOOLCHAIN while the MSRV pin stays intact.
+        env:
+          RUSTUP_TOOLCHAIN: '1.91.0'
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          make -C src/tokenless npm-package
+          # Install root + platform tarballs into a scratch project and verify
+          # all three binaries actually run. The root install omits registry
+          # optional deps (unpublished during CI); the platform tarball
+          # installed in step 1 satisfies the platform lookup instead.
+          DIST="$GITHUB_WORKSPACE/src/tokenless/npm/dist"
+          SMOKE=$(mktemp -d)
+          cd "$SMOKE"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "$DIST"/tokenless-linux-x64/*.tgz
+          npm install --no-audit --no-fund --omit=optional "$DIST"/tokenless/*.tgz
+          ./node_modules/.bin/tokenless --version
+          ./node_modules/.bin/rtk --version
+          ./node_modules/.bin/toon --version
+          # Verify the bundled OpenClaw adapter was built and packaged
+          test -f ./node_modules/anolisa-tokenless/adapters/tokenless/openclaw/dist/index.js
+          # Verify adapter install scripts are executable
+          test -x ./node_modules/anolisa-tokenless/adapters/tokenless/openclaw/scripts/install.sh
+
   # =========================================================================
   # Step 7: Test ws-ckpt
   # =========================================================================
@@ -976,6 +1011,16 @@ jobs:
         with:
           workspaces: src/anolisa
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate npm packaging
+        run: |
+          cd src/anolisa
+          node npm/tests/platforms.test.js
+          node npm/scripts/package-npm.js --validate
+
       - name: Check formatting
         run: |
           cd src/anolisa
@@ -1065,10 +1110,9 @@ jobs:
 
       - name: Run process and PTY integration tests
         env:
-          # Raw CLI PTY tests are wait-bound, not CPU-bound; probe a wider
-          # shared gate on CI runners. Revert this env to fall back to the
-          # in-tree default (8) if timing flakes regress.
-          COSH_RAW_CLI_TEST_PARALLELISM: '16'
+          # Libtest still schedules 16 workers, while the harness gate bounds
+          # live PTY sessions to avoid oversubscribing loaded CI runners.
+          COSH_RAW_CLI_TEST_PARALLELISM: '8'
         run: |
           cd src/cosh-ng
           scripts/run-test-gates.sh integration

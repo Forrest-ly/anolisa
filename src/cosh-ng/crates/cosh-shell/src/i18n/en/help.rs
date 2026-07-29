@@ -3,7 +3,23 @@ use super::MessageId;
 pub(super) fn message(id: MessageId) -> Option<&'static str> {
     Some(match id {
         MessageId::HelpTitle => "Slash commands",
-        MessageId::HelpFooter => "Mode: {mode}. Strategy: {strategy}.",
+        MessageId::HelpFooter => {
+            "Mode: {mode}. Strategy: {strategy}. Shift+Enter / Alt+Enter insert a newline in the prompt; start prompts with ?? to compose multi-line."
+        }
+        MessageId::PromptSoftNewlineTip => {
+            "Tip: start with ?? to compose multi-line prompts (Shift+Enter for newline)."
+        }
+        MessageId::PromptDraftTitle => "Prompt draft",
+        MessageId::PromptDraftFooterEditing => {
+            "Enter send · Shift+Enter newline · Esc cancel"
+        }
+        MessageId::PromptDraftFooterSubmitted => "Sent to agent",
+        MessageId::PromptDraftFooterCancelled => "Draft cancelled",
+        MessageId::HelpGroupPrompt => "Prompt",
+        MessageId::HelpSummaryDraft => "open the multi-line prompt draft card (same as ?? + Enter)",
+        MessageId::PromptMultilineEntryHint => {
+            "For multi-line prompts type ?? then Enter, or use /draft to open the draft card"
+        }
         MessageId::HelpGroupConfig => "Config",
         MessageId::HelpGroupHealth => "Health",
         MessageId::HelpGroupModes => "Modes",
@@ -69,15 +85,62 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
             "render fallback: set COSH_SHELL_RENDER=plain before starting cosh-shell."
         }
         MessageId::SlashInfoConfigFooter => {
-            "Use /config language [auto|en-US|zh-CN]. Saved language takes effect next startup."
+            "Use /config language [auto|en-US|zh-CN]. Takes effect immediately; agent replies follow your message language."
         }
         MessageId::HelpGroupSessions => "Sessions",
         MessageId::HelpSummarySession => "discover, resume, and clear Agent sessions",
         MessageId::HelpGroupRegistry => "Registry",
         MessageId::HelpSummaryExtensions => "list/manage cosh-core extensions",
         MessageId::HelpSummarySkills => "list/inspect cosh-core skills",
+        MessageId::HelpSummaryMcp => "manage MCP servers",
+        MessageId::HelpGroupStatus => "Status",
+        MessageId::HelpSummaryStatus => "show version, provider, model, and runtime status",
+        MessageId::HelpSummaryStats => "show model and tool session statistics",
+        MessageId::SlashValueUnavailable => "unavailable",
+        MessageId::SlashValueNotStarted => "not started",
+        MessageId::SlashValueIdle => "idle",
+        MessageId::SlashValueActive => "active",
+        MessageId::SlashStatusTitle => "Status",
+        MessageId::SlashStatusVersionLine => "cosh-shell: {version}",
+        MessageId::SlashStatusBackendLine => "Backend: {backend}",
+        MessageId::SlashStatusProviderLine => "Provider: {provider}",
+        MessageId::SlashStatusModelLine => "Model: {model}",
+        MessageId::SlashStatusSessionLine => "Session: {session}",
+        MessageId::SlashStatusOsLine => "OS: {os}",
+        MessageId::SlashStatusModesLine => {
+            "Modes: approval={approval}, analysis={analysis}"
+        }
+        MessageId::SlashStatusProviderUnavailableLine => {
+            "Provider details: unavailable from the current backend"
+        }
+        MessageId::SlashStatusFooter => {
+            "/about is an alias for /status. Use /stats [model|tools] for session statistics."
+        }
+        MessageId::SlashStatsTitle => "Session stats",
+        MessageId::SlashStatsModelTitle => "Model stats",
+        MessageId::SlashStatsToolsTitle => "Tool stats",
+        MessageId::SlashStatsModelLine => "Model: {model}",
+        MessageId::SlashStatsBackendLine => "Backend: {backend}",
+        MessageId::SlashStatsRunStateLine => "Agent run: {state}",
+        MessageId::SlashStatsToolTotalsLine => {
+            "Tools: {calls} calls, {successful} successful, {failed} failed, {pending} pending"
+        }
+        MessageId::SlashStatsNoToolCalls => {
+            "No tool calls have been recorded in this session."
+        }
+        MessageId::SlashStatsToolRow => {
+            "{name}: {calls} calls, {successful} successful, {failed} failed, {pending} pending"
+        }
+        MessageId::SlashStatsTelemetryUnavailable => {
+            "Token counts, API errors, and latency are not exposed by the current backend protocol."
+        }
+        MessageId::SlashStatsUsageLine => "Usage: /stats [model|tools]",
+        MessageId::SlashStatsFooter => {
+            "Statistics are read-only and cover data observed by this cosh-shell process."
+        }
         MessageId::SlashExtensionsTitle => "Extensions",
         MessageId::SlashSkillsTitle => "Skills",
+        MessageId::SlashMcpTitle => "MCP Servers",
         MessageId::SlashRegistryUnavailable => {
             "This feature requires cosh-core backend."
         }
