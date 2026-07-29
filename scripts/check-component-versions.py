@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """Fail when component metadata drifts from its authoritative version."""
 
 import json
