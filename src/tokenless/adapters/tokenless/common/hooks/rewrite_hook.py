@@ -14,6 +14,8 @@ FHS spec: /usr/libexec/anolisa/tokenless/rtk.
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 
@@ -40,6 +42,28 @@ from hook_utils import (
 
 _MIN_RTK_VERSION = (0, 35, 0)
 _AGENT_ID = resolve_agent_id()
+
+# Bare `rtk` at a segment start: beginning of the command or right after a
+# shell connective (the compound shapes rtk emits). Whitespace after `rtk`
+# is required (lookahead, preserved) so a bare trailing `rtk` token is left
+# alone; separator whitespace is captured and preserved verbatim.
+_RTK_PREFIX_RE = re.compile(r"(^|&&|\|\||[;|])(\s*)rtk(?=\s)")
+
+
+def _anchor_rtk_prefix(rewritten: str, rtk_bin: str) -> str:
+    """Replace bare `rtk` segment prefixes with the resolved binary path.
+
+    rtk prints rewrites with a literal `rtk` prefix, which only resolves
+    when the shell executing the tool call has the rtk location on its
+    PATH. Agent runtimes with a trimmed PATH (e.g. IDE tool environments
+    without ~/.local/bin) would fail every rewritten command with exit
+    127 even though the hook resolved rtk successfully. Anchoring makes
+    the rewritten command self-contained.
+    """
+    quoted = shlex.quote(rtk_bin)
+    return _RTK_PREFIX_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{quoted}", rewritten
+    )
 
 
 # -- main --------------------------------------------------------------------
@@ -131,6 +155,8 @@ def main() -> None:
     rewritten = proc.stdout.strip()
     if not rewritten or rewritten == cmd:
         skip()
+
+    rewritten = _anchor_rtk_prefix(rewritten, rtk_bin)
 
     # 7. Build response
     # Emit both formats for runtime compatibility:
