@@ -187,6 +187,7 @@ test-integration:
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_compress_response_hook.py
 	python3 tests/test_compress_schema_hook.py
+	python3 tests/test_hermes_plugin_import.py
 	python3 tests/test_rewrite_hook.py
 	python3 tests/test_resolve_agent_id.py
 
