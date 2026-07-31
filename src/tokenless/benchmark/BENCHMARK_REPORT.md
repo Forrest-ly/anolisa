@@ -59,14 +59,12 @@ ResponseCompressor 测试覆盖：
 - 字段保留/规则验证: 11/11
 - 边界值鲁棒性: 16/16
 - 不利输入非膨胀: 7/7 (l1_worst_case)
-- 回归守卫: 1/1
 
 | 测试文件 | 类别 | 测试数 | 结果 |
 |---------|------|-------|------|
 | `l1_response_retention.rs` | 字段保留/规则验证 | 11 | ✅ 全部通过 |
 | `l1_adversarial_response.rs` | 边界值鲁棒性 | 16 | ✅ 全部通过 |
 | `l1_worst_case.rs`（response 相关） | 不利输入非膨胀 | 7 | ✅ 全部通过 |
-| `l1_compression_rate.rs` 回归守卫（response ≥ 60%） | 回归守卫 | 1 | ✅ 通过 |
 
 覆盖列出的合法 Value 和规则用例，不代表任意输入或生产任务准确率。
 
@@ -117,14 +115,12 @@ SchemaCompressor 测试覆盖：
 - 保护字段验证: 8/8
 - 边界值鲁棒性: 14/14
 - 不利输入非膨胀: 2/2
-- 回归守卫: 1/1
 
 | 测试文件 | 类别 | 测试数 | 结果 |
 |---------|------|-------|------|
 | `l1_schema_retention.rs` | 保护字段/截断/深度控制 | 8 | ✅ 全部通过 |
 | `l1_adversarial_schema.rs` | 边界值鲁棒性 | 14 | ✅ 全部通过 |
 | `l1_worst_case.rs`（schema 相关） | 不利输入非膨胀 | 2 | ✅ 全部通过 |
-| `l1_compression_rate.rs` 回归守卫（schema ≥ 40%） | 回归守卫 | 1 | ✅ 通过 |
 
 覆盖列出的合法 Value 和规则用例，不代表任意输入或生产任务准确率。
 
@@ -307,12 +303,12 @@ RTK（rtk 0.43.0）是外部二进制，通过 subprocess 调用 `rtk rewrite <c
 ⚠️ TOON roundtrip 测试使用 non-strict 解码模式（`with_strict(false)`）以兼容压缩器产生的 truncation marker 在 mixed-type 数组中的格式模糊性。strict 模式下此 roundtrip 将报解码错误。
 
 全套件 96 项测试通过（0 失败）：
-- ResponseCompressor: 34 项（保留 11 + 鲁棒性 16 + worst-case 7）
-- SchemaCompressor: 25 项（保留 8 + 鲁棒性 14 + worst-case 2 + 回归 1）
+- ResponseCompressor: 33 项（保留 11 + 鲁棒性 16 + worst-case 7）
+- SchemaCompressor: 24 项（保留 8 + 鲁棒性 14 + worst-case 2）
 - TOON: 18 项（roundtrip 8 + 对抗性 10）
 - RTK: 9 项（协议兼容性）
 - 组合链路: 6 项
-- 压缩率回归: 4 项
+- 压缩率回归: 5 项（`l1_compression_rate.rs`：response ≥ 60%、schema ≥ 40%、full_stack ≥ 55%、no_config_baseline、array_33_expansion）
 
 ### 5.3 组合时延
 
