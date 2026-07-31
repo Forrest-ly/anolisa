@@ -148,7 +148,11 @@ pub(super) fn run_sync_cosh_core_process(
             &terminal_events,
             session_state,
         );
-        let retain_session = retain_context_session(&terminal_events, parser.session_error_phase());
+        let retain_session = retain_context_session(
+            &terminal_events,
+            parser.session_error_phase(),
+            observed_resumability,
+        );
         let commit_outcome = commit_pending_session_for_scope(
             completed || retain_session,
             failed && !retain_session,
@@ -552,7 +556,11 @@ pub(super) fn start_control_protocol_cosh_core_process(
             &terminal_events,
             &session_state,
         );
-        let retain_session = retain_context_session(&terminal_events, parser.session_error_phase());
+        let retain_session = retain_context_session(
+            &terminal_events,
+            parser.session_error_phase(),
+            parser.session_resumable(),
+        );
         let commit_outcome = commit_pending_session_for_scope(
             completed || retain_session,
             failed && !retain_session,
@@ -615,6 +623,8 @@ pub(super) fn replace_synthetic_completion_for_nonzero_exit(
     terminal_events.push(AgentEvent::AgentFailed {
         run_id: run_id.to_string(),
         error,
+        error_code: None,
+        max_turns: None,
     });
 }
 

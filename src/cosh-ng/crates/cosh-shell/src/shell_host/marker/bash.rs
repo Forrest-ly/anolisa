@@ -44,7 +44,10 @@ else
   export PS1="$COSH_POC_PS1"
   set -o history
   export HISTFILE="${COSH_HISTFILE:-/dev/null}"
+  export HISTSIZE=1000
+  export HISTFILESIZE=1000
   export HISTCONTROL=
+  export HISTIGNORE=
   export HISTTIMEFORMAT=
 fi
 _cosh_load_native_bash_history_if_empty
@@ -58,6 +61,8 @@ _COSH_ATTEMPT_TOKEN=
 _COSH_ATTEMPT_TOKEN_FINGERPRINT=
 _COSH_ATTEMPT_SENSITIVE=0
 _COSH_ATTEMPT_UNSAFE=0
+_COSH_ATTEMPT_EXPANSION_DRIFT=0
+_COSH_ATTEMPT_SUBSHELL=
 _COSH_WRAPPER_ID="${COSH_SESSION_ID}:${COSH_MARKER_TOKEN}"
 _cosh_apply_internal_recovery() {
   if [[ -z "${COSH_RECOVERY_REQUEST_FILE:-}" || ! -f "$COSH_RECOVERY_REQUEST_FILE" ]]; then
@@ -216,12 +221,6 @@ _cosh_emit_top_level_missing_marker() {
 }
 _cosh_should_intercept_unknown() {
   local command="$1"
-  case "$command" in
-    /about|/agent|/allow|/answer|/approval-mode|/approve|/audit|/auth|/cancel|/clear|/config|/copy|/debug|/deny|/details|/draft|/explain|/extensions|/health|/help|/hooks|/mcp|/mode|/new|/recommendations|/resume|/select|/send-to-shell|/session|/shell|/skills|/stats|/status)
-      printf '%s' "slash"
-      return 0
-      ;;
-  esac
   if _cosh_is_slash_control_candidate "$command"; then
     printf '%s' "slash"
     return 0
@@ -260,6 +259,14 @@ _cosh_should_intercept_missing_path() {
   [[ "$intent" == "natural_language" ]]
 }
 _COSH_HANDOFF_PREFIX='COSH_SHELL_HANDOFF_BYPASS=1 '
+# Transport-only prefix for agent handoffs whose implicit pagers are disabled.
+# Must stay byte-identical to NON_INTERACTIVE_PAGER_PREFIX in
+# src/types/shell_handoff.rs, or the original command text would leak into
+# markers, history and evidence.
+_COSH_HANDOFF_PAGER_PREFIX='PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat '
+# Only the bypass prefix marks a transport line: handoff_pty_bytes always emits
+# it first, so a line that merely starts with the pager assignments is an
+# ordinary user command and must keep its full text.
 _cosh_is_handoff_wrapper() {
   case "$1" in
     "$_COSH_HANDOFF_PREFIX"*)
@@ -269,8 +276,8 @@ _cosh_is_handoff_wrapper() {
   return 1
 }
 _cosh_unwrap_handoff_command() {
-  local command="$1"
-  printf '%s' "${command#$_COSH_HANDOFF_PREFIX}"
+  local command="${1#$_COSH_HANDOFF_PREFIX}"
+  printf '%s' "${command#$_COSH_HANDOFF_PAGER_PREFIX}"
 }
 _cosh_is_pending_handoff_command() {
   local command="$1"
@@ -283,6 +290,118 @@ _cosh_clear_handoff_request() {
   if [[ -n "${COSH_HANDOFF_REQUEST_FILE:-}" && -f "$COSH_HANDOFF_REQUEST_FILE" ]]; then
     rm -f -- "$COSH_HANDOFF_REQUEST_FILE" 2>/dev/null || true
   fi
+  if [[ -n "${COSH_HANDOFF_REQUEST_FILE:-}"
+     && -f "${COSH_HANDOFF_REQUEST_FILE}.no-pager" ]]; then
+    rm -f -- "${COSH_HANDOFF_REQUEST_FILE}.no-pager" 2>/dev/null || true
+  fi
+}
+# Implicit-pager policy for one approved handoff. The sidecar file is written by
+# the Rust transport before the command reaches the shell; the variable set must
+# stay identical to NON_INTERACTIVE_PAGER_PREFIX in src/types/shell_handoff.rs.
+# Scope is a single command: preexec applies it, precmd restores it, so the
+# user's own commands keep their own pager configuration.
+# Classifies both value visibility and readonly state. An exported readonly
+# pager cannot be assigned, but its export attribute can be removed long enough
+# to keep the inherited value out of the handoff command's environment.
+_cosh_pager_var_state() {
+  local name="$1" dump
+  if [[ -z "${!name+x}" ]]; then
+    printf unset
+    return 0
+  fi
+  # One subshell per variable, and only on approved-handoff lines: the handoff
+  # branch of the preexec marker already forks for _cosh_unwrap_handoff_command.
+  dump="$(declare -p "$name" 2>/dev/null)"
+  case "$dump" in
+    "declare -"*r*" $name="*)
+      case "$dump" in
+        "declare -"*x*" $name="*)
+          printf readonly_export
+          ;;
+        *)
+          printf readonly_shell
+          ;;
+      esac
+      ;;
+    "declare -"*x*" $name="*)
+      printf export
+      ;;
+    *)
+      printf shell
+      ;;
+  esac
+}
+_cosh_apply_handoff_pager_policy() {
+  if [[ -z "${COSH_HANDOFF_REQUEST_FILE:-}"
+     || ! -f "${COSH_HANDOFF_REQUEST_FILE}.no-pager" ]]; then
+    return 0
+  fi
+  local name state
+  for name in PAGER GIT_PAGER MANPAGER SYSTEMD_PAGER; do
+    state="$(_cosh_pager_var_state "$name")"
+    printf -v "_COSH_${name}_STATE" '%s' "$state"
+    printf -v "_COSH_${name}_SAVED" '%s' "${!name-}"
+    case "$state" in
+      readonly_export)
+        export -n "$name"
+        ;;
+      readonly_shell)
+        ;;
+      *)
+        export "$name=cat"
+        ;;
+    esac
+  done
+  _COSH_HANDOFF_PAGER_APPLIED=1
+  return 0
+}
+# Undoes an injection only while it is still exactly what cosh left behind: an
+# exported scalar holding `cat`. A handoff command that changed the value
+# (export PAGER=less), removed it (unset GIT_PAGER) or only dropped the export
+# attribute (export -n PAGER) keeps its own result, because reverting it would
+# report success while silently discarding the effect.
+_cosh_restore_one_pager_var() {
+  local name="$1"
+  local state_var="_COSH_${name}_STATE" saved_var="_COSH_${name}_SAVED"
+  case "${!state_var-unset}" in
+    readonly_export)
+      if [[ "${!name-}" == "${!saved_var-}"
+         && "$(_cosh_pager_var_state "$name")" == readonly_shell ]]; then
+        export "$name"
+      fi
+      return 0
+      ;;
+    readonly_shell)
+      return 0
+      ;;
+  esac
+  if [[ "${!name-}" != cat
+     || "$(_cosh_pager_var_state "$name")" != export ]]; then
+    return 0
+  fi
+  unset "$name"
+  case "${!state_var-unset}" in
+    shell)
+      printf -v "$name" '%s' "${!saved_var-}"
+      ;;
+    export)
+      printf -v "$name" '%s' "${!saved_var-}"
+      export "$name"
+      ;;
+  esac
+  return 0
+}
+_cosh_restore_handoff_pager_policy() {
+  if [[ "${_COSH_HANDOFF_PAGER_APPLIED:-0}" != 1 ]]; then
+    return 0
+  fi
+  unset _COSH_HANDOFF_PAGER_APPLIED 2>/dev/null || true
+  local name
+  for name in PAGER GIT_PAGER MANPAGER SYSTEMD_PAGER; do
+    _cosh_restore_one_pager_var "$name"
+    unset "_COSH_${name}_STATE" "_COSH_${name}_SAVED" 2>/dev/null || true
+  done
+  return 0
 }
 _cosh_replace_handoff_history() {
   if [[ -z "${_COSH_HANDOFF_HISTORY_NO:-}" || -z "${_COSH_HANDOFF_HISTORY_COMMAND+x}" ]]; then
@@ -295,12 +414,15 @@ _cosh_replace_handoff_history() {
 _cosh_begin_attempt() {
   local input="$1"
   local top_token="$2"
+  local expansion_drift="${3:-0}"
   local utf8_status
   _COSH_ATTEMPT_GENERATION=$((_COSH_ATTEMPT_GENERATION + 1))
   _COSH_ATTEMPT_ACTIVE=1
   _COSH_ATTEMPT_WRAPPER_ID="$_COSH_WRAPPER_ID"
   _COSH_ATTEMPT_SENSITIVE=0
   _COSH_ATTEMPT_UNSAFE=0
+  _COSH_ATTEMPT_EXPANSION_DRIFT="$expansion_drift"
+  _COSH_ATTEMPT_SUBSHELL="${BASH_SUBSHELL:-0}"
   _COSH_ATTEMPT_INPUT=
   _COSH_ATTEMPT_TOKEN=
   _COSH_ATTEMPT_TOKEN_FINGERPRINT=
@@ -361,6 +483,12 @@ command_not_found_handle() {
     _cosh_delegate_bash_command_not_found "$command" "$@"
     return $?
   fi
+  if [[ "${_COSH_ATTEMPT_SUBSHELL:-}" != "${BASH_SUBSHELL:-0}"
+     || "${#FUNCNAME[@]}" != 1
+     || "${_COSH_ATTEMPT_EXPANSION_DRIFT:-0}" == 1 ]]; then
+    _cosh_delegate_bash_command_not_found "$command" "$@"
+    return $?
+  fi
   if [[ "${_COSH_ATTEMPT_SENSITIVE:-0}" == 1 || "${_COSH_ATTEMPT_UNSAFE:-0}" == 1 ]]; then
     local command_fingerprint
     command_fingerprint="$(_cosh_token_fingerprint "$command")"
@@ -378,7 +506,9 @@ command_not_found_handle() {
     _cosh_delegate_bash_command_not_found "$command" "$@"
     return $?
   fi
-  if [[ "${_COSH_ATTEMPT_TOKEN:-}" != "$command" || -z "$original" ]]; then
+  if [[ -z "$original" ]] \
+     || ! _cosh_literal_first_word_matches "$original" "${_COSH_ATTEMPT_TOKEN:-}" "$command" \
+     || ! _cosh_arguments_have_no_unquoted_expansion "$original"; then
     _cosh_delegate_bash_command_not_found "$command" "$@"
     return $?
   fi
@@ -422,6 +552,18 @@ _COSH_HAS_BASH_ALIASES=0
 if (( ${BASH_VERSINFO[0]:-0} >= 4 )); then
   _COSH_HAS_BASH_ALIASES=1
 fi
+
+_cosh_has_leading_alias() {
+  local command="$1"
+  local rest="$command"
+  local word
+  [[ "${_COSH_HAS_BASH_ALIASES:-0}" == 1 ]] || return 1
+  while [[ "$rest" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+ ]]; do
+    rest="${rest:${#BASH_REMATCH[0]}}"
+  done
+  word="${rest%%[[:space:]]*}"
+  [[ -n "$word" && -n "${BASH_ALIASES[$word]:-}" ]]
+}
 
 _cosh_compact_alias_expanded() {
   local command="$1" expanded=0 guard=0 prefix rest word expansion done_prefix=""
@@ -533,6 +675,8 @@ _cosh_preexec_marker() {
     # (otherwise every aliased command, e.g. ls='ls --color=auto', loses its
     # preexec marker and an approved shell handoff can never close).
     _COSH_EXPANDED_COMPACT=""
+    local attempt_expansion_drift=0
+    _cosh_has_leading_alias "$command" && attempt_expansion_drift=1
     if [[ -n "$compact_command" && "$compact_bash_command" != *"$compact_command"* && "$compact_command" != *"$compact_bash_command"* ]]; then
       _cosh_compact_alias_expanded "$command"
     fi
@@ -569,8 +713,10 @@ _cosh_preexec_marker() {
         display_command="$(_cosh_unwrap_handoff_command "$command")"
         _COSH_HANDOFF_ACTIVE=1
         _COSH_HANDOFF_HISTORY_NO="$history_no"
+        _cosh_apply_handoff_pager_policy
       elif _cosh_is_pending_handoff_command "$command"; then
         _COSH_HANDOFF_ACTIVE=1
+        _cosh_apply_handoff_pager_policy
       else
         _cosh_clear_handoff_request
         unset _COSH_HANDOFF_ACTIVE 2>/dev/null || true
@@ -601,7 +747,7 @@ _cosh_preexec_marker() {
           eval "$active_debug_trap" 2>/dev/null || true
           return 1
         fi
-        _cosh_begin_attempt "$command" "$first_word"
+        _cosh_begin_attempt "$command" "$first_word" "$attempt_expansion_drift"
       fi
       if [[ "$command" == trap*DEBUG* ]]; then
         _COSH_DEBUG_TRAP_MAY_CHANGE=1
@@ -630,6 +776,7 @@ _cosh_precmd_marker() {
   _cosh_apply_internal_recovery
   _cosh_replace_handoff_history
   _cosh_clear_handoff_request
+  _cosh_restore_handoff_pager_policy
   unset _COSH_HANDOFF_ACTIVE 2>/dev/null || true
   _COSH_ATTEMPT_ACTIVE=0
   _cosh_emit_marker "precmd" "" "$status" false
@@ -703,7 +850,10 @@ shopt -s extdebug 2>/dev/null || true
 _COSH_OLD_DEBUG_TRAP="$(trap -p DEBUG 2>/dev/null | sed "s/^trap -- '\\(.*\\)' DEBUG$/\\1/" || true)"
 _COSH_ACTIVE_DEBUG_TRAP="trap -- '_cosh_preexec_marker' DEBUG"
 trap '_cosh_preexec_marker' DEBUG
-if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
+if [[ -n "${COSH_SHELL_ISOLATED:-}" ]]; then
+  unset _COSH_USER_PROMPT_COMMAND
+  _COSH_USER_PROMPT_COMMAND_IS_ARRAY=0
+elif [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
   _COSH_USER_PROMPT_COMMAND_IS_ARRAY=1
   _COSH_USER_PROMPT_COMMAND=("${PROMPT_COMMAND[@]}")
 elif [[ -n "${PROMPT_COMMAND+x}" ]]; then

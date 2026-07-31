@@ -72,6 +72,8 @@ _COSH_ATTEMPT_TOKEN=
 _COSH_ATTEMPT_TOKEN_FINGERPRINT=
 _COSH_ATTEMPT_SENSITIVE=0
 _COSH_ATTEMPT_UNSAFE=0
+_COSH_ATTEMPT_EXPANSION_DRIFT=0
+_COSH_ATTEMPT_SUBSHELL=
 _COSH_WRAPPER_ID="${COSH_SESSION_ID}:${COSH_MARKER_TOKEN}"
 _cosh_apply_internal_recovery() {
   if [[ -z "${COSH_RECOVERY_REQUEST_FILE:-}" || ! -f "$COSH_RECOVERY_REQUEST_FILE" ]]; then
@@ -145,12 +147,6 @@ _cosh_emit_top_level_missing_marker() {
 }
 _cosh_should_intercept_unknown() {
   local command="$1"
-  case "$command" in
-    /about|/agent|/allow|/answer|/approval-mode|/approve|/audit|/auth|/cancel|/clear|/config|/copy|/debug|/deny|/details|/draft|/explain|/extensions|/health|/help|/hooks|/mcp|/mode|/new|/recommendations|/resume|/select|/send-to-shell|/session|/shell|/skills|/stats|/status)
-      printf '%s' "slash"
-      return 0
-      ;;
-  esac
   if _cosh_is_slash_control_candidate "$command"; then
     printf '%s' "slash"
     return 0
@@ -171,6 +167,14 @@ _cosh_is_slash_control_candidate() {
   return 1
 }
 _COSH_HANDOFF_PREFIX='COSH_SHELL_HANDOFF_BYPASS=1 '
+# Transport-only prefix for agent handoffs whose implicit pagers are disabled.
+# Must stay byte-identical to NON_INTERACTIVE_PAGER_PREFIX in
+# src/types/shell_handoff.rs, or the original command text would leak into
+# markers, history and evidence.
+_COSH_HANDOFF_PAGER_PREFIX='PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat '
+# Only the bypass prefix marks a transport line: handoff_pty_bytes always emits
+# it first, so a line that merely starts with the pager assignments is an
+# ordinary user command and must keep its full text.
 _cosh_is_handoff_wrapper() {
   case "$1" in
     "$_COSH_HANDOFF_PREFIX"*)
@@ -180,8 +184,8 @@ _cosh_is_handoff_wrapper() {
   return 1
 }
 _cosh_unwrap_handoff_command() {
-  local command="$1"
-  printf '%s' "${command#$_COSH_HANDOFF_PREFIX}"
+  local command="${1#$_COSH_HANDOFF_PREFIX}"
+  printf '%s' "${command#$_COSH_HANDOFF_PAGER_PREFIX}"
 }
 _cosh_is_pending_handoff_command() {
   local command="$1"
@@ -194,6 +198,110 @@ _cosh_clear_handoff_request() {
   if [[ -n "${COSH_HANDOFF_REQUEST_FILE:-}" && -f "$COSH_HANDOFF_REQUEST_FILE" ]]; then
     rm -f -- "$COSH_HANDOFF_REQUEST_FILE" 2>/dev/null || true
   fi
+  if [[ -n "${COSH_HANDOFF_REQUEST_FILE:-}"
+     && -f "${COSH_HANDOFF_REQUEST_FILE}.no-pager" ]]; then
+    rm -f -- "${COSH_HANDOFF_REQUEST_FILE}.no-pager" 2>/dev/null || true
+  fi
+}
+# Implicit-pager policy for one approved handoff. The sidecar file is written by
+# the Rust transport before the command reaches the shell; the variable set must
+# stay identical to NON_INTERACTIVE_PAGER_PREFIX in src/types/shell_handoff.rs.
+# Scope is a single command: preexec applies it, precmd restores it, so the
+# user's own commands keep their own pager configuration.
+# Classifies both value visibility and readonly state. An exported readonly
+# pager cannot be assigned, but its export attribute can be removed long enough
+# to keep the inherited value out of the handoff command's environment.
+_cosh_pager_var_state() {
+  local name="$1"
+  local kind="${(Pt)name}"
+  if [[ -z "$kind" ]]; then
+    printf unset
+    return 0
+  fi
+  if [[ "$kind" == *readonly* ]]; then
+    if [[ "$kind" == *export* ]]; then
+      printf readonly_export
+    else
+      printf readonly_shell
+    fi
+    return 0
+  fi
+  if [[ "$kind" == *export* ]]; then
+    printf export
+    return 0
+  fi
+  printf shell
+}
+_cosh_apply_handoff_pager_policy() {
+  if [[ -z "${COSH_HANDOFF_REQUEST_FILE:-}"
+     || ! -f "${COSH_HANDOFF_REQUEST_FILE}.no-pager" ]]; then
+    return 0
+  fi
+  local name state
+  for name in PAGER GIT_PAGER MANPAGER SYSTEMD_PAGER; do
+    state="$(_cosh_pager_var_state "$name")"
+    typeset -g "_COSH_${name}_STATE=$state"
+    typeset -g "_COSH_${name}_SAVED=${(P)name}"
+    case "$state" in
+      readonly_export)
+        typeset +x "$name"
+        ;;
+      readonly_shell)
+        ;;
+      *)
+        export "$name=cat"
+        ;;
+    esac
+  done
+  _COSH_HANDOFF_PAGER_APPLIED=1
+  return 0
+}
+# Undoes an injection only while it is still exactly what cosh left behind: an
+# exported scalar holding `cat`. A handoff command that changed the value
+# (export PAGER=less), removed it (unset GIT_PAGER) or only dropped the export
+# attribute (typeset +x PAGER) keeps its own result, because reverting it would
+# report success while silently discarding the effect.
+_cosh_restore_one_pager_var() {
+  local name="$1"
+  local state_var="_COSH_${name}_STATE" saved_var="_COSH_${name}_SAVED"
+  case "${(P)state_var}" in
+    readonly_export)
+      if [[ "${(P)name}" == "${(P)saved_var}"
+         && "$(_cosh_pager_var_state "$name")" == readonly_shell ]]; then
+        export "$name"
+      fi
+      return 0
+      ;;
+    readonly_shell)
+      return 0
+      ;;
+  esac
+  if [[ "${(P)name}" != cat
+     || "$(_cosh_pager_var_state "$name")" != export ]]; then
+    return 0
+  fi
+  unset "$name"
+  case "${(P)state_var}" in
+    shell)
+      typeset -g "$name=${(P)saved_var}"
+      ;;
+    export)
+      typeset -gx "$name=${(P)saved_var}"
+      ;;
+  esac
+  return 0
+}
+_cosh_restore_handoff_pager_policy() {
+  if [[ "${_COSH_HANDOFF_PAGER_APPLIED:-0}" != 1 ]]; then
+    return 0
+  fi
+  unset _COSH_HANDOFF_PAGER_APPLIED 2>/dev/null || true
+  local name
+  for name in PAGER GIT_PAGER MANPAGER SYSTEMD_PAGER; do
+    _cosh_restore_one_pager_var "$name"
+    unset "_COSH_${name}_STATE" "_COSH_${name}_SAVED" 2>/dev/null || true
+  done
+  return 0
 }
 _cosh_command_has_secret() {
   local lower="${(L)1}"
@@ -248,12 +356,15 @@ _cosh_add_handoff_history() {
 _cosh_begin_attempt() {
   local input="$1"
   local top_token="$2"
+  local expansion_drift="${3:-0}"
   local utf8_status
   _COSH_ATTEMPT_GENERATION=$((_COSH_ATTEMPT_GENERATION + 1))
   _COSH_ATTEMPT_ACTIVE=1
   _COSH_ATTEMPT_WRAPPER_ID="$_COSH_WRAPPER_ID"
   _COSH_ATTEMPT_SENSITIVE=0
   _COSH_ATTEMPT_UNSAFE=0
+  _COSH_ATTEMPT_EXPANSION_DRIFT="$expansion_drift"
+  _COSH_ATTEMPT_SUBSHELL="${ZSH_SUBSHELL:-0}"
   _COSH_ATTEMPT_INPUT=
   _COSH_ATTEMPT_TOKEN=
   _COSH_ATTEMPT_TOKEN_FINGERPRINT=
@@ -314,6 +425,12 @@ command_not_found_handler() {
     _cosh_delegate_zsh_command_not_found "$command" "$@"
     return $?
   fi
+  if (( ${ZSH_SUBSHELL:-0} != ${_COSH_ATTEMPT_SUBSHELL:-0} + 1 )) \
+     || (( ${#funcstack[@]} != 1 )) \
+     || [[ "${_COSH_ATTEMPT_EXPANSION_DRIFT:-0}" == 1 ]]; then
+    _cosh_delegate_zsh_command_not_found "$command" "$@"
+    return $?
+  fi
   if [[ "${_COSH_ATTEMPT_SENSITIVE:-0}" == 1 || "${_COSH_ATTEMPT_UNSAFE:-0}" == 1 ]]; then
     local command_fingerprint
     command_fingerprint="$(_cosh_token_fingerprint "$command")"
@@ -331,7 +448,9 @@ command_not_found_handler() {
     _cosh_delegate_zsh_command_not_found "$command" "$@"
     return $?
   fi
-  if [[ "${_COSH_ATTEMPT_TOKEN:-}" != "$command" || -z "$original" ]]; then
+  if [[ -z "$original" ]] \
+     || ! _cosh_literal_first_word_matches "$original" "${_COSH_ATTEMPT_TOKEN:-}" "$command" \
+     || ! _cosh_arguments_have_no_unquoted_expansion "$original"; then
     _cosh_delegate_zsh_command_not_found "$command" "$@"
     return $?
   fi
@@ -362,6 +481,10 @@ command_not_found_handler() {
 }
 _cosh_preexec_marker() {
   local command="$1"
+  local expanded_command="${2:-$1}"
+  local canonical_command="${(j: :)${(z)command}}"
+  local expansion_drift=0
+  [[ "$canonical_command" != "$expanded_command" ]] && expansion_drift=1
   _COSH_ATTEMPT_ACTIVE=0
   _COSH_ATTEMPT_SENSITIVE=0
   _COSH_ATTEMPT_UNSAFE=0
@@ -373,20 +496,26 @@ _cosh_preexec_marker() {
   if _cosh_is_handoff_wrapper "$command"; then
     display_command="$(_cosh_unwrap_handoff_command "$command")"
     _COSH_HANDOFF_ACTIVE=1
+    _cosh_apply_handoff_pager_policy
     if _cosh_command_has_secret "$display_command"; then
       display_command="<redacted sensitive command>"
     fi
     _COSH_HANDOFF_HISTORY_COMMAND="$display_command"
   elif _cosh_is_pending_handoff_command "$command"; then
     _COSH_HANDOFF_ACTIVE=1
+    _cosh_apply_handoff_pager_policy
   else
     _cosh_clear_handoff_request
     unset _COSH_HANDOFF_ACTIVE 2>/dev/null || true
     unset _COSH_HANDOFF_HISTORY_COMMAND 2>/dev/null || true
-    local first_word="$command"
+    local command_word_source="$command"
+    while [[ "$command_word_source" == ' '* || "$command_word_source" == $'\t'* ]]; do
+      command_word_source="${command_word_source#?}"
+    done
+    local first_word="$command_word_source"
     local argc=1
-    if [[ "$command" == *[[:space:]]* ]]; then
-      first_word="${command%%[[:space:]]*}"
+    if [[ "$command_word_source" == *[[:space:]]* ]]; then
+      first_word="${command_word_source%%[[:space:]]*}"
       argc=2
     fi
     local reason
@@ -394,7 +523,7 @@ _cosh_preexec_marker() {
       _cosh_emit_intercept_marker "$command" "$reason"
       return 1
     fi
-    _cosh_begin_attempt "$command" "$first_word"
+    _cosh_begin_attempt "$command" "$first_word" "$expansion_drift"
   fi
   if [[ "${_COSH_ATTEMPT_SENSITIVE:-0}" == 1
      || "${_COSH_ATTEMPT_UNSAFE:-0}" == 1 ]] \
@@ -410,6 +539,7 @@ _cosh_precmd_marker() {
   _cosh_apply_internal_recovery
   _cosh_add_handoff_history
   _cosh_clear_handoff_request
+  _cosh_restore_handoff_pager_policy
   unset _COSH_HANDOFF_ACTIVE 2>/dev/null || true
   _COSH_ATTEMPT_ACTIVE=0
   _cosh_emit_marker "precmd" "" "$exit_status" false
@@ -423,7 +553,7 @@ _cosh_precmd_marker() {
 # Slash command function stubs — prevent "zsh: no such file or directory" for
 # commands starting with / that zsh would try to exec as an absolute path.
 # The actual interception and marker emission happens in _cosh_preexec_marker.
-for _cosh_sc in about agent allow answer approval-mode approve audit auth cancel clear config copy debug deny details explain extensions health help hooks mcp mode new recommendations select send-to-shell shell skills stats status; do
+for _cosh_sc in about agent allow answer approval-mode approve audit auth cancel clear config copy debug deny details draft explain extensions health help hooks mcp mode new recommendations resume select send-to-shell session shell skills stats status; do
   functions[/$_cosh_sc]=':'
 done
 unset _cosh_sc

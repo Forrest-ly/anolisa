@@ -92,4 +92,7 @@ collect_message_ids!([
     tool_argument_status_ids,
     multiline_entry_ids,
     mcp_registry_ids,
+    approval_foreground_interactive_ids,
+    approval_turn_extension_ids,
+    capture_notice_ids,
 ],);
