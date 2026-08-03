@@ -111,6 +111,22 @@
         "install":   "qwencode/scripts/install.sh",
         "uninstall": "qwencode/scripts/uninstall.sh"
       }
+    },
+    "kimicode": {
+      "compatibleVersions": ">=0.1.0",
+      "capabilities": {
+        "hooks": [
+          "rewrite",
+          "compress-response",
+          "compress-toon",
+          "tool-ready"
+        ]
+      },
+      "actions": {
+        "detect":    "kimicode/scripts/detect.sh",
+        "install":   "kimicode/scripts/install.sh",
+        "uninstall": "kimicode/scripts/uninstall.sh"
+      }
     }
   }
 }
