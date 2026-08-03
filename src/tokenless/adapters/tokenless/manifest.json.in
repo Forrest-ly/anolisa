@@ -118,7 +118,6 @@
         "hooks": [
           "rewrite",
           "compress-response",
-          "compress-toon",
           "tool-ready"
         ]
       },

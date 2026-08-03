@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — Register tokenless hooks for Kimi Code in ~/.kimi/config.toml.
+# install.sh — Register tokenless hooks for Kimi Code in ~/.kimi-code/config.toml.
 #
 # Kimi Code uses a flat TOML config with [[hooks]] entries rather than a
 # plugin manifest. This script injects hook definitions that point to
@@ -10,7 +10,7 @@ AGENT="${ANOLISA_TARGET:-kimicode}"
 COMPONENT="${ANOLISA_COMPONENT:-tokenless}"
 ADAPTER_DIR="${ANOLISA_ADAPTER_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
-KIMI_HOME="${HOME}/.kimi"
+KIMI_HOME="${KIMI_CODE_HOME:-${HOME}/.kimi-code}"
 CONFIG_FILE="${KIMI_HOME}/config.toml"
 
 DRY_RUN="${ANOLISA_DRY_RUN:-0}"
@@ -30,8 +30,8 @@ if [ ! -f "$HOOK_DISPATCHER" ]; then
     exit 1
 fi
 
-# Make dispatcher executable
-chmod +x "$HOOK_DISPATCHER"
+# Make dispatcher executable (check first to avoid EPERM in RPM scenarios)
+[ -x "$HOOK_DISPATCHER" ] || chmod +x "$HOOK_DISPATCHER"
 
 # Convert to absolute path for TOML embedding
 HOOK_DISPATCHER_ABS="$(cd "$(dirname "$HOOK_DISPATCHER")" && pwd)/$(basename "$HOOK_DISPATCHER")"
@@ -110,12 +110,13 @@ skip_until_next_hook = False
 
 for i, line in enumerate(lines):
     if line.strip().startswith("[[hooks]]"):
-        # Look ahead to see if this is a tokenless hook
+        # Look ahead to see if this is a tokenless hook by checking command path
         is_tokenless = False
         for j in range(i+1, min(i+10, len(lines))):
             if lines[j].strip().startswith("[["):
                 break
-            if "tokenless-" in lines[j]:
+            # Match by dispatcher path (works for both RPM and user installs)
+            if "adapters/tokenless/kimicode/hooks/run-hook.sh" in lines[j]:
                 is_tokenless = True
                 break
         

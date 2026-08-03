@@ -36,19 +36,21 @@ else
     note_prereq_missing "kimi CLI"
 fi
 
-# Kimi Code stores global config under ~/.kimi/ (upstream default).
+# Kimi Code stores global config under ~/.kimi-code/ (upstream default).
+# Can be overridden via KIMI_CODE_HOME environment variable.
 # Absence is not a prerequisite failure — created on first run.
-if [ -d "$HOME/.kimi" ]; then
-    field "kimi config dir"     "present ($HOME/.kimi)"
+KIMI_HOME="${KIMI_CODE_HOME:-${HOME}/.kimi-code}"
+if [ -d "$KIMI_HOME" ]; then
+    field "kimi config dir"     "present ($KIMI_HOME)"
 else
     field "kimi config dir"     "missing (created on first Kimi Code run)"
 fi
 
 # Check if config.toml exists (hooks are configured here)
-if [ -f "$HOME/.kimi/config.toml" ]; then
+if [ -f "$KIMI_HOME/config.toml" ]; then
     field "kimi config.toml"    "present"
     # Check if tokenless hooks are already configured
-    if grep -q 'tokenless' "$HOME/.kimi/config.toml" 2>/dev/null; then
+    if grep -q 'adapters/tokenless/kimicode/hooks/run-hook.sh' "$KIMI_HOME/config.toml" 2>/dev/null; then
         field "tokenless hooks"   "configured"
     else
         field "tokenless hooks"   "not configured"

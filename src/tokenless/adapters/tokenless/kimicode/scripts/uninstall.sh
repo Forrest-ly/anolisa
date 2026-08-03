@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# uninstall.sh — Remove tokenless hooks from Kimi Code config (~/.kimi/config.toml).
+# uninstall.sh — Remove tokenless hooks from Kimi Code config (~/.kimi-code/config.toml).
 # Removes all [[hooks]] entries that reference tokenless hooks.
 set -euo pipefail
 
 AGENT="${ANOLISA_TARGET:-kimicode}"
 COMPONENT="${ANOLISA_COMPONENT:-tokenless}"
 
-KIMI_HOME="${HOME}/.kimi"
+KIMI_HOME="${KIMI_CODE_HOME:-${HOME}/.kimi-code}"
 CONFIG_FILE="${KIMI_HOME}/config.toml"
 
 echo "[${COMPONENT}] Uninstalling ${AGENT} adapter..."
@@ -18,13 +18,24 @@ fi
 
 # Check for python3 dependency
 if ! command -v python3 &>/dev/null; then
-    echo "[${COMPONENT}] WARNING: python3 not found — falling back to sed-based cleanup."
-    echo "[${COMPONENT}] This may leave some tokenless hooks in config.toml."
-    echo "[${COMPONENT}] For complete cleanup, install python3 and run this script again."
+    echo "[${COMPONENT}] WARNING: python3 not found — falling back to awk-based cleanup."
+    echo "[${COMPONENT}] This removes tokenless hook blocks by matching dispatcher path."
     
-    # Fallback: use sed to remove lines containing tokenless- (less precise)
-    sed -i.bak '/^# tokenless-/d; /^# Tokenless adapter hooks/d' "$CONFIG_FILE"
-    echo "[${COMPONENT}] Attempted sed-based cleanup (backup: ${CONFIG_FILE}.bak)"
+    # Fallback: use awk to remove [[hooks]] blocks containing tokenless dispatcher
+    awk '
+    /^\[\[hooks\]\]/ { in_hook=1; hook_lines=""; is_tokenless=0 }
+    in_hook {
+        hook_lines = hook_lines $0 "\n"
+        if (/adapters\/tokenless\/kimicode\/hooks\/run-hook\.sh/) is_tokenless=1
+    }
+    /^\[\[/ && !/^\[\[hooks\]\]/ { 
+        if (in_hook && !is_tokenless) printf "%s", hook_lines
+        in_hook=0; hook_lines=""; print; next
+    }
+    !in_hook { print }
+    END { if (in_hook && !is_tokenless) printf "%s", hook_lines }
+    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    echo "[${COMPONENT}] awk-based cleanup complete"
     exit 0
 fi
 
@@ -50,12 +61,13 @@ removed_count = 0
 
 for i, line in enumerate(lines):
     if line.strip().startswith("[[hooks]]"):
-        # Look ahead to see if this is a tokenless hook
+        # Look ahead to see if this is a tokenless hook by checking command path
         is_tokenless = False
         for j in range(i+1, min(i+15, len(lines))):
             if lines[j].strip().startswith("[["):
                 break
-            if "tokenless-" in lines[j]:
+            # Match by dispatcher path (works for both RPM and user installs)
+            if "adapters/tokenless/kimicode/hooks/run-hook.sh" in lines[j]:
                 is_tokenless = True
                 break
         
