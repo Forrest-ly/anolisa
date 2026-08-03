@@ -116,8 +116,6 @@
       "compatibleVersions": ">=0.1.0",
       "capabilities": {
         "hooks": [
-          "rewrite",
-          "compress-response",
           "tool-ready"
         ]
       },

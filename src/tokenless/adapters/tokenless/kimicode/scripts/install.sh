@@ -36,35 +36,29 @@ fi
 # Convert to absolute path for TOML embedding
 HOOK_DISPATCHER_ABS="$(cd "$(dirname "$HOOK_DISPATCHER")" && pwd)/$(basename "$HOOK_DISPATCHER")"
 
-# Define the hooks to install
+# Define the hooks to install.
+# Kimi Code's hook protocol only supports allow/block for PreToolUse and
+# observation-only for PostToolUse — there is no input-replacement or
+# output-replacement mechanism. Only tool-ready (env pre-check + auto-fix)
+# is registered; rewrite and compress-response are not compatible.
 declare -a HOOK_EVENTS=(
     "PreToolUse"
-    "PreToolUse"
-    "PostToolUse"
 )
 
 declare -a HOOK_MATCHERS=(
-    "^(Bash|Shell|run_shell_command|terminal|execute_command)$"
     ""
-    "^(?!(?:Read|Glob|Grep|NotebookRead)$).+"
 )
 
 declare -a HOOK_SCRIPTS=(
-    "rewrite_hook.py"
     "tool_ready_hook.sh"
-    "compress_response_hook.py"
 )
 
 declare -a HOOK_TIMEOUTS=(
-    "10"
-    "15"
     "15"
 )
 
 declare -a HOOK_DESCRIPTIONS=(
-    "tokenless-rewrite: Rewrites shell commands via rtk for token savings"
     "tokenless-tool-ready: Pre-checks tool environment readiness"
-    "tokenless-compress-response: Compresses tool responses for token savings"
 )
 
 # Python script to safely merge hooks into config.toml
@@ -77,23 +71,15 @@ config_path = Path(sys.argv[1])
 dispatcher = sys.argv[2]
 dry_run = sys.argv[3] == "1"
 
-# Hook definitions passed from bash
-hook_events = ["PreToolUse", "PreToolUse", "PostToolUse"]
-hook_matchers = [
-    "^(Bash|Shell|run_shell_command|terminal|execute_command)$",
-    "",
-    "^(?!(?:Read|Glob|Grep|NotebookRead)$).+"
-]
-hook_scripts = [
-    "rewrite_hook.py",
-    "tool_ready_hook.sh",
-    "compress_response_hook.py"
-]
-hook_timeouts = [10, 15, 15]
+# Hook definitions — only tool-ready is compatible with Kimi Code's hook protocol.
+# Kimi Code supports allow/block (PreToolUse) and observation-only (PostToolUse);
+# it does not process tool_input/updatedInput or updatedToolOutput/additionalContext.
+hook_events = ["PreToolUse"]
+hook_matchers = [""]
+hook_scripts = ["tool_ready_hook.sh"]
+hook_timeouts = [15]
 hook_descriptions = [
-    "tokenless-rewrite: Rewrites shell commands via rtk for token savings",
-    "tokenless-tool-ready: Pre-checks tool environment readiness",
-    "tokenless-compress-response: Compresses tool responses for token savings"
+    "tokenless-tool-ready: Pre-checks tool environment readiness"
 ]
 
 # Read existing config or start fresh

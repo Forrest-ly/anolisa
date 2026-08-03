@@ -49,6 +49,7 @@ VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1
         claude-code-install claude-code-uninstall \
         codex-install codex-uninstall \
         qwencode-install qwencode-uninstall \
+        kimicode-install kimicode-uninstall \
         setup help \
         npm-package npm-package-all npm-publish \
         test-hooks
@@ -245,9 +246,9 @@ ADAPTER_ENV = ANOLISA_PREFIX=$(HOME)/.local \
               ANOLISA_COMPONENT=tokenless \
               ANOLISA_VERSION=$(VERSION)
 
-adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install qwencode-install
+adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install qwencode-install kimicode-install
 
-adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall qwencode-uninstall
+adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall qwencode-uninstall kimicode-uninstall
 
 adapter-scan:
 	@echo "=== Tokenless Adapter Manifest ==="
@@ -348,6 +349,18 @@ qwencode-uninstall:
 	@echo "==> Uninstalling Qwen Code plugin..."
 	@$(ADAPTER_ENV) ANOLISA_TARGET=qwencode bash $(QWENCODE_ADAPTER_DIR)/scripts/uninstall.sh
 
+# --- Kimi Code ---
+KIMICODE_ADAPTER_DIR = $(SHARE_DIR)/kimicode
+
+kimicode-install:
+	@echo "==> Installing Kimi Code adapter..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=kimicode bash $(KIMICODE_ADAPTER_DIR)/scripts/detect.sh || true
+	@$(ADAPTER_ENV) ANOLISA_TARGET=kimicode bash $(KIMICODE_ADAPTER_DIR)/scripts/install.sh
+
+kimicode-uninstall:
+	@echo "==> Uninstalling Kimi Code adapter..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=kimicode bash $(KIMICODE_ADAPTER_DIR)/scripts/uninstall.sh
+
 # One-step setup: build + install + all adapters
 setup: install adapter-install
 	@echo ""
@@ -363,7 +376,7 @@ setup: install adapter-install
 	@echo "  Adapter (FHS):"
 	@echo "    $(SHARE_DIR)/"
 	@echo "  Registered:"
-	@echo "    cosh, openclaw, hermes, qoder, claude-code, codex, qwencode"
+	@echo "    cosh, openclaw, hermes, qoder, claude-code, codex, qwencode, kimicode"
 	@echo ""
 	@echo "Verify:"
 	@echo "  tokenless --version"
@@ -426,7 +439,7 @@ help:
 	@echo "  fmt               Format code"
 	@echo "  clean             Clean build artifacts"
 	@echo "  adapter-scan      List registered adapter capabilities"
-	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+qoder+claude-code+codex+qwencode)"
+	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+qoder+claude-code+codex+qwencode+kimicode)"
 	@echo "  adapter-uninstall Unregister all adapters"
 	@echo "  cosh-extension-install  Install cosh extension"
 	@echo "  cosh-extension-uninstall Uninstall cosh extension"
@@ -442,6 +455,8 @@ help:
 	@echo "  codex-uninstall   Unregister Codex plugin"
 	@echo "  qwencode-install  Register Qwen Code plugin via qwen CLI"
 	@echo "  qwencode-uninstall Unregister Qwen Code plugin"
+	@echo "  kimicode-install  Register Kimi Code adapter (tool-ready hook)"
+	@echo "  kimicode-uninstall Unregister Kimi Code adapter"
 	@echo "  setup             Full setup: build + install + register adapters"
 	@echo "  npm-package       Package for npm (current platform)"
 	@echo "  npm-package-all   Package for npm (all platforms)"
