@@ -111,6 +111,8 @@ mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/codex/hooks
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/codex/scripts
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/qwencode/hooks
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/qwencode/scripts
+mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/kimicode/hooks
+mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/kimicode/scripts
 mkdir -p %{buildroot}%{_docdir}/tokenless
 
 # Install binaries — tokenless (user-facing) to /usr/bin, helpers to /usr/libexec/anolisa/tokenless
@@ -207,6 +209,12 @@ install -m 0755 adapters/tokenless/qwencode/scripts/detect.sh %{buildroot}%{_dat
 install -m 0755 adapters/tokenless/qwencode/scripts/install.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/qwencode/scripts/
 install -m 0755 adapters/tokenless/qwencode/scripts/uninstall.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/qwencode/scripts/
 
+# Install Kimi Code adapter (hooks dispatcher + scripts).
+install -m 0755 adapters/tokenless/kimicode/hooks/run-hook.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/kimicode/hooks/
+install -m 0755 adapters/tokenless/kimicode/scripts/detect.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/
+install -m 0755 adapters/tokenless/kimicode/scripts/install.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/
+install -m 0755 adapters/tokenless/kimicode/scripts/uninstall.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/
+
 # Install cosh extension for auto-discovery at /usr/share/anolisa/extensions/tokenless/
 mkdir -p %{buildroot}%{_datadir}/anolisa/extensions/tokenless/hooks
 mkdir -p %{buildroot}%{_datadir}/anolisa/extensions/tokenless/commands
@@ -256,6 +264,9 @@ install -m 0644 adapters/tokenless/common/commands/tokenless-stats.toml %{buildr
 %dir %{_datadir}/anolisa/adapters/tokenless/qwencode
 %dir %{_datadir}/anolisa/adapters/tokenless/qwencode/hooks
 %dir %{_datadir}/anolisa/adapters/tokenless/qwencode/scripts
+%dir %{_datadir}/anolisa/adapters/tokenless/kimicode
+%dir %{_datadir}/anolisa/adapters/tokenless/kimicode/hooks
+%dir %{_datadir}/anolisa/adapters/tokenless/kimicode/scripts
 %attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/manifest.json
 %attr(0644,root,root) %{_datadir}/anolisa/components/tokenless/component.toml
 %attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/common/tool-ready-spec.json
@@ -307,6 +318,11 @@ install -m 0644 adapters/tokenless/common/commands/tokenless-stats.toml %{buildr
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/qwencode/scripts/detect.sh
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/qwencode/scripts/install.sh
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/qwencode/scripts/uninstall.sh
+# Kimi Code adapter — hooks dispatcher + scripts.
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/kimicode/hooks/run-hook.sh
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/detect.sh
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/install.sh
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/uninstall.sh
 # Cosh extension — auto-discovered from /usr/share/anolisa/extensions/
 %dir %{_datadir}/anolisa/extensions
 %dir %{_datadir}/anolisa/extensions/tokenless

@@ -141,12 +141,14 @@ new_hooks = []
 for event, matcher, script, timeout, desc in zip(
     hook_events, hook_matchers, hook_scripts, hook_timeouts, hook_descriptions
 ):
-    command = f'bash "{dispatcher}" {script}'
+    # Escape backslashes and quotes for TOML basic string
+    escaped_dispatcher = dispatcher.replace('\\', '\\\\').replace('"', '\\"')
+    command = f'bash \\"{escaped_dispatcher}\\" {script}'
     hook_entry = f"""
 [[hooks]]
 event = "{event}"
 matcher = "{matcher}"
-command = """ + f'"{command}"' + f"""
+command = "{command}"
 timeout = {timeout}
 # {desc}
 """

@@ -16,6 +16,18 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 0
 fi
 
+# Check for python3 dependency
+if ! command -v python3 &>/dev/null; then
+    echo "[${COMPONENT}] WARNING: python3 not found — falling back to sed-based cleanup."
+    echo "[${COMPONENT}] This may leave some tokenless hooks in config.toml."
+    echo "[${COMPONENT}] For complete cleanup, install python3 and run this script again."
+    
+    # Fallback: use sed to remove lines containing tokenless- (less precise)
+    sed -i.bak '/^# tokenless-/d; /^# Tokenless adapter hooks/d' "$CONFIG_FILE"
+    echo "[${COMPONENT}] Attempted sed-based cleanup (backup: ${CONFIG_FILE}.bak)"
+    exit 0
+fi
+
 # Python script to remove tokenless hooks from config.toml
 python3 - "$CONFIG_FILE" <<'PYTHON_SCRIPT'
 import sys
