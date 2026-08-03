@@ -14,27 +14,46 @@ KIMI_HOME="${KIMI_CODE_HOME:-${HOME}/.kimi-code}"
 CONFIG_FILE="${KIMI_HOME}/config.toml"
 
 DRY_RUN="${ANOLISA_DRY_RUN:-0}"
+FORCE_INSTALL="${ANOLISA_FORCE_INSTALL:-0}"
 
 echo "[${COMPONENT}] Installing ${AGENT} adapter..."
+
+# Short-circuit when the Kimi CLI is missing so `make setup` does not create
+# config files for users who have not installed Kimi Code. Can be overridden
+# with ANOLISA_FORCE_INSTALL=1 for packaging scenarios.
+if [ "$FORCE_INSTALL" != "1" ] && ! command -v kimi &>/dev/null; then
+    echo "[${COMPONENT}] kimi CLI not found — skipping ${AGENT} adapter installation."
+    echo "[${COMPONENT}] Install Kimi Code first, or re-run with ANOLISA_FORCE_INSTALL=1."
+    exit 0
+fi
 
 if [ ! -d "$KIMI_HOME" ]; then
     mkdir -p "$KIMI_HOME"
     echo "[${COMPONENT}] created ${KIMI_HOME}"
 fi
 
-# Determine the absolute path to the run-hook.sh dispatcher
+# Determine the absolute path to the Kimi-specific tool-ready wrapper.
+# The wrapper translates the shared tool_ready_hook.sh output into Kimi Code's
+# PreToolUse protocol (permissionDecision=deny + exit 2 on block).
+HOOK_WRAPPER="${ADAPTER_DIR}/kimicode/hooks/tool-ready-kimi-wrapper.sh"
 HOOK_DISPATCHER="${ADAPTER_DIR}/kimicode/hooks/run-hook.sh"
+if [ ! -f "$HOOK_WRAPPER" ]; then
+    echo "[${COMPONENT}] ERROR: hook wrapper not found: $HOOK_WRAPPER" >&2
+    echo "[${COMPONENT}]        Ensure the kimicode adapter directory is intact." >&2
+    exit 1
+fi
 if [ ! -f "$HOOK_DISPATCHER" ]; then
     echo "[${COMPONENT}] ERROR: hook dispatcher not found: $HOOK_DISPATCHER" >&2
     echo "[${COMPONENT}]        Ensure the kimicode adapter directory is intact." >&2
     exit 1
 fi
 
-# Make dispatcher executable (check first to avoid EPERM in RPM scenarios)
+# Make wrapper/dispatcher executable (check first to avoid EPERM in RPM scenarios)
+[ -x "$HOOK_WRAPPER" ] || chmod +x "$HOOK_WRAPPER"
 [ -x "$HOOK_DISPATCHER" ] || chmod +x "$HOOK_DISPATCHER"
 
 # Convert to absolute path for TOML embedding
-HOOK_DISPATCHER_ABS="$(cd "$(dirname "$HOOK_DISPATCHER")" && pwd)/$(basename "$HOOK_DISPATCHER")"
+HOOK_WRAPPER_ABS="$(cd "$(dirname "$HOOK_WRAPPER")" && pwd)/$(basename "$HOOK_WRAPPER")"
 
 # Define the hooks to install.
 # Kimi Code's hook protocol only supports allow/block for PreToolUse and
@@ -62,13 +81,13 @@ declare -a HOOK_DESCRIPTIONS=(
 )
 
 # Python script to safely merge hooks into config.toml
-python3 - "$CONFIG_FILE" "$HOOK_DISPATCHER_ABS" "$DRY_RUN" <<'PYTHON_SCRIPT'
+python3 - "$CONFIG_FILE" "$HOOK_WRAPPER_ABS" "$DRY_RUN" <<'PYTHON_SCRIPT'
 import sys
 import os
 from pathlib import Path
 
 config_path = Path(sys.argv[1])
-dispatcher = sys.argv[2]
+wrapper = sys.argv[2]
 dry_run = sys.argv[3] == "1"
 
 # Hook definitions — only tool-ready is compatible with Kimi Code's hook protocol.
@@ -101,8 +120,13 @@ for i, line in enumerate(lines):
         for j in range(i+1, min(i+10, len(lines))):
             if lines[j].strip().startswith("[["):
                 break
-            # Match by dispatcher path (works for both RPM and user installs)
-            if "adapters/tokenless/kimicode/hooks/run-hook.sh" in lines[j]:
+            # Match by tokenless marker: wrapper/dispatcher path or description.
+            # This stays stable even if the wrapper/dispatcher filenames change.
+            line_text = lines[j]
+            if (
+                "adapters/tokenless/kimicode/hooks/" in line_text
+                or "tokenless-tool-ready" in line_text
+            ):
                 is_tokenless = True
                 break
         
@@ -129,8 +153,8 @@ for event, matcher, script, timeout, desc in zip(
     hook_events, hook_matchers, hook_scripts, hook_timeouts, hook_descriptions
 ):
     # Escape backslashes and quotes for TOML basic string
-    escaped_dispatcher = dispatcher.replace('\\', '\\\\').replace('"', '\\"')
-    command = f'bash \\"{escaped_dispatcher}\\" {script}'
+    escaped_wrapper = wrapper.replace('\\', '\\\\').replace('"', '\\"')
+    command = f'bash \\"{escaped_wrapper}\\"'
     hook_entry = f"""
 [[hooks]]
 event = "{event}"

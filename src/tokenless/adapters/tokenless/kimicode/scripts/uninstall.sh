@@ -21,14 +21,21 @@ if ! command -v python3 &>/dev/null; then
     echo "[${COMPONENT}] WARNING: python3 not found — falling back to awk-based cleanup."
     echo "[${COMPONENT}] This removes tokenless hook blocks by matching dispatcher path."
     
-    # Fallback: use awk to remove [[hooks]] blocks containing tokenless dispatcher
+    # Fallback: use awk to remove [[hooks]] blocks containing tokenless hooks.
+    # Any TOML table header (plain [table] or array [[table]]) ends the current
+    # hook block, so we do not accidentally consume provider/API-key configs
+    # that follow a tokenless hook.
     awk '
-    /^\[\[hooks\]\]/ { in_hook=1; hook_lines=""; is_tokenless=0 }
+    /^\[\[hooks\]\]/ {
+        if (in_hook && !is_tokenless) printf "%s", hook_lines
+        in_hook=1; hook_lines=""; is_tokenless=0
+    }
     in_hook {
         hook_lines = hook_lines $0 "\n"
-        if (/adapters\/tokenless\/kimicode\/hooks\/run-hook\.sh/) is_tokenless=1
+        if (/adapters\/tokenless\/kimicode\/hooks\//) is_tokenless=1
+        if (/tokenless-tool-ready/) is_tokenless=1
     }
-    /^\[\[/ && !/^\[\[hooks\]\]/ { 
+    /^\[/ && !/^\[\[hooks\]\]/ {
         if (in_hook && !is_tokenless) printf "%s", hook_lines
         in_hook=0; hook_lines=""; print; next
     }
@@ -66,8 +73,12 @@ for i, line in enumerate(lines):
         for j in range(i+1, min(i+15, len(lines))):
             if lines[j].strip().startswith("[["):
                 break
-            # Match by dispatcher path (works for both RPM and user installs)
-            if "adapters/tokenless/kimicode/hooks/run-hook.sh" in lines[j]:
+            # Match by tokenless marker: wrapper/dispatcher path or description.
+            line_text = lines[j]
+            if (
+                "adapters/tokenless/kimicode/hooks/" in line_text
+                or "tokenless-tool-ready" in line_text
+            ):
                 is_tokenless = True
                 break
         

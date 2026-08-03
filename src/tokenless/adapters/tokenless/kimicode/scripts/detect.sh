@@ -50,7 +50,7 @@ fi
 if [ -f "$KIMI_HOME/config.toml" ]; then
     field "kimi config.toml"    "present"
     # Check if tokenless hooks are already configured
-    if grep -q 'adapters/tokenless/kimicode/hooks/run-hook.sh' "$KIMI_HOME/config.toml" 2>/dev/null; then
+    if grep -qE 'adapters/tokenless/kimicode/hooks/(run-hook|tool-ready-kimi-wrapper)\.sh|tokenless-tool-ready' "$KIMI_HOME/config.toml" 2>/dev/null; then
         field "tokenless hooks"   "configured"
     else
         field "tokenless hooks"   "not configured"

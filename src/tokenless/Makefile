@@ -354,8 +354,13 @@ KIMICODE_ADAPTER_DIR = $(SHARE_DIR)/kimicode
 
 kimicode-install:
 	@echo "==> Installing Kimi Code adapter..."
-	@$(ADAPTER_ENV) ANOLISA_TARGET=kimicode bash $(KIMICODE_ADAPTER_DIR)/scripts/detect.sh || true
-	@$(ADAPTER_ENV) ANOLISA_TARGET=kimicode bash $(KIMICODE_ADAPTER_DIR)/scripts/install.sh
+	@$(ADAPTER_ENV) ANOLISA_TARGET=kimicode bash $(KIMICODE_ADAPTER_DIR)/scripts/detect.sh; \
+	_detect_status=$$?; \
+	if [ $$_detect_status -eq 2 ]; then \
+		echo "==> Kimi Code prerequisites missing, skipping kimicode adapter installation."; \
+	else \
+		$(ADAPTER_ENV) ANOLISA_TARGET=kimicode bash $(KIMICODE_ADAPTER_DIR)/scripts/install.sh; \
+	fi
 
 kimicode-uninstall:
 	@echo "==> Uninstalling Kimi Code adapter..."
