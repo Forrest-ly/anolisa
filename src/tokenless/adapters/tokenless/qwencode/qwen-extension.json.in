@@ -29,7 +29,7 @@
             "type": "command",
             "name": "tokenless-rewrite",
             "description": "Rewrites shell commands via rtk for token savings",
-            "command": "bash \"${extensionPath}/hooks/run-hook.sh\" rewrite_hook.py",
+            "command": "bash \"${extensionPath}/hooks/run-hook.sh\" rewrite_hook.py --agent-id qwencode",
             "timeout": 5000,
             "env": { "TOKENLESS_AGENT_ID": "qwencode" }
           }
@@ -44,7 +44,7 @@
             "type": "command",
             "name": "tokenless-compress-response",
             "description": "Compresses tool responses and encodes to TOON format",
-            "command": "bash \"${extensionPath}/hooks/run-hook.sh\" compress_response_hook.py",
+            "command": "bash \"${extensionPath}/hooks/run-hook.sh\" compress_response_hook.py --agent-id qwencode",
             "timeout": 10000,
             "env": { "TOKENLESS_AGENT_ID": "qwencode" }
           }
@@ -58,7 +58,7 @@
             "type": "command",
             "name": "tokenless-compress-schema",
             "description": "Compresses tool schema definitions for token savings",
-            "command": "bash \"${extensionPath}/hooks/run-hook.sh\" compress_schema_hook.py",
+            "command": "bash \"${extensionPath}/hooks/run-hook.sh\" compress_schema_hook.py --agent-id qwencode",
             "timeout": 10000,
             "env": { "TOKENLESS_AGENT_ID": "qwencode" }
           }
