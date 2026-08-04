@@ -27,6 +27,7 @@
   "files": [
     "bin/",
     "scripts/",
+    "adapters/",
     "README.md",
     "LICENSE"
   ],
