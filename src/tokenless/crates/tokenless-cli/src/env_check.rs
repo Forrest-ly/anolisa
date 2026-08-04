@@ -955,6 +955,7 @@ fn auto_fix(missing_deps: &[DepEntry]) -> Result<String, String> {
             "{}/.local/share/anolisa/adapters/tokenless/tokenless-env-fix.sh",
             home
         )),
+        Some("/usr/local/share/anolisa/adapters/tokenless/tokenless-env-fix.sh".to_string()),
         Some("/usr/share/anolisa/adapters/tokenless/tokenless-env-fix.sh".to_string()),
     ];
     let fix_script = fix_script_candidates
@@ -1123,6 +1124,9 @@ fn find_spec_path() -> Result<PathBuf, String> {
             "{}/.local/share/anolisa/adapters/tokenless/tool-ready-spec.json",
             home
         ))),
+        Some(PathBuf::from(
+            "/usr/local/share/anolisa/adapters/tokenless/tool-ready-spec.json",
+        )),
         Some(PathBuf::from(
             "/usr/share/anolisa/adapters/tokenless/tool-ready-spec.json",
         )),
