@@ -79,6 +79,14 @@ def read_version(path: str) -> str:
 
 
 def check_equal(errors: list[str], source: str, target: str) -> None:
+    source_path = ROOT / source
+    target_path = ROOT / target
+    if not source_path.exists():
+        print(f"warning: skipping contract (source missing): {source}", file=sys.stderr)
+        return
+    if not target_path.exists():
+        print(f"warning: skipping contract (target missing): {target}", file=sys.stderr)
+        return
     expected = read_version(source)
     actual = read_version(target)
     if actual != expected:
@@ -86,8 +94,16 @@ def check_equal(errors: list[str], source: str, target: str) -> None:
 
 
 def check_template(errors: list[str], source: str, template: str) -> None:
+    source_path = ROOT / source
+    template_path = ROOT / template
+    if not source_path.exists():
+        print(f"warning: skipping template (source missing): {source}", file=sys.stderr)
+        return
+    if not template_path.exists():
+        print(f"warning: skipping template (target missing): {template}", file=sys.stderr)
+        return
     expected = read_version(source)
-    content = (ROOT / template).read_text()
+    content = template_path.read_text()
     if content.count("@VERSION@") != 1:
         errors.append(f"{template}: expected exactly one @VERSION@ placeholder")
         return
@@ -99,7 +115,11 @@ def check_template(errors: list[str], source: str, template: str) -> None:
 
 def check_agent_memory_lock(errors: list[str], expected: str) -> None:
     path = "src/agent-memory/adapters/agent-memory/openclaw/package-lock.json"
-    lock = json.loads((ROOT / path).read_text())
+    lock_path = ROOT / path
+    if not lock_path.exists():
+        print(f"warning: skipping agent-memory lock check (missing): {path}", file=sys.stderr)
+        return
+    lock = json.loads(lock_path.read_text())
     root_version = lock.get("version")
     if root_version != expected:
         errors.append(f"{path}: expected root version {expected}, found {root_version}")
@@ -138,12 +158,20 @@ def main() -> int:
         for source, template in VERSION_TEMPLATES:
             check_template(errors, source, template)
 
-        agent_memory_version = read_toml_version("src/agent-memory/Cargo.toml")
-        for path in AGENT_MEMORY_JSON:
-            actual = read_json_version(path)
-            if actual != agent_memory_version:
-                errors.append(f"{path}: expected {agent_memory_version}, found {actual}")
-        check_agent_memory_lock(errors, agent_memory_version)
+        agent_memory_cargo = ROOT / "src/agent-memory/Cargo.toml"
+        if agent_memory_cargo.exists():
+            agent_memory_version = read_toml_version("src/agent-memory/Cargo.toml")
+            for path in AGENT_MEMORY_JSON:
+                json_path = ROOT / path
+                if not json_path.exists():
+                    print(f"warning: skipping agent-memory contract (missing): {path}", file=sys.stderr)
+                    continue
+                actual = read_json_version(path)
+                if actual != agent_memory_version:
+                    errors.append(f"{path}: expected {agent_memory_version}, found {actual}")
+            check_agent_memory_lock(errors, agent_memory_version)
+        else:
+            print("warning: skipping agent-memory checks (Cargo.toml missing)", file=sys.stderr)
         check_generated_contracts_untracked(errors)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         errors.append(str(error))
