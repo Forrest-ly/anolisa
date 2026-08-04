@@ -213,14 +213,29 @@ clean:
 	rm -f  $(OPENCLAW_PLUGIN_SRC_DIR)/package-lock.json
 	rm -f  $(ADAPTER_TEMPLATES) $(COMPONENT_CONTRACT)
 
-# Create source tarball (excludes build artifacts)
-dist: clean stamp-adapter-templates
+# Create source tarball (excludes build artifacts).
+# `clean` must finish before the generated contract and adapter manifests
+# are re-stamped: as sibling prerequisites, `make -jN dist` may run the two
+# concurrently and the cleanup can delete the stamped files, shipping an
+# archive without the embedded install contract. Invoke the stamping
+# sequentially from the recipe instead.
+dist: clean
+	$(MAKE) stamp-adapter-templates
 	@echo "==> Creating tarball (with pre-patched rtk source)..."
 	just setup-rtk
 	tar czf ../tokenless-$(VERSION).tar.gz \
 	    --exclude='target' \
 	    --exclude='.git' \
 	    -C .. tokenless
+	@tar_list=$$(tar -tzf ../tokenless-$(VERSION).tar.gz); \
+	for required in \
+	    tokenless/.anolisa/component.toml \
+	    tokenless/adapters/tokenless/manifest.json; do \
+		echo "$$tar_list" | grep -q "^$$required$$" || { \
+			echo "ERROR: tokenless-$(VERSION).tar.gz is missing $$required" >&2; \
+			exit 1; \
+		}; \
+	done
 	@echo "==> Tarball: ../tokenless-$(VERSION).tar.gz"
 
 # Adapter management — invokes detect/install/uninstall action scripts per the
