@@ -59,9 +59,12 @@ from hook_utils import (
     _TOKENLESS_LOCAL_LIB,
     _TOKENLESS_LOCAL_SHARE,
     SKIP_TOOLS,
+    build_cosh_ng_post_tool_output,
     classify_env_error,
-    detect_cosh_ng_runtime,
+    cosh_ng_supports_replacement,
+    extract_llm_content,
     get_thresholds,
+    is_cosh_ng_runtime,
     is_skill_file,
     parse_version,
     resolve_agent_id,
@@ -77,6 +80,9 @@ from hook_utils import (
 # -- constants ---------------------------------------------------------------
 
 _MIN_RESPONSE_CHARS = 200
+
+# Cosh-NG gets a distinct agent ID for stats attribution.
+_COSH_NG_AGENT_ID = "cosh-ng"
 
 # Claude Code added hookSpecificOutput.updatedToolOutput (normal-path tool
 # output replacement for all tools) in v2.1.121. Older versions only support
@@ -247,19 +253,7 @@ def _warn_subprocess(label: str, proc: subprocess.CompletedProcess) -> None:
 
 
 def main() -> None:
-    # 1. Detect runtime (Cosh-NG vs copilot-shell)
-    cosh_ng_version = detect_cosh_ng_runtime()
-    cosh_ng_detected = cosh_ng_version is not None
-
-    # If Cosh-NG is detected but unsupported version, fail open
-    if cosh_ng_detected and cosh_ng_version == (0, 0, 0):
-        warn("Unsupported Cosh-NG version. Response compression disabled (fail open).")
-        skip()
-
-    # 2. Resolve agent ID based on runtime
-    agent_id = resolve_agent_id()
-
-    # 3. Resolve binaries
+    # 1. Resolve binaries
     tokenless_bin = resolve_binary(
         "tokenless", _TOKENLESS_FALLBACK, _TOKENLESS_LOCAL_SHARE, _TOKENLESS_LOCAL_LIB
     )
@@ -267,62 +261,80 @@ def main() -> None:
         warn("tokenless is not installed. Response compression hook disabled.")
         skip()
 
-    # 4. Read stdin JSON
+    # 2. Read stdin JSON
     try:
         input_data = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError, ValueError):
         warn("failed to read PostToolUse payload. Passing through unchanged.")
         skip()
 
-    # 5. Extract tool_name (skip-tools handled after attribution)
+    # 3. Detect Cosh-NG runtime from wrapped tool_response
+    cosh_ng = is_cosh_ng_runtime(input_data)
+
+    # 4. Cosh-NG version guard: fail open if replacement is not supported.
+    # When Cosh-NG doesn't support the replacement field (version too old
+    # or version info unavailable), compression would inject duplicate content
+    # (original + compressed summary).
+    if cosh_ng and not cosh_ng_supports_replacement():
+        warn(
+            "Cosh-NG version does not support response replacement "
+            "(version too old or not configured). "
+            "Compression disabled to avoid duplicate injection."
+        )
+        skip()
+
+    # 5. Resolve agent ID based on runtime
+    agent_id = _COSH_NG_AGENT_ID if cosh_ng else resolve_agent_id()
+
+    # 6. Extract tool_name (skip-tools handled after attribution)
     tool_name = input_data.get("tool_name", "unknown")
 
-    # 6. Extract tool_response
+    # 7. Extract tool_response
     tool_response_raw = input_data.get("tool_response", "")
     if not tool_response_raw or tool_response_raw == "{}":
         skip()
 
-    # 7. For Cosh-NG, extract only llmContent from the wrapped response.
-    #    Never include returnDisplay in the provider-visible replacement.
-    llm_content = None
-    if isinstance(tool_response_raw, dict):
-        llm_content = tool_response_raw.get("llmContent")
+    parsed: object | None = None
+    if cosh_ng:
+        # Cosh-NG wraps tool_response as {llmContent, returnDisplay}.
+        # Compress only llmContent (model-visible content).
+        llm_content = extract_llm_content(input_data)
         if llm_content is None:
-            llm_content = tool_response_raw.get("returnDisplay")
-    elif isinstance(tool_response_raw, str):
-        # Try to parse as the {llmContent, returnDisplay} wrapper
-        parsed_wrapper = try_parse_json(tool_response_raw)
-        if isinstance(parsed_wrapper, dict) and "llmContent" in parsed_wrapper:
-            llm_content = parsed_wrapper["llmContent"]
-
-    # The model-visible content we will compress
-    model_visible_before = llm_content if llm_content is not None else tool_response_raw
-
-    # 8. Skip skill files (YAML frontmatter)
-    if isinstance(model_visible_before, str) and is_skill_file(model_visible_before):
-        skip()
-
-    # 9. Normalize response
-    if isinstance(model_visible_before, str):
-        unwrapped = unwrap_string_json(model_visible_before)
-        if not unwrapped:
-            skip()  # Plain text, not JSON
-        tool_response = unwrapped
-    elif isinstance(model_visible_before, (dict, list)):
-        tool_response = json.dumps(model_visible_before, separators=(",", ":"))
+            skip()
+        parsed = try_parse_json(llm_content)
+        if parsed is not None:
+            tool_response = llm_content
+        else:
+            # Plain text llmContent -- wrap for the compression pipeline.
+            wrapped = {"stdout": llm_content}
+            tool_response = json.dumps(
+                wrapped, separators=(",", ":"), ensure_ascii=False
+            )
+            parsed = wrapped
     else:
-        skip()
+        # Copilot-Shell / other runtimes: tool_response is a plain string.
+        if isinstance(tool_response_raw, str):
+            if is_skill_file(tool_response_raw):
+                skip()
+            unwrapped = unwrap_string_json(tool_response_raw)
+            if not unwrapped:
+                skip()  # Plain text, not JSON
+            tool_response = unwrapped
+        elif isinstance(tool_response_raw, (dict, list)):
+            tool_response = json.dumps(tool_response_raw, separators=(",", ":"))
+        else:
+            skip()
 
-    # 10. Validate it's JSON (needed for attribution on skip-tools too)
-    parsed = try_parse_json(tool_response)
-    if parsed is None:
-        skip()
+        # Validate it's JSON (needed for attribution on skip-tools too)
+        parsed = try_parse_json(tool_response)
+        if parsed is None:
+            skip()
 
-    # 11. Extract caller context
+    # 8. Extract caller context
     session_id = input_data.get("session_id", "")
     tool_use_id = resolve_tool_call_id(agent_id, input_data)
 
-    # 12. Environment attribution analysis
+    # 9. Environment attribution analysis
     env_attribution = ""
     attr_category, attr_fix_hint = classify_env_error(parsed)
     if attr_category:
@@ -331,17 +343,37 @@ def main() -> None:
             f"{attr_category} ({attr_fix_hint}). Skip retry."
         )
 
-    # 13. Content retrieval -- skip entirely (preserve integrity)
+    # 10. Content retrieval -- skip entirely (preserve integrity)
     if tool_name in SKIP_TOOLS:
-        _emit_attribution_or_skip(env_attribution)
+        if env_attribution:
+            if cosh_ng:
+                _emit(
+                    build_cosh_ng_post_tool_output(
+                        replacement=None, additional_context=env_attribution
+                    )
+                )
+            else:
+                _emit_attribution_or_skip(env_attribution)
+        else:
+            skip()
 
-    # 14. All other tools -- skip small responses, but still inject
+    # 11. All other tools -- skip small responses, but still inject
     # env attribution for error cases (small size doesn't mean the
     # error classification is unimportant to the agent).
     if len(tool_response) < _MIN_RESPONSE_CHARS:
-        _emit_attribution_or_skip(env_attribution)
+        if env_attribution:
+            if cosh_ng:
+                _emit(
+                    build_cosh_ng_post_tool_output(
+                        replacement=None, additional_context=env_attribution
+                    )
+                )
+            else:
+                _emit_attribution_or_skip(env_attribution)
+        else:
+            skip()
 
-    # 15. Step 1: Response compression with 3-layer thresholds
+    # 12. Step 1: Response compression with 3-layer thresholds
     compressed = tool_response
     used_resp_compression = False
 
@@ -367,7 +399,6 @@ def main() -> None:
             )
             if proc.returncode == 0 and proc.stdout.strip():
                 candidate = proc.stdout.strip()
-                # Compare against actual model-visible before size
                 if len(candidate) < len(tool_response):
                     compressed = candidate
                     used_resp_compression = True
@@ -376,7 +407,7 @@ def main() -> None:
         except Exception as e:
             warn(f"Response compression error: {e}")
 
-    # 16. Step 2: TOON encoding
+    # 13. Step 2: TOON encoding
     toon_output = ""
 
     if tokenless_bin:
@@ -405,12 +436,22 @@ def main() -> None:
     # Determine final output
     final_output = toon_output if toon_output else compressed
 
-    # Nothing shrank — pass the original through untouched instead of
+    # 14. Nothing shrank -- pass the original through untouched instead of
     # emitting a same-size duplicate of the response (applies to all agents).
     if not used_resp_compression and not toon_output:
-        _emit_attribution_or_skip(env_attribution)
+        if env_attribution:
+            if cosh_ng:
+                _emit(
+                    build_cosh_ng_post_tool_output(
+                        replacement=None, additional_context=env_attribution
+                    )
+                )
+            else:
+                _emit_attribution_or_skip(env_attribution)
+        else:
+            skip()
 
-    # 17. Build response — dispatch by agent runtime.
+    # 15. Build response -- dispatch by agent runtime.
     #
     # Claude Code and Qoder support real tool-output replacement. Keep
     # additionalContext for additive diagnostics only; using it for compressed
@@ -449,19 +490,26 @@ def main() -> None:
         _emit({"suppressOutput": True, "hookSpecificOutput": hook_output})
         return
 
-    # Cosh-NG: use updatedToolResponse for response replacement.
-    # Skip compression if it doesn't reduce model-visible size.
-    if cosh_ng_detected:
+    # Cosh-NG: emit replacement (model-visible compressed content) +
+    # additionalContext (environment attribution). The replacement field tells
+    # Cosh-NG to substitute the original llmContent with the compressed version.
+    if cosh_ng:
         if len(final_output) >= len(tool_response):
-            _emit_attribution_or_skip(env_attribution)
+            if env_attribution:
+                _emit(
+                    build_cosh_ng_post_tool_output(
+                        replacement=None, additional_context=env_attribution
+                    )
+                )
+            else:
+                skip()
 
-        hook_specific = {
-            "hookEventName": "PostToolUse",
-            "updatedToolResponse": final_output,
-        }
-        if env_attribution:
-            hook_specific["additionalContext"] = env_attribution
-        _emit({"suppressOutput": True, "hookSpecificOutput": hook_specific})
+        additional_ctx = env_attribution if env_attribution else None
+        _emit(
+            build_cosh_ng_post_tool_output(
+                replacement=final_output, additional_context=additional_ctx
+            )
+        )
         return
 
     # Other agents: inject via additionalContext per their hook contracts.
