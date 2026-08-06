@@ -48,6 +48,7 @@ VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1
         qoder-install qoder-uninstall \
         claude-code-install claude-code-uninstall \
         codex-install codex-uninstall \
+        opencode-install opencode-uninstall \
         qwencode-install qwencode-uninstall \
         kimicode-install kimicode-uninstall \
         setup help \
@@ -188,12 +189,16 @@ test-integration:
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_compress_response_hook.py
 	python3 tests/test_compress_schema_hook.py
+	python3 tests/test_hermes_plugin_import.py
 	python3 tests/test_rewrite_hook.py
 	python3 tests/test_resolve_agent_id.py
 
 test-adapters:
 	@echo "==> Testing qoder adapter installer..."
 	bash tests/test-qoder-adapter-install.sh
+	@echo "==> Testing OpenCode adapter..."
+	bash tests/test-opencode-adapter-install.sh
+	node tests/test-opencode-plugin.mjs
 
 # Lint (rtk excluded — vendored third-party source)
 lint:
@@ -246,9 +251,9 @@ ADAPTER_ENV = ANOLISA_PREFIX=$(HOME)/.local \
               ANOLISA_COMPONENT=tokenless \
               ANOLISA_VERSION=$(VERSION)
 
-adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install qwencode-install kimicode-install
+adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install opencode-install qwencode-install kimicode-install
 
-adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall qwencode-uninstall kimicode-uninstall
+adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall opencode-uninstall qwencode-uninstall kimicode-uninstall
 
 adapter-scan:
 	@echo "=== Tokenless Adapter Manifest ==="
@@ -337,6 +342,18 @@ codex-uninstall:
 	@echo "==> Uninstalling Codex plugin..."
 	@$(ADAPTER_ENV) ANOLISA_TARGET=codex bash $(CODEX_ADAPTER_DIR)/scripts/uninstall.sh
 
+# --- OpenCode ---
+OPENCODE_ADAPTER_DIR = $(SHARE_DIR)/opencode
+
+opencode-install:
+	@echo "==> Installing OpenCode plugin..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=opencode bash $(OPENCODE_ADAPTER_DIR)/scripts/detect.sh || true
+	@$(ADAPTER_ENV) ANOLISA_TARGET=opencode bash $(OPENCODE_ADAPTER_DIR)/scripts/install.sh
+
+opencode-uninstall:
+	@echo "==> Uninstalling OpenCode plugin..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=opencode bash $(OPENCODE_ADAPTER_DIR)/scripts/uninstall.sh
+
 # --- Qwen Code ---
 QWENCODE_ADAPTER_DIR = $(SHARE_DIR)/qwencode
 
@@ -381,7 +398,7 @@ setup: install adapter-install
 	@echo "  Adapter (FHS):"
 	@echo "    $(SHARE_DIR)/"
 	@echo "  Registered:"
-	@echo "    cosh, openclaw, hermes, qoder, claude-code, codex, qwencode, kimicode"
+	@echo "    cosh, openclaw, hermes, qoder, claude-code, codex, opencode, qwencode, kimicode"
 	@echo ""
 	@echo "Verify:"
 	@echo "  tokenless --version"
@@ -444,7 +461,7 @@ help:
 	@echo "  fmt               Format code"
 	@echo "  clean             Clean build artifacts"
 	@echo "  adapter-scan      List registered adapter capabilities"
-	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+qoder+claude-code+codex+qwencode+kimicode)"
+	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+qoder+claude-code+codex+opencode+qwencode+kimicode)"
 	@echo "  adapter-uninstall Unregister all adapters"
 	@echo "  cosh-extension-install  Install cosh extension"
 	@echo "  cosh-extension-uninstall Uninstall cosh extension"
@@ -458,6 +475,8 @@ help:
 	@echo "  claude-code-uninstall Unregister Claude Code plugin"
 	@echo "  codex-install     Register Codex plugin via codex CLI"
 	@echo "  codex-uninstall   Unregister Codex plugin"
+	@echo "  opencode-install  Register OpenCode local plugin"
+	@echo "  opencode-uninstall Unregister OpenCode local plugin"
 	@echo "  qwencode-install  Register Qwen Code plugin via qwen CLI"
 	@echo "  qwencode-uninstall Unregister Qwen Code plugin"
 	@echo "  kimicode-install  Register Kimi Code adapter (tool-ready hook)"

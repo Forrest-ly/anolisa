@@ -812,6 +812,7 @@ jobs:
         run: |
           cd src/tokenless
           python3 tests/test_compress_response_hook.py
+          python3 tests/test_hermes_plugin_import.py
 
       - uses: actions/setup-node@v4
         with:
