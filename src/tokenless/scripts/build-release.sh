@@ -35,22 +35,45 @@ err()  { echo -e "\033[0;31m[ERROR]\033[0m $*" >&2; }
 # -----------------------------------------------------------------------------
 # Pre-flight guards
 # -----------------------------------------------------------------------------
+# Report a [build] target / target-dir override in a Cargo config file.
+# Returns 1 when an override is found (so the caller sets its fail flag),
+# 0 when the file is absent or clean — preserving the original behavior of
+# reporting every offending config in one pass rather than stopping early.
+_check_cargo_config_file() {
+    local cfg="$1"
+    [ -f "${cfg}" ] || return 0
+    local bad=0
+    if grep -qE '^\s*target\s*=' "${cfg}" 2>/dev/null; then
+        err "Cargo config ${cfg} sets [build] target."
+        bad=1
+    fi
+    if grep -qE '^\s*target-dir\s*=' "${cfg}" 2>/dev/null; then
+        err "Cargo config ${cfg} sets [build] target-dir."
+        bad=1
+    fi
+    return "${bad}"
+}
+
 check_cargo_config() {
     local fail=0
     local cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
-    for cfg in ".cargo/config.toml" ".cargo/config" \
-               "${cargo_home}/config.toml" "${cargo_home}/config"; do
-        if [ -f "${cfg}" ]; then
-            if grep -qE '^\s*target\s*=' "${cfg}" 2>/dev/null; then
-                err "Cargo config ${cfg} sets [build] target."
-                fail=1
-            fi
-            if grep -qE '^\s*target-dir\s*=' "${cfg}" 2>/dev/null; then
-                err "Cargo config ${cfg} sets [build] target-dir."
-                fail=1
-            fi
-        fi
+    local dir
+
+    # Cargo merges .cargo/config* hierarchically from the cwd up to the
+    # filesystem root, plus $CARGO_HOME. A parent [build] target / target-dir
+    # would divert artifacts away from target/release/, so the release could
+    # package stale or host artifacts — walk every ancestor, not just the
+    # component dir.
+    dir="${ROOT_DIR}"
+    while :; do
+        _check_cargo_config_file "${dir}/.cargo/config.toml" || fail=1
+        _check_cargo_config_file "${dir}/.cargo/config" || fail=1
+        [ "${dir}" = "/" ] && break
+        dir="$(dirname "${dir}")"
     done
+    _check_cargo_config_file "${cargo_home}/config.toml" || fail=1
+    _check_cargo_config_file "${cargo_home}/config" || fail=1
+
     if [ "${fail}" -ne 0 ]; then
         exit 1
     fi
@@ -89,7 +112,10 @@ check_environment() {
 # -----------------------------------------------------------------------------
 build_binaries() {
     log "Building tokenless, rtk and openclaw plugin..."
-    make build
+    # Skip build-toon: `make build` runs `cargo install` without --root,
+    # clobbering the caller's global cargo install root. toon is rebuilt in
+    # isolated staging during packaging (see package_release).
+    make build-tokenless build-openclaw-plugin
 }
 
 # -----------------------------------------------------------------------------

@@ -795,7 +795,17 @@ jobs:
           INSTALL_SH=$(ls dist/tokenless-*/install.sh)
           grep -q 'PREFIX must be an absolute path' "$INSTALL_SH" || { echo "FAIL: missing PREFIX validation"; exit 1; }
           grep -q 'cp -r ' "$INSTALL_SH" || { echo "FAIL: missing cp -r"; exit 1; }
-          grep -qv 'cp -pr ' "$INSTALL_SH" || { echo "FAIL: still uses cp -pr"; exit 1; }
+          if grep -q 'cp -pr ' "$INSTALL_SH"; then echo "FAIL: still uses cp -pr"; exit 1; fi
+          # Self-test: prove the cp -pr guard actually fails when the banned
+          # command is present (regression guard for the grep -qv false-pass).
+          _FIXTURE=$(mktemp)
+          echo 'cp -pr src dst' > "$_FIXTURE"
+          if ! grep -q 'cp -pr ' "$_FIXTURE"; then
+            echo "FAIL: cp -pr guard does not detect the banned command"
+            exit 1
+          fi
+          rm -f "$_FIXTURE"
+          echo "cp -pr guard self-test: OK"
           grep -q 'COSH_EXT_DIR' "$INSTALL_SH" || { echo "FAIL: missing cosh extension deployment"; exit 1; }
           grep -q 'cosh-extension.json' "$INSTALL_SH" || { echo "FAIL: missing cosh-extension.json deployment"; exit 1; }
           echo "install.sh content validation: OK"
@@ -854,6 +864,42 @@ jobs:
           fi
           rm -f .cargo/config.toml
           rmdir .cargo 2>/dev/null || true
+
+          # Test Cargo config guard: ancestor directory target override.
+          # Cargo merges .cargo/config* from cwd up to the filesystem root;
+          # a parent [build] target would bypass the component-dir guard.
+          mkdir -p ../.cargo
+          echo '[build]' > ../.cargo/config.toml
+          echo 'target = "x86_64-unknown-linux-gnu"' >> ../.cargo/config.toml
+          if bash scripts/build-release.sh --check-cargo-config 2>&1 | grep -q "sets \[build\] target"; then
+            echo "Ancestor Cargo config target guard: OK"
+          else
+            echo "FAIL: ancestor Cargo config target guard not triggered"
+            exit 1
+          fi
+          rm -rf ../.cargo
+
+          # Test Cargo config guard: ancestor directory target-dir override
+          mkdir -p ../.cargo
+          echo '[build]' > ../.cargo/config.toml
+          echo 'target-dir = "/tmp/custom-target"' >> ../.cargo/config.toml
+          if bash scripts/build-release.sh --check-cargo-config 2>&1 | grep -q "sets \[build\] target-dir"; then
+            echo "Ancestor Cargo config target-dir guard: OK"
+          else
+            echo "FAIL: ancestor Cargo config target-dir guard not triggered"
+            exit 1
+          fi
+          rm -rf ../.cargo
+
+          # The release build must not call bare `make build`, which includes
+          # build-toon (a `cargo install` without --root that clobbers the
+          # caller's global cargo install root). toon is rebuilt in isolated
+          # staging during packaging instead.
+          if grep -Eq '^\s*make build\s*$' scripts/build-release.sh; then
+            echo "FAIL: build-release.sh calls bare 'make build' (global toon install)"
+            exit 1
+          fi
+          echo "Release build skips global toon install: OK"
 
       # The benchmark suite is split into two standalone workspaces (each with an
       # empty [workspace] table in its Cargo.toml), so the --workspace commands
