@@ -15,3 +15,6 @@ adapters/tokenless/qwencode/qwen-extension.json
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Release tarballs and staging directory
+dist/

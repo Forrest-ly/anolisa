@@ -785,6 +785,76 @@ jobs:
           cd src/tokenless
           cargo test --workspace -- --test-threads=1
 
+      - name: Validate release install script generation
+        run: |
+          cd src/tokenless
+          make release-install-script
+          bash -n dist/tokenless-*/install.sh
+          echo "install.sh syntax: OK"
+
+          INSTALL_SH=$(ls dist/tokenless-*/install.sh)
+          grep -q 'PREFIX must be an absolute path' "$INSTALL_SH" || { echo "FAIL: missing PREFIX validation"; exit 1; }
+          grep -q 'cp -r ' "$INSTALL_SH" || { echo "FAIL: missing cp -r"; exit 1; }
+          grep -qv 'cp -pr ' "$INSTALL_SH" || { echo "FAIL: still uses cp -pr"; exit 1; }
+          grep -q 'COSH_EXT_DIR' "$INSTALL_SH" || { echo "FAIL: missing cosh extension deployment"; exit 1; }
+          grep -q 'cosh-extension.json' "$INSTALL_SH" || { echo "FAIL: missing cosh-extension.json deployment"; exit 1; }
+          echo "install.sh content validation: OK"
+
+          # Smoke test the install script without a full release build.
+          STAGE=$(dirname "$INSTALL_SH")
+          TMPDIR=$(mktemp -d)
+          mkdir -p "$STAGE/bin" "$STAGE/libexec" "$STAGE/share/adapters/tokenless/common/hooks"
+          mkdir -p "$STAGE/share/adapters/tokenless/common/commands"
+          echo '#!/bin/sh' > "$STAGE/bin/tokenless"
+          echo '#!/bin/sh' > "$STAGE/libexec/rtk"
+          chmod +x "$STAGE/bin/tokenless" "$STAGE/libexec/rtk"
+          echo '[component]' > "$STAGE/share/component.toml"
+
+          # Relative PREFIX should be rejected.
+          if PREFIX=relative-prefix bash "$INSTALL_SH" 2>&1 | grep -q "PREFIX must be an absolute path"; then
+            echo "install.sh relative PREFIX rejection: OK"
+          else
+            echo "FAIL: install.sh did not reject relative PREFIX"
+            exit 1
+          fi
+
+          # Absolute PREFIX should succeed.
+          PREFIX="$TMPDIR/usr/local" bash "$INSTALL_SH"
+          test -x "$TMPDIR/usr/local/bin/tokenless" || { echo "FAIL: tokenless not installed"; exit 1; }
+          test -L "$TMPDIR/usr/local/bin/rtk" || { echo "FAIL: rtk symlink missing"; exit 1; }
+          test -d "$TMPDIR/usr/local/share/anolisa/extensions/tokenless" || { echo "FAIL: cosh ext dir missing"; exit 1; }
+          test -f "$TMPDIR/usr/local/share/anolisa/components/tokenless/component.toml" || { echo "FAIL: component.toml not installed"; exit 1; }
+          echo "install.sh smoke test: OK"
+          rm -rf "$TMPDIR"
+
+      - name: Validate release pre-flight guards
+        run: |
+          cd src/tokenless
+
+          # Test Cargo config guard: target override
+          mkdir -p .cargo
+          echo '[build]' > .cargo/config.toml
+          echo 'target = "x86_64-unknown-linux-gnu"' >> .cargo/config.toml
+          if bash scripts/build-release.sh --check-cargo-config 2>&1 | grep -q "sets \[build\] target"; then
+            echo "Cargo config target guard: OK"
+          else
+            echo "FAIL: Cargo config target guard not triggered"
+            exit 1
+          fi
+          rm -f .cargo/config.toml
+
+          # Test Cargo config guard: target-dir override
+          echo '[build]' > .cargo/config.toml
+          echo 'target-dir = "/tmp/custom-target"' >> .cargo/config.toml
+          if bash scripts/build-release.sh --check-cargo-config 2>&1 | grep -q "sets \[build\] target-dir"; then
+            echo "Cargo config target-dir guard: OK"
+          else
+            echo "FAIL: Cargo config target-dir guard not triggered"
+            exit 1
+          fi
+          rm -f .cargo/config.toml
+          rmdir .cargo 2>/dev/null || true
+
       # The benchmark suite is split into two standalone workspaces (each with an
       # empty [workspace] table in its Cargo.toml), so the --workspace commands
       # above never touch them. Exercise both explicitly: fmt, clippy and the

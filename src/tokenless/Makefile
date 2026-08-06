@@ -35,6 +35,11 @@ ADAPTER_TEMPLATES := \
 COMPONENT_CONTRACT := .anolisa/component.toml
 ANOLISA_COMPONENT_MANIFEST := ../anolisa/manifests/components/tokenless/component.toml
 TOON_VER := 0.5.0
+# Architecture suffix for release tarball naming (derived from the Rust host
+# triple — more accurate than uname -m under Rosetta). Cross-architecture
+# builds are NOT supported: set up a native build environment for the target
+# arch instead, or pass CARGO_TARGET_TRIPLE and a matching --target to cargo.
+ARCH ?= $(shell rustc -vV 2>/dev/null | sed -n 's/^host: *\([^ -]*\).*/\1/p' || uname -m)
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
 
 .PHONY: build build-tokenless build-toon build-openclaw-plugin \
@@ -52,7 +57,8 @@ VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1
         qwencode-install qwencode-uninstall \
         setup help \
         npm-package npm-package-all npm-publish \
-        test-hooks
+        test-hooks \
+        release release-7u release-with-suffix release-install-script release-check-cargo-config
 
 # Default target
 all: build
@@ -231,6 +237,9 @@ dist: clean
 	tar czf ../tokenless-$(VERSION).tar.gz \
 	    --exclude='target' \
 	    --exclude='.git' \
+	    --exclude='tokenless/dist' \
+	    --exclude='node_modules' \
+	    --exclude='__pycache__' \
 	    -C .. tokenless
 	@tar_list=$$(tar -tzf ../tokenless-$(VERSION).tar.gz); \
 	for required in \
@@ -242,6 +251,28 @@ dist: clean
 		}; \
 	done
 	@echo "==> Tarball: ../tokenless-$(VERSION).tar.gz"
+
+# -----------------------------------------------------------------------------
+# Binary release tarballs
+# -----------------------------------------------------------------------------
+# Build tokenless, rtk and toon, then package into dist/tokenless-$(VERSION)-$(ARCH).tar.gz
+# with an embedded install.sh. Run on the target Linux distribution so the
+# resulting binaries link against the same glibc version.
+release: release-check-cargo-config
+	@bash scripts/build-release.sh
+
+# 7u-specific release tarball for Anolis OS 7u / Alibaba Cloud Linux 2 / el7.
+# Produces dist/tokenless-$(VERSION)-7u-$(ARCH).tar.gz.
+release-7u: release-check-cargo-config
+	@bash scripts/build-release.sh 7u
+
+# Generate the embedded install.sh without a full build (used by CI tests).
+release-install-script:
+	@bash scripts/build-release.sh --install-script-only
+
+# Verify no Cargo config overrides are active.
+release-check-cargo-config:
+	@bash scripts/build-release.sh --check-cargo-config
 
 # Adapter management — invokes detect/install/uninstall action scripts per the
 # ANOLISA FHS adapter spec.  Environment variables point to installed FHS paths.
@@ -462,6 +493,8 @@ help:
 	@echo "  qwencode-install  Register Qwen Code plugin via qwen CLI"
 	@echo "  qwencode-uninstall Unregister Qwen Code plugin"
 	@echo "  setup             Full setup: build + install + register adapters"
+	@echo "  release           Build all + package release tarball"
+	@echo "  release-7u        Build all + package 7u release tarball"
 	@echo "  npm-package       Package for npm (current platform)"
 	@echo "  npm-package-all   Package for npm (all platforms)"
 	@echo "  npm-publish       Build and publish all npm packages"
