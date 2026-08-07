@@ -170,5 +170,80 @@ class CopyInstallResolutionTest(unittest.TestCase):
             self.assertNotEqual(plugin._HOOK_UTILS_RESOLVED, os.path.realpath(hooks))
 
 
+class VersionMismatchTest(unittest.TestCase):
+    """Regression tests for shared hook_utils version mismatch (PR #2249 P1).
+
+    When a candidate passes the trust check (hook_utils.py exists, ownership
+    and permissions OK) but ships an older hook_utils that lacks the symbols
+    this plugin needs (e.g. _anchor_rtk_prefix), the plugin must either
+    continue to the next candidate or fall back to a local implementation —
+    never crash with ImportError.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hermes-version-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        plugin_dir = os.path.join(self.tmp, "plugins", "tokenless")
+        os.makedirs(plugin_dir)
+        shutil.copy(_PLUGIN_SRC, plugin_dir)
+        self.plugin_copy = os.path.join(plugin_dir, "__init__.py")
+        self._saved_xdg = os.environ.get("XDG_DATA_HOME")
+
+    def tearDown(self):
+        if self._saved_xdg is None:
+            os.environ.pop("XDG_DATA_HOME", None)
+        else:
+            os.environ["XDG_DATA_HOME"] = self._saved_xdg
+
+    def _make_old_hooks_dir(self, base: str) -> str:
+        """Create a hooks dir with hook_utils.py that LACKS _anchor_rtk_prefix."""
+        hooks = os.path.join(base, "anolisa", "adapters", "tokenless", "common", "hooks")
+        os.makedirs(hooks, mode=0o755)
+        # Write a minimal hook_utils.py without the required symbol
+        with open(os.path.join(hooks, "hook_utils.py"), "w") as f:
+            f.write(
+                "# Old hook_utils without _anchor_rtk_prefix\n"
+                "def resolve_binary(name, *fallbacks): return None\n"
+            )
+        # Copy tool_categories.json (needed by some imports)
+        shutil.copy(
+            os.path.join(_HOOKS_SRC, "tool_categories.json"),
+            hooks,
+        )
+        os.chmod(hooks, 0o755)
+        return hooks
+
+    def test_old_hooks_rejected_by_api_compat_check(self):
+        # A candidate with hook_utils.py that lacks _anchor_rtk_prefix must
+        # be rejected by _check_api_compat, not accepted and then crash.
+        xdg = os.path.join(self.tmp, "xdg-data")
+        old_hooks = self._make_old_hooks_dir(xdg)
+        os.environ["XDG_DATA_HOME"] = xdg
+        try:
+            plugin = _load_plugin(self.plugin_copy, "hermes_plugin_old_hooks")
+        except ImportError as exc:
+            # No compatible candidate found — diagnostic mentions API mismatch.
+            self.assertIn("API mismatch", str(exc))
+            self.assertIn(old_hooks, str(exc))
+        else:
+            # A later candidate with the correct version won.
+            self.assertNotEqual(plugin._HOOK_UTILS_RESOLVED, os.path.realpath(old_hooks))
+
+    def test_plugin_loads_with_fallback_when_no_compat_candidate(self):
+        # When no candidate has the required symbols, the plugin should still
+        # load (using local fallbacks) instead of crashing with ImportError.
+        xdg = os.path.join(self.tmp, "xdg-data")
+        self._make_old_hooks_dir(xdg)
+        os.environ["XDG_DATA_HOME"] = xdg
+        # The plugin should load without raising ImportError
+        plugin = _load_plugin(self.plugin_copy, "hermes_plugin_fallback")
+        # Verify the fallback _anchor_rtk_prefix works
+        self.assertFalse(plugin._HOOK_UTILS_AVAILABLE)
+        result = plugin._anchor_rtk_prefix(
+            "rtk grep foo", "/usr/bin/rtk",
+        )
+        self.assertEqual(result, "/usr/bin/rtk grep foo")
+
+
 if __name__ == "__main__":
     unittest.main()

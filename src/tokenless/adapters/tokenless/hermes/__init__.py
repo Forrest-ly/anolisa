@@ -95,13 +95,48 @@ def _validate_hooks_dir(path: str) -> str | None:
     return None
 
 
+# Symbols that must exist in the shared hook_utils module.  When a candidate
+# passes the trust check but ships an older hook_utils.py that lacks these
+# symbols (e.g. a stale install from a previous adapter version), the
+# candidate is rejected and the search continues to later paths.
+_HOOK_UTILS_REQUIRED_SYMBOLS = ("_anchor_rtk_prefix",)
+
+
+def _check_api_compat(candidate_dir: str) -> str | None:
+    """Trial-import hook_utils from *candidate_dir* and verify required symbols.
+
+    Returns ``None`` when the module loads and exposes every symbol in
+    :data:`_HOOK_UTILS_REQUIRED_SYMBOLS`, otherwise a human-readable
+    rejection reason.  On rejection the ``sys.path`` mutation and the
+    partially-imported module are cleaned up so later candidates start
+    from a clean state.
+    """
+    sys.path.insert(0, candidate_dir)
+    saved = sys.modules.pop("hook_utils", None)
+    try:
+        import hook_utils as _trial  # type: ignore[import-not-found]
+        missing = [s for s in _HOOK_UTILS_REQUIRED_SYMBOLS
+                   if not hasattr(_trial, s)]
+        if missing:
+            return f"API mismatch: missing {', '.join(missing)}"
+        return None
+    except Exception as exc:
+        return f"import failed: {exc}"
+    finally:
+        sys.path.pop(0)
+        if saved is not None:
+            sys.modules["hook_utils"] = saved
+        else:
+            sys.modules.pop("hook_utils", None)
+
+
 def _resolve_hook_utils() -> tuple[str, list[str]]:
     """Locate a trusted shared hooks directory and make it importable.
 
     Returns ``(resolved_path, candidate_list)``.  The resolved path is
     inserted at the front of ``sys.path`` so the shared ``hook_utils``
     module can be imported.  Raises :exc:`ImportError` when no candidate
-    passes the trust policy.
+    passes both the trust policy and the API compatibility check.
     """
     # Resolve real home from passwd DB for user-install fallback path
     # (NOT $HOME — env-controllable).
@@ -133,11 +168,17 @@ def _resolve_hook_utils() -> tuple[str, list[str]]:
     rejections: list[str] = []
     for candidate in candidates:
         reason = _validate_hooks_dir(candidate)
-        if reason is None:
-            resolved = os.path.realpath(candidate)
-            sys.path.insert(0, resolved)
-            return resolved, candidates
-        rejections.append(f"  - {candidate}: {reason}")
+        if reason is not None:
+            rejections.append(f"  - {candidate}: {reason}")
+            continue
+        # Trust check passed — verify API compat (version mismatch guard).
+        resolved = os.path.realpath(candidate)
+        api_reason = _check_api_compat(resolved)
+        if api_reason is not None:
+            rejections.append(f"  - {candidate}: {api_reason}")
+            continue
+        sys.path.insert(0, resolved)
+        return resolved, candidates
 
     raise ImportError(
         "tokenless: no trusted shared hook_utils module (common/hooks/) found.\n"
@@ -150,27 +191,130 @@ def _resolve_hook_utils() -> tuple[str, list[str]]:
     )
 
 
-_HOOK_UTILS_RESOLVED, _HOOK_UTILS_CANDIDATES = _resolve_hook_utils()
+try:
+    _HOOK_UTILS_RESOLVED, _HOOK_UTILS_CANDIDATES = _resolve_hook_utils()
 
-from hook_utils import (
-    _TOKENLESS_FALLBACK,
-    _TOKENLESS_LOCAL_SHARE,
-    _TOKENLESS_LOCAL_LIB,
-    _RTK_FALLBACK,
-    _RTK_LOCAL_SHARE,
-    _RTK_LOCAL_LIB,
-    _anchor_rtk_prefix,
-    resolve_binary,
-    warn as _warn_shared,
-    try_parse_json as _try_parse_json,
-    is_skill_file as _is_skill_file,
-    write_context as _write_context,
-    run as _run,
-    parse_version as _parse_version,
-    SKIP_TOOLS as _SKIP_TOOLS_SHARED,
-    SHELL_TOOLS as _SHELL_TOOLS_SHARED,
-    get_thresholds,
-)
+    from hook_utils import (
+        _TOKENLESS_FALLBACK,
+        _TOKENLESS_LOCAL_SHARE,
+        _TOKENLESS_LOCAL_LIB,
+        _RTK_FALLBACK,
+        _RTK_LOCAL_SHARE,
+        _RTK_LOCAL_LIB,
+        _anchor_rtk_prefix,
+        resolve_binary,
+        warn as _warn_shared,
+        try_parse_json as _try_parse_json,
+        is_skill_file as _is_skill_file,
+        write_context as _write_context,
+        run as _run,
+        parse_version as _parse_version,
+        SKIP_TOOLS as _SKIP_TOOLS_SHARED,
+        SHELL_TOOLS as _SHELL_TOOLS_SHARED,
+        get_thresholds,
+    )
+    _HOOK_UTILS_AVAILABLE = True
+except ImportError:
+    _HOOK_UTILS_AVAILABLE = False
+    _HOOK_UTILS_RESOLVED = ""
+    _HOOK_UTILS_CANDIDATES = []
+
+    _TOKENLESS_FALLBACK = "/usr/libexec/anolisa/tokenless/tokenless"
+    _TOKENLESS_LOCAL_SHARE = ""
+    _TOKENLESS_LOCAL_LIB = ""
+    _RTK_FALLBACK = "/usr/libexec/anolisa/tokenless/rtk"
+    _RTK_LOCAL_SHARE = ""
+    _RTK_LOCAL_LIB = ""
+
+    # Minimal fallbacks — the plugin gracefully skips features that
+    # require shared utilities (compression, TOON, env-check, skill-file
+    # detection).  RTK rewrite still works because _anchor_rtk_prefix and
+    # _parse_version are provided locally below.
+
+    def resolve_binary(name: str, *fallbacks: str) -> str | None:  # type: ignore[misc]
+        import shutil
+        found = shutil.which(name)
+        if found:
+            return found
+        for fb in fallbacks:
+            if fb and os.path.isfile(fb) and os.access(fb, os.X_OK):
+                return fb
+        return None
+
+    def _warn_shared(msg: str) -> None:  # type: ignore[misc]
+        pass
+
+    def _try_parse_json(text: str):  # type: ignore[misc]
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    def _is_skill_file(text: str) -> bool:  # type: ignore[misc]
+        return False
+
+    def _write_context(agent_id: str, session_id: str, tool_call_id: str) -> None:  # type: ignore[misc]
+        pass
+
+    def _run(cmd: list[str], stdin_data: str, timeout: int = 5):  # type: ignore[misc]
+        try:
+            return subprocess.run(
+                cmd, input=stdin_data, capture_output=True, text=True, timeout=timeout,
+            )
+        except Exception:
+            return None
+
+    def get_thresholds(tool_name: str) -> tuple[int, int, int]:  # type: ignore[misc]
+        return (65536, 128, 8)
+
+    _SKIP_TOOLS_SHARED: set[str] = {
+        "Read", "Glob", "Grep", "WebFetch", "WebSearch",
+        "read_file", "list_files", "search_files",
+    }
+    _SHELL_TOOLS_SHARED: set[str] = {"Bash", "Shell", "terminal"}
+
+    import re as _re
+
+    def _parse_version(version_str: str) -> tuple[int, ...] | None:  # type: ignore[misc]
+        m = _re.match(r"(\d+)\.(\d+)\.(\d+)", version_str)
+        if not m:
+            return None
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+    import shlex as _shlex
+
+    _SEGMENT_OPS_FB = frozenset({"&&", "||", ";", "|", "&"})
+
+    def _is_env_assignment_fb(token: str) -> bool:
+        name, sep, _ = token.partition("=")
+        if not sep or not name:
+            return False
+        if not (name[0].isalpha() or name[0] == "_"):
+            return False
+        return all(c.isalnum() or c == "_" for c in name)
+
+    def _anchor_rtk_prefix(rewritten: str, rtk_bin: str) -> str:  # type: ignore[misc]
+        """Local fallback when shared hook_utils is unavailable or too old."""
+        lexer = _shlex.shlex(rewritten, posix=False)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        try:
+            tokens = list(lexer)
+        except ValueError:
+            return rewritten
+        quoted = _shlex.quote(rtk_bin)
+        result = list(tokens)
+        wrapped = False
+        for i, token in enumerate(tokens):
+            if token in _SEGMENT_OPS_FB:
+                wrapped = False
+                continue
+            if _is_env_assignment_fb(token):
+                continue
+            if not wrapped and token == "rtk":
+                result[i] = quoted
+                wrapped = True
+        return " ".join(result)
 
 logger = logging.getLogger(__name__)
 
@@ -573,3 +717,8 @@ def register(ctx: Any) -> None:
         "tokenless: Hermes plugin registered — active features: %s",
         ", ".join(features) if features else "none (install tokenless/rtk binary)",
     )
+    if not _HOOK_UTILS_AVAILABLE:
+        logger.warning(
+            "tokenless: running in degraded mode — shared hook_utils not available, "
+            "response compression and TOON encoding disabled"
+        )

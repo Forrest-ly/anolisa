@@ -11,74 +11,24 @@
  *   - fd redirections preserved
  *   - command substitutions preserved
  *   - multiple pipeline segments
+ *   - escaped double quotes in arguments (regression: shellTokenize P1)
+ *   - single quotes in RTK path (regression: quoting P1)
+ *   - known-limitation: non-wrapper rtk anchored (regression: TS/Python parity)
  *
- * These functions are duplicated here from index.ts because the plugin does
- * not export them (it is a self-contained OpenClaw plugin).  The logic under
- * test is pure text manipulation with no I/O, so duplication is acceptable
- * and avoids introducing a build step into the test runner.
+ * Imports the production helpers from the compiled plugin build so CI
+ * catches any drift between the test expectations and the shipped code.
+ * Requires ``make build-openclaw-plugin`` before running.
  */
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-// ---- Inline copy of the anchor helpers from openclaw/index.ts ---------------
-// Keep in sync with adapters/tokenless/openclaw/index.ts.
-
-const SEGMENT_OPS = new Set(["&&", "||", ";", "|", "&"]);
-
-function isEnvAssignment(token) {
-  const eq = token.indexOf("=");
-  if (eq <= 0) return false;
-  const name = token.slice(0, eq);
-  if (!/^[A-Za-z_]/.test(name)) return false;
-  return /^[A-Za-z0-9_]+$/.test(name);
-}
-
-function shellTokenize(cmd) {
-  const tokens = [];
-  let i = 0;
-  const n = cmd.length;
-  while (i < n) {
-    while (i < n && (cmd[i] === " " || cmd[i] === "\t")) i++;
-    if (i >= n) break;
-    let tok = "";
-    while (i < n && cmd[i] !== " " && cmd[i] !== "\t") {
-      const ch = cmd[i];
-      if (ch === "'") {
-        const end = cmd.indexOf("'", i + 1);
-        if (end === -1) return null;
-        tok += cmd.slice(i, end + 1);
-        i = end + 1;
-      } else if (ch === '"') {
-        const end = cmd.indexOf('"', i + 1);
-        if (end === -1) return null;
-        tok += cmd.slice(i, end + 1);
-        i = end + 1;
-      } else {
-        tok += ch;
-        i++;
-      }
-    }
-    if (tok) tokens.push(tok);
-  }
-  return tokens;
-}
-
-function anchorRtkPrefix(rewritten, resolvedRtkPath) {
-  const tokens = shellTokenize(rewritten);
-  if (!tokens) return rewritten;
-  const needsQuote = /[ \t'"\\$`!*?{}[\]|;&<>()#]/.test(resolvedRtkPath);
-  const quoted = needsQuote ? `'${resolvedRtkPath}'` : resolvedRtkPath;
-  const result = [...tokens];
-  let wrapped = false;
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-    if (SEGMENT_OPS.has(token)) { wrapped = false; continue; }
-    if (isEnvAssignment(token)) continue;
-    if (!wrapped && token === "rtk") { result[i] = quoted; wrapped = true; }
-  }
-  return result.join(" ");
-}
+import {
+  SEGMENT_OPS,
+  isEnvAssignment,
+  shellTokenize,
+  anchorRtkPrefix,
+} from "../adapters/tokenless/openclaw/dist/anchor-helpers.js";
 
 // ---- Tests ------------------------------------------------------------------
 
@@ -120,7 +70,6 @@ test("single & connective", () => {
 });
 
 test("quoted regex pattern with rtk inside is untouched", () => {
-  // The `rtk` inside the single-quoted string must survive byte-for-byte.
   assert.equal(
     anchorRtkPrefix("rtk grep -E 'foo|rtk bar' src/", RTK),
     `${RTK} grep -E 'foo|rtk bar' src/`,
@@ -178,4 +127,54 @@ test("no rtk token — passthrough unchanged", () => {
 test("unparseable input (unmatched quote) — returned untouched", () => {
   const cmd = "rtk grep 'unclosed";
   assert.equal(anchorRtkPrefix(cmd, RTK), cmd);
+});
+
+// ---- Regression tests (PR #2249 review) ------------------------------------
+
+test("escaped double quote inside double-quoted argument", () => {
+  // shellTokenize must skip \" inside double quotes instead of treating
+  // the backslash-quote as the closing delimiter (P1 review finding).
+  const cmd = 'rtk grep "foo\\"bar" src/';
+  const tokens = shellTokenize(cmd);
+  assert.notEqual(tokens, null, "tokenize must not return null for escaped quote");
+  assert.equal(
+    anchorRtkPrefix(cmd, RTK),
+    `${RTK} grep "foo\\"bar" src/`,
+  );
+});
+
+test("escaped backslash before closing double quote", () => {
+  // \\\\ inside double quotes: the backslash escapes the next backslash,
+  // so the closing quote is the one after the second backslash.
+  const cmd = 'rtk echo "path\\\\end" done';
+  const tokens = shellTokenize(cmd);
+  assert.notEqual(tokens, null);
+  assert.deepEqual(tokens, ["rtk", "echo", '"path\\\\end"', "done"]);
+});
+
+test("rtk path containing single quote is properly escaped", () => {
+  // A path like /home/o'brien/rtk must not produce broken shell quoting.
+  const trickyRtk = "/home/o'brien/rtk";
+  const result = anchorRtkPrefix("rtk grep foo", trickyRtk);
+  // Expected: '/home/o'\''brien/rtk' grep foo  (standard shell single-quote escaping)
+  assert.equal(
+    result,
+    `'/home/o'\\''brien/rtk' grep foo`,
+  );
+});
+
+test("known limitation: rtk as non-wrapper argument is anchored", () => {
+  // Matches Python behavior: a bare rtk that appears as a positional
+  // argument (not a command) is incorrectly treated as a wrapper.
+  // This is accepted because rtk rewrite output never produces such shapes.
+  const cmd = "echo rtk done";
+  const result = anchorRtkPrefix(cmd, RTK);
+  assert.equal(result, `echo ${RTK} done`);
+});
+
+test("shellTokenize handles mixed escaped and normal content", () => {
+  const cmd = 'rtk grep "normal" "with\\"escape" file';
+  const tokens = shellTokenize(cmd);
+  assert.notEqual(tokens, null);
+  assert.deepEqual(tokens, ["rtk", "grep", '"normal"', '"with\\"escape"', "file"]);
 });

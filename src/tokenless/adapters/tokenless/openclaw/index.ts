@@ -23,6 +23,9 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, statSync, readFileSync } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
+import {
+  anchorRtkPrefix,
+} from "./anchor-helpers.js";
 
 // ---- Session ID mapping --------------------------------------------------------
 // OpenClaw's tool_result_persist ctx provides sessionKey ("agent:main:main")
@@ -156,89 +159,6 @@ function isSkillContent(message: any): boolean {
   // Check the first few lines for typical skill metadata fields
   const firstLines = trimmed.split("\n", 20).join("\n");
   return /^name:/m.test(firstLines) || /^description:/m.test(firstLines);
-}
-
-// Shell connectives that terminate a command-list / pipeline segment.
-const SEGMENT_OPS = new Set(["&&", "||", ";", "|", "&"]);
-
-function isEnvAssignment(token: string): boolean {
-  const eq = token.indexOf("=");
-  if (eq <= 0) return false;
-  const name = token.slice(0, eq);
-  if (!/^[A-Za-z_]/.test(name)) return false;
-  return /^[A-Za-z0-9_]+$/.test(name);
-}
-
-/**
- * Tokenize a shell command string without a shell, preserving quoted strings,
- * globs, fd redirections, and command substitutions as single tokens.
- * Mirrors Python shlex.shlex(posix=False, whitespace_split=True, commenters="").
- */
-function shellTokenize(cmd: string): string[] | null {
-  const tokens: string[] = [];
-  let i = 0;
-  const n = cmd.length;
-  while (i < n) {
-    // skip whitespace
-    while (i < n && (cmd[i] === " " || cmd[i] === "\t")) i++;
-    if (i >= n) break;
-    let tok = "";
-    while (i < n && cmd[i] !== " " && cmd[i] !== "\t") {
-      const ch = cmd[i];
-      if (ch === "'" ) {
-        // single-quoted string: consume up to closing '
-        const end = cmd.indexOf("'", i + 1);
-        if (end === -1) return null; // unmatched quote
-        tok += cmd.slice(i, end + 1);
-        i = end + 1;
-      } else if (ch === '"') {
-        // double-quoted string: consume up to closing "
-        const end = cmd.indexOf('"', i + 1);
-        if (end === -1) return null; // unmatched quote
-        tok += cmd.slice(i, end + 1);
-        i = end + 1;
-      } else {
-        tok += ch;
-        i++;
-      }
-    }
-    if (tok) tokens.push(tok);
-  }
-  return tokens;
-}
-
-/**
- * Replace bare `rtk` wrapper tokens with the resolved absolute binary path.
- *
- * Ports the Python _anchor_rtk_prefix logic: swaps the first unquoted `rtk`
- * token of each pipeline segment (at command start or right after a connective
- * like `&&`/`||`/`;`/`|`/`&`, optionally behind env assignments or wrappers
- * like `sudo`). Quoted patterns, globs, fd redirections, and command
- * substitutions are never modified. Unparseable input is returned untouched.
- */
-function anchorRtkPrefix(rewritten: string, resolvedRtkPath: string): string {
-  const tokens = shellTokenize(rewritten);
-  if (!tokens) return rewritten; // unmatched quote — return untouched
-
-  // Quote the path if it contains spaces or special chars
-  const needsQuote = /[ \t'"\\$`!*?{}[\]|;&<>()#]/.test(resolvedRtkPath);
-  const quoted = needsQuote ? `'${resolvedRtkPath}'` : resolvedRtkPath;
-
-  const result = [...tokens];
-  let wrapped = false;
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-    if (SEGMENT_OPS.has(token)) {
-      wrapped = false;
-      continue;
-    }
-    if (isEnvAssignment(token)) continue;
-    if (!wrapped && token === "rtk") {
-      result[i] = quoted;
-      wrapped = true;
-    }
-  }
-  return result.join(" ");
 }
 
 function checkTokenless(): boolean {

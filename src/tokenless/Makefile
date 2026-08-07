@@ -190,6 +190,8 @@ test-integration:
 	python3 tests/test_hermes_plugin_import.py
 	python3 tests/test_rewrite_hook.py
 	python3 tests/test_resolve_agent_id.py
+	@echo "==> Testing OpenClaw anchor helpers (Node)..."
+	node --test tests/test_openclaw_anchor.mjs
 
 test-adapters:
 	@echo "==> Testing qoder adapter installer..."
