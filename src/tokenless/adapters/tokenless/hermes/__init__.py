@@ -591,8 +591,10 @@ def on_pre_tool_call(
     Step 2: for ``terminal`` calls, blocks and suggests RTK-rewritten
     command (one extra round-trip; safe — rtk rewrite never executes).
     """
-    # Step 1: env-check (all tools, needs tokenless)
-    if _have("tokenless", _TOKENLESS_FALLBACK):
+    # Step 1: env-check (all tools, needs tokenless + shared hook_utils).
+    # Skipped in degraded mode — _env_check depends on shared get_thresholds
+    # and tokenless compress-response which require a compatible hook_utils.
+    if _HOOK_UTILS_AVAILABLE and _have("tokenless", _TOKENLESS_FALLBACK):
         if session_id:
             os.environ["TOKENLESS_SESSION_ID"] = str(session_id)
         feedback = _env_check(tool_name)
@@ -628,6 +630,8 @@ def on_transform_tool_result(
     Shell/exec tools (Bash/Shell) use moderate truncation (64K/128/8).
     All other tools use zero-truncation compress-response + TOON.
     """
+    if not _HOOK_UTILS_AVAILABLE:
+        return None
     if not _have("tokenless", _TOKENLESS_FALLBACK):
         return None
 
@@ -706,7 +710,7 @@ def register(ctx: Any) -> None:
 
     # Log what's active
     features: list[str] = []
-    if _have("tokenless", _TOKENLESS_FALLBACK):
+    if _HOOK_UTILS_AVAILABLE and _have("tokenless", _TOKENLESS_FALLBACK):
         features.append("response-compression")
         features.append("toon-encoding")
         features.append("tool-ready")

@@ -178,3 +178,17 @@ test("shellTokenize handles mixed escaped and normal content", () => {
   assert.notEqual(tokens, null);
   assert.deepEqual(tokens, ["rtk", "grep", '"normal"', '"with\\"escape"', "file"]);
 });
+
+test("backslash-escaped quote outside quotes does not start quoted context", () => {
+  // Python shlex posix=False treats backslash as escape even outside quotes.
+  // rtk grep foo\"bar src/ must tokenize successfully.
+  const cmd = 'rtk grep foo\\"bar src/';
+  const tokens = shellTokenize(cmd);
+  assert.notEqual(tokens, null, "tokenize must not return null for escaped quote outside quotes");
+  assert.deepEqual(tokens, ["rtk", "grep", 'foo\\"bar', "src/"]);
+  // anchorRtkPrefix must still anchor rtk
+  assert.equal(
+    anchorRtkPrefix(cmd, RTK),
+    `${RTK} grep foo\\"bar src/`,
+  );
+});

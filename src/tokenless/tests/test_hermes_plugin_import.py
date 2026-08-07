@@ -244,6 +244,34 @@ class VersionMismatchTest(unittest.TestCase):
         )
         self.assertEqual(result, "/usr/bin/rtk grep foo")
 
+    def test_degraded_mode_disables_compression_and_env_check(self):
+        # In degraded mode (_HOOK_UTILS_AVAILABLE=False), response compression,
+        # TOON encoding, and env-check must all be skipped — only RTK rewrite
+        # remains active (via local fallback).
+        xdg = os.path.join(self.tmp, "xdg-data")
+        self._make_old_hooks_dir(xdg)
+        os.environ["XDG_DATA_HOME"] = xdg
+        plugin = _load_plugin(self.plugin_copy, "hermes_plugin_degraded")
+        self.assertFalse(plugin._HOOK_UTILS_AVAILABLE)
+        # on_transform_tool_result must return None in degraded mode
+        result = plugin.on_transform_tool_result(
+            tool_name="Bash",
+            result='{"output": "hello world"}',
+            session_id="test-session",
+            tool_call_id="test-call",
+        )
+        self.assertIsNone(result)
+        # on_pre_tool_call env-check step must be skipped (returns None or
+        # only RTK rewrite if rtk is available)
+        pre_result = plugin.on_pre_tool_call(
+            tool_name="Read",
+            args={"file_path": "/tmp/test"},
+            session_id="test-session",
+            tool_call_id="test-call",
+        )
+        # Read tool has no RTK rewrite; env-check must not fire
+        self.assertIsNone(pre_result)
+
 
 if __name__ == "__main__":
     unittest.main()

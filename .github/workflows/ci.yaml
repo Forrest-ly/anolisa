@@ -818,6 +818,11 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Run OpenClaw anchor helper tests (Node)
+        run: |
+          make -C src/tokenless build-openclaw-plugin
+          node --test src/tokenless/tests/test_openclaw_anchor.mjs
+
       - uses: extractions/setup-just@v2
 
       - name: npm packaging smoke test (native Linux)

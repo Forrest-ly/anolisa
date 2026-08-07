@@ -15,10 +15,11 @@ export function isEnvAssignment(token: string): boolean {
  * Tokenize a shell command string without a shell, preserving quoted strings.
  *
  * Splits on whitespace while keeping single- and double-quoted spans intact.
- * Handles backslash-escaped characters inside double quotes (mirrors Python
- * shlex with ``posix=False``).  Does **not** recognize fd redirections, globs,
- * or command substitutions as special tokens — they pass through as ordinary
- * characters within their enclosing whitespace-delimited token.
+ * Handles backslash-escaped characters both outside and inside double quotes
+ * (mirrors Python shlex with ``posix=False``).  Does **not** recognize fd
+ * redirections, globs, or command substitutions as special tokens — they pass
+ * through as ordinary characters within their enclosing whitespace-delimited
+ * token.
  *
  * Returns ``null`` when the input contains an unmatched quote.
  */
@@ -52,6 +53,9 @@ export function shellTokenize(cmd: string): string[] | null {
         if (i >= n) return null;
         tok += cmd[i];
         i++;
+      } else if (ch === "\\" && i + 1 < n) {
+        tok += cmd[i] + cmd[i + 1];
+        i += 2;
       } else {
         tok += ch;
         i++;

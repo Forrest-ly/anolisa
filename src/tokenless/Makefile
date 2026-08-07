@@ -183,7 +183,7 @@ test-hooks:
 	bash tests/test-tool-ready-readable-fixer.sh
 	bash tests/run-all-tests.sh
 
-test-integration:
+test-integration: build-openclaw-plugin
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_compress_response_hook.py
 	python3 tests/test_compress_schema_hook.py
