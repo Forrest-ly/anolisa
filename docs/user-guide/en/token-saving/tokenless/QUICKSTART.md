@@ -69,22 +69,17 @@ curl -fsSL https://raw.githubusercontent.com/alibaba/anolisa/main/src/tokenless/
 Pin a version or set a custom install directory:
 
 ```bash
-TOKENLESS_VERSION=0.7.4 curl -fsSL https://raw.githubusercontent.com/alibaba/anolisa/main/src/tokenless/scripts/install.sh | bash
-TOKENLESS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/alibaba/anolisa/main/src/tokenless/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/alibaba/anolisa/main/src/tokenless/scripts/install.sh | TOKENLESS_VERSION=0.7.4 bash
+curl -fsSL https://raw.githubusercontent.com/alibaba/anolisa/main/src/tokenless/scripts/install.sh | TOKENLESS_INSTALL_DIR=/usr/local/bin bash
 ```
 
 ### Method D: Skill (for agents)
 
-When an agent framework (cosh, OpenClaw, Hermes, etc.) needs to install and manage Tokenless on its own, use the Skill method:
+When an agent framework (cosh, OpenClaw, Hermes, etc.) needs to install and manage Tokenless on its own, use the Skill method.
 
-```bash
-# Install the tokenless Skill via os-skills
-anolisa skill install install-tokenless
-```
+The Skill file is at `src/os-skills/ai/install-tokenless/SKILL.md` in the repository. An agent that loads this file can complete installation and configuration automatically.
 
-The Skill contains complete installation, verification, and framework integration guidance. An agent that reads the Skill can complete installation and configuration automatically.
-
-The Skill source is at `src/os-skills/ai/install-tokenless/SKILL.md`.
+To use it, point your agent framework at the Skill file path, or pass its contents directly to the agent. The Skill contains complete installation, verification, and framework integration guidance.
 
 After installing Tokenless, enable the adapter for the target agent framework (the Skill guides this step automatically):
 
