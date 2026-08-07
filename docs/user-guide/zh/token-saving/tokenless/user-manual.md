@@ -17,7 +17,7 @@ cargo build --release --locked -p tokenless-cli
 ./target/release/tokenless --version
 ```
 
-这条路径只生成独立的 `tokenless` CLI，不会安装 `rtk`、`toon` 或 Agent 接入资源。需要在 Agent 中使用完整能力时，请按照[快速开始](QUICKSTART.md)通过 anolisa CLI 安装。
+这条路径只生成独立的 `tokenless` CLI，不会安装 `rtk`、`toon` 或 Agent 接入资源。需要在 Agent 中使用完整能力时，请按照[快速开始](QUICKSTART.md)通过 anolisa CLI、npm、curl 或 Skill 安装。
 
 ## 能力与边界
 
@@ -48,7 +48,7 @@ cargo build --release --locked -p tokenless-cli
 
 ### 安装不等于启用
 
-`anolisa install tokenless` 安装组件和 Adapter 资源。要让某个 Agent 自动使用 Tokenless，还需要：
+无论通过 anolisa CLI、npm、curl 还是 Skill 安装 Tokenless，都只是安装组件和 Adapter 资源。要让某个 Agent 自动使用 Tokenless，还需要：
 
 ```bash
 anolisa adapter enable tokenless <framework>
@@ -108,6 +108,7 @@ Stash 并不能让所有压缩都可逆。被移除的 `debug`/`trace` 字段、
 | 我想做什么 | 文档 |
 |------------|------|
 | 第一次安装并验证 | [快速开始](QUICKSTART.md) |
+| 使用 npm、curl 或 Skill 安装 | [快速开始 · 安装 Tokenless](QUICKSTART.md#2-安装-tokenless) |
 | 从源码构建独立 CLI | [本页 · 从源码构建独立 CLI](#从源码构建独立-cli) |
 | 接入或切换 Agent 框架 | [框架集成](framework-integration.md) |
 | 手动压缩、取回或运行 MCP | [CLI 参考](cli-reference.md) |
