@@ -9,10 +9,6 @@ Releases from 0.7.2 onward follow
 
 ## [Unreleased]
 
-### Added
-
-- `tokenless init` command: detects installed agent frameworks, reports adapter status (ready / installable / missing prerequisites), and runs the appropriate `install.sh` to register the tokenless adapter — providing a single entry point for community onboarding.
-
 ## [0.7.14] - 2026-08-26
 
 ### Added
