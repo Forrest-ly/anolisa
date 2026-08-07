@@ -18,6 +18,8 @@ Savings vary by task. Short tasks or tasks that are mostly conversation may show
 
 ## 2. Install Tokenless
 
+### anolisa CLI
+
 Install the anolisa CLI first, then use it to install Tokenless:
 
 ```bash
@@ -25,6 +27,22 @@ curl -fsSL https://get.agentic-os.sh | bash
 anolisa --version
 anolisa install tokenless
 tokenless --version
+```
+
+### curl (standalone)
+
+If you only need the Tokenless CLI and framework adapters, install directly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alibaba/anolisa/main/src/tokenless/install.sh | bash
+```
+
+This uses npm when available and falls back to installing Node.js LTS via nvm if npm is missing.
+
+### npm
+
+```bash
+npm install -g anolisa-tokenless
 ```
 
 ## 3. Start using Tokenless

@@ -63,12 +63,39 @@ tokenless 只优化**工具调用响应**进入 LLM 上下文前的冗余，不�
 
 ## 快速开始
 
+### curl（推荐人类用户）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alibaba/anolisa/main/src/tokenless/install.sh | bash
+```
+
+安装器会优先使用 npm；若未安装 npm，则通过 nvm 安装 Node.js LTS。
+
+### npm
+
+```bash
+npm install -g anolisa-tokenless
+```
+
+### 源码构建
+
 ```bash
 # 完整安装：构建 + 安装二进制 + 部署所有适配器
 make setup
 ```
 
 安装完成后 `tokenless` 命令位于 `~/.local/bin`，RTK/TOON 辅助二进制同目录。
+
+### Skill 安装（面向 Agent）
+
+Agent 可通过附带的 skill 安装 Token-Less。从仓库克隆 skill 目录后运行安装器：
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse https://github.com/alibaba/anolisa.git /tmp/anolisa-tokenless
+cd /tmp/anolisa-tokenless && git sparse-checkout set src/tokenless/skills/install-tokenless
+bash src/tokenless/skills/install-tokenless/scripts/install.sh
+rm -rf /tmp/anolisa-tokenless
+```
 
 ### OpenCode 安装
 
@@ -85,7 +112,17 @@ make opencode-install
 `XDG_CONFIG_HOME` 和显式的 `TOKENLESS_OPENCODE_CONFIG_DIR` 覆盖。
 安装后重启 OpenCode 即可加载插件。
 
-## npm 安装
+## 安装选项
+
+### curl（推荐人类用户）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alibaba/anolisa/main/src/tokenless/install.sh | bash
+```
+
+安装器会检测平台，优先使用 npm；若未安装 npm，则通过 nvm 安装 Node.js LTS。自动安装适合您平台的预编译二进制文件（`tokenless`、`rtk`、`toon`），支持 Linux 和 macOS 的 x86_64 和 arm64 架构。
+
+### npm
 
 ```bash
 npm install -g anolisa-tokenless
@@ -93,6 +130,17 @@ npm install -g anolisa-tokenless
 
 自动安装适合您平台的预编译二进制文件（`tokenless`、`rtk`、`toon`）。
 支持 Linux 和 macOS 的 x86_64 和 arm64 架构。
+
+### Skill 安装（面向 Agent）
+
+将 Token-Less 作为 skill 安装，供 Agent 发现并执行：
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse https://github.com/alibaba/anolisa.git /tmp/anolisa-tokenless
+cd /tmp/anolisa-tokenless && git sparse-checkout set src/tokenless/skills/install-tokenless
+bash src/tokenless/skills/install-tokenless/scripts/install.sh
+rm -rf /tmp/anolisa-tokenless
+```
 
 ## 查看 Token 节省明细
 
@@ -133,6 +181,8 @@ export TOKENLESS_DATA_DIR="$HOME/path/to/tokenless-data"
 - `crates/tokenless-cli/` — CLI 二进制
 - `adapters/tokenless/` — 适配器包（OpenClaw / Hermes / Qoder / Claude Code / Codex / OpenCode）
 - `third_party/rtk/` — RTK 命令重写引擎（vendored）
+- `install.sh` — 面向人类用户的一键 curl 安装脚本
+- `skills/install-tokenless/` — 面向 Agent 的 Copilot Shell skill
 
 ## 许可证
 

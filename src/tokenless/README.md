@@ -101,10 +101,28 @@ Token-Less/
 ├── third_party/rtk/           # RTK vendored source (justfile clone+patch from GitHub)
 ├── third_party/patches/      # Patches for vendored third_party sources
 ├── Makefile                   # Unified build system
-└── scripts/                    # Helper scripts
+├── install.sh                 # One-line curl installer for human users
+├── scripts/                   # Helper scripts
+└── skills/install-tokenless/  # Copilot Shell skill for agent-driven install
 ```
 
 ## Quick Start
+
+### curl (recommended for human users)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alibaba/anolisa/main/src/tokenless/install.sh | bash
+```
+
+The installer uses npm when available and falls back to installing Node.js LTS via nvm if npm is missing.
+
+### npm
+
+```bash
+npm install -g anolisa-tokenless
+```
+
+### Build from source
 
 ```bash
 # Clone repo (no submodules needed)
@@ -115,7 +133,19 @@ cd Token-Less
 make setup
 ```
 
-Both methods install `tokenless` to `~/.local/bin`, helper binaries `rtk`/`toon` alongside it, and deploy the adapters (hooks + OpenClaw plugin + Hermes plugin).
+All methods install `tokenless` to `~/.local/bin`, helper binaries `rtk`/`toon` alongside it, and deploy the adapters (hooks + OpenClaw plugin + Hermes plugin).
+
+### Skill install (for agents)
+
+Agents can install Token-Less via the bundled skill. Clone the skill directory
+from the repository, then run the installer:
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse https://github.com/alibaba/anolisa.git /tmp/anolisa-tokenless
+cd /tmp/anolisa-tokenless && git sparse-checkout set src/tokenless/skills/install-tokenless
+bash src/tokenless/skills/install-tokenless/scripts/install.sh
+rm -rf /tmp/anolisa-tokenless
+```
 
 ## CLI Usage
 
@@ -425,7 +455,17 @@ The installer creates a `tokenless.js` symbolic link in OpenCode's global
 `TOKENLESS_OPENCODE_CONFIG_DIR` override.
 
 
-## npm Install
+## Install Options
+
+### curl (recommended for human users)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alibaba/anolisa/main/src/tokenless/install.sh | bash
+```
+
+The installer detects the platform, uses npm when available, and falls back to installing Node.js LTS via nvm if npm is missing. It installs the correct prebuilt binaries (`tokenless`, `rtk`, `toon`) for Linux or macOS on x86_64 and arm64.
+
+### npm
 
 ```bash
 npm install -g anolisa-tokenless
@@ -433,6 +473,17 @@ npm install -g anolisa-tokenless
 
 This automatically installs the correct prebuilt binaries (`tokenless`, `rtk`, `toon`) for your platform.
 Supports Linux and macOS on x86_64 and arm64.
+
+### Skill install (for agents)
+
+Install Token-Less as a skill so agents can discover and run the installer:
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse https://github.com/alibaba/anolisa.git /tmp/anolisa-tokenless
+cd /tmp/anolisa-tokenless && git sparse-checkout set src/tokenless/skills/install-tokenless
+bash src/tokenless/skills/install-tokenless/scripts/install.sh
+rm -rf /tmp/anolisa-tokenless
+```
 
 ## Build
 
@@ -486,6 +537,8 @@ make install BIN_DIR=/usr/local/bin
 | `third_party/rtk/` | RTK vendored source — command rewriting engine (justfile clone+patch) |
 | `third_party/patches/` | Patches for vendored third_party sources |
 | `Makefile` | Unified build system for the entire workspace |
+| `install.sh` | One-line curl installer for human users |
+| `skills/install-tokenless/` | Copilot Shell skill for agent-driven install |
 
 ## Prerequisites
 
