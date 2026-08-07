@@ -5,12 +5,6 @@ All notable changes to Tokenless will be documented in this file.
 Releases from 0.7.2 onward follow
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
-
-### Added
-
-- `tokenless init` command: detects installed agent frameworks, reports adapter status (ready / installable / missing prerequisites), and runs the appropriate `install.sh` to register the tokenless adapter — providing a single entry point for community onboarding.
-
 ## [0.7.4] - 2026-07-31
 
 ### Added
