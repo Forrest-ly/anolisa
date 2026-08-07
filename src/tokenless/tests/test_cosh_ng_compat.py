@@ -210,7 +210,7 @@ class TestBuildCoshNGPostToolOutput(unittest.TestCase):
     """Test building Cosh-NG-compatible PostToolUse hook output."""
 
     def test_post_tool_output_with_replacement(self):
-        """PostToolUse output includes replacement field."""
+        """PostToolUse output includes updated_tool_response field."""
         output = hook_utils.build_cosh_ng_post_tool_output(
             replacement="compressed content",
             additional_context="[tokenless:env] error info",
@@ -218,7 +218,7 @@ class TestBuildCoshNGPostToolOutput(unittest.TestCase):
         self.assertIn("hookSpecificOutput", output)
         specific = output["hookSpecificOutput"]
         self.assertEqual(specific["hookEventName"], "PostToolUse")
-        self.assertEqual(specific["replacement"], "compressed content")
+        self.assertEqual(specific["updated_tool_response"], "compressed content")
         self.assertEqual(specific["additionalContext"], "[tokenless:env] error info")
 
     def test_post_tool_output_no_replacement(self):
@@ -228,7 +228,7 @@ class TestBuildCoshNGPostToolOutput(unittest.TestCase):
             additional_context="env attribution",
         )
         specific = output["hookSpecificOutput"]
-        self.assertNotIn("replacement", specific)
+        self.assertNotIn("updated_tool_response", specific)
         self.assertEqual(specific["additionalContext"], "env attribution")
 
     def test_post_tool_output_no_additional_context(self):
@@ -238,7 +238,7 @@ class TestBuildCoshNGPostToolOutput(unittest.TestCase):
             additional_context=None,
         )
         specific = output["hookSpecificOutput"]
-        self.assertEqual(specific["replacement"], "compressed")
+        self.assertEqual(specific["updated_tool_response"], "compressed")
         self.assertNotIn("additionalContext", specific)
 
     def test_return_display_absent_from_post_output(self):
@@ -292,6 +292,11 @@ class TestVersionDetection(unittest.TestCase):
     def test_detect_version_unparseable(self):
         """Return None for unparseable version strings."""
         os.environ["COSH_NG_VERSION"] = "not-a-version"
+        self.assertIsNone(hook_utils.detect_cosh_ng_version())
+
+    def test_detect_version_whitespace_only(self):
+        """Return None for whitespace-only version strings."""
+        os.environ["COSH_NG_VERSION"] = "   \n\t  "
         self.assertIsNone(hook_utils.detect_cosh_ng_version())
 
     def test_supports_replacement_supported_version(self):
@@ -357,7 +362,7 @@ class TestCoshNGCompressResponseIntegration(unittest.TestCase):
         return json.loads(stdout)
 
     def test_cosh_ng_replacement_field_emitted(self):
-        """Cosh-NG path emits replacement with compressed llmContent."""
+        """Cosh-NG path emits updated_tool_response with compressed llmContent."""
         llm_content = _make_large_llm_content(500)
         stdin_data = {
             "tool_name": "Bash",
@@ -372,7 +377,7 @@ class TestCoshNGCompressResponseIntegration(unittest.TestCase):
         )
         specific = out.get("hookSpecificOutput", {})
         self.assertEqual(specific.get("hookEventName"), "PostToolUse")
-        self.assertIn("replacement", specific)
+        self.assertIn("updated_tool_response", specific)
         # returnDisplay must never leak into the replacement output.
         self.assertNotIn("returnDisplay", json.dumps(specific))
 
@@ -437,7 +442,7 @@ class TestCoshNGCompressResponseIntegration(unittest.TestCase):
             env_overrides={"COSH_NG_VERSION": "0.6.0"},
         )
         specific = out.get("hookSpecificOutput", {})
-        self.assertNotIn("replacement", specific)
+        self.assertNotIn("updated_tool_response", specific)
         self.assertIn("additionalContext", specific)
         self.assertIn("ENV_DEPENDENCY_MISSING", specific["additionalContext"])
 
@@ -455,7 +460,7 @@ class TestCoshNGCompressResponseIntegration(unittest.TestCase):
             env_overrides={"COSH_NG_VERSION": "0.6.0"},
         )
         specific = out.get("hookSpecificOutput", {})
-        self.assertIn("replacement", specific)
+        self.assertIn("updated_tool_response", specific)
 
 
 class TestCoshNGRewriteIntegration(unittest.TestCase):
@@ -527,7 +532,7 @@ class TestOutputFormat(unittest.TestCase):
         )
         serialized = json.dumps(output, ensure_ascii=False)
         reparsed = json.loads(serialized)
-        self.assertEqual(reparsed["hookSpecificOutput"]["replacement"], "test")
+        self.assertEqual(reparsed["hookSpecificOutput"]["updated_tool_response"], "test")
 
     def test_pre_tool_output_serializable(self):
         """Cosh-NG PreToolUse output is valid JSON."""

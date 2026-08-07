@@ -637,7 +637,7 @@ def build_cosh_ng_post_tool_output(
     """
     specific: dict = {"hookEventName": "PostToolUse"}
     if replacement is not None:
-        specific["replacement"] = replacement
+        specific["updated_tool_response"] = replacement
     if additional_context is not None:
         specific["additionalContext"] = additional_context
     return {"hookSpecificOutput": specific}
@@ -668,7 +668,7 @@ def detect_cosh_ng_version() -> tuple | None:
 
     Returns a (major, minor, patch) tuple or ``None`` if not set or unparseable.
     """
-    version_str = os.environ.get("COSH_NG_VERSION", "")
+    version_str = os.environ.get("COSH_NG_VERSION", "").strip()
     if not version_str:
         return None
     return parse_version(version_str)
