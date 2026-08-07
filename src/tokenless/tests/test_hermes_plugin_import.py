@@ -244,33 +244,115 @@ class VersionMismatchTest(unittest.TestCase):
         )
         self.assertEqual(result, "/usr/bin/rtk grep foo")
 
-    def test_degraded_mode_disables_compression_and_env_check(self):
-        # In degraded mode (_HOOK_UTILS_AVAILABLE=False), response compression,
-        # TOON encoding, and env-check must all be skipped — only RTK rewrite
-        # remains active (via local fallback).
+    def test_degraded_mode_guards_block_compression_and_env_check(self):
+        # In degraded mode, even when _have returns True (tokenless binary
+        # exists), the _HOOK_UTILS_AVAILABLE guard must prevent compression,
+        # TOON encoding, and env-check from running.  Previous test was weak
+        # because _have returned False in the test env, so the guard was
+        # never actually exercised.
         xdg = os.path.join(self.tmp, "xdg-data")
         self._make_old_hooks_dir(xdg)
         os.environ["XDG_DATA_HOME"] = xdg
-        plugin = _load_plugin(self.plugin_copy, "hermes_plugin_degraded")
+        plugin = _load_plugin(self.plugin_copy, "hermes_degraded_guards")
         self.assertFalse(plugin._HOOK_UTILS_AVAILABLE)
-        # on_transform_tool_result must return None in degraded mode
-        result = plugin.on_transform_tool_result(
-            tool_name="Bash",
-            result='{"output": "hello world"}',
-            session_id="test-session",
-            tool_call_id="test-call",
-        )
-        self.assertIsNone(result)
-        # on_pre_tool_call env-check step must be skipped (returns None or
-        # only RTK rewrite if rtk is available)
-        pre_result = plugin.on_pre_tool_call(
-            tool_name="Read",
-            args={"file_path": "/tmp/test"},
-            session_id="test-session",
-            tool_call_id="test-call",
-        )
-        # Read tool has no RTK rewrite; env-check must not fire
-        self.assertIsNone(pre_result)
+
+        # Mock _have to return True — simulates tokenless binary being installed
+        original_have = plugin._have
+        plugin._have = lambda *a, **kw: True
+        try:
+            # on_transform_tool_result: must return None despite _have being True
+            # Use a payload > _MIN_RESPONSE_LEN (200) to prove the guard fires,
+            # not the length check.
+            big_result = '{"output": "' + "x" * 300 + '"}'
+            self.assertGreater(len(big_result), 200)
+            result = plugin.on_transform_tool_result(
+                tool_name="Bash",
+                result=big_result,
+                session_id="test-session",
+                tool_call_id="test-call",
+            )
+            self.assertIsNone(result, "degraded mode must skip compression even when _have is True")
+
+            # on_pre_tool_call: env-check must be skipped for non-shell tools
+            pre_result = plugin.on_pre_tool_call(
+                tool_name="Read",
+                args={"file_path": "/tmp/test"},
+                session_id="test-session",
+                tool_call_id="test-call",
+            )
+            self.assertIsNone(pre_result, "degraded mode must skip env-check even when _have is True")
+        finally:
+            plugin._have = original_have
+
+    def test_degraded_mode_parse_version_handles_program_prefix(self):
+        # _parse_version must use re.search (not re.match) so "rtk 0.34.0"
+        # is parsed correctly — the shared parse_version has search semantics.
+        xdg = os.path.join(self.tmp, "xdg-data")
+        self._make_old_hooks_dir(xdg)
+        os.environ["XDG_DATA_HOME"] = xdg
+        plugin = _load_plugin(self.plugin_copy, "hermes_degraded_ver")
+        self.assertFalse(plugin._HOOK_UTILS_AVAILABLE)
+        # "rtk 0.34.0" has a program name prefix — re.match would fail
+        self.assertEqual(plugin._parse_version("rtk 0.34.0"), (0, 34, 0))
+        self.assertEqual(plugin._parse_version("rtk 0.43.0"), (0, 43, 0))
+        # Pure version string still works
+        self.assertEqual(plugin._parse_version("0.35.0"), (0, 35, 0))
+        # Old version must be below the minimum
+        ver = plugin._parse_version("rtk 0.34.0")
+        self.assertIsNotNone(ver)
+        self.assertLess(ver, plugin._MIN_RTK_VERSION)
+
+    def test_degraded_mode_resolve_binary_finds_libexec_rtk(self):
+        # In degraded mode, resolve_binary must find RTK in libexec install
+        # paths even when PATH is empty — the local fallback must cover the
+        # same paths as the shared _known_binary_paths.
+        xdg = os.path.join(self.tmp, "xdg-data")
+        self._make_old_hooks_dir(xdg)
+        os.environ["XDG_DATA_HOME"] = xdg
+        plugin = _load_plugin(self.plugin_copy, "hermes_degraded_resolve")
+        self.assertFalse(plugin._HOOK_UTILS_AVAILABLE)
+
+        # Use a unique name that won't exist on the real system
+        fake_name = "_test_rtk_degraded_" + str(os.getpid())
+
+        # Create a fake binary in a libexec-like path
+        libexec_dir = os.path.join(self.tmp, "libexec", "anolisa", "tokenless")
+        os.makedirs(libexec_dir)
+        fake_rtk = os.path.join(libexec_dir, fake_name)
+        with open(fake_rtk, "w") as f:
+            f.write("#!/bin/sh\necho rtk 0.43.0\n")
+        os.chmod(fake_rtk, 0o755)
+
+        # Mock shutil.which to return None (simulate binary not in PATH)
+        import shutil as _shutil_mod
+        original_which = _shutil_mod.which
+        _shutil_mod.which = lambda name, path=None: None
+        try:
+            # With which returning None and no known paths matching our
+            # unique name, resolve_binary should find the explicit fallback
+            found = plugin.resolve_binary(fake_name, fake_rtk)
+            self.assertEqual(found, fake_rtk)
+
+            # Verify known paths are checked even without explicit fallbacks:
+            # create the binary in ~/.local/libexec/anolisa/tokenless/
+            home = os.path.expanduser("~")
+            local_libexec = os.path.join(
+                home, ".local", "libexec", "anolisa", "tokenless",
+            )
+            os.makedirs(local_libexec, exist_ok=True)
+            local_rtk = os.path.join(local_libexec, fake_name)
+            try:
+                with open(local_rtk, "w") as f:
+                    f.write("#!/bin/sh\necho rtk 0.43.0\n")
+                os.chmod(local_rtk, 0o755)
+                # Should find it in ~/.local/libexec without explicit fallback
+                found2 = plugin.resolve_binary(fake_name)
+                self.assertEqual(found2, local_rtk)
+            finally:
+                if os.path.exists(local_rtk):
+                    os.unlink(local_rtk)
+        finally:
+            _shutil_mod.which = original_which
 
 
 if __name__ == "__main__":

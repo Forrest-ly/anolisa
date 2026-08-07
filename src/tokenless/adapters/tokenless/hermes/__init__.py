@@ -220,11 +220,19 @@ except ImportError:
     _HOOK_UTILS_CANDIDATES = []
 
     _TOKENLESS_FALLBACK = "/usr/libexec/anolisa/tokenless/tokenless"
-    _TOKENLESS_LOCAL_SHARE = ""
-    _TOKENLESS_LOCAL_LIB = ""
+    _TOKENLESS_LOCAL_SHARE = os.path.join(
+        os.path.expanduser("~"), ".local", "libexec", "anolisa", "tokenless", "tokenless",
+    )
+    _TOKENLESS_LOCAL_LIB = os.path.join(
+        os.path.expanduser("~"), ".local", "lib", "anolisa", "libexec", "tokenless", "tokenless",
+    )
     _RTK_FALLBACK = "/usr/libexec/anolisa/tokenless/rtk"
-    _RTK_LOCAL_SHARE = ""
-    _RTK_LOCAL_LIB = ""
+    _RTK_LOCAL_SHARE = os.path.join(
+        os.path.expanduser("~"), ".local", "libexec", "anolisa", "tokenless", "rtk",
+    )
+    _RTK_LOCAL_LIB = os.path.join(
+        os.path.expanduser("~"), ".local", "lib", "anolisa", "libexec", "tokenless", "rtk",
+    )
 
     # Minimal fallbacks — the plugin gracefully skips features that
     # require shared utilities (compression, TOON, env-check, skill-file
@@ -236,9 +244,19 @@ except ImportError:
         found = shutil.which(name)
         if found:
             return found
-        for fb in fallbacks:
-            if fb and os.path.isfile(fb) and os.access(fb, os.X_OK):
-                return fb
+        home = os.path.expanduser("~")
+        known = [
+            os.path.join(home, ".local", "bin", name),
+            os.path.join(home, ".local", "lib", "anolisa", "libexec", "tokenless", name),
+            os.path.join(home, ".local", "libexec", "anolisa", "tokenless", name),
+            os.path.join("/usr/local/libexec/anolisa/tokenless", name),
+            os.path.join("/usr/local/bin", name),
+            os.path.join("/usr/libexec/anolisa/tokenless", name),
+            os.path.join("/usr/lib/anolisa/tokenless", name),
+        ]
+        for path in (*known, *fallbacks):
+            if path and os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
         return None
 
     def _warn_shared(msg: str) -> None:  # type: ignore[misc]
@@ -276,7 +294,7 @@ except ImportError:
     import re as _re
 
     def _parse_version(version_str: str) -> tuple[int, ...] | None:  # type: ignore[misc]
-        m = _re.match(r"(\d+)\.(\d+)\.(\d+)", version_str)
+        m = _re.search(r"(\d+)\.(\d+)\.(\d+)", version_str)
         if not m:
             return None
         return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
