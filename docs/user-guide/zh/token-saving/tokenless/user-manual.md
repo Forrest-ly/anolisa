@@ -161,7 +161,7 @@ Stash 并不能让所有压缩都可逆。被移除的 `debug`/`trace` 字段、
 | 我想做什么 | 文档 |
 |------------|------|
 | 第一次安装并验证 | [快速开始](QUICKSTART.md) |
-| 使用 npm、curl 或 Skill 安装 | [快速开始 · 安装 Tokenless](QUICKSTART.md#2-安装-tokenless) |
+| 使用 npm、curl 或 Skill 安装 | [快速开始 · 安装 Tokenless](QUICKSTART.md#安装-tokenless) |
 | 从源码构建独立 CLI | [本页 · 从源码构建独立 CLI](#从源码构建独立-cli) |
 | 从源码构建进程内 Python Runtime | [本页 · 从源码构建 Python Runtime](#从源码构建-python-runtime) |
 | 接入 Agent 产品或集成 AgentScope | [Agent 与框架集成](framework-integration.md) |

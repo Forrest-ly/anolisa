@@ -163,7 +163,7 @@ Command rewriting also changes the shell command submitted by the host. Most ada
 | I want to | Document |
 |-----------|----------|
 | Install and verify for the first time | [Quick Start](QUICKSTART.md) |
-| Install via npm, curl, or Skill | [Quick Start · Install Tokenless](QUICKSTART.md#2-install-tokenless) |
+| Install via npm, curl, or Skill | [Quick Start · Install Tokenless](QUICKSTART.md#install-tokenless) |
 | Build the standalone CLI from source | [This page · Build the standalone CLI from source](#build-the-standalone-cli-from-source) |
 | Build the in-process Python runtime | [This page · Build the Python runtime from source](#build-the-python-runtime-from-source) |
 | Connect an Agent product or integrate AgentScope | [Agent and framework integration](framework-integration.md) |
