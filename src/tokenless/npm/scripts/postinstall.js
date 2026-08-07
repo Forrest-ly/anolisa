@@ -189,17 +189,32 @@ function enableClaudeAdapter(adapterDir) {
     return;
   }
 
+  const claudeBin = process.env.CLAUDE_BIN || 'claude';
   try {
-    execFileSync('bash', [installScript], {
-      env: { ...process.env, CLAUDE_BIN: process.env.CLAUDE_BIN || 'claude' },
+    const out = execFileSync('bash', [installScript], {
+      env: { ...process.env, CLAUDE_BIN: claudeBin },
       stdio: 'pipe',
-    });
-    console.log('anolisa-tokenless: Enabled claude-code adapter');
+    }).toString();
+    // install.sh exits 0 but prints a "skipping" line when claude CLI is absent.
+    if (out.includes('skipping plugin installation')) {
+      console.log(
+        `anolisa-tokenless: claude-code adapter skipped (${claudeBin} not found)`,
+      );
+      console.log(
+        `anolisa-tokenless: Install Claude Code, then run: bash ${installScript}`,
+      );
+    } else {
+      console.log(`anolisa-tokenless: Enabled claude-code adapter (CLAUDE_BIN=${claudeBin})`);
+    }
   } catch (err) {
     console.warn(
       `anolisa-tokenless: Could not enable claude-code adapter: ${err.message}`,
     );
-    console.warn('anolisa-tokenless: You can enable it later by running:');
+    console.warn(
+      `anolisa-tokenless: Prerequisite: the claude CLI must be installed and reachable` +
+      ` (CLAUDE_BIN=${claudeBin}).`,
+    );
+    console.warn('anolisa-tokenless: Once the prerequisite is met, re-enable with:');
     console.warn(`  bash ${installScript}`);
   }
 }
