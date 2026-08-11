@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -582,3 +583,59 @@ def parse_version(version_str: str) -> tuple | None:
     if m:
         return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
     return None
+
+
+# -- RTK command anchoring ----------------------------------------------------
+#
+# Shell connectives that terminate a command-list / pipeline segment.
+# A bare `rtk` wrapper can appear at command start or right after one.
+_RTK_SEGMENT_OPS: frozenset[str] = frozenset({"&&", "||", ";", "|", "&"})
+
+
+def _is_rtk_env_assignment(token: str) -> bool:
+    """Return True for a leading shell variable assignment (NAME=value)."""
+    name, sep, _ = token.partition("=")
+    if not sep or not name:
+        return False
+    if not (name[0].isalpha() or name[0] == "_"):
+        return False
+    return all(c.isalnum() or c == "_" for c in name)
+
+
+def anchor_rtk_prefix(rewritten: str, rtk_bin: str) -> str:
+    """Replace bare ``rtk`` wrapper tokens with the resolved binary path.
+
+    rtk prints rewrites with a literal ``rtk`` prefix, which only resolves
+    when the shell executing the tool call has the rtk location on its
+    PATH. Agent runtimes with a trimmed PATH (e.g. IDE tool environments
+    without ``~/.local/bin``) would fail every rewritten command with exit
+    127 even though the hook resolved rtk successfully. Anchoring makes
+    the rewritten command self-contained.
+
+    The pass swaps the first unquoted ``rtk`` token of each segment — at
+    command start or right after ``&&`` / ``||`` / ``;`` / ``|`` / ``&``,
+    optionally behind leading environment assignments or wrappers such
+    as ``sudo``. Unparseable input is returned untouched.
+    """
+    lexer = shlex.shlex(rewritten, posix=False)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return rewritten
+
+    quoted = shlex.quote(rtk_bin)
+    result = list(tokens)
+    wrapped = False
+    for i, token in enumerate(tokens):
+        if token in _RTK_SEGMENT_OPS:
+            wrapped = False
+            continue
+        if _is_rtk_env_assignment(token):
+            continue
+        if not wrapped and token == "rtk":
+            result[i] = quoted
+            wrapped = True
+
+    return " ".join(result)

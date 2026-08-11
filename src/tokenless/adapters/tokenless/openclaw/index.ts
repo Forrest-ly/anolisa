@@ -222,6 +222,79 @@ function checkTokenless(): boolean {
 
 // ---- Subprocess helpers -------------------------------------------------------
 
+// Shell connectives that delimit command-list segments.
+const _RTK_SEGMENT_OPS = new Set(["&&", "||", ";", "|", "&"]);
+
+function _isEnvAssignment(token: string): boolean {
+  const eq = token.indexOf("=");
+  if (eq <= 0) return false;
+  const name = token.slice(0, eq);
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
+}
+
+/**
+ * Tokenize a shell command string into words, treating quoted spans as atomic
+ * tokens (non-POSIX mode — quotes are preserved in the output, matching
+ * Python shlex(posix=False) with whitespace_split=True).  Returns null when
+ * an unterminated quote is detected so callers can bail out safely.
+ */
+function _shellTokenize(s: string): string[] | null {
+  const tokens: string[] = [];
+  let i = 0;
+  while (i < s.length) {
+    // skip inter-token whitespace
+    while (i < s.length && /\s/.test(s[i])) i++;
+    if (i >= s.length) break;
+    let tok = "";
+    while (i < s.length && !/\s/.test(s[i])) {
+      const ch = s[i];
+      if (ch === "'" || ch === '"') {
+        const close = s.indexOf(ch, i + 1);
+        if (close === -1) return null; // unterminated quote
+        tok += s.slice(i, close + 1);
+        i = close + 1;
+      } else {
+        tok += ch;
+        i++;
+      }
+    }
+    if (tok.length > 0) tokens.push(tok);
+  }
+  return tokens;
+}
+
+/** Replace bare ``rtk`` prefix tokens with the resolved binary path.
+ *
+ * Mirrors Python ``anchor_rtk_prefix`` in hook_utils.py. Prevents exit-127
+ * failures when the agent tool shell PATH lacks the rtk install location.
+ * Uses shell-aware tokenization so quoted arguments containing connectives or
+ * the word ``rtk`` are never modified.
+ */
+function anchorRtkPrefix(rewritten: string, resolvedRtkPath: string): string {
+  const tokens = _shellTokenize(rewritten);
+  if (tokens === null) return rewritten; // unterminated quote — return untouched
+  let wrapped = false;
+  const result: string[] = [];
+  for (const token of tokens) {
+    if (_RTK_SEGMENT_OPS.has(token)) {
+      wrapped = false;
+      result.push(token);
+      continue;
+    }
+    if (_isEnvAssignment(token)) {
+      result.push(token);
+      continue;
+    }
+    if (!wrapped && token === "rtk") {
+      result.push(resolvedRtkPath.includes(" ") ? `'${resolvedRtkPath}'` : resolvedRtkPath);
+      wrapped = true;
+      continue;
+    }
+    result.push(token);
+  }
+  return result.join(" ");
+}
+
 function tryRtkRewrite(command: string, context: TokenlessCallContext): string | null {
   try {
     const result = spawnSync(rtkPath, ["rewrite", command], {
@@ -239,7 +312,7 @@ function tryRtkRewrite(command: string, context: TokenlessCallContext): string |
     //       user confirmation; in non-interactive hook context, treat as valid
     //       rewrite since the intent is token optimization, not permission gating)
     if ((result.status === 0 || result.status === 3) && rewritten && rewritten !== command) {
-      return rewritten;
+      return anchorRtkPrefix(rewritten, rtkPath);
     }
     return null;
   } catch {
