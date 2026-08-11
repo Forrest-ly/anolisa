@@ -26,16 +26,31 @@ pub fn parse_marker(s: &str) -> Option<&str> {
     Some(inner)
 }
 
-/// Extract the first marker's hash from arbitrary text. Useful when the LLM
-/// quotes a whole truncation line such as
+/// Extract the first valid marker's hash from arbitrary text. Useful when the
+/// LLM quotes a whole truncation line such as
 /// `<... 12 items truncated, retrieve with <<tokenless:abcd…>>`.
+/// Skips malformed markers (e.g. wrong hash length) and keeps scanning until
+/// a valid one is found.
 pub fn extract_hash(text: &str) -> Option<&str> {
-    let start = text.find(MARKER_PREFIX)?;
-    let rest = &text[start + MARKER_PREFIX.len()..];
-    let end = rest.find(MARKER_SUFFIX)?;
-    let hash = &rest[..end];
-    validate_hash(hash)?;
-    Some(hash)
+    let mut remaining = text;
+    while let Some(start) = remaining.find(MARKER_PREFIX) {
+        let after_prefix = &remaining[start + MARKER_PREFIX.len()..];
+        let Some(end) = after_prefix.find(MARKER_SUFFIX) else {
+            // No closing suffix from this prefix — skip past the prefix and
+            // keep scanning so a later complete marker can still be found.
+            remaining = after_prefix;
+            continue;
+        };
+        let hash = &after_prefix[..end];
+        if is_valid_hash(hash) {
+            return Some(hash);
+        }
+        // Invalid hash — advance past this prefix only (not past the suffix)
+        // so that a valid marker nested inside the malformed span is not
+        // dropped, e.g. `<<tokenless:abc <<tokenless:valid_hash>>`.
+        remaining = after_prefix;
+    }
+    None
 }
 
 /// Whether `hash` is a valid stash key: exactly 24 ASCII hex characters
@@ -120,5 +135,49 @@ mod tests {
         let text =
             "<<tokenless:000000000000000000000000>> then <<tokenless:111111111111111111111111>>";
         assert_eq!(extract_hash(text), Some("000000000000000000000000"));
+    }
+
+    #[test]
+    fn extract_hash_skips_malformed_before_valid() {
+        // Malformed marker (too short) followed by a valid one.
+        assert_eq!(
+            extract_hash("see <<tokenless:abc>> then <<tokenless:0123456789abcdef01234567>>"),
+            Some("0123456789abcdef01234567"),
+        );
+        // Malformed (non-hex) followed by a valid one.
+        assert_eq!(
+            extract_hash(
+                "<<tokenless:ZZZZZZZZZZZZZZZZZZZZZZZZ>> <<tokenless:aabbccdd11223344aabbccdd>>"
+            ),
+            Some("aabbccdd11223344aabbccdd"),
+        );
+        // Multiple malformed before a valid one.
+        assert_eq!(
+            extract_hash("<<tokenless:x>> <<tokenless:yy>> <<tokenless:0123456789abcdef01234567>>"),
+            Some("0123456789abcdef01234567"),
+        );
+        // Only malformed markers — still None.
+        assert_eq!(extract_hash("<<tokenless:abc>> <<tokenless:def>>"), None);
+    }
+
+    #[test]
+    fn extract_hash_nested_marker_in_malformed_span() {
+        // A stray prefix whose content happens to contain a valid marker.
+        // The valid marker must be found even though the outer span is malformed.
+        assert_eq!(
+            extract_hash("<<tokenless:abc <<tokenless:0123456789abcdef01234567>>"),
+            Some("0123456789abcdef01234567"),
+        );
+    }
+
+    #[test]
+    fn extract_hash_missing_suffix_skips_to_later_marker() {
+        // First prefix has no closing suffix, but a complete marker follows.
+        assert_eq!(
+            extract_hash("<<tokenless: no suffix <<tokenless:0123456789abcdef01234567>>"),
+            Some("0123456789abcdef01234567"),
+        );
+        // Unclosed prefix with no later marker — still None.
+        assert_eq!(extract_hash("<<tokenless: no suffix at all"), None);
     }
 }
