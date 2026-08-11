@@ -1579,3 +1579,70 @@ fn normalize_dep_with_fallback() {
     assert_eq!(dep.fallback.len(), 1);
     assert_eq!(dep.fallback[0].binary.as_deref(), Some("rtk-fallback"));
 }
+
+#[test]
+fn generate_checklist_json_structure() {
+    let results = vec![
+        ToolReadyResult {
+            tool_name: "ReadyTool".to_string(),
+            status: ReadyStatus::Ready,
+            required_results: vec![(make_dep("sh"), DepStatus::Available)],
+            recommended_results: vec![],
+            config_results: vec![],
+            permission_results: vec![("file_read".to_string(), true)],
+            network_results: vec![],
+        },
+        ToolReadyResult {
+            tool_name: "BrokenTool".to_string(),
+            status: ReadyStatus::NotReady,
+            required_results: vec![(make_dep("missing"), DepStatus::Missing)],
+            recommended_results: vec![],
+            config_results: vec![("~/.config".to_string(), false)],
+            permission_results: vec![],
+            network_results: vec![("https_outbound".to_string(), false)],
+        },
+    ];
+    let json = generate_checklist_json(&results);
+    let tools = json["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0]["tool"], "ReadyTool");
+    assert_eq!(tools[0]["status"], "READY");
+    assert_eq!(tools[0]["required"][0]["binary"], "sh");
+    assert_eq!(tools[0]["required"][0]["status"], "INSTALLED");
+    assert_eq!(tools[0]["permissions"][0]["name"], "file_read");
+    assert_eq!(tools[0]["permissions"][0]["status"], "GRANTED");
+    assert_eq!(tools[1]["tool"], "BrokenTool");
+    assert_eq!(tools[1]["status"], "NOT_READY");
+    assert_eq!(tools[1]["required"][0]["status"], "MISSING");
+    assert_eq!(tools[1]["config"][0]["status"], "MISSING");
+    assert_eq!(tools[1]["network"][0]["status"], "MISSING");
+    let summary = &json["summary"];
+    assert_eq!(summary["ready"], 1);
+    assert_eq!(summary["not_ready"], 1);
+    assert_eq!(summary["total"], 2);
+}
+
+#[test]
+fn generate_checklist_json_unknown_count() {
+    let results = vec![ToolReadyResult {
+        tool_name: "UnknownTool".to_string(),
+        status: ReadyStatus::Unknown,
+        required_results: vec![],
+        recommended_results: vec![],
+        config_results: vec![],
+        permission_results: vec![],
+        network_results: vec![],
+    }];
+    let json = generate_checklist_json(&results);
+    assert_eq!(json["summary"]["unknown"], 1);
+    assert_eq!(json["summary"]["total"], 1);
+    assert_eq!(json["tools"][0]["status"], "UNKNOWN");
+}
+
+#[test]
+fn run_checklist_json_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = write_test_spec(dir.path());
+    let _guard = EnvGuard::set_spec(spec_path.to_str().unwrap());
+    assert!(run(None, false, false, true, true).is_ok());
+}

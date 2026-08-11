@@ -6,7 +6,7 @@
 //! permissions, and network connectivity. Generates a structured
 //! ready checklist and supports auto-fix via config-driven install engine.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -937,6 +937,87 @@ fn generate_checklist(results: &[ToolReadyResult]) -> String {
     output
 }
 
+/// Build a JSON checklist mirroring [`generate_checklist`]'s text layout: a
+/// `tools` array (each with status, required/recommended deps, config,
+/// permissions, network) and a `summary` object with per-status counts.
+fn generate_checklist_json(results: &[ToolReadyResult]) -> Value {
+    let tools: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            let required: Vec<Value> = r
+                .required_results
+                .iter()
+                .map(|(dep, status)| {
+                    json!({"binary": dep.binary, "status": format_dep_status_label(status)})
+                })
+                .collect();
+            let recommended: Vec<Value> = r
+                .recommended_results
+                .iter()
+                .map(|(dep, status)| {
+                    json!({"binary": dep.binary, "status": format_dep_status_label(status)})
+                })
+                .collect();
+            let config: Vec<Value> = r
+                .config_results
+                .iter()
+                .map(|(cfg, ok)| {
+                    json!({"path": cfg, "status": if *ok { "INSTALLED" } else { "MISSING" }})
+                })
+                .collect();
+            let permissions: Vec<Value> = r
+                .permission_results
+                .iter()
+                .map(|(perm, ok)| {
+                    json!({"name": perm, "status": if *ok { "GRANTED" } else { "DENIED" }})
+                })
+                .collect();
+            let network: Vec<Value> = r
+                .network_results
+                .iter()
+                .map(|(net, ok)| json!({"name": net, "status": if *ok { "OK" } else { "MISSING" }}))
+                .collect();
+            json!({
+                "tool": r.tool_name,
+                "status": format_status(&r.status),
+                "required": required,
+                "recommended": recommended,
+                "config": config,
+                "permissions": permissions,
+                "network": network,
+            })
+        })
+        .collect();
+
+    let ready_count = results
+        .iter()
+        .filter(|r| r.status == ReadyStatus::Ready)
+        .count();
+    let partial_count = results
+        .iter()
+        .filter(|r| r.status == ReadyStatus::Partial)
+        .count();
+    let not_ready_count = results
+        .iter()
+        .filter(|r| r.status == ReadyStatus::NotReady)
+        .count();
+    let unknown_count = results
+        .iter()
+        .filter(|r| r.status == ReadyStatus::Unknown)
+        .count();
+
+    let mut summary = serde_json::Map::new();
+    summary.insert("ready".to_string(), Value::from(ready_count));
+    summary.insert("partial".to_string(), Value::from(partial_count));
+    summary.insert("not_ready".to_string(), Value::from(not_ready_count));
+    if unknown_count > 0 {
+        summary.insert("unknown".to_string(), Value::from(unknown_count));
+    }
+    summary.insert("total".to_string(), Value::from(results.len()));
+
+    json!({"tools": tools, "summary": Value::Object(summary)})
+}
+
 /// Build the ordered candidate list for `auto_fix`.
 ///
 /// Order mirrors `spec_path_candidates`: env override → user dot-dir →
@@ -1202,7 +1283,14 @@ pub fn run(
             .keys()
             .map(|name| check_tool(name, specs.get(name).unwrap()))
             .collect();
-        println!("{}", generate_checklist(&results));
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string(&generate_checklist_json(&results)).unwrap()
+            );
+        } else {
+            println!("{}", generate_checklist(&results));
+        }
         return Ok(());
     }
 
