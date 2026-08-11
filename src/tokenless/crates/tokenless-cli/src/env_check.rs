@@ -1010,9 +1010,7 @@ fn generate_checklist_json(results: &[ToolReadyResult]) -> Value {
     summary.insert("ready".to_string(), Value::from(ready_count));
     summary.insert("partial".to_string(), Value::from(partial_count));
     summary.insert("not_ready".to_string(), Value::from(not_ready_count));
-    if unknown_count > 0 {
-        summary.insert("unknown".to_string(), Value::from(unknown_count));
-    }
+    summary.insert("unknown".to_string(), Value::from(unknown_count));
     summary.insert("total".to_string(), Value::from(results.len()));
 
     json!({"tools": tools, "summary": Value::Object(summary)})
