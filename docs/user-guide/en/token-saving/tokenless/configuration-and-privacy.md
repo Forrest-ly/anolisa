@@ -14,8 +14,6 @@ Environment variable > ~/.tokenless/config.json > default
 
 An empty environment variable is treated as unset. For Boolean environment variables, `1`, `true`, and `yes` are true, case-insensitively; any other non-empty value is false. Prefer explicit `true` or `false` values for readability.
 
-There is one current implementation exception: when both `TOKENLESS_STATS_ENABLED` and `TOKENLESS_SLS_ENABLED` are non-empty, the config file is skipped completely. In that branch, compression uses `TOKENLESS_COMPRESSION_ENABLED` when set and otherwise defaults to `true`. If you export both recording variables, export the compression variable explicitly as well.
-
 ## Configuration file
 
 Configuration path:

@@ -168,7 +168,7 @@ fn test_compression_empty_env_treated_as_unset() {
 
 #[test]
 fn test_stats_sls_envs_do_not_bypass_compression_file_config() {
-    // GH-2362: setting both stats and sls env vars must not silently reset
+    // Setting both stats and sls env vars must not silently reset
     // compression_enabled to the default (true); it must still honor the
     // config file value when compression_env is unset.
     let dir = tempfile::tempdir().unwrap();
@@ -202,6 +202,26 @@ fn test_stats_sls_envs_compression_env_still_wins() {
         Some(&path),
     );
     assert!(config.is_compression_enabled());
+}
+
+#[test]
+fn test_stats_sls_envs_missing_config_uses_defaults() {
+    // When config.json is absent and stats/sls envs are set,
+    // compression should still default to true (no config file to read from).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let config = TokenlessConfig::load_with_envs_and_path(
+        Some("true"),
+        Some("true"),
+        None,
+        Some(&path),
+    );
+    assert!(config.is_stats_enabled());
+    assert!(config.is_sls_enabled());
+    assert!(
+        config.is_compression_enabled(),
+        "missing config.json should yield all-true defaults for compression"
+    );
 }
 
 #[test]

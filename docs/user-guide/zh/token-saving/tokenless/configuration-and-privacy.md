@@ -14,8 +14,6 @@ Tokenless 默认启用压缩、本地统计和 SLS 度量。由于本地统计�
 
 空环境变量视为未设置。布尔环境变量中，`1`、`true`、`yes`（大小写不敏感）表示 true；其他非空值表示 false。为了可读性，建议明确使用 `true` 或 `false`。
 
-当前实现有一个例外：当 `TOKENLESS_STATS_ENABLED` 和 `TOKENLESS_SLS_ENABLED` 都是非空值时，代码会完全跳过配置文件。在这个分支中，压缩开关优先使用 `TOKENLESS_COMPRESSION_ENABLED`；未设置时直接默认为 `true`。如果同时导出两个记录开关，也应显式导出压缩开关。
-
 ## 配置文件
 
 配置路径：
