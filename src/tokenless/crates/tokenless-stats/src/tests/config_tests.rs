@@ -167,6 +167,44 @@ fn test_compression_empty_env_treated_as_unset() {
 }
 
 #[test]
+fn test_stats_sls_envs_do_not_bypass_compression_file_config() {
+    // GH-2362: setting both stats and sls env vars must not silently reset
+    // compression_enabled to the default (true); it must still honor the
+    // config file value when compression_env is unset.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let _ = std::fs::write(&path, "{\"compression_enabled\":false}");
+    let config = TokenlessConfig::load_with_envs_and_path(
+        Some("true"),
+        Some("true"),
+        None,
+        Some(&path),
+    );
+    assert!(config.is_stats_enabled());
+    assert!(config.is_sls_enabled());
+    assert!(
+        !config.is_compression_enabled(),
+        "compression_enabled should honor config.json (false), not default to true"
+    );
+}
+
+#[test]
+fn test_stats_sls_envs_compression_env_still_wins() {
+    // In the same stats+sls scenario, an explicit compression_env override
+    // still takes priority over the config file value.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let _ = std::fs::write(&path, "{\"compression_enabled\":false}");
+    let config = TokenlessConfig::load_with_envs_and_path(
+        Some("true"),
+        Some("true"),
+        Some("1"),
+        Some(&path),
+    );
+    assert!(config.is_compression_enabled());
+}
+
+#[test]
 fn test_parse_env_bool_yes_variant() {
     let config = TokenlessConfig::load_with_env(Some("yes"));
     assert!(config.is_stats_enabled());

@@ -70,8 +70,6 @@ impl TokenlessConfig {
     /// Load config with explicit env overrides for all toggles and optional custom path.
     /// Priority (per toggle): env > config.json file > default
     /// Empty env var values are normalized to None (treated as unset).
-    /// When stats and sls envs are both set, skips the config file read entirely
-    /// (compression still defaults to true unless its own env is set).
     pub fn load_with_envs_and_path(
         stats_env: Option<&str>,
         sls_env: Option<&str>,
@@ -82,17 +80,6 @@ impl TokenlessConfig {
         let stats_env = stats_env.filter(|v| !v.is_empty());
         let sls_env = sls_env.filter(|v| !v.is_empty());
         let compression_env = compression_env.filter(|v| !v.is_empty());
-
-        // When both stats and sls env vars are set, skip the file read entirely.
-        // This avoids unnecessary I/O when the config file is on a slow
-        // or unavailable filesystem (e.g. broken NFS mount).
-        if let (Some(stats_val), Some(sls_val)) = (stats_env, sls_env) {
-            return Self {
-                stats_enabled: parse_env_bool(stats_val),
-                sls_enabled: parse_env_bool(sls_val),
-                compression_enabled: compression_env.map(parse_env_bool).unwrap_or(true),
-            };
-        }
 
         let default_path = Self::config_path();
         let config_path = path.unwrap_or(&default_path);
