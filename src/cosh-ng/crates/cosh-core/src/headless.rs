@@ -6,18 +6,31 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::cli::CliArgs;
 use crate::compaction::{ContextBudget, ModelCapability};
 use crate::config::CoreConfig;
-use crate::core::CoshCore;
+use crate::core::{AgentTurnOutcome, CoshCore};
 use crate::extension::{ExtensionManager, RuntimeSnapshotBuilder};
 use crate::metrics::TurnMetrics;
 use crate::protocol::{InputMessage, OutputMessage, ShellControlRequest};
 use crate::session::{PersistedSession, ProviderSessionId, SessionError, SessionStore};
 use crate::sls;
+use crate::tool::SessionWorkspace;
 
 mod auth;
 
 use auth::request_auth;
 
-pub async fn run(args: &CliArgs, mut config: CoreConfig) -> Result<i32, String> {
+/// Exit code for a session that lost the JSONL control transport.
+///
+/// The Shell owns recovery: it already replaces a missing terminal result when
+/// the child exits non-zero, and stderr carries the reason. Staying alive on a
+/// transport we cannot write to would only reproduce the #1994 hang.
+const EXIT_CONTROL_TRANSPORT_FAILURE: i32 = 74;
+
+pub async fn run(
+    args: &CliArgs,
+    mut config: CoreConfig,
+    project_root: PathBuf,
+    workspace: SessionWorkspace,
+) -> Result<i32, String> {
     apply_cli_overrides(args, &mut config);
 
     let stdout = io::stdout();
@@ -32,7 +45,10 @@ pub async fn run(args: &CliArgs, mut config: CoreConfig) -> Result<i32, String> 
 
     // Build and validate the complete runtime before authentication so invalid
     // tool selections fail without entering the interactive auth protocol.
-    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // Use the workspace passed from the shell host (e.g. cosh-shell) so tools
+    // such as MCP filesystem servers resolve the user's project root, not the
+    // cosh-core process cwd. The helper absolutizes relative paths and treats
+    // empty --workspace "" as missing.
     let mut ext_manager = ExtensionManager::new(project_root.clone());
     if !args.bare {
         ext_manager.refresh();
@@ -43,13 +59,17 @@ pub async fn run(args: &CliArgs, mut config: CoreConfig) -> Result<i32, String> 
             1
         },
     );
-    let snapshot =
-        RuntimeSnapshotBuilder::new(&mut ext_manager, &config, project_root, generation_id)
-            .with_shell_evidence(args.enable_shell_evidence_tool)
-            .with_skill_loading(!args.bare)
-            .with_tool_selection(args.tools.as_deref())
-            .build()
-            .await;
+    let snapshot = RuntimeSnapshotBuilder::new(
+        &mut ext_manager,
+        &config,
+        project_root.clone(),
+        generation_id,
+    )
+    .with_shell_evidence(args.enable_shell_evidence_tool)
+    .with_skill_loading(!args.bare)
+    .with_tool_selection(args.tools.as_deref())
+    .build()
+    .await;
     if let Some(diagnostic) = snapshot
         .diagnostics
         .iter()
@@ -107,6 +127,8 @@ pub async fn run(args: &CliArgs, mut config: CoreConfig) -> Result<i32, String> 
         provider,
         snapshot,
         session.record.session_id.to_string(),
+        project_root,
+        workspace,
     );
     let live_extension_runtime = crate::registry::LiveExtensionRuntime::new(
         engine.extension_generation.clone(),
@@ -150,6 +172,7 @@ pub async fn run(args: &CliArgs, mut config: CoreConfig) -> Result<i32, String> 
                     result: Some("completed".to_string()),
                     errors: None,
                     error_code: None,
+                    max_turns: None,
                     session_error_code: None,
                     session_error_phase: None,
                     session_id: Some(engine.session_id.clone()),
@@ -165,8 +188,13 @@ pub async fn run(args: &CliArgs, mut config: CoreConfig) -> Result<i32, String> 
                 engine.emit(&mut writer, &err_msg);
             }
         }
+        let transport_failed = engine.control_transport_failure().is_some();
         engine.shutdown_extension_runtime().await;
-        return Ok(0);
+        return Ok(if transport_failed {
+            EXIT_CONTROL_TRANSPORT_FAILURE
+        } else {
+            0
+        });
     }
 
     let mut extensions = HeadlessExtensionRuntime {
@@ -197,6 +225,10 @@ pub async fn run(args: &CliArgs, mut config: CoreConfig) -> Result<i32, String> 
                 return Ok(1);
             }
         }
+        if engine.control_transport_failure().is_some() {
+            engine.shutdown_extension_runtime().await;
+            return Ok(EXIT_CONTROL_TRANSPORT_FAILURE);
+        }
     }
 
     while let Ok(Some(line)) = lines.next_line().await {
@@ -225,6 +257,12 @@ pub async fn run(args: &CliArgs, mut config: CoreConfig) -> Result<i32, String> 
                 engine.shutdown_extension_runtime().await;
                 return Ok(1);
             }
+        }
+        // Checked after every line, not only after a turn: once the transport
+        // is gone the process can neither answer nor be answered.
+        if engine.control_transport_failure().is_some() {
+            engine.shutdown_extension_runtime().await;
+            return Ok(EXIT_CONTROL_TRANSPORT_FAILURE);
         }
     }
     engine.shutdown_extension_runtime().await;
@@ -288,7 +326,7 @@ where
             request_id,
             request,
         } => match request {
-            ShellControlRequest::Initialize => {
+            ShellControlRequest::Initialize { fire_session_start } => {
                 engine.emit(
                     writer,
                     &OutputMessage::initialize_success(
@@ -304,32 +342,37 @@ where
                 );
                 engine.emit(writer, &init_msg);
 
-                // ─── Hook: SessionStart ───
-                let cwd_str = engine.cwd().to_string_lossy().to_string();
-                let ss_result = engine
-                    .hook_system
-                    .fire_session_start(&engine.session_id, &cwd_str)
-                    .await;
-                engine
-                    .audit
-                    .record_session_hook_decision("session_start", "observed");
-                for n in &ss_result.notifications {
-                    engine.emit(
-                        writer,
-                        &OutputMessage::hook_notification(
-                            &n.hook_name,
-                            &n.message,
-                            None,
-                            n.decision.as_deref(),
-                        ),
-                    );
-                }
-                if let Some(ref ctx) = ss_result.additional_context {
+                // Only the shell-owned transport may suppress SessionStart.
+                // Generic headless clients keep the historical lifecycle even
+                // if they send the optional control field themselves.
+                if fire_session_start || !args.cosh_shell_transport {
+                    // ─── Hook: SessionStart ───
+                    let cwd_str = engine.cwd().to_string_lossy().to_string();
+                    let ss_result = engine
+                        .hook_system
+                        .fire_session_start(&engine.session_id, &cwd_str)
+                        .await;
                     engine
-                        .messages
-                        .push(crate::provider::Message::system(&format!(
-                            "[Hook context] {ctx}"
-                        )));
+                        .audit
+                        .record_session_hook_decision("session_start", "observed");
+                    for n in &ss_result.notifications {
+                        engine.emit(
+                            writer,
+                            &OutputMessage::hook_notification(
+                                &n.hook_name,
+                                &n.message,
+                                None,
+                                n.decision.as_deref(),
+                            ),
+                        );
+                    }
+                    if let Some(ref ctx) = ss_result.additional_context {
+                        engine
+                            .messages
+                            .push(crate::provider::Message::system(&format!(
+                                "[Hook context] {ctx}"
+                            )));
+                    }
                 }
 
                 // A resumed session may already exceed the soft threshold;
@@ -393,8 +436,12 @@ where
             engine.metrics = TurnMetrics::default();
             let start = std::time::Instant::now();
 
+            let raw_user_input = args
+                .cosh_shell_transport
+                .then_some(message.raw_user_input.as_deref())
+                .flatten();
             let turn_result = engine
-                .handle_user_message(&message.content, lines, writer)
+                .handle_user_message_with_raw_input(&message.content, raw_user_input, lines, writer)
                 .await;
             let persist_result = session.persist(engine);
             match combine_turn_and_persist(turn_result, persist_result) {
@@ -407,6 +454,7 @@ where
                         result: Some("completed".to_string()),
                         errors: None,
                         error_code: None,
+                        max_turns: None,
                         session_error_code: None,
                         session_error_phase: None,
                         session_id: Some(engine.session_id.clone()),
@@ -433,6 +481,9 @@ where
         }
 
         InputMessage::ControlResponse { .. } => {}
+        // Receipts only matter to an interactive `wait_for_approval` loop;
+        // the headless path never waits on one.
+        InputMessage::ApprovalReceipt { .. } => {}
         InputMessage::RegistryRequest {
             request_id,
             domain,
@@ -472,11 +523,7 @@ struct SessionRuntime {
 
 impl SessionRuntime {
     fn initialize(args: &CliArgs, config: &CoreConfig) -> Result<Self, SessionError> {
-        let workspace = args
-            .workspace
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let workspace = args.workspace_root();
         let store = match SessionStore::for_workspace(&config.session.persist_dir, &workspace) {
             Ok(store) => Some(store),
             // Resume cannot proceed without the store, but a fresh turn can:
@@ -616,6 +663,8 @@ impl SessionRuntime {
 
 struct TurnFailure {
     message: String,
+    error_code: Option<&'static str>,
+    max_turns: Option<u32>,
     session_error_code: Option<&'static str>,
 }
 
@@ -625,26 +674,55 @@ impl TurnFailure {
             Some(code) => {
                 OutputMessage::session_result_error(session_id, &self.message, code, "persist")
             }
-            None => OutputMessage::result_error(session_id, &self.message),
+            None if self.error_code == Some("max_turns") && self.max_turns.is_some() => {
+                OutputMessage::max_turns_result_error(
+                    session_id,
+                    &self.message,
+                    self.max_turns.unwrap_or_default(),
+                )
+            }
+            None => {
+                OutputMessage::result_error_with_code(session_id, &self.message, self.error_code)
+            }
         }
     }
 }
 
 fn combine_turn_and_persist(
-    turn: Result<(), String>,
+    turn: Result<AgentTurnOutcome, String>,
     persist: Result<(), SessionError>,
 ) -> Result<(), TurnFailure> {
     match (turn, persist) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(AgentTurnOutcome::Completed), Ok(())) => Ok(()),
+        (Ok(AgentTurnOutcome::MaxTurns { limit }), Ok(())) => Err(TurnFailure {
+            message: crate::core::max_turns_error(limit),
+            error_code: Some("max_turns"),
+            max_turns: Some(limit),
+            session_error_code: None,
+        }),
         (Err(turn_error), Ok(())) => Err(TurnFailure {
+            error_code: None,
+            max_turns: None,
             message: turn_error,
             session_error_code: None,
         }),
-        (Ok(()), Err(persist_error)) => Err(TurnFailure {
+        (Ok(AgentTurnOutcome::Completed), Err(persist_error)) => Err(TurnFailure {
             message: format!(
                 "session persistence failed [{}]: {persist_error}",
                 persist_error.code()
             ),
+            error_code: None,
+            max_turns: None,
+            session_error_code: Some(persist_error.code()),
+        }),
+        (Ok(AgentTurnOutcome::MaxTurns { limit }), Err(persist_error)) => Err(TurnFailure {
+            message: format!(
+                "{}; session persistence failed [{}]: {persist_error}",
+                crate::core::max_turns_error(limit),
+                persist_error.code()
+            ),
+            error_code: None,
+            max_turns: None,
             session_error_code: Some(persist_error.code()),
         }),
         (Err(turn_error), Err(persist_error)) => Err(TurnFailure {
@@ -652,6 +730,8 @@ fn combine_turn_and_persist(
                 "{turn_error}; session persistence failed [{}]: {persist_error}",
                 persist_error.code()
             ),
+            error_code: None,
+            max_turns: None,
             session_error_code: Some(persist_error.code()),
         }),
     }
@@ -709,6 +789,28 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn typed_max_turn_outcome_sets_structured_result_fields() {
+        let failure = combine_turn_and_persist(Ok(AgentTurnOutcome::MaxTurns { limit: 5 }), Ok(()))
+            .expect_err("max-turn outcome");
+
+        assert_eq!(failure.error_code, Some("max_turns"));
+        assert_eq!(failure.max_turns, Some(5));
+        assert_eq!(failure.message, "Agent exceeded max turns (5)");
+        assert_eq!(failure.session_error_code, None);
+    }
+
+    #[test]
+    fn matching_provider_error_text_stays_an_ordinary_failure() {
+        let failure = combine_turn_and_persist(Err(crate::core::max_turns_error(5)), Ok(()))
+            .expect_err("provider error");
+
+        assert_eq!(failure.error_code, None);
+        assert_eq!(failure.max_turns, None);
+        assert_eq!(failure.message, "Agent exceeded max turns (5)");
+        assert_eq!(failure.session_error_code, None);
+    }
 
     #[test]
     fn bare_reload_keeps_project_config_isolated() {

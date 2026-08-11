@@ -97,18 +97,20 @@ sudo agentsight trace --daemon \
 
 Query token consumption data.
 
+When the Linux systemd service owns the data, run these queries with `sudo`:
+
 ```bash
 # Today's token usage
-agentsight token
+sudo agentsight token
 
 # This week, compared to last week
-agentsight token --period week --compare
+sudo agentsight token --period week --compare
 
 # Detailed breakdown by role and type
-agentsight token --detail
+sudo agentsight token --detail
 
 # JSON output
-agentsight token --json
+sudo agentsight token --json
 ```
 
 ### `agentsight audit`
@@ -160,7 +162,7 @@ agentsight discover --verbose
 
 ## Dashboard
 
-The Dashboard is a React-based web UI for visualizing conversation history, trace details, and token statistics. It is embedded into the `agentsight serve` binary at compile time.
+The Dashboard is a React-based web UI for visualizing conversation history, trace details, and token statistics. It is embedded into the `agentsight serve` binary at compile time. By default, the Dashboard follows the browser language; you can switch languages manually, and the choice is persisted across refreshes.
 
 ### Build the Dashboard
 
@@ -184,11 +186,14 @@ make build-all
 Run the tracer and the API server in two separate terminals:
 
 ```bash
+# Stop the packaged tracer before starting a foreground tracer
+sudo systemctl stop agentsight.service
+
 # Terminal 1: start eBPF tracing (writes to SQLite)
 sudo agentsight trace
 
 # Terminal 2: start the API server (reads from the same SQLite)
-agentsight serve
+sudo agentsight serve
 ```
 
 **macOS** (trajectory collector only):
@@ -273,6 +278,49 @@ You can verify all dependencies with the included check script:
 | clang / llvm | >= 11 (for eBPF compilation) |
 | libbpf | >= 0.8 |
 
+### Install with Anolisa
+
+```bash
+sudo anolisa --install-mode system install agentsight
+```
+
+AgentSight requires Linux system mode. This installs the AgentSight service and
+the `agentsight-enforcer` service together.
+
+### Install via RPM
+
+```bash
+sudo yum install agentsight
+```
+
+Installs:
+- `/usr/local/bin/agentsight` — CLI binary
+- `/usr/local/bin/agentsight-enforcer` — ActPlane enforcement engine
+- `/usr/lib/systemd/system/agentsight.service` — AgentSight system unit
+- `/usr/lib/systemd/system/agentsight-enforcer.service` — enforcement system unit
+
+The RPM is a Linux system package. Its units are installed but not enabled by
+default; when both units run, AgentSight is ordered after the enforcer.
+
+### Start the Service
+
+Both package routes leave the units stopped and disabled. Start the main unit
+when you are ready to begin collection:
+
+```bash
+sudo systemctl enable --now agentsight.service
+sudo systemctl status agentsight.service
+```
+
+The main unit runs eBPF tracing and the Dashboard together and starts the
+enforcer dependency in the required order. Open `http://localhost:7396` after
+the service becomes active.
+
+The unit runs as root with `UMask=0077`, so its data under
+`/var/log/sysak/.agentsight` is private. Use `sudo` for CLI queries and
+Dashboard access commands that read service-owned data. Stop the unit before
+starting a foreground tracer.
+
 ### Build from Source
 
 ```bash
@@ -285,7 +333,10 @@ cd src/agentsight
 make build-all
 ```
 
-The binary is output to `target/release/agentsight`.
+The binary is output to `target/release/agentsight`. On supported Linux systems,
+`make build-all` also invokes `scripts/build-enforcer.sh` to build the attested
+ActPlane `target/release/agentsight-enforcer` binary. `make build-mac` does not
+build the enforcer.
 
 > `cargo build --release` only compiles Rust. It does not rebuild the embedded Dashboard UI, so use `make build-all` for user-facing builds.
 
@@ -328,15 +379,6 @@ agentsight serve --host 0.0.0.0 --port 8080
 Open `http://127.0.0.1:7396` to view the Agent Dashboard. `trace` scans local AI agent session files (Claude Code, Qoder, Codex, Cursor) and stores them as ATIF trajectories in `trajectories.db`. `serve` reads from the same database.
 
 > **macOS limitations**: eBPF-dependent commands (`discover`, `token`, `audit`, `metrics`, `interruption`, `skill-metrics`, `summary`) are Linux-only. The `--db` and `--config` flags are also Linux-only. On macOS, `trace` collects trajectories only (no eBPF), and `serve` reads from `trajectories.db`.
-
-### Install via RPM
-
-```bash
-sudo yum install agentsight
-```
-
-Installs:
-- `/usr/local/bin/agentsight` — CLI binary
 
 ### Start Tracing
 

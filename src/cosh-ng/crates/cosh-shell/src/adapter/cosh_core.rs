@@ -29,6 +29,7 @@ pub(super) mod question_writer;
 mod recovery;
 mod session;
 
+pub(crate) use recovery::max_turn_limit;
 pub(super) use recovery::{
     begin_session_attempt, commit_pending_session_for_scope, invalidate_resume_on_session_failure,
     mark_recovery_failure, retain_context_session, session_scope_from_request,
@@ -89,29 +90,6 @@ impl CoshCoreAdapter {
     pub fn with_model_call(mut self, allow: bool) -> Self {
         self.allow_model_call = allow;
         self
-    }
-
-    /// Lists persisted sessions in a canonical workspace.
-    ///
-    /// # Errors
-    ///
-    /// Returns a recoverable management protocol error.
-    pub fn list_sessions(&self, workspace_scope: &str) -> Result<SessionList, SessionErrorInfo> {
-        self.list_sessions_page(workspace_scope, 20, None)
-    }
-
-    /// Lists one bounded page while preserving the core-owned opaque cursor.
-    ///
-    /// # Errors
-    ///
-    /// Returns a recoverable management protocol error.
-    pub fn list_sessions_page(
-        &self,
-        workspace_scope: &str,
-        limit: usize,
-        cursor: Option<&str>,
-    ) -> Result<SessionList, SessionErrorInfo> {
-        SessionManagementClient::new(self.program.clone()).list(workspace_scope, limit, cursor)
     }
 
     /// Inspects a persisted session summary without selecting it.
@@ -313,6 +291,7 @@ impl CoshCoreAdapter {
         };
         let mut args = vec![
             "--headless".to_string(),
+            "--cosh-shell-transport".to_string(),
             "--enable-shell-evidence-tool".to_string(),
             "--approval-mode".to_string(),
             approval_mode.to_string(),
@@ -345,9 +324,11 @@ impl CoshCoreAdapter {
         }
 
         let resume_attempt = self.begin_resume_attempt(&mut prepared, &session_scope);
+        let raw_user_input = request.user_input.clone();
         self.runtime.start_run(
             request.id,
             prepared,
+            raw_user_input,
             mode,
             Arc::clone(&self.session),
             session_scope,
@@ -637,14 +618,16 @@ fn start_cancellable_cosh_core_process(
             &terminal_events,
             &session_state,
         );
-        let retain_session = retain_context_session(&terminal_events, parser.session_error_phase());
+        let session_metadata = (parser.session_error_phase(), parser.session_resumable());
+        let retain_session =
+            retain_context_session(&terminal_events, session_metadata.0, session_metadata.1);
         let commit_outcome = commit_pending_session_for_scope(
             completed || retain_session,
             failed && !retain_session,
             &session_state,
             &pending_session_for_thread,
             &session_scope_for_thread,
-            parser.session_resumable(),
+            session_metadata.1,
             &resume_attempt,
         );
         for event in terminal_events_for_session_commit(&run_id, terminal_events, commit_outcome) {

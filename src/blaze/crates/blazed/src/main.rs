@@ -14,7 +14,9 @@ mod failpoint;
 #[path = "failpoint_disabled.rs"]
 mod failpoint;
 mod file_provider;
+mod guest;
 mod metrics;
+mod sandbox;
 mod spawner;
 mod state;
 

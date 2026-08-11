@@ -1,5 +1,6 @@
 //! Long-lived cosh-core JSONL process shared by Agent turns and registry requests.
 
+mod command;
 mod control;
 mod process;
 mod question;
@@ -22,19 +23,21 @@ use super::claude::{
 use super::cosh_core::question_ingress::CoshCoreQuestionGate;
 use super::cosh_core::{
     commit_pending_session_for_scope, invalidate_resume_on_session_failure, mark_recovery_failure,
-    terminal_events_for_session_commit, SessionResumeAttempt, SessionRuntimeState,
+    retain_context_session, terminal_events_for_session_commit, SessionResumeAttempt,
+    SessionRuntimeState,
 };
 use super::cosh_core_registry::{
     extension_mutation_requires_reload, registry_timeout, RegistryQueryError,
 };
 use super::{
     control_protocol, record_cancellation_pending_session, AdapterError, AgentRunHandle,
-    ApprovalResponse, AuthResponse, ClaudeStreamParser, PreparedInvocation,
+    ApprovalChannelMessage, ApprovalResponse, AuthResponse, ClaudeStreamParser, PreparedInvocation,
     ProviderCancellationArtifactStore,
 };
 use process::{
     control_request, execute_registry, flush_pending_reload, process_error, reset_process,
-    send_json, spawn_process, spawn_response_writer, stop_process, user_message, PersistentProcess,
+    send_json, spawn_process, spawn_response_writer, stop_process, user_message_with_raw_input,
+    PersistentProcess,
 };
 
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
@@ -59,6 +62,7 @@ impl PersistentCoshCoreRuntime {
         &self,
         run_id: String,
         prepared: PreparedInvocation,
+        raw_user_input: Option<String>,
         mode: CoshApprovalMode,
         session_state: Arc<Mutex<SessionRuntimeState>>,
         session_scope: String,
@@ -139,6 +143,7 @@ impl PersistentCoshCoreRuntime {
         let command = RunCommand {
             run_id,
             prepared,
+            raw_user_input,
             mode,
             session_state,
             session_scope,
@@ -273,32 +278,7 @@ enum ServiceCommand {
     Shutdown,
 }
 
-struct RunCommand {
-    run_id: String,
-    prepared: PreparedInvocation,
-    mode: CoshApprovalMode,
-    session_state: Arc<Mutex<SessionRuntimeState>>,
-    session_scope: String,
-    resume_attempt: SessionResumeAttempt,
-    event_tx: mpsc::Sender<Result<AgentEvent, AdapterError>>,
-    internal_response_tx: mpsc::Sender<ApprovalResponse>,
-    approval_rx: Option<mpsc::Receiver<ApprovalResponse>>,
-    auth_rx: Option<mpsc::Receiver<AuthResponse>>,
-    answer_confirmation_tx: mpsc::Sender<Result<String, AdapterError>>,
-    pending_session: Arc<Mutex<Option<String>>>,
-    cancellation_artifacts: ProviderCancellationArtifactStore,
-    control_capabilities: Arc<Mutex<control_protocol::ControlProtocolCapabilities>>,
-    cancelled: Arc<AtomicBool>,
-    run_done: Arc<AtomicBool>,
-}
-
-struct RegistryCommand {
-    request_id: String,
-    domain: String,
-    action: String,
-    params: Value,
-    response_tx: mpsc::Sender<Result<Value, RegistryQueryError>>,
-}
+use command::{RegistryCommand, RunCommand};
 
 fn service_loop(
     receiver: mpsc::Receiver<ServiceCommand>,
@@ -409,6 +389,13 @@ fn run_turn(
             &control_protocol::serialize_initialize("init-1"),
         )?;
         process.initialized = true;
+    } else if process.control_capabilities.provider_initialize_seen {
+        // The initialize response arrives once per process; later turns seed
+        // their per-run capability set from the process record so the #1940
+        // receipt gate keeps emitting `approval_receipt` after the first turn.
+        if let Ok(mut current) = command.control_capabilities.lock() {
+            *current = process.control_capabilities;
+        }
     }
     // Consume a reload noted while the core sat idle before the next user
     // message goes out; otherwise the coming turn would still run on the
@@ -418,8 +405,9 @@ fn run_turn(
     let session_id = process.session_id.clone();
     send_json(
         &process.stdin,
-        &user_message(
+        &user_message_with_raw_input(
             &command.prepared.prompt,
+            command.raw_user_input.as_deref(),
             session_id.as_deref(),
             &command.session_scope,
         ),
@@ -450,13 +438,15 @@ fn run_turn(
             .take()
             .ok_or_else(|| "auth receiver is unavailable".to_string())?,
         Arc::clone(&question_gate),
+        Arc::clone(&command.control_capabilities),
         writer_failure_tx,
         command.answer_confirmation_tx.clone(),
     );
     let mut parser = ClaudeStreamParser::new(
         command.run_id.clone(),
         Some(Arc::clone(&command.pending_session)),
-    );
+    )
+    .with_session_resumable(process.session_resumable);
     let pending_control_tool_call =
         RefCell::new(control_protocol::PendingControlProtocolToolCall::default());
     let mut completed = false;
@@ -517,6 +507,10 @@ fn run_turn(
             }
         }
         if let Some(capabilities) = control_protocol::parse_initialize_capabilities(&line) {
+            // Announced once per process: keep the durable copy on the
+            // process record so later turns inherit it (mirrors
+            // `session_resumable`).
+            process.control_capabilities = capabilities;
             if let Ok(mut current) = command.control_capabilities.lock() {
                 *current = capabilities;
             }
@@ -612,7 +606,13 @@ fn run_turn(
         completed = false;
         failed = true;
     }
-    let session_resumable = parser.session_resumable();
+    // Only the turn that carried `initialize` sees `system/init`. The parser
+    // starts with the process's cached value and writes back any value the
+    // current turn announced.
+    if let Some(observed) = parser.session_resumable() {
+        process.session_resumable = Some(observed);
+    }
+    let session_resumable = parser.session_resumable().or(process.session_resumable);
     if command.cancelled.load(Ordering::SeqCst)
         && !terminal_events
             .iter()
@@ -630,6 +630,15 @@ fn run_turn(
         &terminal_events,
         &command.session_state,
     );
+    // A retained failure keeps the persisted transcript resumable, so the commit
+    // and the process binding below both act on the effective state rather than
+    // the raw terminal flags. Cancellation never qualifies: the user asked to
+    // stop, so the fresh pending session must not be committed.
+    let session_error_phase = parser.session_error_phase();
+    let retain_session = !command.cancelled.load(Ordering::SeqCst)
+        && retain_context_session(&terminal_events, session_error_phase, session_resumable);
+    let session_completed = completed || retain_session;
+    let session_failed = failed && !retain_session;
     let commit_outcome = if command.cancelled.load(Ordering::SeqCst) {
         record_cancellation_pending_session(
             &command.cancellation_artifacts,
@@ -652,8 +661,8 @@ fn run_turn(
         )
     } else {
         commit_pending_session_for_scope(
-            completed,
-            failed,
+            session_completed,
+            session_failed,
             &command.session_state,
             &command.pending_session,
             &command.session_scope,
@@ -661,7 +670,7 @@ fn run_turn(
             &command.resume_attempt,
         )
     };
-    if completed && !failed && session_resumable != Some(false) {
+    if session_completed && !session_failed && session_resumable != Some(false) {
         process.session_id = command
             .pending_session
             .lock()

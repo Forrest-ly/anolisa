@@ -104,11 +104,52 @@ pub(crate) enum RawInputMode {
         generation: u64,
         next_capture: Option<RawInputCapture>,
         invalidated: bool,
+        post_owner: PostCaptureOwner,
     },
     Terminal {
         previous_capture: RawInputCapture,
         generation: u64,
     },
+}
+
+/// Input owner acknowledged by the observer for after the capture chain
+/// drains. The drain terminal installs this owner (instead of assuming
+/// the main prompt) so quarantined submit-window bytes replay with the
+/// same routing a live keystroke would get under that owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostCaptureOwner {
+    MainPrompt,
+    Delay,
+    RawPassthrough,
+    Hold,
+    /// A prompt ghost cannot be reconstructed from the drain terminal;
+    /// replaying into its interactive Tab/Enter interpreter could submit
+    /// text the user never confirmed, so this owner rejects the replay.
+    PromptGhost,
+}
+
+impl PostCaptureOwner {
+    /// Exhaustive on purpose: a new observer action must pick an owner
+    /// classification before it can follow a submitted capture.
+    pub(crate) fn from_action(action: &RawObserverAction) -> Self {
+        match action {
+            RawObserverAction::DelayShellOutput => Self::Delay,
+            RawObserverAction::RawPassthrough => Self::RawPassthrough,
+            RawObserverAction::HoldShellOutput => Self::Hold,
+            RawObserverAction::RestorePrompt {
+                ghost_text: Some(_),
+                ..
+            } => Self::PromptGhost,
+            RawObserverAction::CaptureInput(_)
+            | RawObserverAction::Continue
+            | RawObserverAction::EmitToPty(_)
+            | RawObserverAction::EmitToPtyWithPromptRestore(_)
+            | RawObserverAction::InterruptForeground
+            | RawObserverAction::RestorePrompt {
+                ghost_text: None, ..
+            } => Self::MainPrompt,
+        }
+    }
 }
 
 /// Input ownership boundary for a [`RawInputMode`]. Display-only updates
@@ -153,6 +194,7 @@ pub enum RawInputCapture {
     Question {
         id: String,
         option_count: usize,
+        selected: usize,
         allow_free_text: bool,
         multiple: bool,
         secret: bool,
@@ -186,6 +228,7 @@ pub enum RawInputCapture {
         id: String,
         option_count: usize,
         selected: usize,
+        marked_for_clear: Vec<bool>,
         confirming_clear: bool,
     },
     Consultation {
@@ -201,4 +244,31 @@ pub enum RawInputCapture {
         id: String,
         initial_text: String,
     },
+}
+
+impl RawInputCapture {
+    pub(super) fn is_session_mark_refresh(&self, next: &Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Session {
+                    id: current_id,
+                    option_count: current_option_count,
+                    selected: current_selected,
+                    confirming_clear: current_confirming_clear,
+                    ..
+                },
+                Self::Session {
+                    id: next_id,
+                    option_count: next_option_count,
+                    selected: next_selected,
+                    confirming_clear: next_confirming_clear,
+                    ..
+                }
+            ) if current_id == next_id
+                && current_option_count == next_option_count
+                && current_selected == next_selected
+                && current_confirming_clear == next_confirming_clear
+        )
+    }
 }

@@ -235,7 +235,8 @@ build_agent_sec_core() {
     cp -p "${SEC_DIR}/scripts/agent-sec-daemon-wrapper.sh" "$pkg_dir/scripts/"
     cp -p "${SEC_DIR}/tools/sign-skill.sh" "$pkg_dir/tools/"
     cp "${SEC_DIR}/Makefile" "$pkg_dir/"
-    tar -cf - -C "${SEC_DIR}" adapters/ | tar -xf - -C "$pkg_dir/"
+    tar -cf - -C "${SEC_DIR}" \
+        .anolisa/ packaging/systemd/ | tar -xf - -C "$pkg_dir/"
     [ -f "${SEC_DIR}/LICENSE" ] && cp "${SEC_DIR}/LICENSE" "$pkg_dir/"
     [ -f "${SEC_DIR}/README.md" ] && cp "${SEC_DIR}/README.md" "$pkg_dir/"
 
@@ -394,16 +395,22 @@ build_agentsight() {
     (
         cd "$SIGHT_DIR"
         # Build frontend (embed into Rust binary via include_dir!)
-        if [ -d "dashboard" ] && command -v npm &>/dev/null; then
+        if [ -d "${SIGHT_DIR}/dashboard" ] && command -v npm &>/dev/null; then
             log "Building frontend..."
-            cd dashboard
+            cd "${SIGHT_DIR}/dashboard"
             npm install
             npm run build:embed
             cd "$SIGHT_DIR"
         else
-            warn "Skipping frontend build (dashboard/ not found or npm unavailable)"
+            local reason=""
+            [ -d "${SIGHT_DIR}/dashboard" ] || reason="${reason}dashboard/ not found at ${SIGHT_DIR}/dashboard; "
+            command -v npm &>/dev/null || reason="${reason}npm not available in PATH; "
+            err "Cannot build agentsight frontend: ${reason}"
+            err "Frontend embedding is required for WebUI/serve tests. Aborting build."
+            exit 1
         fi
-        cargo build --release
+        cargo build --release --bin agentsight
+        ./scripts/build-enforcer.sh
     )
 
     # Step 2: Process spec template and create tarball
@@ -417,9 +424,11 @@ build_agentsight() {
     mkdir -p "$pkg_dir"
 
     # Copy relevant files
-    cp -rp "${SIGHT_DIR}/target/release/agentsight" "$pkg_dir/" 2>/dev/null || warn "Binary missing"
-    [ -f "${SIGHT_DIR}/scripts/agentsight.service" ] && cp "${SIGHT_DIR}/scripts/agentsight.service" "$pkg_dir/"
-    [ -f "${SIGHT_DIR}/scripts/agentsight-start.sh" ] && cp "${SIGHT_DIR}/scripts/agentsight-start.sh" "$pkg_dir/agentsight-start"
+    cp -p "${SIGHT_DIR}/target/release/agentsight" "$pkg_dir/"
+    cp -p "${SIGHT_DIR}/target/release/agentsight-enforcer" "$pkg_dir/"
+    cp -p "${SIGHT_DIR}/scripts/agentsight.service" "$pkg_dir/"
+    cp -p "${SIGHT_DIR}/scripts/agentsight-enforcer.service" "$pkg_dir/"
+    cp -p "${SIGHT_DIR}/scripts/agentsight-start.sh" "$pkg_dir/agentsight-start"
     [ -f "${SIGHT_DIR}/README.md" ] && cp "${SIGHT_DIR}/README.md" "$pkg_dir/"
     [ -f "${SIGHT_DIR}/README_zh.md" ] && cp "${SIGHT_DIR}/README_zh.md" "$pkg_dir/"
     [ -f "${SIGHT_DIR}/LICENSE" ] && cp "${SIGHT_DIR}/LICENSE" "$pkg_dir/"

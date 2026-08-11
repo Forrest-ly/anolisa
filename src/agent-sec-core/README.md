@@ -134,6 +134,24 @@ agent-sec-core/
 └── README_zh.md
 ```
 
+## Observability Hook Toggle
+
+The OpenClaw, Hermes, cosh, Qwen Code, Qoder, and Codex integrations enable
+their observability hooks by default. To disable them, set this variable before
+starting the host:
+
+```bash
+export OBSERVABILITY_HOOK_ENABLED=false
+```
+
+The variable accepts only `true` / `false` (ignoring case and surrounding
+whitespace). An unset or invalid value keeps the hook enabled. Restart the host
+after changing it.
+
+For OpenClaw and Hermes, the existing observability capability `enabled` setting
+remains an independent gate. Either switch can disable recording; setting this
+variable to `true` does not re-enable a capability disabled in plugin configuration.
+
 ## Quick Start
 
 ### Prerequisites
@@ -146,6 +164,54 @@ agent-sec-core/
 | **gpg / gnupg2** | >= 2.0 (Phase 2 asset signature verification) |
 | **Python3** | >= 3.6 |
 | **Rust** | >= 1.91 (for building linux-sandbox) |
+
+### Install AgentSecCore
+
+Source and RPM installations support Linux x86_64 and aarch64. The published
+ANOLISA raw package is limited to Linux x86_64 in system mode and requires CLI
+version 0.2.17 or later. Update the CLI through its installation owner:
+
+```bash
+# CLI installed by get.agentic-os.sh
+anolisa update self
+
+# RPM-owned CLI
+sudo anolisa update self
+
+sudo anolisa --install-mode system install sec-core
+sudo anolisa status sec-core
+```
+
+`sec-core` is the ANOLISA component name. The RPM keeps the package name
+`agent-sec-core`:
+
+```bash
+sudo yum install anolisa agent-sec-core
+sudo anolisa --install-mode system adopt sec-core
+```
+
+Installing the CLI from YUM makes it available on sudo's system path. Adoption
+records the directly installed RPM in system state so adapter commands can read
+its component contract.
+
+Developers building from source should use the repository-level entry point:
+
+```bash
+./scripts/build-all.sh --component sec-core
+```
+
+The source build installs runtime and integration resources in user paths but
+does not register the component in ANOLISA state. Use the installed integration
+scripts instead of `anolisa adapter enable`; see
+[Source-build Integration](../../docs/user-guide/en/agent-security/agent-sec-core/QUICKSTART.md#source-build-integration).
+
+An ANOLISA-managed raw package or adopted RPM places the framework adapters.
+Enable one as the user who owns the target framework configuration:
+
+```bash
+anolisa adapter scan
+anolisa adapter enable sec-core openclaw
+```
 
 ### Run the Security Workflow
 
@@ -181,22 +247,19 @@ make build-sandbox
 
 The binary is output to `linux-sandbox/target/release/linux-sandbox`.
 
-### Install via RPM
-
-```bash
-sudo yum install agent-sec-core
-```
-
 ### Protect Qwen Code from PII leakage
 
-The Qwen Code extension observes user input, tool input/output, and final model output
-by default. Set `PII_CHECKER_MODE=block` to enforce high-risk scanner `deny` verdicts
-at supported decision points; failed tool outputs are audit-only in Qwen Code 0.19.9,
-and scanner failures remain fail-open.
+The Qwen Code extension scans user input, tool input/output, and final model output
+with `PII_CHECKER_MODE=observe` by default. Set the policy to `block` to enforce
+high-risk scanner `deny` verdicts at supported decision points. Use
+`PII_CHECKER_HOOK_ENABLED=false` to disable the hook before it reads input or invokes
+the scanner. `debug` maps to `observe`, and `deny` maps to `block`. Qwen Code additionally accepts the
+legacy `PII_CHECKER_ENABLED` switch when the new enabled switch is absent. Failed tool outputs
+are audit-only in Qwen Code 0.19.9, and scanner failures remain fail-open.
 
 ```bash
-export PII_CHECKER_MODE=block
-./qwen-code-extension/scripts/deploy.sh
+anolisa adapter enable sec-core qwencode
+PII_CHECKER_MODE=block qwen
 ```
 
 See [the Qwen Code extension guide](qwen-code-extension/README.md) for configuration and
@@ -258,12 +321,14 @@ For the complete guide (manual key management, custom skills, CI/CD, troubleshoo
 ## Skill Ledger
 
 Ed25519-based integrity ledger for skill directories. Tracks file hashes, version chains, and scan results in `.skill-meta/` manifests — all managed via the `agent-sec-cli skill-ledger` subcommand.
+For an existing manifest, authenticity is verified before file drift; an unsigned existing manifest is reported as `tampered`.
 
 ### Key Commands
 
 | Command | Description |
 |---------|-------------|
 | `init` | Initialize keys and quick-scan covered skills |
+| `analyze <dir> --format json` | Read-only content analysis without creating or updating ledger state |
 | `scan <dir>` | Run built-in quick scanners and sign the manifest |
 | `check <dir>` | Detect drift / tampering against the manifest |
 | `show <dir>` | Show latest/active exposure summary, user decision, warnings, and findings |
@@ -283,6 +348,9 @@ agent-sec-cli skill-ledger init
 # Check integrity without modifying ledger metadata
 agent-sec-cli skill-ledger check /path/to/skill
 
+# Analyze current content without keys, manifests, signatures, or events
+agent-sec-cli skill-ledger analyze /path/to/skill --format json
+
 # Inspect runtime exposure and user-decision state
 agent-sec-cli skill-ledger show /path/to/skill
 
@@ -300,7 +368,9 @@ agent-sec-cli skill-ledger status
 The bundled Qoder CLI plugin registers a `PreToolUse` hook for the `Skill`
 tool. It resolves user Skills from `~/.qoder/skills/` before project Skills
 from `<cwd>/.qoder/skills/`, runs a read-only `skill-ledger check`, and applies the
-`SKILL_LEDGER_HOOK_POLICY=ask|debug|warn|block` policy (default: `ask`). Each
+`SKILL_LEDGER_MODE=observe|warn|ask|block` policy (default: `ask`). Set
+`SKILL_LEDGER_HOOK_ENABLED=false` to bypass the hook. The legacy `debug` value is an
+alias for `observe`, while `deny` is an alias for `block`. Each
 check carries Qoder trace identifiers into the security audit log.
 
 Design doc: [`docs/design/SKILL_LEDGER_zh.md`](docs/design/SKILL_LEDGER_zh.md) · User guide: [Skill Ledger User Guide](../../docs/user-guide/en/agent-security/agent-sec-core/skill-ledger.md)

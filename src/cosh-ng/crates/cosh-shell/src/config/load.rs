@@ -12,7 +12,9 @@ pub fn load_config() -> CoshConfig {
         load_config_file_into(&path, &mut config);
     }
     if let Some(path) = project_trust_store_path() {
-        load_project_trust_store(&mut config, &path);
+        if let Err(error) = load_project_trust_store(&mut config, &path) {
+            tracing::error!("load project trust store failed: {error}");
+        }
     }
 
     apply_env_overrides(&mut config);
@@ -53,6 +55,11 @@ fn apply_env_overrides(config: &mut CoshConfig) {
     }
     if let Ok(v) = std::env::var("COSH_SHELL_APPROVAL_MODE") {
         config.approval_mode = v;
+    }
+    if let Ok(v) = std::env::var("COSH_SHELL_INPUT_WAIT_TIMEOUT_SECS") {
+        if let Ok(secs) = v.trim().parse::<u64>() {
+            config.input_wait_timeout_secs = secs;
+        }
     }
     if let Ok(v) = std::env::var("COSH_SHELL_DEFAULT_SHELL") {
         config.shell_default = v;

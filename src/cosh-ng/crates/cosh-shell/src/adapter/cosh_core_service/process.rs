@@ -16,8 +16,8 @@ use super::super::cosh_core::question_ingress::{
     protocol_error, CoreQuestionProtocolReason, CoshCoreQuestionGate,
 };
 use super::super::{
-    control_protocol, spawn_provider_child, AdapterError, ApprovalDecision, ApprovalResponse,
-    AuthResponse, PreparedInvocation, ProviderPromptArgMode, ProviderStdinMode,
+    control_protocol, spawn_provider_child, AdapterError, ApprovalChannelMessage, ApprovalDecision,
+    ApprovalResponse, AuthResponse, PreparedInvocation, ProviderPromptArgMode, ProviderStdinMode,
 };
 use super::{
     registry_timeout, PersistentCoshCoreRuntime, RegistryCommand, RegistryQueryError,
@@ -47,15 +47,31 @@ pub(super) struct PersistentProcess {
     pub(super) approval_mode: CoshApprovalMode,
     pub(super) session_id: Option<String>,
     pub(super) workspace_scope: String,
+    /// Resumability reported by the `system/init` this process emitted.
+    ///
+    /// cosh-core announces it once per process, in response to `initialize`, so
+    /// a per-turn stream parser only observes it on the first turn. Later turns
+    /// read it from here instead of defaulting to "unknown".
+    pub(super) session_resumable: Option<bool>,
+    /// Control-protocol capabilities announced by this process.
+    ///
+    /// Like `session_resumable`, the `initialize` response arrives once per
+    /// process, so only the first turn parses it. Later turns seed their
+    /// per-run capability set from here; otherwise the #1940 receipt gate
+    /// would fall back to "not capable" and stop emitting `approval_receipt`
+    /// from the second turn on.
+    pub(super) control_capabilities: control_protocol::ControlProtocolCapabilities,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_response_writer(
     stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
     done: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
-    approval_rx: mpsc::Receiver<ApprovalResponse>,
+    approval_rx: mpsc::Receiver<ApprovalChannelMessage>,
     auth_rx: mpsc::Receiver<AuthResponse>,
     question_gate: Arc<Mutex<CoshCoreQuestionGate>>,
+    capabilities: Arc<Mutex<control_protocol::ControlProtocolCapabilities>>,
     failure_tx: mpsc::Sender<AdapterError>,
     answer_confirmation_tx: mpsc::Sender<Result<String, AdapterError>>,
 ) -> thread::JoinHandle<()> {
@@ -65,7 +81,26 @@ pub(super) fn spawn_response_writer(
         while !done.load(Ordering::SeqCst) && !cancelled.load(Ordering::SeqCst) {
             if approval_open {
                 match approval_rx.recv_timeout(Duration::from_millis(25)) {
-                    Ok(response) => {
+                    Ok(ApprovalChannelMessage::Receipt { request_id }) => {
+                        // #1940 receipt protocol: only providers that announce
+                        // `can_handle_approval_receipt` understand this line;
+                        // for the rest the receipt is skipped and the core-side
+                        // last-resort guard stays armed (the designed
+                        // degradation for a lost receipt).
+                        if !control_protocol::receipt_capable(&capabilities) {
+                            continue;
+                        }
+                        if send_json(
+                            &stdin,
+                            &control_protocol::serialize_approval_receipt(&request_id),
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(ApprovalChannelMessage::Response(response)) => {
                         let message = approval_message(&response);
                         if matches!(&response.decision, ApprovalDecision::Answer { .. }) {
                             let write_result =
@@ -199,6 +234,8 @@ pub(super) fn spawn_process(
         approval_mode,
         session_id: None,
         workspace_scope: String::new(),
+        session_resumable: None,
+        control_capabilities: control_protocol::ControlProtocolCapabilities::default(),
     })
 }
 
@@ -389,20 +426,29 @@ pub(super) fn control_request(subtype: &str, request_id: &str, fields: Value) ->
     .to_string()
 }
 
-pub(super) fn user_message(content: &str, session_id: Option<&str>, cwd: &str) -> String {
-    serde_json::json!({
+pub(super) fn user_message_with_raw_input(
+    content: &str,
+    raw_user_input: Option<&str>,
+    session_id: Option<&str>,
+    cwd: &str,
+) -> String {
+    let mut message = serde_json::json!({
         "type": "user",
         "message": {"role": "user", "content": content},
         "parent_tool_use_id": null,
         "session_id": session_id.unwrap_or("default"),
         "shell_context": {"cwd": cwd, "env": {}, "last_exit_code": 0},
-    })
-    .to_string()
+    });
+    if let Some(raw_user_input) = raw_user_input {
+        message["message"]["raw_user_input"] = Value::String(raw_user_input.to_string());
+    }
+    message.to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_registry_response_for;
+    use super::{is_registry_response_for, user_message_with_raw_input};
+    use serde_json::Value;
 
     #[test]
     fn registry_response_requires_discriminator_and_correlation_id() {
@@ -424,5 +470,18 @@ mod tests {
             "request_id": "reg-2",
         });
         assert!(!is_registry_response_for(&other_request, "reg-1"));
+    }
+
+    #[test]
+    fn user_message_omits_raw_input_for_legacy_payloads() {
+        let with_raw =
+            user_message_with_raw_input("envelope", Some("raw"), Some("session-1"), "/tmp");
+        let value: Value = serde_json::from_str(&with_raw).unwrap();
+        assert_eq!(value["message"]["content"], "envelope");
+        assert_eq!(value["message"]["raw_user_input"], "raw");
+
+        let without_raw = user_message_with_raw_input("legacy", None, None, "/tmp");
+        let value: Value = serde_json::from_str(&without_raw).unwrap();
+        assert!(value["message"].get("raw_user_input").is_none());
     }
 }

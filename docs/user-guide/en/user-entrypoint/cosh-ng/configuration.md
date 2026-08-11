@@ -1,76 +1,89 @@
-# Configuration
+# cosh-ng configuration
 
-The three cosh-ng binaries share the configuration file `~/.copilot-shell/config.toml`. Environment variable overrides and CLI parameter precedence are supported.
+[中文版](../../../zh/user-entrypoint/cosh-ng/configuration.md)
 
-## Configuration File Locations
+Start with the defaults. Use `/auth`, `/mode`, and `/config language` for
+interactive changes; edit TOML when settings must persist or be shared.
 
-Configuration is loaded in the following priority order (highest to lowest):
+## Files and authority
 
-1. `.copilot-shell/config.toml` (project-level, current directory)
-2. `~/.copilot-shell/config.toml` (user-level)
-3. `/etc/copilot-shell/config.toml` (system-level)
+| File | Read by | Scope |
+|---|---|---|
+| `/etc/copilot-shell/config.toml` | `cosh-core` and audit | Administrator defaults |
+| `~/.copilot-shell/config.toml` | `cosh-core` and `cosh-shell` | User settings |
+| `<workspace>/.copilot-shell/config.toml` | `cosh-core` | Project runtime preferences |
 
-## cosh-core Configuration
+Core layers files in system → user → project order. Project config may set
+Agent, Hook, Skill, session, `active_model`, and output-language preferences,
+but `active_provider`, provider definitions, MCP servers, and project audit
+settings are ignored. Project Hooks still require `/hooks trust-project` in the
+interactive shell. `cosh-shell` reads the user file, not the system or project
+file.
+
+## Minimal user configuration
 
 ```toml
 [ai]
-# Active model identifier
-active_model = "qwen-plus"
-# Output language (optional)
-output_language = "zh"
-
-[ai.providers.aliyun]
-type = "aliyun"
-access_key_id = ""        # Or via ALIBABA_CLOUD_ACCESS_KEY_ID
-access_key_secret = ""    # Or via ALIBABA_CLOUD_ACCESS_KEY_SECRET
-model = "qwen-plus"
+active_provider = "dashscope"
+active_model = "qwen3.7-plus"
+output_language = "en"
 
 [ai.providers.dashscope]
 type = "dashscope"
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-api_key = ""              # Or via DASHSCOPE_API_KEY
-model = "qwen-plus"
+api_key = "${DASHSCOPE_API_KEY}"
+model = "qwen3.7-plus"
 
 [agent]
-# Approval mode: trust | auto | balanced | suggest | strict
 approval_mode = "balanced"
-# Maximum conversation turns
-max_turns = 20
-
-[hooks]
-enabled = true
+max_turns = 50
+max_tool_calls_per_turn = 10
 
 [skills]
-# Custom skill search paths
-custom_paths = []
-
-[mcp.servers.filesystem]
-# Local stdio server.
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
-# Startup/discovery timeout; first npx launch may download its package.
-startup_timeout_ms = 30000
-# Timeout for a subsequent tools/call request.
-timeout_ms = 10000
-# Omit to expose all discovered tools. Use [] to expose none.
-allowed_tools = ["read_file", "list_directory"]
-
-[mcp.servers.remote-search]
-# Streamable HTTP endpoint. Do not combine `url` and `command`.
-url = "https://mcp.example.com/mcp"
-# For static-token authentication instead of OAuth, uncomment:
-# bearer_token = "${REMOTE_SEARCH_TOKEN}"
-allowed_tools = ["search"]
-
-# OAuth settings are optional; discovery and dynamic client registration are used by default.
-[mcp.servers.remote-search.oauth]
-scopes = ["search"]
+custom_paths = ["~/team-skills"]
 
 [session]
-# Root for workspace-scoped provider conversations
-persist_dir = "~/.copilot-shell/cosh-core/sessions"
-# Disable to keep turns in memory only; emitted IDs will not be resumed
 auto_persist = true
+persist_dir = "~/.copilot-shell/cosh-core/sessions"
+
+[logging]
+level = "warn"
+
+[ui]
+language = "auto"
+log_level = "warn"
+
+[shell]
+default = "auto"
+adapter_default = "cosh-core"
+analysis_mode = "smart"
+approval_mode = "auto"
+```
+
+Use environment expansion or `/auth` instead of writing a raw secret into
+TOML. See [Providers](core/providers.md) for provider choices.
+
+## Approval and turn budgets
+
+Core approval modes apply to direct integrations:
+
+| Mode | ReadOnly | FileEdit | Shell, network, MCP, external |
+|---|---|---|---|
+| `trust` | Run | Run | Run |
+| `auto` | Run | Run | Ask |
+| `balanced`, `suggest`, `strict` | Run | Ask | Ask |
+
+The shell exposes `recommend`, `auto`, and `trust`; `recommend` uses strict
+Core behavior. `agent.max_turns` limits one Agent request (default `50`), while
+`max_tool_calls_per_turn` defaults to `10`. A new prompt starts a fresh turn
+budget.
+
+## Sessions and compaction
+
+```toml
+[session]
+auto_persist = true
+persist_dir = "~/.copilot-shell/cosh-core/sessions"
 
 [session.compaction]
 enabled = true
@@ -79,170 +92,73 @@ trigger_ratio = 0.70
 emergency_ratio = 0.90
 target_ratio = 0.30
 preserve_recent_runs = 2
-
-[logging]
-level = "warn"
+# auto_compact_token_limit = 89600
+# model_context_window = 128000
+# model_max_output_tokens = 8192
 ```
 
-The project layer is loaded from
-`<workspace>/.copilot-shell/config.toml`, where `workspace` is the path passed
-through `--workspace` or the session-management request. Relative
-`session.persist_dir` values are resolved from that workspace, not from the
-Core process's launcher directory.
+Keep `target_ratio <= trigger_ratio <= emergency_ratio`. Compaction changes
+only the model-visible history; the persisted transcript remains complete. Set
+`auto_persist = false` to disable resumability for the process.
 
-## Session Compaction
+## MCP and other optional sections
 
-Compaction keeps the persisted transcript complete and replaces only the
-model-visible prefix with a summary projection. The automatic and emergency
-paths retain recent runs according to `preserve_recent_runs`; an explicit
-`/session compact` may summarize the latest complete run.
+Define MCP clients only in system or user config. Each server uses one of
+`command` (stdio) or `url` (Streamable HTTP); `allowed_tools` omitted means all,
+while `[]` means none. Follow [Connect an MCP server](mcp.md) for examples,
+OAuth, and lifecycle commands.
 
-| Setting | Default | Purpose |
-|---------|---------|---------|
-| `session.compaction.enabled` | `true` | Enable manual, automatic, and emergency compaction |
-| `session.compaction.auto` | `true` | Recommend background compaction at an idle boundary |
-| `session.compaction.auto_compact_token_limit` | unset | Optional absolute automatic trigger, clamped to the usable model budget |
-| `session.compaction.trigger_ratio` | `0.70` | Fraction of usable history that triggers automatic compaction |
-| `session.compaction.emergency_ratio` | `0.90` | Fraction that arms in-run emergency protection |
-| `session.compaction.target_ratio` | `0.30` | Best-effort retained-history target after compaction |
-| `session.compaction.preserve_recent_runs` | `2` | Complete recent runs kept verbatim by automatic and emergency compaction |
-| `session.compaction.model_context_window` | model-derived | Explicit model context-window override |
-| `session.compaction.model_max_output_tokens` | model-derived | Explicit maximum-output reserve override |
-
-Ratios must satisfy `target_ratio <= trigger_ratio <= emergency_ratio`.
-Invalid ratio groups fall back to the compiled defaults. See
-[Session Compaction](shell/session-compaction.md) for commands, safety
-guarantees, and manual-versus-automatic behavior.
-
-## MCP Servers
-
-`cosh-core --headless` can start configured stdio MCP servers or connect to
-configured Streamable HTTP MCP endpoints, call
-`tools/list`, and register each permitted tool as `mcp__<server>__<tool>`.
-The client supports `initialize`, `tools/list`, and `tools/call`. HTTP servers
-may reply with JSON or SSE. Streamable HTTP servers can use OAuth with
-`cosh-core mcp login <server>`; credentials are stored separately from the
-configuration. Deprecated `2024-11-05` HTTP+SSE servers are also supported
-through automatic fallback. Hosting cosh-core as an MCP server is not supported.
-
-MCP server definitions are read only from `/etc/copilot-shell/config.toml` and
-`~/.copilot-shell/config.toml`. Project-level `.copilot-shell/config.toml` is
-ignored for MCP to prevent a checked-out project from starting arbitrary local
-programs or connecting to untrusted endpoints. Each server must set exactly
-one of `command` (stdio) or `url` (Streamable HTTP). Commands are launched
-directly rather than through a shell.
-
-`command`, `args`, and values under `env` support `${NAME}` environment
-expansion. The child process receives only `HOME`, `PATH`, `TMPDIR`, `LANG`,
-and the explicitly configured `env` values. `startup_timeout_ms` defaults to
-30000 and covers process startup plus tool discovery; `timeout_ms` defaults to
-10000 for subsequent requests. HTTP `url` and `bearer_token` also support
-`${NAME}` expansion; the bearer token is sent only to that endpoint. Remote MCP
-endpoints must use HTTPS; HTTP is accepted only for loopback endpoints. Tool output
-is limited to 64 KiB before it enters the Agent context. OAuth requires an HTTP
-server without `bearer_token`; use `cosh-core mcp logout <server>` to remove its
-saved credentials.
-
-Use these short-lived commands to manage configured servers. Their JSON status
-contains only `has_credentials`, never access or refresh tokens.
-
-```bash
-cosh-core mcp list
-cosh-core mcp inspect <server>
-cosh-core mcp refresh <server>
-cosh-core mcp disconnect <server>
-cosh-core mcp connect <server>
-```
-
-`inspect` and `refresh` each create a connection, rediscover tools, print the
-result, then exit. `disconnect` prevents headless startup from connecting to the
-server and removes saved OAuth credentials. `connect` verifies discovery first,
-then re-enables a disconnected server.
-
-`[mcp.servers.<name>].allowed_tools` restricts discovery: omit it to expose all
-tools, provide a list to expose named tools, or set `[]` to disable every tool
-from that server. MCP tools otherwise require approval in `auto`, `balanced`,
-`suggest`, and `strict` modes. `[agent].allowed_tools` or `--allowed-tools`
-bypasses approval for exact registered tool names such as
-`mcp__remote_search__search`.
-
-## cosh-shell Configuration
+For shell recommendations and health checks, add only what you need:
 
 ```toml
-[ui]
-# Log level
-log_level = "warn"
+[shell.recommendations]
+enabled = true
+bash_history = false
 
-[shell]
-# Default shell (auto = auto-detect)
-default = "auto"
-# Default AI adapter
-adapter_default = "cosh-core"
-# Analysis mode (smart | auto | manual)
-analysis_mode = "smart"
-# Approval mode (recommend | auto | trust)
-approval_mode = "auto"
+[health]
+enabled = true
+role = "web-server"
+critical_mounts = ["/", "/var"]
+
+[[health.services]]
+name = "nginx"
+expected = "active"
 ```
 
-## Audit Configuration
+`analysis_mode` accepts `smart`, `auto`, or `manual`; shell approval accepts
+`recommend`, `auto`, or `trust`. `health.services.expected` accepts `active` or
+`inactive`.
 
-Audit uses the existing configuration files, but its authority order is intentionally stricter:
-`/etc/copilot-shell/config.toml` is authoritative when it contains `[audit]`; otherwise the user
-file is used. Project `[audit]` tables are ignored.
+## Audit settings
+
+Audit settings come from the system file when it has an `[audit]` table;
+otherwise the user table is used. Project audit tables are ignored.
 
 ```toml
 [audit]
-mode = "best_effort" # best_effort | required
+mode = "best_effort"         # best_effort | required
 retention_days = 30
 max_disk_bytes = 1073741824
 ```
 
-`COSH_AUDIT_DIR` overrides only the storage root. Without it, storage uses
-`$XDG_STATE_HOME/cosh/audit` or `~/.local/state/cosh/audit`. See the
-[audit operations guide](cli/audit.md) for failure and retention behavior.
+`retention_days` and `max_disk_bytes` must be greater than zero. The storage
+root is `$XDG_STATE_HOME/cosh/audit` or `~/.local/state/cosh/audit`; set
+`COSH_AUDIT_DIR` to an absolute path to override it.
 
-## Environment Variable Overrides
+## Environment overrides
 
-| Environment Variable | Purpose | Mapped Configuration |
-|---------------------|---------|---------------------|
-| `COSH_MODEL` | Override active model | `ai.active_model` |
-| `COSH_APPROVAL_MODE` | Override approval mode | `agent.approval_mode` |
-| `COSH_AI_PROVIDER` | Override active provider | `ai.active_provider` |
-| `COSH_OUTPUT_LANGUAGE` | Output language | `ai.output_language` |
-| `COSH_MAX_TURNS` | Maximum turns | `agent.max_turns` |
-| `COSH_LOG` | Log level (global) | `logging.level` |
-| `RUST_LOG` | Rust log filter | — |
-| `COSH_SHELL_ADAPTER` | Shell adapter | `shell.adapter_default` |
-| `COSH_SHELL_DEBUG` | Maps to debug level | `ui.log_level` |
-| `COSH_SHELL_LANG` | Shell language | — |
-| `COSH_AUDIT_DIR` | Unified audit storage root | — |
-| `ALIBABA_CLOUD_ACCESS_KEY_ID` | Alibaba Cloud AK | `ai.providers.aliyun.access_key_id` |
-| `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | Alibaba Cloud SK | `ai.providers.aliyun.access_key_secret` |
-| `DASHSCOPE_API_KEY` | DashScope API Key | Provider resolution chain |
+| Variables | Effect |
+|---|---|
+| `COSH_AI_PROVIDER`, `COSH_MODEL`, `COSH_OUTPUT_LANGUAGE` | Core provider, model, and response language |
+| `COSH_APPROVAL_MODE`, `COSH_MAX_TURNS` | Core approval and per-request turn budget |
+| `DASHSCOPE_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` | OpenAI-compatible credentials and URL fallbacks |
+| `ALIBABA_CLOUD_ACCESS_KEY_ID`, `ALIBABA_CLOUD_ACCESS_KEY_SECRET`, `ALIBABA_CLOUD_SECURITY_TOKEN` | Aliyun credential fallbacks |
+| `COSH_SHELL_DEFAULT_SHELL`, `COSH_SHELL_ADAPTER`, `COSH_SHELL_ANALYSIS_MODE`, `COSH_SHELL_APPROVAL_MODE` | Interactive shell choices |
+| `COSH_SHELL_LANG`, `COSH_SHELL_AI`, `COSH_SHELL_INPUT_WAIT_TIMEOUT_SECS` | Shell language, AI toggle, and input-wait timeout |
+| `COSH_RECOMMENDATIONS_BASH_HISTORY` | Opt in to Bash-history recommendations |
+| `COSH_LOG`, `RUST_LOG` | Log filtering (`COSH_LOG` wins) |
+| `COSH_AUDIT_DIR` | Audit storage root |
 
-## Log Level Priority
-
-```
-COSH_LOG > RUST_LOG > --verbose > config file > default (warn)
-```
-
-Valid values: `error`, `warn`, `info`, `debug`, `trace`
-
-## Log Files
-
-```
-~/.copilot-shell/logs/
-├── cosh-shell.log.2026-06-26    # Daily rotation
-├── cosh-core.log.2026-06-26
-└── ...
-```
-
-## Approval Mode Reference
-
-| Mode | ReadOnly Tools | FileEdit Tools | ShellExec Tools | MCP Tools |
-|------|----------------|----------------|-----------------|
-| `trust` | Auto-execute | Auto-execute | Auto-execute | Auto-execute |
-| `auto` | Auto-execute | Auto-execute | Require approval | Require approval |
-| `balanced` | Auto-execute | Require approval | Require approval | Require approval |
-| `suggest` | Auto-execute | Require approval | Require approval | Require approval |
-| `strict` | Auto-execute | Require approval | Require approval | Require approval |
+Environment values take precedence when the relevant binary supports them.
+Logs rotate daily under `~/.copilot-shell/logs/` and old files are kept for
+seven days.

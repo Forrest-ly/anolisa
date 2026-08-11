@@ -3,10 +3,10 @@ use super::{RawInputCapture, RawInputEvent, CTRL_C};
 use crate::question::choices::toggle_question_option;
 
 use events::{
-    approval_event_for_action, cancel_event, capture_action_set, card_answer_event,
-    empty_question_submission, is_csi_final_byte, is_removed_question_answer_slash,
-    is_removed_question_answer_slash_fragment, question_choice_count, releases_capture,
-    selected_options_answer,
+    approval_event_for_action, cancel_event, capture_action_set, capture_initial_selection,
+    card_answer_event, empty_question_submission, is_csi_final_byte,
+    is_removed_question_answer_slash, is_removed_question_answer_slash_fragment,
+    question_choice_count, releases_capture, selected_options_answer,
 };
 // capture_bridge shares events::releases_capture with the consume loop (#1932).
 pub(in crate::raw_input) mod events;
@@ -20,6 +20,9 @@ pub(super) struct CardInputState {
     free_text: String,
     active_kind: Option<CardInputKind>,
     selected_options: Vec<usize>,
+    // Mirror toggles before emitting events so same-read Enter sees the
+    // effective marks.
+    session_marked_for_clear: Vec<bool>,
     pending_input: Vec<u8>,
     /// Multi-line draft state while a PromptDraft capture is active (#1721).
     draft: PromptDraftEditor,
@@ -75,6 +78,7 @@ impl CardInputState {
                 allow_free_text,
                 multiple,
                 secret,
+                ..
             } => CardInputKind::Question {
                 id: id.clone(),
                 option_count: *option_count,
@@ -157,29 +161,7 @@ impl CardInputState {
                     return;
                 }
             }
-            let selected = match capture {
-                RawInputCapture::Mode {
-                    selected,
-                    option_count,
-                    ..
-                }
-                | RawInputCapture::Config {
-                    selected,
-                    option_count,
-                    ..
-                }
-                | RawInputCapture::ConfigLanguage {
-                    selected,
-                    option_count,
-                    ..
-                }
-                | RawInputCapture::Session {
-                    selected,
-                    option_count,
-                    ..
-                } => (*selected).min(option_count.saturating_sub(1)),
-                _ => 0,
-            };
+            let selected = capture_initial_selection(capture);
             self.active_kind = Some(kind);
             self.selected = selected;
             self.free_text = match capture {
@@ -187,6 +169,12 @@ impl CardInputState {
                 _ => String::new(),
             };
             self.selected_options.clear();
+            self.session_marked_for_clear = match capture {
+                RawInputCapture::Session {
+                    marked_for_clear, ..
+                } => marked_for_clear.clone(),
+                _ => Vec::new(),
+            };
             self.pending_input.clear();
             self.draft = match capture {
                 RawInputCapture::PromptDraft { initial_text, .. } => {
@@ -203,6 +191,7 @@ impl CardInputState {
         self.selected = 0;
         self.free_text.clear();
         self.selected_options.clear();
+        self.session_marked_for_clear.clear();
         self.pending_input.clear();
         self.draft = PromptDraftEditor::default();
         self.draft_paste = false;
@@ -486,6 +475,11 @@ impl CardInputState {
                                 }
                             }
                             b' ' if !*confirming_clear && self.selected < *option_count => {
+                                if let Some(marked) =
+                                    self.session_marked_for_clear.get_mut(self.selected)
+                                {
+                                    *marked = !*marked;
+                                }
                                 events
                                     .push(RawInputEvent::SessionToggle(id.clone(), self.selected));
                             }
@@ -547,6 +541,7 @@ impl CardInputState {
                 allow_free_text,
                 multiple,
                 secret,
+                ..
             } => {
                 let answer = self.free_text.trim();
                 if is_removed_question_answer_slash(answer) {
@@ -645,6 +640,9 @@ impl CardInputState {
             } => {
                 if *confirming_clear {
                     return Some(RawInputEvent::SessionClearConfirm(id.clone()));
+                }
+                if self.session_marked_for_clear.iter().any(|marked| *marked) {
+                    return Some(RawInputEvent::SessionDelete(id.clone()));
                 }
                 if *option_count == 0 || self.selected >= *option_count {
                     return None;

@@ -86,7 +86,7 @@ graph TB
 | **L4: Analyze** | `src/analyzer/`, `src/tokenizer/` | Token 提取、审计记录、消息解析 | → L3, L2 |
 | **L5: Semantic** | `src/genai/`, `src/atif/` | 语义事件构建、轨迹格式导出 | → L4, L3, L2, Cross |
 | **L6: Persist** | `src/storage/` | SQLite 持久化、SLS 远程导出 | → L4, L5 |
-| **L7: Serve** | `src/server/`, `src/health/`, `src/agent_sec/`, `src/grader/` | HTTP API、前端、agent-sec daemon 代理、健康检查、会话质量评估 | → L6, L5 |
+| **L7: Serve and Control** | `src/server/`, `src/health/`, `src/agent_sec/`, `src/grader/`, `src/security/`, `src/enforcement/` | HTTP API、前端、agent-sec daemon 代理、健康检查、会话质量评估、安全审计与特权执行协调 | → L6, L5, L7 control peers |
 | **L8: Entry** | `src/bin/`, `src/unified.rs`, `src/config.rs` | CLI 入口、编排器、配置 | → L1-L7 |
 | **Cross** | `src/discovery/` | Agent 进程发现与匹配 | 被 L1, L8 使用 |
 
@@ -108,6 +108,9 @@ graph LR
     atif[atif]
     agent_sec[agent_sec]
     grader[grader]
+    enforcement[enforcement]
+    security[security]
+    private_sqlite[private_sqlite]
     server[server]
     unified[unified]
 
@@ -136,12 +139,19 @@ graph LR
     genai --> parser
     storage --> analyzer
     storage --> genai
+    storage --> security
     grader --> storage
     server --> storage
     server --> health
     server --> atif
     server --> agent_sec
     server --> grader
+    server --> enforcement
+    server --> security
+    security --> enforcement
+    security --> private_sqlite
+    enforcement --> storage
+    enforcement --> private_sqlite
     health --> storage
     atif --> genai
     atif --> storage
@@ -189,6 +199,8 @@ sequenceDiagram
 系统启动时 `AgentScanner` 扫描 `/proc` 发现已运行的 Agent，运行时通过 procmon 的 `Exec`/`Exit` 事件动态追踪 Agent 生命周期。发现新 Agent 后自动 attach SSL 探针。
 
 **实现**: `src/unified.rs:AgentSight::handle_procmon_event()` — 由 ProcMon 事件驱动，调用 `AgentScanner::on_process_create()`。
+
+两条发现路径都用事件里的 pid 去解析 `/proc`，因此该 pid 必须是**用户态所在 pid namespace** 的编号，而不是目标进程最内层 namespace 的编号 —— 二者在容器场景下会不同。约定与实现见 [ebpf-probes.md](design-docs/ebpf-probes.md) 的「PID 命名空间约定」。
 
 ### 3. Dual Export Path: AnalysisResult vs GenAISemanticEvent
 
@@ -286,6 +298,9 @@ src/
 │   ├── storage.rs         # evaluation_runs 持久化
 │   ├── evidence.rs        # evidence_refs 构建
 │   └── types.rs           # API 和存储共享类型
+├── security/              # 归一化安全事件、风险案件、处置生命周期与专用持久化
+├── enforcement/           # 特权执行服务客户端、策略状态与无间隙切换协调
+├── private_sqlite.rs       # 安全控制模块共享的私有 SQLite 文件创建与权限校验
 ├── server/                # HTTP 服务器（feature=server）
 │   ├── mod.rs             # Actix-web 服务器 + 前端嵌入
 │   └── handlers.rs        # API 处理函数

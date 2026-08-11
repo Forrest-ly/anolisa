@@ -11,7 +11,7 @@ Skill Ledger 是 agent-sec-core 的安全子系统，为 AI Agent Skill 提供�
 | 概念 | 说明 |
 |------|------|
 | **Manifest** | JSON 记录（`.skill-meta/latest.json`），包含文件哈希、扫描结果和数字签名；由 `scan`、`certify` 或 `init` baseline 创建和更新 |
-| **版本链** | 只追加的账本——每个版本通过 `previousManifestSignature` 链接上一版本，形成防篡改历史 |
+| **版本链** | 只追加的账本——每个非根版本通过 `previousVersionId` 和 `previousManifestSignature` 指向已验真的父版本；恢复时可以建立新的签名链段 |
 | **状态** | 每个 Skill 的安全状态：`pass` ✅ · `none` 🆕 · `drifted` 🔄 · `warn` ⚠️ · `deny` 🚨 · `tampered` 🔴 |
 
 ### 1. 初始化签名密钥
@@ -48,14 +48,72 @@ agent-sec-cli skill-ledger check /path/to/your-skill
 
 | 状态 | 含义 |
 |------|------|
-| `none` 🆕 | 从未扫描——没有可验证的签名 manifest |
-| `pass` ✅ | 文件未变 + 签名有效 + 扫描通过 |
-| `drifted` 🔄 | Skill 文件已变更（fileHashes 不匹配） |
-| `warn` ⚠️ | 签名有效，但上次扫描存在低风险发现 |
-| `deny` 🚨 | 签名有效，但上次扫描存在高危发现 |
-| `tampered` 🔴 | manifest 签名校验失败——元数据可能被伪造 |
+| `none` 🆕 | `latest.json` 与任何版本 JSON/snapshot artifact 均不存在，或已验真且与当前文件匹配的 manifest 为 `scanStatus=none` |
+| `pass` ✅ | manifest 验真成功 + 文件未变 + 扫描通过 |
+| `drifted` 🔄 | manifest 验真成功，但 live Skill 与已签名 fileHashes 不同；这是尚未扫描的内容分歧，不是 scanner 已确认的风险结论 |
+| `warn` ⚠️ | manifest 验真成功，但上次扫描存在低风险发现 |
+| `deny` 🚨 | manifest 验真成功，但上次扫描存在高危发现 |
+| `tampered` 🔴 | Ledger metadata 的 schema、哈希、签名、已签名身份或 latest/版本 artifact 一致性校验失败，包括历史 artifact 仍存在但 `latest.json` 缺失、缺少签名或回放旧的已签名 latest |
+
+Skill Ledger 会先验证已有 manifest 的真实性，并将 `latest.json` 绑定到最新已验真的版本 artifact，再将其中的文件哈希与当前 Skill 比较。仅当 `latest.json` 和版本 JSON/snapshot artifact 均不存在时，缺少 latest 才表示 `none`；若历史 artifact 仍存在，则 Ledger 不完整，返回 `tampered`。因此，即使当前文件同时发生变化，缺少签名、签名无效或回放旧的已签名 latest 仍返回 `tampered`；只有已验真的当前 manifest 才可能返回 `drifted`。
 
 ### 3. 快速扫描 + 签名认证
+
+如需在认证前执行机器可调用的只读评估，可运行：
+
+```bash
+agent-sec-cli skill-ledger analyze /path/to/your-skill --format json
+```
+
+`analyze` 会针对当前目录依次运行 `code-scanner` 和 `static-scanner`。它不会
+创建密钥、`.skill-meta`、manifest、snapshot、签名、配置项或安全事件。投稿
+服务可以将结果作为增量信号，但不能用它替代已有内容规则和审核策略。
+
+进程契约如下：
+
+| 退出码 | 含义 |
+|--------|------|
+| `0` | 覆盖完整；通过 `status` 判断 `pass`、`warn` 或 `deny` |
+| `1` | scanner 或文件未能完整覆盖；`status=error` 且 `coverage_complete=false` |
+| `2` | 输入或协议使用错误，包括缺少 `SKILL.md` |
+
+协议错误包括缺少 Skill 根目录参数（`skill-root-required`）和不支持的输出格式
+（`unsupported-format`）；两者均返回退出码 `2` 和 JSON 错误负载。
+
+调用方必须同时检查退出码、顶层 `status` 和 `coverage_complete`。Findings
+按 `file`、`line`、`rule` 排序；scanner 结果固定先输出 `code-scanner`，再输出
+`static-scanner`。随包 JSON Schema 位于
+`agent_sec_cli/skill_ledger/analyze.schema.json`。
+分析最多接受 2,000 个普通文件、50 MiB 文件总量和 32 层目录深度；超过任一限制
+都会返回覆盖不完整。
+
+Node.js subprocess 示例：
+
+```javascript
+import { spawn } from "node:child_process";
+
+const child = spawn(
+  "agent-sec-cli",
+  ["skill-ledger", "analyze", skillDir, "--format", "json"],
+  { stdio: ["ignore", "pipe", "pipe"] },
+);
+
+let stdout = "";
+child.stdout.setEncoding("utf8");
+child.stdout.on("data", (chunk) => {
+  stdout += chunk;
+});
+child.on("close", (code) => {
+  const result = JSON.parse(stdout);
+  if (code !== 0 || result.status === "error" || !result.coverage_complete) {
+    throw new Error("Skill analysis did not complete");
+  }
+  // 保留现有投稿规则，将 result.scanners 作为补充证据。
+});
+```
+
+`analyze` 当前随完整的 `agent-sec-cli` wheel 和 RPM 交付。后续可将共享 scanner
+提取为 scanner-only wheel 或 RPM 子包，但 scanner 规则必须继续保持单一源码。
 
 默认认证路径使用内置快速扫描器，不依赖 LLM。对单个 Skill 执行：
 
@@ -80,10 +138,12 @@ agent-sec-cli skill-ledger certify /path/to/your-skill \
 
 `scan` 会运行内置快速扫描器并签名入账；`certify` 则只导入外部 findings。`certify` 会依次：
 
-1. 验证文件一致性（文件变更时自动创建新版本）
+1. 先验证已有 manifest 的真实性，再验证文件一致性（文件变更或 manifest 无效时自动创建新版本）
 2. 规范化 findings 并合并到 manifest 的 `scans[]` 数组
 3. 聚合 `scanStatus`（`pass` / `warn` / `deny`）
 4. 重新签名并写入 `.skill-meta/latest.json`
+
+已有 manifest 无效或缺少签名时，CLI 不会原地签名，也不会继承其中的扫描结果或用户决策。恢复操作会创建新版本，并且只链接身份、哈希、签名和 snapshot 均通过校验的最新历史版本。若不存在这样的父版本，新签名版本会将两个 previous 字段都置为 `null`，成为新的链段根。
 
 输出示例：
 
@@ -120,7 +180,7 @@ agent-sec-cli skill-ledger status --verbose
 
 ### 5. 审计完整版本链
 
-深度验证全部历史版本——校验哈希完整性、签名有效性和版本链链接：
+深度验证全部历史版本——校验 schema、哈希、签名、已签名身份和显式父版本链接。父链接必须指向编号更早且通过验真的版本，并携带该父版本的准确签名；两个 previous 字段均为 `null` 的已签名版本是合法链段根。无效历史版本仍会使整体 audit 失败。
 
 ```bash
 agent-sec-cli skill-ledger audit /path/to/your-skill
@@ -183,7 +243,7 @@ Skill Ledger 推荐与 SkillFS 联合使用：SkillFS 捕获 Skill 变更，通�
 ```
 
 - **推荐路径——SkillFS + daemon activation**：SkillFS 负责发现 Skill 文件变化；daemon 根据最新签名 manifest、用户决策和 activation policy 刷新可执行 activation 目标。Agent 运行时读取 activation metadata，而不是默认依赖宿主 hook 前置检查。
-- **兼容路径——宿主 hook/capability policy**：OpenClaw、Hermes 和 copilot-shell 可在 Skill 加载前调用 `agent-sec-cli skill-ledger show`；Qoder CLI 则在 `Skill` tool 执行前对解析出的本地绝对目录调用只读的 `agent-sec-cli skill-ledger check`。默认 `ask` 请求用户确认；也可显式配置 `warn` / `debug` / `block`。
+- **兼容路径——宿主 hook/capability policy**：OpenClaw、Hermes、copilot-shell 和 Qwen Code 在 Skill 加载前调用 `agent-sec-cli skill-ledger show`；Codex 和 Qoder CLI 则在各自的本地 Skill 触发边界调用只读的 `agent-sec-cli skill-ledger check`。默认值为 `ask`；也可显式配置 `observe` / `warn` / `block`，旧值 `debug` 仅作为 `observe` 的兼容别名。
 - **Agent 驱动扫描**：`scan` 执行内置快速扫描并签名；`skill-ledger` Skill 在用户要求深度扫描时驱动完整的四阶段安全审查，并通过 `certify --findings` 导入结果。**按需触发**，由用户请求发起。
 
 ### 推荐路径：SkillFS + daemon activation
@@ -195,7 +255,7 @@ Skill Ledger 推荐与 SkillFS 联合使用：SkillFS 捕获 Skill 变更，通�
 1. SkillFS 捕获 Skill 目录创建、更新、删除或内容变更。
 2. SkillFS 通知 Skill Ledger daemon 的 `skill_ledger.skillfs_notify_change` 接口。
 3. daemon 根据签名 manifest、当前文件状态、用户决策和 activation policy 刷新 `.skill-meta/activation.json`，并尽力同步写入 xattr。
-4. 若当前风险版本不可直接激活，activation metadata 会指向上一个可信 `pass` / `warn` snapshot；若没有可信 fallback，则指向安全 pending review stub；用户 `block` 决策或 fail-safe 场景才写 `target: null`。
+4. 若当前版本不可直接激活，activation metadata 会指向上一个可信 `pass` / `warn` snapshot；若没有可信 fallback，则指向安全 pending review stub；用户 `block` 决策或 fail-safe 场景才写 `target: null`。
 
 **版本要求：SkillFS 必须 ≥ 0.4.0。**
 
@@ -228,24 +288,39 @@ Hermes 布局下 activation 流程携带的是嵌套身份（`category/skill`）
 [Skill Ledger 的 SkillFS 集成设计](../../../../../src/agent-sec-core/docs/design/SKILL_LEDGER_SKILLFS_INTEGRATION_zh.md)
 与 [SkillFS 用户指南](../../runtime/skillfs.md)。
 
+### 统一宿主 Hook 控制
+
+宿主 adapter 使用 `SKILL_LEDGER_HOOK_ENABLED` 作为总开关，使用
+`SKILL_LEDGER_MODE` 选择行为。开关默认 `true`；policy 默认 `ask`，支持
+`observe`、`warn`、`ask`、`block`。`observe` 执行检查和审计但不显示用户提示；旧值
+`debug` 映射为 `observe`，旧值 `deny` 映射为 `block`。环境变量 policy 优先于
+Hermes/OpenClaw capability 配置。
+
+宿主 Agent 在加载插件时读取这些变量。修改后需重启承载该 hook 的 Agent 进程；
+hook 和 agent-sec-core 并不是需要单独重启的 policy 服务。
+
+hook 无法请求确认时，`ask` fallback 为 `warn`；hook 无法在当前边界执行阻断时，
+`block` 同样 fallback 为 `warn`，且不得声称已经阻断。设置
+`SKILL_LEDGER_HOOK_ENABLED=false` 后不读取业务输入、不初始化密钥，也不调用 CLI。
+
 ### 兼容路径：Hook / capability policy
 
-当 Agent 加载 Skill 时，OpenClaw、Hermes 和 copilot-shell hook 会解析 Skill 目录，执行 `agent-sec-cli skill-ledger show <skill_dir>`，并由统一 `policy` 控制可见行为。这些 hook 只消费 summary 中的 `message`：
+当 Agent 加载 Skill 时，OpenClaw、Hermes、copilot-shell 和 Qwen Code hook 会解析 Skill 目录，执行 `agent-sec-cli skill-ledger show <skill_dir>`，并由统一 `policy` 控制宿主特定行为。这些 hook 只消费 summary 中的 `message`：
 
 | Policy | 行为 |
 |--------|------|
-| `ask` | 默认值。`message == null` 静默放行；`message != null` 时请求用户确认或使用宿主 approval UI。 |
+| `observe` | `message != null` 时只写审计/debug 诊断并放行。 |
 | `warn` | `message == null` 静默放行；`message != null` 时展示 warning 并放行。 |
-| `debug` | `message != null` 时只写 debug 诊断并放行。 |
+| `ask` | 默认值。`message == null` 静默放行；`message != null` 时请求用户确认或使用宿主 approval UI。 |
 | `block` | `message != null` 时直接阻断，并把 message 作为原因或告警信息。 |
 
 `message` 的触发规则由 Skill Ledger 统一决定：用户已有 `allow` / `always_allow` / `rollback` / `block` 决策时不提示；latest 为 `pass` 或 `warn` 且可直接暴露时不提示；无用户决策且 latest 为 `deny` / `none` / `drifted` / `tampered` 时提示，并说明当前 active 是 fallback 版本还是安全 pending review stub。`latestStatus=unmanaged` 表示当前 daemon 无法管理该 root，无法写 `.skill-meta` 或记录用户决策，因此只作为诊断返回，`message=null`，所有 hook policy 包括 `block` 都静默放行。
 
-Qoder CLI 是低层完整性门禁：plugin 为 `Skill` tool 注册独立的 `PreToolUse` hook，根据事件中的绝对 `cwd` 建立 user → project 目录表，解析 `SKILL.md` frontmatter `name`（无 frontmatter 时回退目录名），完成 canonical path 和根目录边界校验后执行 `skill-ledger check <skill_dir>`。frontmatter 存在但 `name` 缺失、歧义或使用 hook 无法安全解析的 YAML scalar 时，不会降级为非本地 Skill，而是按当前 policy 处理。`pass` 静默放行；`none` / `drifted` / `warn` / `deny` / `tampered` 以及 `error` 按 `ask` / `debug` / `warn` / `block` policy 请求确认、仅记 debug、提示后放行或阻断。CLI 不可用、执行失败、超时或输出不可解析也按该四档 policy 处理，而不是固定 fail-open。
+Codex 和 Qoder CLI 是低层完整性门禁，均在完成 canonical path 和根目录边界校验后执行 `skill-ledger check <skill_dir>`。Codex 在 `UserPromptSubmit` 解析 `$skill-name`；该边界无法请求确认，因此 `ask` fallback 为 `warn`。Qoder CLI 为 `Skill` tool 注册独立的 `PreToolUse` hook，根据事件中的绝对 `cwd` 建立 user → project 目录表，并解析 `SKILL.md` frontmatter `name`（无 frontmatter 时回退目录名）。Qoder frontmatter 存在但 `name` 缺失、歧义或使用 hook 无法安全解析的 YAML scalar 时，不会降级为非本地 Skill，而是按当前 policy 处理。`pass` 静默放行；`none` / `drifted` / `warn` / `deny` / `tampered` 以及 `error` 按 `observe` / `warn` / `ask` / `block` policy 静默审计、提示后放行、在支持的边界请求确认或阻断。Qoder CLI 不可用、执行失败、超时或输出不可解析也按该四档 policy 处理，而不是固定 fail-open；旧值 `debug` 仅作为 `observe` 的兼容别名。
 
-OpenClaw 默认 `enabled=true, policy="ask"`；Hermes 默认 `enabled=true, policy="ask"`；copilot-shell 和 Qoder CLI 默认 manifest 注册 Skill Ledger PreToolUse hook，并通过 `SKILL_LEDGER_HOOK_POLICY` 控制 policy。除 Qoder CLI 上述低层门禁外，其它兼容 hook 在 CLI 基础设施异常时保持 fail-open，避免阻断 Skill 加载。
+六个 adapter 均默认启用 Skill Ledger，policy 为 `ask`；copilot-shell、Codex、Qoder CLI 和 Qwen Code 在默认 manifest 注册各自的 hook 边界。OpenClaw 和 Hermes 还可使用 capability 配置，`SKILL_LEDGER_MODE` 仍作为部署级覆盖。除上述明确说明的 Qoder CLI 低层门禁外，其它兼容 hook 在 CLI 基础设施异常时保持 fail-open，避免阻断 Skill 加载。
 
-copilot-shell hook 当前仅覆盖 project / user / system 三类目录：`<cwd>/.copilot-shell/skills/`、`~/.copilot-shell/skills/`、`/usr/share/anolisa/skills/`。若 Skill 来自 custom、extension、remote 或其它路径，hook 会 fail-open 并跳过 skill-ledger 检查；OpenClaw 插件则按读取到的 `SKILL.md` 路径提取 Skill 目录。
+copilot-shell hook 当前仅覆盖 project / user / system 三类目录：`<cwd>/.copilot-shell/skills/`、`~/.copilot-shell/skills/`，以及 RPM 与 raw install 对应的 system 根目录 `/usr/share/anolisa/skills/` 和 `/usr/local/share/anolisa/skills/`。若 Skill 来自 custom、extension、remote 或其它路径，hook 会 fail-open 并跳过 skill-ledger 检查；OpenClaw 插件则按读取到的 `SKILL.md` 路径提取 Skill 目录。
 
 批量认证或安装后认证场景中，建议先完成目录定位和认证，再让 Agent 读取未认证 Skill 内容：批量认证前避免主动读取未认证 Skill 的 `SKILL.md` 或辅助文件；安装成功后应先定位最终本地目录，确认包含 `SKILL.md`，再执行快速扫描认证。
 
@@ -272,13 +347,13 @@ policy = "ask"
 enable_block = false
 ```
 
-**copilot-shell 配置方式**：默认 Cosh manifest 已注册 `skill-ledger` hook。默认 policy 为 `ask`；如需 warning-only、debug-only 或强拒绝，可设置 `SKILL_LEDGER_HOOK_POLICY=warn` / `debug` / `block`。该环境变量应由可信宿主或部署环境设置，不应由 Skill、项目脚本或不可信 shell 启动逻辑设置；如需防止本地 shell profile 被篡改后降级策略，后续应迁移到可信宿主配置源。
+**copilot-shell 配置方式**：默认 Cosh manifest 已注册 `skill-ledger` hook。默认 policy 为 `ask`；如需 observe-only、warning-only 或强拒绝，可设置 `SKILL_LEDGER_MODE=observe` / `warn` / `block`。`debug` 仍作为 `observe` 的别名。该环境变量应由可信宿主或部署环境设置，不应由 Skill、项目脚本或不可信 shell 启动逻辑设置；如需防止本地 shell profile 被篡改后降级策略，后续应迁移到可信宿主配置源。
 
-**Qoder CLI 配置方式**：安装 `qoder-plugin` 后，plugin 自动注册 matcher 为 `Skill` 的 `PreToolUse` hook。默认 policy 为 `ask`；可由可信启动环境设置 `SKILL_LEDGER_HOOK_POLICY=debug` / `warn` / `block`，并通过 `SKILL_LEDGER_TIMEOUT` 调整 CLI 超时（默认 5 秒）。hook 覆盖 `~/.qoder/skills/` 和 `<cwd>/.qoder/skills/` 下的本地 Skill，用户级同名 Skill 优先；仅在两个目录表都可信解析且没有匹配时，才把调用视为内置、plugin 或 remote Skill，放行并记录 debug。hook 不自动执行 `init` 或 `scan`，未签名 Skill 会以 `none` 状态进入 policy；完成审查后需显式执行 `agent-sec-cli skill-ledger scan <skill_dir>`。
+**Qoder CLI 配置方式**：安装 `qoder-plugin` 后，plugin 自动注册 matcher 为 `Skill` 的 `PreToolUse` hook。默认 policy 为 `ask`；可由可信启动环境设置 `SKILL_LEDGER_MODE=observe` / `warn` / `block`，并通过 `SKILL_LEDGER_TIMEOUT` 调整 CLI 超时（默认 5 秒）。`debug` 仍作为 `observe` 的别名。hook 覆盖 `~/.qoder/skills/` 和 `<cwd>/.qoder/skills/` 下的本地 Skill，用户级同名 Skill 优先；仅在两个目录表都可信解析且没有匹配时，才把调用视为内置、plugin 或 remote Skill，放行并记录 debug。hook 不自动执行 `init` 或 `scan`。`latest.json` 与任何版本 JSON/snapshot artifact 均不存在的 Skill 以 `none` 状态进入 policy；历史 artifact 仍存在但 `latest.json` 缺失，或已有 latest manifest 缺少签名、签名无效时，则以 `tampered` 进入。完成审查后需显式执行 `agent-sec-cli skill-ledger scan <skill_dir>`。
 
 Skill Ledger 全局 `activationPolicy` 属于 SkillFS/daemon activation；这里的 hook `policy` 只控制宿主 hook/capability 的用户可见行为和日志等级。
 
-### 风险 Skill 用户审查与决策
+### 非 pass Skill 用户审查与决策
 
 当 hook 或 `show` 提示当前 skill 需要用户审查时，先查看统一暴露摘要：
 
@@ -296,7 +371,7 @@ agent-sec-cli skill-ledger show /path/to/skill
 | `userDecision` | 当前命中的用户决策；为 `null` 表示尚未决策 |
 | `message` | 需要提示用户的信息；为 `null` 时 hook 静默 |
 
-若需要完整查看不可见的风险版本，导出 latest snapshot、manifest 和 findings：
+若需要完整查看未暴露的待审查版本，导出 latest snapshot、manifest 和 findings：
 
 ```bash
 agent-sec-cli skill-ledger export /path/to/skill --version latest --output /tmp/skill-review
@@ -327,7 +402,7 @@ agent-sec-cli skill-ledger decide /path/to/skill --clear
 
 #### 配置 Skill 目录（批量扫描使用）
 
-默认已包含五个内置目录：`~/.openclaw/skills/*`、`~/.copilot-shell/skills/*`、`~/.hermes/skills/**`、`~/.qoder/skills/*`、`/usr/share/anolisa/skills/*`。项目级 Qoder 目录不作为相对默认项；对项目 Skill 显式执行 `scan` 或 `certify` 后，其绝对目录会沿用自动记忆机制写入 `managedSkillDirs`。如需添加其它目录，创建或编辑 `~/.config/agent-sec/skill-ledger/config.json`：
+默认已包含六个内置目录：`~/.openclaw/skills/*`、`~/.copilot-shell/skills/*`、`~/.hermes/skills/**`、`~/.qoder/skills/*`、`/usr/share/anolisa/skills/*`、`/usr/local/share/anolisa/skills/*`。项目级 Qoder 目录不作为相对默认项；对项目 Skill 显式执行 `scan` 或 `certify` 后，其绝对目录会沿用自动记忆机制写入 `managedSkillDirs`。如需添加其它目录，创建或编辑 `~/.config/agent-sec/skill-ledger/config.json`：
 
 ```json
 {
@@ -419,7 +494,7 @@ agent-sec-cli skill-ledger check /path/to/my-skill
 # → {"status": "drifted", "added": [...], "modified": [...]}
 ```
 
-更新 Skill 后状态变为 `drifted`。触发重新扫描恢复到 `pass`：
+更新 Skill 后状态变为 `drifted`。这只表示 live root 与已签名版本不同，不是 scanner 已确认的风险结果。触发重新扫描认证新内容，并获得当前扫描状态：
 
 ```
 扫描 /path/to/my-skill
@@ -431,7 +506,7 @@ agent-sec-cli skill-ledger check /path/to/my-skill
 agent-sec-cli skill-ledger audit /path/to/my-skill --verify-snapshots
 ```
 
-逐版本验证：哈希完整性 → 签名有效性 → 版本链链接 → 快照一致性。
+逐版本验证：schema → 哈希完整性 → 签名有效性 → 已签名身份 → 显式父版本链接 → 快照一致性。
 
 ---
 

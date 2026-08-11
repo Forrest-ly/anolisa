@@ -20,6 +20,9 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
             "上/下或 j/k 移动 · Enter 恢复 · Space 切换清理标记 · d 打开清理确认 · Esc 取消"
         }
         MessageId::SessionPickerMarkedCount => "已标记 {count}",
+        MessageId::SessionPickerMarkedFooter => {
+            "上/下或 j/k 移动 · Enter 打开清理确认 · Space 切换清理标记 · d 打开清理确认 · Esc 取消"
+        }
         MessageId::SessionClearConfirmTitle => "确认清理会话",
         MessageId::SessionClearConfirmCountLine => "将删除以下 {count} 个持久化会话：",
         MessageId::SessionClearConfirmFooter => "Enter 或 y 确认 · Esc、Ctrl+C 或 n 取消",
@@ -35,7 +38,7 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
         MessageId::SessionCancelledTitle => "会话管理已关闭",
         MessageId::SessionCancelledBody => "模型会话和持久化文件均未改变。",
         MessageId::SessionUsageBody => {
-            "用法：/session [new|status|list|resume <id>|clear <id>...|clear --all|compact [status|cancel]]"
+            "用法：/session [new|status|list [--all]|resume <id>|clear <id>...|clear --all|compact [status|cancel]]"
         }
         MessageId::SessionNewTitle => "全新会话",
         MessageId::SessionNewDetachedBody => {

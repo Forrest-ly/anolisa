@@ -165,13 +165,34 @@ pub fn extract_usage_object(
         }
     };
 
-    // Extract cache tokens (Anthropic-specific)
+    // Extract cache tokens.
+    //
+    // Anthropic reports two separate counters: `cache_creation_input_tokens`
+    // (write) and `cache_read_input_tokens` (hit).
+    //
+    // OpenAI nests cache hits under `prompt_tokens_details.cached_tokens`;
+    // DashScope may surface them at the top level as `cached_tokens`.
+    // DashScope also nests `cache_creation_input_tokens` under
+    // `prompt_tokens_details`, so we fall back there as well.
     let cache_creation_input_tokens = usage
         .get("cache_creation_input_tokens")
-        .and_then(|v| v.as_u64());
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cache_creation_input_tokens"))
+                .and_then(|v| v.as_u64())
+        });
     let cache_read_input_tokens = usage
         .get("cache_read_input_tokens")
-        .and_then(|v| v.as_u64());
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+        })
+        .or_else(|| usage.get("cached_tokens").and_then(|v| v.as_u64()));
 
     // Extract model name
     let model = full_json

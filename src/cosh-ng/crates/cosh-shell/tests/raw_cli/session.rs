@@ -55,13 +55,14 @@ fn raw_cli_session_list_prints_full_canonical_ids() {
 }
 
 #[test]
-fn raw_cli_session_picker_space_then_enter_resumes_without_deleting() {
+fn raw_cli_session_picker_space_then_enter_confirms_and_deletes_without_resuming() {
     let fixture = SessionFixture::new("picker-space-enter", FixtureMode::Ready);
     let output = fixture.run(
         &[],
         vec![
             (b"/session\n".to_vec(), Duration::from_millis(400)),
             (b" ".to_vec(), Duration::from_millis(300)),
+            (b"\n".to_vec(), Duration::from_millis(300)),
             (b"\n".to_vec(), Duration::from_millis(300)),
             (
                 b"echo after-space-enter\nexit\n".to_vec(),
@@ -70,11 +71,15 @@ fn raw_cli_session_picker_space_then_enter_resumes_without_deleting() {
         ],
     );
 
-    assert!(output.contains("Session selected"), "{output}");
-    assert!(output.contains(SESSION_ONE), "{output}");
-    assert!(!output.contains("Confirm session clear"), "{output}");
+    let request = fs::read_to_string(&fixture.clear_log).expect("clear request log");
+    assert!(output.contains("Confirm session clear"), "{output}");
+    assert!(request.contains(SESSION_ONE), "{request}");
+    assert!(!output.contains("Session selected"), "{output}");
+    assert!(
+        output.contains("Deleted 1 persisted session(s)"),
+        "{output}"
+    );
     assert!(output.contains("after-space-enter"), "{output}");
-    assert!(!fixture.clear_log.exists());
 }
 
 #[test]
@@ -189,6 +194,36 @@ fn raw_cli_session_picker_keeps_list_workspace_for_validate_and_clear() {
     assert!(requests.contains(r#""action":"clear""#), "{requests}");
     assert!(requests.contains(&format!(r#""workspace_scope":"{workspace}""#)));
     assert!(!requests.contains("/other/workspace"), "{requests}");
+}
+
+#[test]
+fn raw_cli_session_list_all_groups_foreign_workspace_and_resume_fails() {
+    let fixture = SessionFixture::new("list-all-foreign", FixtureMode::ScopeMismatchFirst);
+    let output = fixture.run(
+        &[],
+        vec![
+            (
+                b"/session list --all\n".to_vec(),
+                Duration::from_millis(400),
+            ),
+            (
+                format!("/session resume {SESSION_ONE}\n").into_bytes(),
+                Duration::from_millis(300),
+            ),
+            (
+                b"echo after-list-all-foreign\nexit\n".to_vec(),
+                Duration::from_millis(200),
+            ),
+        ],
+    );
+
+    assert!(output.contains("/other/workspace"), "{output}");
+    assert!(output.contains(SESSION_ONE), "{output}");
+    assert!(output.contains("session-list-all-foreign"), "{output}");
+    assert!(output.contains(SESSION_TWO), "{output}");
+    assert!(output.contains("scope_mismatch"), "{output}");
+    assert!(output.contains("(current)"), "{output}");
+    assert!(output.contains("after-list-all-foreign"), "{output}");
 }
 
 #[test]
@@ -544,6 +579,7 @@ impl SessionFixture {
         };
         let validate_missing = matches!(mode, FixtureMode::MissingOnValidate);
         let protected_only = matches!(mode, FixtureMode::ProtectedOnly);
+        let scope_mismatch_first = matches!(mode, FixtureMode::ScopeMismatchFirst);
         let script = SESSION_CORE_SCRIPT
             .replace("__SESSIONS__", &sessions)
             .replace("__WORKSPACE__", &workspace_text)
@@ -555,7 +591,11 @@ impl SessionFixture {
                 "__VALIDATE_MISSING__",
                 if validate_missing { "1" } else { "0" },
             )
-            .replace("__PROTECTED_ONLY__", if protected_only { "1" } else { "0" });
+            .replace("__PROTECTED_ONLY__", if protected_only { "1" } else { "0" })
+            .replace(
+                "__SCOPE_MISMATCH_FIRST__",
+                if scope_mismatch_first { "1" } else { "0" },
+            );
         write_executable(&core, &script);
         Self {
             home,
@@ -628,6 +668,8 @@ if [ "$1" = "--session-control" ]; then
         printf '%s\n' '{"ok":false,"error":{"code":"not_found","message":"session disappeared after listing","recoverable":true,"hint":"Refresh the session list and retry."}}'
       elif printf '%s' "$request" | grep -q '11111111-1111-4111-8111-111111111111'; then
         printf '%s\n' '{"ok":true,"data":{"action":"validate","session":{"session_id":"11111111-1111-4111-8111-111111111111","workspace_scope":"__WORKSPACE__","created_at_ms":1,"updated_at_ms":2,"model":"mock-history","message_count":2,"first_prompt":"second prompt","schema_version":1,"health":"ready"}}}'
+      elif [ "__SCOPE_MISMATCH_FIRST__" = "1" ]; then
+        printf '%s\n' '{"ok":false,"error":{"code":"scope_mismatch","message":"session belongs to another workspace","recoverable":true,"hint":"Return to the original workspace to resume this session."}}'
       else
         printf '%s\n' '{"ok":true,"data":{"action":"validate","session":{"session_id":"00000000-0000-4000-8000-000000000000","workspace_scope":"__WORKSPACE__","created_at_ms":1,"updated_at_ms":2,"model":"mock-history","message_count":2,"first_prompt":"first prompt","schema_version":1,"health":"ready"}}}'
       fi

@@ -6,9 +6,80 @@ use crate::agent::run::{ActiveAgentRun, AgentRunOrigin};
 use crate::evidence::stream::CoshRequestStreamFilter;
 
 const SESSION_ID: &str = "00000000-0000-4000-8000-000000000000";
-const SESSION_USAGE: &str =
-    "Usage: /session [new|status|list|resume <id>|clear <id>...|clear --all|compact [status|cancel]]";
+const SESSION_USAGE_PREFIX: &str = "Usage: /session";
 const SESSION_UNAVAILABLE: &str = "Session recovery requires the cosh-core backend.";
+
+#[test]
+fn session_all_workspaces_list_lines_groups_by_workspace_and_orders_newest_first() {
+    let summaries = vec![
+        SessionSummary {
+            session_id: "00000000-0000-4000-8000-000000000000".to_string(),
+            workspace_scope: "/beta".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 20,
+            model: Some("mock".to_string()),
+            message_count: 2,
+            first_prompt: Some("beta newer".to_string()),
+            schema_version: Some(1),
+            health: SessionHealth::Ready,
+        },
+        SessionSummary {
+            session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            workspace_scope: "/alpha".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 30,
+            model: Some("mock".to_string()),
+            message_count: 2,
+            first_prompt: Some("alpha".to_string()),
+            schema_version: Some(1),
+            health: SessionHealth::Ready,
+        },
+        SessionSummary {
+            session_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            workspace_scope: "/beta".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 10,
+            model: Some("mock".to_string()),
+            message_count: 2,
+            first_prompt: Some("beta older".to_string()),
+            schema_version: Some(1),
+            health: SessionHealth::Ready,
+        },
+    ];
+
+    let lines = session_all_workspaces_list_lines(&summaries, "/beta");
+
+    // Workspaces are sorted alphabetically; current workspace is labelled.
+    let alpha_index = lines.iter().position(|line| line == "/alpha").unwrap();
+    let beta_index = lines
+        .iter()
+        .position(|line| line == "/beta (current)")
+        .unwrap();
+    assert!(alpha_index < beta_index);
+    assert!(!lines.iter().any(|line| line == "/beta"));
+
+    // Entries are indented under their workspace.
+    assert!(lines
+        .iter()
+        .any(|line| line.starts_with("  ") && line.contains("alpha")));
+    assert!(lines
+        .iter()
+        .any(|line| line.starts_with("  ") && line.contains("beta newer")));
+    assert!(lines
+        .iter()
+        .any(|line| line.starts_with("  ") && line.contains("beta older")));
+
+    // Within a workspace, newer entries come first.
+    let beta_newer_index = lines
+        .iter()
+        .position(|line| line.contains("beta newer"))
+        .unwrap();
+    let beta_older_index = lines
+        .iter()
+        .position(|line| line.contains("beta older"))
+        .unwrap();
+    assert!(beta_newer_index < beta_older_index);
+}
 
 #[test]
 fn malformed_session_commands_render_usage_instead_of_selecting() {
@@ -23,7 +94,7 @@ fn malformed_session_commands_render_usage_instead_of_selecting() {
     ] {
         let rendered = render_session_arguments(arguments);
         assert!(
-            rendered.contains(SESSION_USAGE),
+            rendered.contains(SESSION_USAGE_PREFIX),
             "{arguments:?} did not render usage: {rendered}"
         );
         assert!(
@@ -42,21 +113,21 @@ fn valid_resume_and_clear_all_keep_session_recovery_routes() {
             "{arguments:?} did not enter session recovery: {rendered}"
         );
         assert!(
-            !rendered.contains(SESSION_USAGE),
+            !rendered.contains(SESSION_USAGE_PREFIX),
             "{arguments:?} unexpectedly rendered usage: {rendered}"
         );
     }
 
     let rendered = render_session_arguments("clear --all");
     assert!(rendered.contains(SESSION_UNAVAILABLE), "{rendered}");
-    assert!(!rendered.contains(SESSION_USAGE), "{rendered}");
+    assert!(!rendered.contains(SESSION_USAGE_PREFIX), "{rendered}");
 }
 
 #[test]
 fn resume_without_id_keeps_picker_contract() {
     let rendered = render_session_arguments("resume");
     assert!(rendered.contains(SESSION_UNAVAILABLE), "{rendered}");
-    assert!(!rendered.contains(SESSION_USAGE), "{rendered}");
+    assert!(!rendered.contains(SESSION_USAGE_PREFIX), "{rendered}");
 }
 
 #[test]
@@ -128,14 +199,25 @@ fn picker_panel_shows_short_ids_marked_count_and_key_semantics() {
         });
     let mut output = Vec::new();
 
+    assert!(matches!(
+        crate::runtime::controller::pending_card_capture(&state),
+        Some(crate::raw_input::RawInputCapture::Session {
+            marked_for_clear,
+            ..
+        }) if marked_for_clear == vec![true]
+    ));
     render_current_session_panel(&adapter, &mut state, &mut output).expect("render picker panel");
 
-    // Collapse renderer wrapping so contract assertions stay width-agnostic.
+    // Strip per-line borders before joining so wrapped footer text stays width-agnostic.
     let rendered = String::from_utf8(output).expect("UTF-8 picker panel");
-    let flat = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = rendered
+        .lines()
+        .map(|line| line.trim_matches(|ch: char| ch == '│' || ch.is_whitespace()))
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(flat.contains("[x] 00000000… · first prompt"), "{rendered}");
     assert!(flat.contains("1/1 · 1 marked"), "{rendered}");
-    assert!(flat.contains("Enter resume"), "{rendered}");
+    assert!(flat.contains("Enter review clear"), "{rendered}");
     assert!(flat.contains("Space toggle clear mark"), "{rendered}");
     assert!(flat.contains("d review clear"), "{rendered}");
     assert!(!flat.contains("Space mark for clear"), "{rendered}");

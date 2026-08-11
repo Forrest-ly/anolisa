@@ -1,11 +1,42 @@
 # Changelog
 
+[中文版](CHANGELOG_zh.md)
+
 All notable changes to Tokenless will be documented in this file.
 
 Releases from 0.7.2 onward follow
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
+
+## [0.7.5] - 2026-08-10
+
+### Added
+
+- OpenCode users can now enable Tokenless through a collision-safe local plugin that shares the existing readiness, rewrite, schema, and response-compression hooks ([1233cfcf](https://github.com/alibaba/anolisa/commit/1233cfcfd863de4bca7819b0a98615c569da2c9a)).
+
+### Changed
+
+- The Qoder adapter now uses native plugin and hook conventions, replacing compressed tool output in place while preserving fail-open behavior ([13817938](https://github.com/alibaba/anolisa/commit/13817938f0a8cf2b8df78d3e59f97302e4fb1947)).
+
+### Fixed
+
+- Rewritten shell commands now use the resolved absolute `rtk` path, so they continue to work in agent environments with a restricted `PATH` ([ae83f7d3](https://github.com/alibaba/anolisa/commit/ae83f7d3ef9c85d5f42e7b1c0fd6884a0ffc4869)).
+- Qoder and OpenClaw hooks now preserve agent, session, and tool attribution across rewrite and proxy boundaries ([#2158](https://github.com/alibaba/anolisa/issues/2158), [2f330656](https://github.com/alibaba/anolisa/commit/2f330656fe94fc5936e1ebcaf586d7ebcd7df0d5)).
+- Adapter installation now recognizes legacy `/usr/local` layouts, recommends RPM upgrade mode, and removes stale packaged user-manual files during upgrades ([f7ce3878](https://github.com/alibaba/anolisa/commit/f7ce38786cfba318614849a73a7f9acb693ea803), [ec25d516](https://github.com/alibaba/anolisa/commit/ec25d516b8c05ebd8e88a703f57708749c8032ab), [917f151e](https://github.com/alibaba/anolisa/commit/917f151ea4157850b51162668b3e1a441fb04262)).
+
+## [0.7.4] - 2026-07-31
+
+### Added
+
+- Tokenless can now be installed from npm on Linux and macOS x64/arm64, including the `tokenless`, `rtk`, and `toon` binaries plus framework adapters ([#1929](https://github.com/alibaba/anolisa/pull/1929)).
+- `tokenless stats diff` now explains estimated savings for records, sessions, and tool uses with text or JSON reports and bounded unified diffs ([#1991](https://github.com/alibaba/anolisa/pull/1991)).
+- `TOKENLESS_DATA_DIR` now sets one trusted directory for both statistics and reversible-compression databases while preserving per-database overrides ([#2038](https://github.com/alibaba/anolisa/pull/2038)).
+
+### Fixed
+
+- The Qwencode adapter now declares its delivered `compress-toon` capability, keeping adapter discovery consistent with its compression behavior ([#1945](https://github.com/alibaba/anolisa/pull/1945)).
+- Hermes copy installations now resolve shared hook resources from trusted system, XDG, and user data paths with actionable diagnostics when no safe candidate exists ([#2058](https://github.com/alibaba/anolisa/pull/2058)).
 
 ## [0.7.3] - 2026-07-28
 
@@ -203,6 +234,8 @@ Releases from 0.7.2 onward follow
 
 - introduce tokenless into ANOLISA (#199)
 
-[Unreleased]: https://github.com/alibaba/anolisa/compare/tokenless/v0.7.3...HEAD
+[Unreleased]: https://github.com/alibaba/anolisa/compare/tokenless/v0.7.5...HEAD
+[0.7.5]: https://github.com/alibaba/anolisa/compare/tokenless/v0.7.4...tokenless/v0.7.5
+[0.7.4]: https://github.com/alibaba/anolisa/compare/tokenless/v0.7.3...tokenless/v0.7.4
 [0.7.3]: https://github.com/alibaba/anolisa/compare/tokenless/v0.7.2...tokenless/v0.7.3
 [0.7.2]: https://github.com/alibaba/anolisa/compare/tokenless/v0.7.1...tokenless/v0.7.2

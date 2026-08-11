@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Daemon-wide shared state: configuration, policy engine, pool, template
-//! and hook registries, and the in-memory instance map. All API handlers
+//! Daemon-wide shared state: configuration, policy engine, pool, hook registry,
+//! and the in-memory instance map. All API handlers
 //! receive an [`Arc<ServerState>`] and acquire the relevant `Mutex<...>`
 //! lock just long enough to read or mutate the piece they need — locks
 //! are never held across `.await` boundaries.
@@ -16,33 +16,32 @@ use blaze_core::lifecycle::SandboxInstance;
 use blaze_core::policy::PolicyEngine;
 use blaze_core::pool::PoolManager;
 use blaze_core::storage::StorageProvider;
-use blaze_core::template::TemplateRegistry;
-use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::error::Result;
 use crate::metrics::Metrics;
-use crate::spawner::{DynBackendInstance, DynSpawner, SpawnerRegistry};
+use crate::sandbox::template::TemplateCatalog;
+#[cfg(test)]
+use crate::sandbox::template::validate_template_roots;
+use crate::sandbox::{SandboxManager, SandboxManagerInit};
+use crate::spawner::SpawnerRegistry;
 
 /// All daemon mutable state. Cloning is via `Arc` (see the `state.clone()`
 /// idiom in `daemon.rs`); the struct itself is never `Clone`.
 pub struct ServerState {
     pub config: Mutex<DaemonConfig>,
     pub policy: Mutex<PolicyEngine>,
-    pub pool: Mutex<PoolManager>,
-    pub template: Mutex<TemplateRegistry>,
+    pub pool: Arc<Mutex<PoolManager>>,
     pub hook: Mutex<HookRegistry>,
-    pub instances: Mutex<HashMap<Uuid, SandboxInstance>>,
-    pub backend_instances: Mutex<HashMap<Uuid, DynBackendInstance>>,
-    operation_locks: Mutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>,
-    pub spawners: SpawnerRegistry,
+    pub instances: Arc<Mutex<HashMap<Uuid, SandboxInstance>>>,
+    pub manager: Arc<SandboxManager>,
     /// The backend kind that `build_spawner` actually probed and selected.
     /// API handlers use this to constrain availability to the single active
     /// backend rather than reporting all configured binaries.
     pub active_backend: BackendKind,
     pub storage: Arc<dyn StorageProvider>,
     pub state_dir: PathBuf,
-    pub metrics: Metrics,
+    pub metrics: Arc<Metrics>,
 }
 
 impl ServerState {
@@ -50,62 +49,84 @@ impl ServerState {
     /// `instances` map from previous runs (best-effort; corrupt entries
     /// are skipped with a warning).
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn build(
         config: DaemonConfig,
         policy: PolicyEngine,
         pool: PoolManager,
-        template: TemplateRegistry,
         hook: HookRegistry,
         spawners: SpawnerRegistry,
         active_backend: BackendKind,
         storage: Arc<dyn StorageProvider>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let template_roots = validate_template_roots(
+            &config.template,
+            &config.storage.images_dir,
+            &config.storage.instances_dir,
+            &config.policy.dir,
+            &config.backends,
+            &config.daemon.state_dir,
+            &config.daemon.socket,
+            None,
+        )?;
+        let template_catalog = TemplateCatalog::open_validated(&config.template, template_roots)?;
+        Self::build_with_template_catalog(
+            config,
+            policy,
+            pool,
+            hook,
+            spawners,
+            active_backend,
+            storage,
+            template_catalog,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_template_catalog(
+        config: DaemonConfig,
+        policy: PolicyEngine,
+        pool: PoolManager,
+        hook: HookRegistry,
+        spawners: SpawnerRegistry,
+        active_backend: BackendKind,
+        storage: Arc<dyn StorageProvider>,
+        template_catalog: TemplateCatalog,
+    ) -> Result<Self> {
         let state_dir = config.daemon.state_dir.clone();
         let instances = scan_state_dir(&state_dir).unwrap_or_else(|err| {
             tracing::warn!(error = %err, "failed to scan state_dir, starting empty");
             HashMap::new()
         });
-        let operation_locks = instances
-            .keys()
-            .copied()
-            .map(|id| (id, Arc::new(AsyncMutex::new(()))))
-            .collect();
+        let (manager, resources) = SandboxManager::new(SandboxManagerInit {
+            instances,
+            pool,
+            spawners,
+            active_backend,
+            storage: storage.clone(),
+            state_dir: state_dir.clone(),
+            rootfs_size: config.storage.rootfs_size,
+            mem_size: config.storage.mem_size,
+            template_catalog,
+        });
 
-        Self {
+        Ok(Self {
             config: Mutex::new(config),
             policy: Mutex::new(policy),
-            pool: Mutex::new(pool),
-            template: Mutex::new(template),
+            pool: resources.pool,
             hook: Mutex::new(hook),
-            instances: Mutex::new(instances),
-            backend_instances: Mutex::new(HashMap::new()),
-            operation_locks: Mutex::new(operation_locks),
-            spawners,
+            instances: resources.instances,
+            manager: Arc::new(manager),
             active_backend,
             storage,
             state_dir,
-            metrics: Metrics::new(),
-        }
+            metrics: resources.metrics,
+        })
     }
 
     /// Return the async operation lock that serializes one sandbox mutation.
-    pub fn operation_lock(&self, id: Uuid) -> Arc<AsyncMutex<()>> {
-        match self.operation_locks.lock() {
-            Ok(mut locks) => locks
-                .entry(id)
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone(),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .entry(id)
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone(),
-        }
-    }
-
-    /// Return the implementation responsible for a persisted backend kind.
-    pub fn spawner_for(&self, kind: BackendKind) -> Option<DynSpawner> {
-        self.spawners.get(kind)
+    pub fn operation_lock(&self, id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        self.manager.operation_lock(id)
     }
 }
 

@@ -34,6 +34,12 @@ pub struct AuthField {
 pub struct AuthProvider {
     pub id: String,
     pub label: String,
+    /// Short guidance shown under the provider label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Simplified Chinese guidance shown when the shell uses zh-CN.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description_zh_cn: Option<String>,
     pub fields: Vec<AuthField>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub builtin_base_url: Option<String>,
@@ -69,6 +75,13 @@ pub enum InputMessage {
     #[serde(rename = "control_response")]
     ControlResponse { response: ControlResponsePayload },
 
+    /// #1940 receipt protocol: the shell emits this as soon as a control
+    /// approval request reaches its main thread, proving the request has an
+    /// owner for its terminal state. Cores that predate the receipt simply
+    /// fail to deserialize this line and keep their residual guard.
+    #[serde(rename = "approval_receipt")]
+    ApprovalReceipt { request_id: String },
+
     #[serde(rename = "registry_request")]
     RegistryRequest {
         request_id: String,
@@ -83,6 +96,11 @@ pub enum InputMessage {
 pub struct UserMessageContent {
     pub role: String,
     pub content: String,
+    /// Original user text supplied by cosh-shell for hook compatibility.
+    ///
+    /// Older clients omit this field; callers must fall back to `content`.
+    #[serde(default)]
+    pub raw_user_input: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -98,7 +116,15 @@ pub struct ShellContext {
 #[serde(tag = "subtype")]
 pub enum ShellControlRequest {
     #[serde(rename = "initialize")]
-    Initialize,
+    Initialize {
+        /// Whether this initialization should run SessionStart hooks.
+        ///
+        /// The default keeps older clients compatible. cosh-shell's one-shot
+        /// transport disables the lifecycle event because its former
+        /// positional invocation did not emit startup hooks.
+        #[serde(default = "default_fire_session_start")]
+        fire_session_start: bool,
+    },
 
     #[serde(rename = "interrupt")]
     Interrupt,
@@ -119,6 +145,10 @@ pub enum ShellControlRequest {
 
     #[serde(rename = "reload_config")]
     ReloadConfig,
+}
+
+fn default_fire_session_start() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -209,6 +239,8 @@ pub enum OutputMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         error_code: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        max_turns: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         session_error_code: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         session_error_phase: Option<String>,
@@ -249,6 +281,11 @@ pub struct CoreControlCapabilities {
     pub can_handle_can_use_tool: bool,
     pub can_handle_host_executed_shell_tool_result: bool,
     pub can_handle_shell_evidence_tool: bool,
+    /// #1940 receipt protocol: the core consumes `approval_receipt` lines to
+    /// disarm its last-resort approval timeout. Announced so the shell only
+    /// sends receipts to a core that understands them; older or mock
+    /// providers without this capability never see receipt lines.
+    pub can_handle_approval_receipt: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -452,6 +489,7 @@ impl OutputMessage {
                         can_handle_can_use_tool: true,
                         can_handle_host_executed_shell_tool_result: true,
                         can_handle_shell_evidence_tool,
+                        can_handle_approval_receipt: true,
                     },
                 },
             },
@@ -518,6 +556,7 @@ impl OutputMessage {
             result: Some(result.to_string()),
             errors: None,
             error_code: None,
+            max_turns: None,
             session_error_code: None,
             session_error_phase: None,
             session_id: Some(session_id.to_string()),
@@ -538,6 +577,24 @@ impl OutputMessage {
             result: Some(error.to_string()),
             errors: Some(vec![error.to_string()]),
             error_code: error_code.map(str::to_string),
+            max_turns: None,
+            session_error_code: None,
+            session_error_phase: None,
+            session_id: Some(session_id.to_string()),
+            env_delta: None,
+            duration_ms: None,
+        }
+    }
+
+    /// Builds a max-turn result with stable machine-readable metadata.
+    pub fn max_turns_result_error(session_id: &str, error: &str, max_turns: u32) -> Self {
+        Self::Result {
+            subtype: Some("error".to_string()),
+            is_error: true,
+            result: Some(error.to_string()),
+            errors: Some(vec![error.to_string()]),
+            error_code: Some("max_turns".to_string()),
+            max_turns: Some(max_turns),
             session_error_code: None,
             session_error_phase: None,
             session_id: Some(session_id.to_string()),
@@ -558,6 +615,7 @@ impl OutputMessage {
             result: Some(error.to_string()),
             errors: Some(vec![error.to_string()]),
             error_code: None,
+            max_turns: None,
             session_error_code: Some(session_error_code.to_string()),
             session_error_phase: Some(session_error_phase.to_string()),
             session_id: Some(session_id.to_string()),
@@ -767,10 +825,39 @@ mod tests {
             } => {
                 assert_eq!(message.role, "user");
                 assert_eq!(message.content, "hello world");
+                assert_eq!(message.raw_user_input, None);
                 assert_eq!(session_id.as_deref(), Some("default"));
             }
             _ => panic!("expected User variant"),
         }
+    }
+
+    #[test]
+    fn parse_user_message_preserves_optional_raw_input() {
+        let json = r#"{"type":"user","message":{"role":"user","content":"envelope","raw_user_input":"raw"}}"#;
+        let msg: InputMessage = serde_json::from_str(json).expect("should parse raw user input");
+        match msg {
+            InputMessage::User { message, .. } => {
+                assert_eq!(message.content, "envelope");
+                assert_eq!(message.raw_user_input.as_deref(), Some("raw"));
+            }
+            _ => panic!("expected User variant"),
+        }
+    }
+
+    #[test]
+    fn parse_initialize_can_disable_session_start() {
+        let json = r#"{"request_id":"init-1","type":"control_request","request":{"subtype":"initialize","fire_session_start":false}}"#;
+        let msg: InputMessage = serde_json::from_str(json).expect("should parse initialize");
+        assert!(matches!(
+            msg,
+            InputMessage::ControlRequest {
+                request: ShellControlRequest::Initialize {
+                    fire_session_start: false
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -783,7 +870,12 @@ mod tests {
                 request,
             } => {
                 assert_eq!(request_id, "init-1");
-                assert!(matches!(request, ShellControlRequest::Initialize));
+                assert!(matches!(
+                    request,
+                    ShellControlRequest::Initialize {
+                        fire_session_start: true
+                    }
+                ));
             }
             _ => panic!("expected ControlRequest variant"),
         }
@@ -901,6 +993,10 @@ mod tests {
         assert_eq!(
             v["response"]["response"]["capabilities"]["can_handle_shell_evidence_tool"],
             false
+        );
+        assert_eq!(
+            v["response"]["response"]["capabilities"]["can_handle_approval_receipt"],
+            true
         );
         assert!(v["response"]["response"]["capabilities"]
             .get("can_handle_shell_output_evidence_tool")
@@ -1059,6 +1155,16 @@ mod tests {
         assert_eq!(v["type"], "result");
         assert_eq!(v["is_error"], true);
         assert!(v.get("session_error_code").is_none());
+    }
+
+    #[test]
+    fn serialize_max_turns_result_error() {
+        let msg = OutputMessage::max_turns_result_error("sess-1", "turn limit", 50);
+        let value = serde_json::to_value(msg).unwrap();
+
+        assert_eq!(value["type"], "result");
+        assert_eq!(value["error_code"], "max_turns");
+        assert_eq!(value["max_turns"], 50);
     }
 
     #[test]

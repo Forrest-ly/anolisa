@@ -26,6 +26,9 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
             "Up/Down or j/k move · Enter resume · Space toggle clear mark · d review clear · Esc cancel"
         }
         MessageId::SessionPickerMarkedCount => "{count} marked",
+        MessageId::SessionPickerMarkedFooter => {
+            "Up/Down or j/k move · Enter review clear · Space toggle clear mark · d review clear · Esc cancel"
+        }
         MessageId::SessionClearConfirmTitle => "Confirm session clear",
         MessageId::SessionClearConfirmCountLine => {
             "The following {count} persisted session(s) will be deleted:"
@@ -45,7 +48,7 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
         MessageId::SessionCancelledTitle => "Session manager closed",
         MessageId::SessionCancelledBody => "No provider session or persisted file changed.",
         MessageId::SessionUsageBody => {
-            "Usage: /session [new|status|list|resume <id>|clear <id>...|clear --all|compact [status|cancel]]"
+            "Usage: /session [new|status|list [--all]|resume <id>|clear <id>...|clear --all|compact [status|cancel]]"
         }
         MessageId::SessionNewTitle => "Fresh session",
         MessageId::SessionNewDetachedBody => {
