@@ -626,7 +626,7 @@ fn retrieve_output_matches_stashed_payload_without_trailing_newline() {
 
     let compress_output = fixture
         .command()
-        .args(["compress-response", "--truncate-strings-at", "20"])
+        .args(["compress-response", "--truncate-strings-at", "100"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -644,14 +644,13 @@ fn retrieve_output_matches_stashed_payload_without_trailing_newline() {
     );
 
     let stdout = String::from_utf8_lossy(&compress_output.stdout);
-    let start = match stdout.find("<<tokenless:") {
-        Some(i) => i,
-        None => return,
-    };
-    let end = match stdout[start..].find(">>") {
-        Some(i) => start + i + 2,
-        None => return,
-    };
+    let start = stdout
+        .find("<<tokenless:")
+        .expect("compressed output must contain a reversible stash marker");
+    let end = stdout[start..]
+        .find(">>")
+        .map(|i| start + i + 2)
+        .expect("stash marker must be closed with >>");
     let marker = stdout[start..end].to_string();
 
     let retrieve_output = fixture
