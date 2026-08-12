@@ -54,8 +54,13 @@ fn array_truncation_custom_limit() {
     let arr: Vec<i32> = (1..=10).collect();
     let out = compressor.compress(&json!(arr));
     let a = out.as_array().unwrap();
+    // Head+tail sampling: 2 head items + 1 marker + 1 tail item, with the
+    // marker between the samples: [1, 2, marker, 10].
     assert_eq!(a.len(), 4);
-    assert!(a[3].as_str().unwrap().contains("truncated"));
+    assert_eq!(a[0], json!(1));
+    assert_eq!(a[1], json!(2));
+    assert!(a[2].as_str().unwrap().contains("truncated"));
+    assert_eq!(a[3], json!(10));
 }
 
 #[test]
@@ -132,11 +137,12 @@ fn stash_round_trip_recovers_dropped_items_verbatim() {
     let arr = json!(["a", "b", "c", "d", "e"]);
     let out = compressor.compress(&arr);
     let a = out.as_array().unwrap();
-    // Head+tail: 1 head item + 1 tail item + 1 marker.
+    // Head+tail: 1 head item + 1 marker + 1 tail item, with the marker
+    // between the samples: ["a", marker, "e"].
     assert_eq!(a.len(), 3);
     assert_eq!(a[0], json!("a"));
-    assert_eq!(a[1], json!("e"));
-    let hash = extract_hash(a.last().unwrap().as_str().unwrap()).unwrap();
+    assert_eq!(a[2], json!("e"));
+    let hash = extract_hash(a[1].as_str().unwrap()).unwrap();
     let recovered: Vec<String> =
         serde_json::from_str(&store.retrieve(hash).unwrap().unwrap()).unwrap();
     assert_eq!(recovered, vec!["b", "c", "d"]);

@@ -18,11 +18,13 @@
 //! (ResponseCompressor/SchemaCompressor → TOON encode → TOON decode) retain
 //! their semantic fields while noise is stripped.
 //!
-//! **Known limitation**: TOON's decoder does not recover root-level scalar keys
-//! (like `tool`, `status`) that appear after a large mixed-type array in the
-//! encoded text. The `response_pipeline_preserves_tool_and_status` test therefore
-//! asserts on the L1 compressed value (before TOON), not on the decoded output.
-//! See `response_toon_roundtrip_known_limitation` for the documented behavior.
+//! **Known limitation**: head+tail sampling places the array-truncation marker
+//! between the kept head and tail samples, so a truncated array of objects
+//! becomes a mixed-type list with a scalar in the middle. TOON 0.5's decoder
+//! cannot parse that scalar (even in non-strict mode) and the whole decode
+//! fails. The response pipeline tests therefore run with the truncation marker
+//! disabled; see `response_toon_roundtrip_known_limitation` for the documented
+//! decode failure when the marker is present.
 
 use serde_json::{Value, json};
 use tokenless_bench::{response_canonical, schema_canonical};
@@ -35,16 +37,16 @@ fn response_compressed(value: &Value) -> Value {
 
 /// Run a response value through compress → TOON encode → TOON decode.
 ///
-/// Uses non-strict decode because the compressor's array-truncation marker
-/// (a string appended after object elements) produces a mixed-type array
-/// whose TOON text is ambiguous under strict validation. Non-strict mode
-/// still round-trips the result-item fields correctly. Root-level scalar
-/// keys (`tool`, `status`) that appear after the long mixed-type list in the
-/// TOON text are not recovered by the decoder — a known TOON limitation with
-/// large mixed-type arrays. Tests for those keys assert on the compressed
-/// value instead.
+/// Uses non-strict decode and disables the array-truncation marker: head+tail
+/// sampling places the marker between the kept samples, and TOON 0.5 cannot
+/// decode a scalar sitting in the middle of an object list (the decode fails
+/// outright — see `response_toon_roundtrip_known_limitation`). With the marker
+/// disabled, the kept head+tail items are a uniform object list and
+/// round-trip correctly, including root-level keys after the array.
 fn response_pipeline(value: &Value) -> Value {
-    let compressed = ResponseCompressor::new().compress(value);
+    let compressed = ResponseCompressor::new()
+        .with_add_truncation_marker(false)
+        .compress(value);
     let encoded = toon_format::encode_default(&compressed).expect("TOON encode");
     let opts = toon_format::DecodeOptions::default().with_strict(false);
     toon_format::decode::<Value>(&encoded, &opts).expect("TOON decode")
@@ -59,10 +61,9 @@ fn schema_pipeline(value: &Value) -> Value {
 
 #[test]
 fn response_pipeline_preserves_tool_and_status() {
-    // Tool and status are top-level scalar keys that TOON's decoder does not
-    // recover when they follow the large mixed-type `results` list (a known
-    // TOON limitation). Verify them on the compressed value — the compression
-    // stage is what must preserve them.
+    // Tool and status are top-level scalar keys after the large `results`
+    // list. Verify them on the compressed value — the compression stage is
+    // what must preserve them, independent of TOON codec behavior.
     let compressed = response_compressed(&response_canonical());
     assert_eq!(compressed["tool"], "search_code");
     assert_eq!(compressed["status"], "ok");
@@ -74,9 +75,10 @@ fn response_pipeline_preserves_result_item_fields() {
     let results = decoded["results"]
         .as_array()
         .expect("results array exists after pipeline");
-    // The canonical response has 60 items; the compressor truncates to 32
-    // kept items (+1 marker). After the TOON round-trip the first element
-    // must still be an object carrying the semantic fields.
+    // The canonical response has 60 items; head+tail sampling keeps 32
+    // (16 head + 16 tail; the marker is disabled for the TOON round-trip,
+    // see `response_pipeline`). After the round-trip the first element must
+    // still be an object carrying the semantic fields.
     let first = &results[0];
     assert!(first["id"].is_number(), "id preserved");
     assert!(first["name"].is_string(), "name preserved");
@@ -157,19 +159,19 @@ fn schema_pipeline_preserves_semantic_fields() {
 
 #[test]
 fn response_toon_roundtrip_known_limitation() {
-    // Documents the known TOON limitation: root-level keys appearing after the
-    // large mixed-type `results` array are NOT recovered by the decoder.
-    // This is expected behavior, not a bug in the benchmark suite.
-    let decoded = response_pipeline(&response_canonical());
-    // tool and status are lost after TOON roundtrip — assert their absence
-    // to document the limitation. If TOON is fixed in the future, this test
-    // will fail, signaling that the limitation no longer applies.
+    // Documents the known TOON limitation: with the truncation marker between
+    // the head and tail samples, a truncated object array becomes a
+    // mixed-type list whose mid-list scalar marker TOON 0.5 cannot parse —
+    // the whole decode fails, even in non-strict mode. This is expected
+    // behavior of the current codec, not a bug in the benchmark suite.
+    // Canary: if a future toon-format release learns to parse the mid-list
+    // marker, this assertion flips and signals the limitation no longer
+    // applies (and the marker can be re-enabled in `response_pipeline`).
+    let compressed = ResponseCompressor::new().compress(&response_canonical());
+    let encoded = toon_format::encode_default(&compressed).expect("TOON encode");
+    let opts = toon_format::DecodeOptions::default().with_strict(false);
     assert!(
-        decoded.get("tool").is_none() || decoded["tool"].is_null(),
-        "TOON limitation: tool should NOT survive roundtrip with current codec"
-    );
-    assert!(
-        decoded.get("status").is_none() || decoded["status"].is_null(),
-        "TOON limitation: status should NOT survive roundtrip with current codec"
+        toon_format::decode::<Value>(&encoded, &opts).is_err(),
+        "TOON limitation: mid-list truncation marker must fail to decode with current codec"
     );
 }

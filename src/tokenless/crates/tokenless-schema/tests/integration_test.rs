@@ -291,9 +291,14 @@ fn test_response_array_truncation() {
     let result = compressor.compress(&json!(arr));
 
     let arr_result = result.as_array().unwrap();
-    // 2 head items + 1 truncation marker + 1 tail item = 4
+    // Head+tail sampling: 2 head items + 1 truncation marker + 1 tail item.
+    // The marker sits between the head and tail samples so the output
+    // preserves original ordering: [1, 2, marker, 10].
     assert_eq!(arr_result.len(), 4);
+    assert_eq!(arr_result[0], json!(1));
+    assert_eq!(arr_result[1], json!(2));
     assert!(arr_result[2].as_str().unwrap().contains("truncated"));
+    assert_eq!(arr_result[3], json!(10));
 }
 
 #[test]
