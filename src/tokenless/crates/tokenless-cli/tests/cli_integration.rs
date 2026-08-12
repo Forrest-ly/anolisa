@@ -613,3 +613,62 @@ fn stats_diff_invalid_scope_and_missing_record_use_expected_exit_codes() {
         .unwrap();
     assert_eq!(missing.status.code(), Some(1));
 }
+
+#[test]
+fn retrieve_output_matches_stashed_payload_without_trailing_newline() {
+    let fixture = match TempDataDir::new() {
+        Some(f) => f,
+        None => return,
+    };
+
+    let payload = "A".repeat(500);
+    let input = serde_json::json!({ "text": payload }).to_string();
+
+    let compress_output = fixture
+        .command()
+        .args(["compress-response", "--truncate-strings-at", "20"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(input.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(
+        compress_output.status.success(),
+        "compress-response failed: {}",
+        String::from_utf8_lossy(&compress_output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&compress_output.stdout);
+    let start = match stdout.find("<<tokenless:") {
+        Some(i) => i,
+        None => return,
+    };
+    let end = match stdout[start..].find(">>") {
+        Some(i) => start + i + 2,
+        None => return,
+    };
+    let marker = stdout[start..end].to_string();
+
+    let retrieve_output = fixture
+        .command()
+        .args(["retrieve", &marker])
+        .output()
+        .unwrap();
+    assert!(
+        retrieve_output.status.success(),
+        "retrieve failed: {}",
+        String::from_utf8_lossy(&retrieve_output.stderr)
+    );
+
+    let retrieved = &retrieve_output.stdout;
+    assert_eq!(
+        retrieved,
+        payload.as_bytes(),
+        "retrieve output must match stashed payload byte-for-byte (no trailing newline)"
+    );
+}

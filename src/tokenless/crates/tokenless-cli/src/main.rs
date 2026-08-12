@@ -693,7 +693,9 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             };
             match store.retrieve(&key) {
                 Ok(Some(payload)) => {
-                    println!("{}", payload);
+                    // print! not println!: stash payloads are byte-exact, and a trailing
+                    // \n breaks lossless retrieval when the original did not end with one.
+                    print!("{}", payload);
                 }
                 Ok(None) => {
                     return Err((format!("no stashed payload for hash: {}", key), 1));
