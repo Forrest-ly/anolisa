@@ -316,6 +316,7 @@ impl PyTokenlessRuntime {
         let options = CompressOptions {
             truncate_strings_at,
             truncate_arrays_at,
+            array_tail_preserve: None,
             max_depth,
             stash_enabled,
             require_reversible,

@@ -83,6 +83,9 @@ enum Commands {
         /// Max array length before truncation
         #[arg(long)]
         truncate_arrays_at: Option<usize>,
+        /// Items preserved from the tail of truncated arrays (default: 8)
+        #[arg(long)]
+        array_tail_preserve: Option<usize>,
         /// Max nesting depth before truncation
         #[arg(long)]
         max_depth: Option<usize>,
@@ -580,6 +583,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             tool_use_id,
             truncate_strings_at,
             truncate_arrays_at,
+            array_tail_preserve,
             max_depth,
             no_stash,
             stash_db,
@@ -603,6 +607,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                 &CompressOptions {
                     truncate_strings_at,
                     truncate_arrays_at,
+                    array_tail_preserve,
                     max_depth,
                     stash_enabled: !no_stash,
                     // Preserve the existing CLI contract: stash failure is

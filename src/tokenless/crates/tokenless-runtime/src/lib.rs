@@ -50,6 +50,12 @@ pub struct CompressOptions {
     pub truncate_strings_at: Option<usize>,
     /// Maximum array item count before truncation.
     pub truncate_arrays_at: Option<usize>,
+    /// Items preserved from the tail of truncated arrays.
+    ///
+    /// When set, truncated arrays keep this many trailing items in addition
+    /// to the head, with a truncation marker between them. `None` uses the
+    /// compressor default.
+    pub array_tail_preserve: Option<usize>,
     /// Maximum JSON nesting depth before truncation.
     pub max_depth: Option<usize>,
     /// Whether reversible stash markers may be created.
@@ -64,6 +70,7 @@ impl Default for CompressOptions {
         Self {
             truncate_strings_at: None,
             truncate_arrays_at: None,
+            array_tail_preserve: None,
             max_depth: None,
             stash_enabled: true,
             require_reversible: false,
@@ -566,6 +573,9 @@ pub fn compress_response_with_store(
     }
     if let Some(value) = options.truncate_arrays_at {
         compressor = compressor.with_truncate_arrays_at(value);
+    }
+    if let Some(value) = options.array_tail_preserve {
+        compressor = compressor.with_array_tail_preserve(value);
     }
     if let Some(value) = options.max_depth {
         compressor = compressor.with_max_depth(value);
