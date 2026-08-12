@@ -90,7 +90,7 @@ def _resolve_hook_utils() -> tuple[str, list[str]]:
         real_home = ""
 
     candidates = [
-        os.path.join(_HERE, "..", "..", "common", "hooks"),
+        os.path.join(_HERE, "..", "common", "hooks"),
         "/usr/share/anolisa/adapters/tokenless/common/hooks",
         "/usr/local/share/anolisa/adapters/tokenless/common/hooks",
     ]

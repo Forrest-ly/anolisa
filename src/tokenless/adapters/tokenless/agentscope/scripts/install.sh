@@ -59,23 +59,28 @@ elif [ -x /usr/bin/tokenless ]; then
 fi
 
 if [ -z "$TOKENLESS_BIN" ]; then
-    if [ -n "${TOKENLESS_SOURCE_DIR:-}" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        line "DRY-RUN: would build tokenless from source (skipped)"
+        TOKENLESS_BIN=""
+    elif [ -n "${TOKENLESS_SOURCE_DIR:-}" ]; then
         SRCDIR="$TOKENLESS_SOURCE_DIR"
     else
-        SRCDIR="$(cd "$SCRIPT_DIR/../../../.." && pwd 2>/dev/null || true)"
+        SRCDIR="$(cd "$ADAPTER_DIR/../.." && pwd 2>/dev/null || true)"
     fi
 
-    if [ -z "$SRCDIR" ] || [ ! -f "$SRCDIR/Cargo.toml" ]; then
-        line "ERROR: tokenless binary not found and no source tree at $SRCDIR" >&2
-        exit 1
-    fi
+    if [ "$DRY_RUN" != "1" ]; then
+        if [ -z "$SRCDIR" ] || [ ! -f "$SRCDIR/Cargo.toml" ]; then
+            line "ERROR: tokenless binary not found and no source tree at $SRCDIR" >&2
+            exit 1
+        fi
 
-    line "Building tokenless from source: $SRCDIR"
-    cd "$SRCDIR"
-    cargo build --release -p tokenless-cli 2>&1 | tail -3
-    mkdir -p "$BINDIR"
-    cp "$SRCDIR/target/release/tokenless" "$BINDIR/tokenless"
-    chmod 755 "$BINDIR/tokenless"
+        line "Building tokenless from source: $SRCDIR"
+        cd "$SRCDIR"
+        cargo build --release -p tokenless-cli 2>&1 | tail -3
+        mkdir -p "$BINDIR"
+        cp "$SRCDIR/target/release/tokenless" "$BINDIR/tokenless"
+        chmod 755 "$BINDIR/tokenless"
+    fi
 else
     line "Binary: $TOKENLESS_BIN ($("$TOKENLESS_BIN" --version))"
 fi
