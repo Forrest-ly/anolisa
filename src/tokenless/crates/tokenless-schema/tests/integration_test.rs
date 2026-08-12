@@ -291,9 +291,9 @@ fn test_response_array_truncation() {
     let result = compressor.compress(&json!(arr));
 
     let arr_result = result.as_array().unwrap();
-    // 3 items + 1 truncation marker
+    // 2 head items + 1 truncation marker + 1 tail item = 4
     assert_eq!(arr_result.len(), 4);
-    assert!(arr_result[3].as_str().unwrap().contains("truncated"));
+    assert!(arr_result[2].as_str().unwrap().contains("truncated"));
 }
 
 #[test]
