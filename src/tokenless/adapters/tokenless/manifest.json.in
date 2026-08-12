@@ -45,6 +45,22 @@
         "uninstall": "hermes/scripts/uninstall.sh"
       }
     },
+    "agentscope": {
+      "compatibleVersions": ">=0.1.0",
+      "capabilities": {
+        "hooks": [
+          "tool-ready",
+          "rewrite",
+          "compress-response",
+          "compress-toon"
+        ]
+      },
+      "actions": {
+        "detect":    "agentscope/scripts/detect.sh",
+        "install":   "agentscope/scripts/install.sh",
+        "uninstall": "agentscope/scripts/uninstall.sh"
+      }
+    },
     "qoder": {
       "compatibleVersions": ">=0.2.0",
       "capabilities": {

@@ -16,6 +16,7 @@ Framework integrations are available for:
 - **OpenClaw plugin** — covers command rewriting, response compression, and schema compression in one plugin.
 - **copilot-shell hook** — intercepts Shell commands via a PreToolUse hook and delegates to RTK for command rewriting + output filtering.
 - **Hermes Agent plugin** — response compression, TOON encoding, command rewriting (block + suggest), and registered but hard-disabled Tool Ready via Hermes's native plugin system.
+- **AgentScope SDK middleware** — registered but hard-disabled Tool Ready, command rewriting, response compression, and TOON encoding via AgentScope's middleware onion.
 - **Qoder CLI plugin** — registered but hard-disabled Tool Ready, command rewriting, and response compression via Qoder's native hook system.
 - **Claude Code plugin** — RTK command rewriting, response/TOON compression, and registered but hard-disabled Tool Ready via Claude Code's official plugin marketplace.
 - **Codex plugin** — response compression, TOON encoding, registered but hard-disabled Tool Ready, and command rewriting via Codex's native hook system.
@@ -34,6 +35,7 @@ Framework integrations are available for:
 | OpenClaw plugin | — | Command rewriting ✅, Response compression ✅, Schema compression ✅ |
 | copilot-shell hooks | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅, TOON ✅, Schema compression ✅ |
 | Hermes Agent plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅, TOON ✅, Schema compression ⏳ |
+| AgentScope SDK middleware | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅, TOON ✅ |
 | Qoder CLI plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅ |
 | Claude Code plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅, TOON ✅ |
 | Codex plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅, TOON ✅ |
@@ -94,6 +96,7 @@ Token-Less/
 │   │   └── commands/            # Hook command configs
 │   ├── openclaw/                # OpenClaw plugin + agent scripts
 │   ├── hermes/                  # Hermes Agent plugin + scripts
+│   ├── agentscope/              # AgentScope SDK middleware + scripts
 │   ├── qoder/                   # Qoder CLI plugin + scripts
 │   ├── claude-code/             # Claude Code plugin + marketplace + hooks
 │   ├── codex/                   # Codex plugin + scripts
@@ -415,6 +418,35 @@ plugins:
     - tokenless
 ```
 
+## AgentScope SDK Middleware
+
+The middleware registers with AgentScope's toolkit onion, covering four strategies:
+
+| Strategy | Event | Action | Status |
+|---|---|---|---|
+| Tool Ready | middleware pre-call | Registered silent pass-through; no check, repair, context, or block | ⛔ Hard-disabled |
+| Command rewriting | middleware pre-call (shell tools) | Blocks original command and suggests an RTK-rewritten equivalent | ✅ Active |
+| Response compression | middleware post-call | Compresses tool results via `tokenless compress-response` | ✅ Active |
+| TOON encoding | middleware post-call | Pipeline step after response compression — encodes JSON to TOON format | ✅ Active |
+
+Each hook degrades gracefully — if the corresponding binary (`tokenless` or `rtk`) is not installed, that hook is silently skipped.
+
+### Install
+
+```bash
+make agentscope-install
+```
+
+### Activate in code
+
+```python
+from agentscope.tool import Toolkit
+from anolisa_tokenless_agentscope import register
+
+toolkit = Toolkit()
+register(toolkit)
+```
+
 ## Qoder CLI Plugin
 
 The plugin registers hooks at three Qoder events, covering three strategies:
@@ -574,6 +606,7 @@ layout and single-target interface.
 | `crates/tokenless-schema/` | Core Rust library — `SchemaCompressor` and `ResponseCompressor` |
 | `adapters/tokenless/` | FHS adapter bundle — manifest, env-check spec/fix, hooks, OpenClaw plugin |
 | `adapters/tokenless/hermes/` | Hermes Agent adapter — plugin + detect/install/uninstall scripts |
+| `adapters/tokenless/agentscope/` | AgentScope SDK adapter — middleware + detect/install/uninstall scripts |
 | `adapters/tokenless/qoder/` | Qoder CLI adapter — plugin + detect/install/uninstall scripts |
 | `adapters/tokenless/claude-code/` | Claude Code adapter — marketplace + plugin + hooks dispatcher |
 | `adapters/tokenless/codex/` | Codex adapter — plugin + Python hook scripts |

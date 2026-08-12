@@ -57,6 +57,10 @@ Claude Code plugin (RTK command rewriting, response/TOON compression, and Tool R
 environment pre-check) is available under /usr/share/anolisa/adapters/tokenless/claude-code/.
 Register it with the official `claude plugin marketplace add` / `claude plugin install`
 CLI, or run the install script: claude-code/scripts/install.sh
+AgentScope SDK middleware (Tool Ready, RTK command rewriting, response compression,
+and TOON encoding) is available under /usr/share/anolisa/adapters/tokenless/agentscope/.
+Activate it by importing `anolisa_tokenless_agentscope` and calling `register(toolkit)`,
+or run the install script: agentscope/scripts/install.sh
 Qwen Code plugin (RTK command rewriting, response/TOON compression, and Tool Ready
 environment pre-check) is available under /usr/share/anolisa/adapters/tokenless/qwencode/.
 Register it with `qwen extensions link`, or run the install script: qwencode/scripts/install.sh
@@ -103,6 +107,7 @@ mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/common/commands
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/openclaw/scripts
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/openclaw/dist
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/hermes/scripts
+mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/agentscope/scripts
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/qoder/.qoder-plugin
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/qoder/scripts
 mkdir -p %{buildroot}%{_datadir}/anolisa/adapters/tokenless/qoder/commands
@@ -171,6 +176,13 @@ install -m 0644 adapters/tokenless/hermes/plugin.yaml %{buildroot}%{_datadir}/an
 install -m 0755 adapters/tokenless/hermes/scripts/detect.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/hermes/scripts/
 install -m 0755 adapters/tokenless/hermes/scripts/install.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/hermes/scripts/
 install -m 0755 adapters/tokenless/hermes/scripts/uninstall.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/hermes/scripts/
+
+# Install AgentScope SDK middleware (Python package + lifecycle scripts).
+install -m 0755 adapters/tokenless/agentscope/__init__.py %{buildroot}%{_datadir}/anolisa/adapters/tokenless/agentscope/
+install -m 0644 adapters/tokenless/agentscope/plugin.yaml %{buildroot}%{_datadir}/anolisa/adapters/tokenless/agentscope/
+install -m 0755 adapters/tokenless/agentscope/scripts/detect.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/agentscope/scripts/
+install -m 0755 adapters/tokenless/agentscope/scripts/install.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/agentscope/scripts/
+install -m 0755 adapters/tokenless/agentscope/scripts/uninstall.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/agentscope/scripts/
 
 # Install the native Qoder CLI plugin. The wrapper resolves implementation
 # scripts from common/hooks/ so the hook logic remains shared.
@@ -254,6 +266,8 @@ install -m 0644 adapters/tokenless/common/commands/tokenless-stats.toml %{buildr
 %dir %{_datadir}/anolisa/adapters/tokenless/openclaw/dist
 %dir %{_datadir}/anolisa/adapters/tokenless/hermes
 %dir %{_datadir}/anolisa/adapters/tokenless/hermes/scripts
+%dir %{_datadir}/anolisa/adapters/tokenless/agentscope
+%dir %{_datadir}/anolisa/adapters/tokenless/agentscope/scripts
 %dir %{_datadir}/anolisa/adapters/tokenless/qoder
 %dir %{_datadir}/anolisa/adapters/tokenless/qoder/.qoder-plugin
 %dir %{_datadir}/anolisa/adapters/tokenless/qoder/scripts
@@ -292,6 +306,12 @@ install -m 0644 adapters/tokenless/common/commands/tokenless-stats.toml %{buildr
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/hermes/scripts/detect.sh
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/hermes/scripts/install.sh
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/hermes/scripts/uninstall.sh
+# AgentScope SDK middleware (Python package + lifecycle scripts).
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/agentscope/__init__.py
+%attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/agentscope/plugin.yaml
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/agentscope/scripts/detect.sh
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/agentscope/scripts/install.sh
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/agentscope/scripts/uninstall.sh
 # Qoder CLI plugin — native hook wrapper resolves scripts from common/hooks/.
 %attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/qoder/.qoder-plugin/plugin.json
 %attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/qoder/hooks/hooks.json

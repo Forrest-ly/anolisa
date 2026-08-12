@@ -60,6 +60,7 @@ tokenless 只优化**工具调用响应**进入 LLM 上下文前的冗余，不�
 - **OpenClaw 插件** — 命令重写 + 响应压缩 + Schema 压缩
 - **copilot-shell 钩子** — Tool Ready（已硬关闭）+ 命令重写 + 响应压缩 + TOON
 - **Hermes Agent 插件** — Tool Ready（已硬关闭）+ 命令重写 + 响应压缩 + TOON
+- **AgentScope SDK 中间件** — Tool Ready（已硬关闭）+ 命令重写 + 响应压缩 + TOON
 - **Qoder CLI 插件** — Tool Ready（已硬关闭）+ 命令重写 + 响应压缩
 - **Claude Code 插件** — Tool Ready（已硬关闭）+ 命令重写 + 响应压缩 + TOON
 - **Codex 插件** — Tool Ready（已硬关闭）+ 命令重写 + 响应压缩 + TOON
@@ -136,6 +137,35 @@ make opencode-install
 不会覆盖同名的非托管文件。配置目录支持 `OPENCODE_CONFIG_DIR`、
 `XDG_CONFIG_HOME` 和显式的 `TOKENLESS_OPENCODE_CONFIG_DIR` 覆盖。
 安装后重启 OpenCode 即可加载插件。
+
+### AgentScope SDK 中间件
+
+该中间件注册到 AgentScope 的 Toolkit 洋葱模型，覆盖四种策略：
+
+| 策略 | 事件 | 动作 | 状态 |
+|------|------|------|------|
+| Tool Ready | middleware 调用前 | 已注册但静默透传；不检查、不修复、不提供上下文、不阻断 | ⛔ 已硬关闭 |
+| 命令重写 | middleware 调用前（Shell 工具） | 拦截原命令并建议 RTK 重写后的等价命令 | ✅ Active |
+| 响应压缩 | middleware 调用后 | 通过 `tokenless compress-response` 压缩工具结果 | ✅ Active |
+| TOON 编码 | middleware 调用后 | 响应压缩后的管道步骤，将 JSON 编码为 TOON 格式 | ✅ Active |
+
+每个钩子都会优雅降级——如果对应的二进制（`tokenless` 或 `rtk`）未安装，则自动跳过该策略。
+
+#### 安装
+
+```bash
+make agentscope-install
+```
+
+#### 在代码中启用
+
+```python
+from agentscope.tool import Toolkit
+from anolisa_tokenless_agentscope import register
+
+toolkit = Toolkit()
+register(toolkit)
+```
 
 ## Raw 打包
 
@@ -239,7 +269,7 @@ tokenless env-check --tool Shell --fix
 - `crates/tokenless-schema/` — 核心库：SchemaCompressor + ResponseCompressor
 - `crates/tokenless-ccr/` — 可逆压缩缓存（Compress-Cache-Retrieve）
 - `crates/tokenless-cli/` — CLI 二进制
-- `adapters/tokenless/` — 适配器包（OpenClaw / Hermes / Qoder / Claude Code / Codex / OpenCode）
+- `adapters/tokenless/` — 适配器包（OpenClaw / Hermes / AgentScope / Qoder / Claude Code / Codex / OpenCode）
 - `third_party/rtk/` — RTK 命令重写引擎（vendored）
 - `packaging/raw/` — Tokenless 自维护的 ANOLISA Raw 打包与目标校验
 

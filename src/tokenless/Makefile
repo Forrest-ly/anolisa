@@ -25,6 +25,7 @@ ADAPTER_TEMPLATES := \
     $(ADAPTER_SRC_DIR)/openclaw/package.json \
     $(ADAPTER_SRC_DIR)/openclaw/openclaw.plugin.json \
     $(ADAPTER_SRC_DIR)/hermes/plugin.yaml \
+    $(ADAPTER_SRC_DIR)/agentscope/plugin.yaml \
     $(ADAPTER_SRC_DIR)/qoder/.qoder-plugin/plugin.json \
     $(ADAPTER_SRC_DIR)/claude-code/.claude-plugin/plugin.json \
     $(ADAPTER_SRC_DIR)/codex/.codex-plugin/plugin.json \
@@ -48,6 +49,7 @@ NATIVE_NPM_INPUT_DIR := $(CURDIR)/target/npm-prebuilt/$(NATIVE_NPM_TARGET)
         cosh-extension-install cosh-extension-uninstall \
         openclaw-install openclaw-uninstall \
         hermes-install hermes-uninstall \
+        agentscope-install agentscope-uninstall \
         qoder-install qoder-uninstall \
         claude-code-install claude-code-uninstall \
         codex-install codex-uninstall \
@@ -97,6 +99,10 @@ $(ADAPTER_SRC_DIR)/openclaw/openclaw.plugin.json: $(ADAPTER_SRC_DIR)/openclaw/op
 
 $(ADAPTER_SRC_DIR)/hermes/plugin.yaml: $(ADAPTER_SRC_DIR)/hermes/plugin.yaml.in Cargo.toml
 	@echo "==> Generating hermes/plugin.yaml (version=$(VERSION))..."
+	sed 's/@VERSION@/$(VERSION)/g' $< > $@
+
+$(ADAPTER_SRC_DIR)/agentscope/plugin.yaml: $(ADAPTER_SRC_DIR)/agentscope/plugin.yaml.in Cargo.toml
+	@echo "==> Generating agentscope/plugin.yaml (version=$(VERSION))..."
 	sed 's/@VERSION@/$(VERSION)/g' $< > $@
 
 $(ADAPTER_SRC_DIR)/qoder/.qoder-plugin/plugin.json: $(ADAPTER_SRC_DIR)/qoder/.qoder-plugin/plugin.json.in Cargo.toml
@@ -193,6 +199,7 @@ test-integration:
 	python3 tests/test_compress_response_hook.py
 	python3 tests/test_compress_schema_hook.py
 	python3 tests/test_hermes_plugin_import.py
+	python3 tests/test_agentscope_middleware.py
 	python3 tests/test_rewrite_hook.py
 	python3 tests/test_resolve_agent_id.py
 
@@ -274,9 +281,9 @@ ADAPTER_ENV = ANOLISA_PREFIX=$(HOME)/.local \
               ANOLISA_COMPONENT=tokenless \
               ANOLISA_VERSION=$(VERSION)
 
-adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install opencode-install qwencode-install
+adapter-install: cosh-extension-install openclaw-install hermes-install agentscope-install qoder-install claude-code-install codex-install opencode-install qwencode-install
 
-adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall opencode-uninstall qwencode-uninstall
+adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall agentscope-uninstall qoder-uninstall claude-code-uninstall codex-uninstall opencode-uninstall qwencode-uninstall
 
 adapter-scan:
 	@echo "=== Tokenless Adapter Manifest ==="
@@ -323,6 +330,18 @@ hermes-install:
 hermes-uninstall:
 	@echo "==> Uninstalling Hermes Agent plugin..."
 	@$(ADAPTER_ENV) ANOLISA_TARGET=hermes bash $(HERMES_ADAPTER_DIR)/scripts/uninstall.sh
+
+# --- AgentScope SDK ---
+AGENTSCOPE_ADAPTER_DIR = $(SHARE_DIR)/agentscope
+
+agentscope-install:
+	@echo "==> Installing tokenless AgentScope middleware..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=agentscope bash $(AGENTSCOPE_ADAPTER_DIR)/scripts/detect.sh || true
+	@$(ADAPTER_ENV) ANOLISA_TARGET=agentscope bash $(AGENTSCOPE_ADAPTER_DIR)/scripts/install.sh
+
+agentscope-uninstall:
+	@echo "==> Uninstalling tokenless AgentScope middleware..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=agentscope bash $(AGENTSCOPE_ADAPTER_DIR)/scripts/uninstall.sh
 
 # --- Qoder CLI ---
 QODER_ADAPTER_DIR = $(SHARE_DIR)/qoder
@@ -404,7 +423,7 @@ setup: install adapter-install
 	@echo "  Adapter (FHS):"
 	@echo "    $(SHARE_DIR)/"
 	@echo "  Registered:"
-	@echo "    cosh, openclaw, hermes, qoder, claude-code, codex, opencode, qwencode"
+	@echo "    cosh, openclaw, hermes, agentscope, qoder, claude-code, codex, opencode, qwencode"
 	@echo ""
 	@echo "Verify:"
 	@echo "  tokenless --version"
@@ -477,7 +496,7 @@ help:
 	@echo "  fmt               Format code"
 	@echo "  clean             Clean build artifacts"
 	@echo "  adapter-scan      List registered adapter capabilities"
-	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+qoder+claude-code+codex+opencode+qwencode)"
+	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+agentscope+qoder+claude-code+codex+opencode+qwencode)"
 	@echo "  adapter-uninstall Unregister all adapters"
 	@echo "  cosh-extension-install  Install cosh extension"
 	@echo "  cosh-extension-uninstall Uninstall cosh extension"
@@ -485,6 +504,8 @@ help:
 	@echo "  openclaw-uninstall Unregister OpenClaw plugin"
 	@echo "  hermes-install    Install Hermes Agent plugin"
 	@echo "  hermes-uninstall  Uninstall Hermes Agent plugin"
+	@echo "  agentscope-install    Install AgentScope SDK middleware"
+	@echo "  agentscope-uninstall  Uninstall AgentScope SDK middleware"
 	@echo "  qoder-install     Register Qoder CLI plugin"
 	@echo "  qoder-uninstall   Unregister Qoder CLI plugin"
 	@echo "  claude-code-install   Register Claude Code plugin via claude CLI"

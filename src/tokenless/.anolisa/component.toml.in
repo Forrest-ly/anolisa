@@ -100,6 +100,17 @@ detect = { binary = "hermes" }
 entry = "plugin.yaml"
 
 [[adapters]]
+framework = "agentscope"
+adapter_type = "plugin"
+plugin_id = "tokenless"
+source = "adapters/agentscope"
+dest = "{datadir}/adapters/{component}/agentscope/"
+detect = { binary = "python3" }
+
+[adapters.bundle]
+entry = "plugin.yaml"
+
+[[adapters]]
 framework = "qoder"
 adapter_type = "plugin"
 plugin_id = "tokenless"
