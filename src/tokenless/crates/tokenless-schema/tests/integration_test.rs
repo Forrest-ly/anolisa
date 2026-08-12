@@ -553,7 +553,8 @@ const ALL_SCHEMA_FIXTURES: &[&str] = &[
 const RESPONSE_FIXTURES: &[&str] = &["github_issues.json"];
 
 // github_issues_stashable.json has 35 items, which exceeds the default
-// truncate_arrays_at=32, so the array tail gets stashed reversibly.
+// truncate_arrays_at=32, so the array middle gets stashed reversibly
+// (head+tail sampling: 16 head + 16 tail kept, 3 middle items stashed).
 // Use this fixture wherever we need to assert store.len() > 0.
 const RESPONSE_STASH_FIXTURES: &[&str] = &["github_issues_stashable.json"];
 
@@ -715,31 +716,33 @@ fn bench_l1_stash_response() {
     let items = response["items"]
         .as_array()
         .expect("fixture must have items array");
-    let dropped_original = Value::Array(items[32..].to_vec());
+    // Head+tail with 35 items and limit=32: tail_budget=16, head_budget=16,
+    // tail_start=19. Dropped middle is items[16..19] (3 items).
+    let dropped_original = Value::Array(items[16..19].to_vec());
 
     let compressed = compressor.compress(&response);
     let compressed_str = serde_json::to_string(&compressed).unwrap();
     let hash = tokenless_ccr::extract_hash(&compressed_str).expect(
-        "compressed output must contain a <<tokenless:KEY>> marker for the truncated array tail",
+        "compressed output must contain a <<tokenless:KEY>> marker for the truncated array middle",
     );
     let retrieved = store
         .retrieve(hash)
         .expect("store retrieve must not error")
         .expect("stash key must be present and non-expired");
-    let tail: serde_json::Value =
+    let dropped: serde_json::Value =
         serde_json::from_str(&retrieved).expect("stashed payload must be valid JSON");
     assert!(
-        tail.is_array(),
+        dropped.is_array(),
         "stashed payload must be an array of the dropped items, got: {:?}",
-        tail
+        dropped
     );
     assert!(
-        !tail.as_array().unwrap().is_empty(),
+        !dropped.as_array().unwrap().is_empty(),
         "stashed array must be non-empty"
     );
     assert_eq!(
-        tail, dropped_original,
-        "retrieved tail must match the original dropped items exactly"
+        dropped, dropped_original,
+        "retrieved middle must match the original dropped items exactly"
     );
 }
 

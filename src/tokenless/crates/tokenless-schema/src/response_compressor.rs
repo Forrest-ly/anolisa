@@ -295,35 +295,58 @@ impl ResponseCompressor {
         }
     }
 
-    /// Compress an array, truncating if necessary
+    /// Compress an array, truncating if necessary.
+    ///
+    /// Uses a head+tail sampling strategy: when the array exceeds the limit,
+    /// items are kept from both ends rather than only the front. This
+    /// preserves recency-sensitive content (latest diff hunks, trailing error
+    /// entries in tool responses) that pure head truncation would discard.
+    /// The budget splits evenly, with the head rounding up on odd limits.
     fn compress_array(&self, arr: &[Value], depth: usize) -> Value {
         let mut result = Vec::new();
         let truncate = arr.len() > self.truncate_arrays_at;
-        let limit = if truncate {
-            self.truncate_arrays_at
+
+        let (head_end, tail_start) = if truncate {
+            // Split the keep-budget between head and tail. Tail gets floor(N/2),
+            // head gets the remainder, clamped so the two slices never overlap.
+            let tail_budget = self.truncate_arrays_at / 2;
+            let head_budget = std::cmp::min(
+                self.truncate_arrays_at - tail_budget,
+                arr.len() - tail_budget,
+            );
+            let tail_start = arr.len() - tail_budget;
+            (head_budget, tail_start)
         } else {
-            arr.len()
+            (arr.len(), arr.len())
         };
 
-        for item in arr.iter().take(limit) {
+        // Compress kept head items.
+        for item in arr.iter().take(head_end) {
             let compressed = self.compress_value(item, depth + 1);
-
-            // Skip null values if configured
             if self.drop_nulls && compressed.is_null() {
                 continue;
             }
-
-            // Skip empty values if configured
             if self.drop_empty_fields && self.is_empty_value(&compressed) {
                 continue;
             }
-
             result.push(compressed);
         }
 
-        // Add truncation marker if array was truncated
+        // Compress kept tail items.
+        for item in arr.iter().skip(tail_start) {
+            let compressed = self.compress_value(item, depth + 1);
+            if self.drop_nulls && compressed.is_null() {
+                continue;
+            }
+            if self.drop_empty_fields && self.is_empty_value(&compressed) {
+                continue;
+            }
+            result.push(compressed);
+        }
+
+        // Add truncation marker if array was truncated.
         if truncate && self.add_truncation_marker {
-            let remaining = arr.len() - self.truncate_arrays_at;
+            let remaining = tail_start - head_end;
             // NOTE: the dropped slice is captured BEFORE compress_value runs,
             // so stashed items preserve fields the compressor would otherwise
             // strip (drop_fields like `debug`/`stacktrace`, nulls, depth
@@ -331,7 +354,7 @@ impl ResponseCompressor {
             // original content verbatim — but it means drop_fields serves no
             // data-hygiene purpose for stashed content; if a field must not
             // survive in the stash DB, strip it upstream of the compressor.
-            let dropped = &arr[self.truncate_arrays_at..];
+            let dropped = &arr[head_end..tail_start];
             let marker = match self.stash_dropped(dropped) {
                 Some(key) => format!(
                     "<... {} items truncated, retrieve with {}>",

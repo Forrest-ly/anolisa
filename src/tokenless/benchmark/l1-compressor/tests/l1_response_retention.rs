@@ -132,12 +132,14 @@ fn stash_round_trip_recovers_dropped_items_verbatim() {
     let arr = json!(["a", "b", "c", "d", "e"]);
     let out = compressor.compress(&arr);
     let a = out.as_array().unwrap();
+    // Head+tail: 1 head item + 1 tail item + 1 marker.
+    assert_eq!(a.len(), 3);
     assert_eq!(a[0], json!("a"));
-    assert_eq!(a[1], json!("b"));
+    assert_eq!(a[1], json!("e"));
     let hash = extract_hash(a.last().unwrap().as_str().unwrap()).unwrap();
     let recovered: Vec<String> =
         serde_json::from_str(&store.retrieve(hash).unwrap().unwrap()).unwrap();
-    assert_eq!(recovered, vec!["c", "d", "e"]);
+    assert_eq!(recovered, vec!["b", "c", "d"]);
     assert_eq!(compressor.stash_writes(), 1);
 }
 

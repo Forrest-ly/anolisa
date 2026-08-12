@@ -192,10 +192,10 @@ curl -s https://api.example.com/data | tokenless compress-response
 
 输出：
 ```json
-[1, 2, 3, "<... 7 more items truncated>"]
+[1, 2, 10, "<... 7 more items truncated>"]
 ```
 
-默认阈值 32 个元素。
+采用首尾采样策略：保留数组头部和尾部元素，丢弃中间部分。这确保最近的内容（如末尾的错误条目、最新的 diff hunk）不会被无差别截断。默认阈值 32 个元素。
 
 ### 示例 4 — 深度截断（R6）
 
@@ -268,12 +268,12 @@ curl -s https://api.example.com/data | tokenless compress-response
 ```json
 [
   {"id": 1},
-  {"id": 2},
+  {"id": 4},
   "<... 2 more items truncated>"
 ]
 ```
 
-第一个对象的 `debug`（R3）和 `value: null`（R4）被移除，数组在第 2 个元素后截断（R2）。
+第一个对象的 `debug`（R3）和 `value: null`（R4）被移除。数组采用首尾采样，保留头部和尾部各一个元素，中间两个元素被截断（R2）。
 
 ## 六、默认配置汇总
 

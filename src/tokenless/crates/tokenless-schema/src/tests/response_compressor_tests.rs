@@ -240,9 +240,11 @@ fn test_array_with_objects() {
     // 2 items + truncation marker
     assert_eq!(arr_result.len(), 3);
 
-    // First item should have debug and null removed
+    // Head+tail: kept item[0] (compressed: debug and null stripped)
+    // and item[3] (no debug/null to strip).
     assert!(!arr_result[0].as_object().unwrap().contains_key("debug"));
     assert!(!arr_result[0].as_object().unwrap().contains_key("value"));
+    assert_eq!(arr_result[1]["id"], json!(4));
 }
 
 #[test]
@@ -276,11 +278,11 @@ fn test_array_truncation_without_stash_is_lossy() {
     let arr: Vec<i32> = (1..=10).collect();
     let result = compressor.compress(&json!(arr));
     let arr_result = result.as_array().unwrap();
-    // 3 kept items + 1 marker
+    // Head+tail: 2 head items + 1 tail item + 1 marker.
     assert_eq!(arr_result.len(), 4);
     assert_eq!(arr_result[0], json!(1));
     assert_eq!(arr_result[1], json!(2));
-    assert_eq!(arr_result[2], json!(3));
+    assert_eq!(arr_result[2], json!(10));
     let marker = arr_result[3].as_str().unwrap();
     assert!(marker.contains("more items truncated"));
     assert!(marker.contains("7")); // 10 - 3 dropped
@@ -299,20 +301,20 @@ fn test_array_truncation_with_stash_round_trip() {
     let arr: Vec<i32> = (1..=10).collect();
     let result = compressor.compress(&json!(arr));
     let arr_result = result.as_array().unwrap();
-    // 3 kept items + 1 marker
+    // 2 head + 1 tail + 1 marker
     assert_eq!(arr_result.len(), 4);
-    // Kept items are the first 3 (off-by-one in the slice would break this).
+    // Head+tail: kept items are first 2 and last 1.
     assert_eq!(arr_result[0], json!(1));
     assert_eq!(arr_result[1], json!(2));
-    assert_eq!(arr_result[2], json!(3));
+    assert_eq!(arr_result[2], json!(10));
     let marker = arr_result[3].as_str().unwrap();
     assert!(marker.contains("retrieve with"));
     let hash = extract_hash(marker).expect("marker should embed a hash");
 
-    // Retrieved payload is the JSON array of the dropped items [4..=10].
+    // Retrieved payload is the JSON array of the dropped middle [3..=9].
     let retrieved = store.retrieve(hash).unwrap().expect("must be retrievable");
     let recovered: Vec<i32> = serde_json::from_str(&retrieved).unwrap();
-    assert_eq!(recovered, (4..=10).collect::<Vec<_>>());
+    assert_eq!(recovered, (3..=9).collect::<Vec<_>>());
     // One truncated array → one stash write.
     assert_eq!(compressor.stash_writes(), 1);
 }
@@ -356,7 +358,10 @@ fn test_array_truncation_with_failing_stash_falls_back_to_lossy() {
         .with_stash_store(Arc::new(AlwaysFail));
     let arr: Vec<i32> = (1..=10).collect();
     let result = compressor.compress(&json!(arr));
-    let marker = result.as_array().unwrap().last().unwrap();
+    let result_arr = result.as_array().unwrap();
+    // Head+tail: 2 head + 1 tail + 1 marker = 4.
+    assert_eq!(result_arr.len(), 4);
+    let marker = result_arr.last().unwrap();
     let s = marker.as_str().unwrap();
     assert!(s.contains("more items truncated"));
     assert!(!s.contains("tokenless:"));
@@ -427,14 +432,14 @@ fn test_stash_round_trip_with_cjk_items() {
     let arr = json!(["你好世界", "第二个条目", "第三个条目", "第四个条目"]);
     let result = compressor.compress(&arr);
     let arr_result = result.as_array().unwrap();
-    // Kept items are the first 2.
+    // Head+tail: kept items are first 1 and last 1.
     assert_eq!(arr_result[0], json!("你好世界"));
-    assert_eq!(arr_result[1], json!("第二个条目"));
+    assert_eq!(arr_result[1], json!("第四个条目"));
     let marker = arr_result.last().unwrap();
     let hash = extract_hash(marker.as_str().unwrap()).unwrap();
     let retrieved = store.retrieve(hash).unwrap().unwrap();
     let recovered: Vec<String> = serde_json::from_str(&retrieved).unwrap();
-    assert_eq!(recovered, vec!["第三个条目", "第四个条目"]);
+    assert_eq!(recovered, vec!["第二个条目", "第三个条目"]);
 }
 
 #[test]
