@@ -81,7 +81,7 @@ strategies:
 
 ```json
 "agentscope": {
-  "compatibleVersions": ">=0.1.0",
+  "compatibleVersions": ">=2.0.0",
   "capabilities": {
     "hooks": [
       "tool-ready",
@@ -130,6 +130,6 @@ strategies:
 ## Relationship to the LLM Provider Proxy
 
 If an AgentScope application cannot use middleware (e.g., an older version or a
-restricted runtime), the [LLM Provider proxy](llm-provider-proxy.md) can still
-provide compression transparently by changing the model endpoint. The
-middleware adapter is the preferred integration when available.
+restricted runtime), a Tokenless LLM Provider proxy can still provide
+compression transparently by changing the model endpoint. The middleware
+adapter is the preferred integration when available.

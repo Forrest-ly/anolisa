@@ -76,7 +76,7 @@ Tokenless 策略的阶段注册处理器：
 
 ```json
 "agentscope": {
-  "compatibleVersions": ">=0.1.0",
+  "compatibleVersions": ">=2.0.0",
   "capabilities": {
     "hooks": [
       "tool-ready",
@@ -115,5 +115,5 @@ Tokenless 策略的阶段注册处理器：
 ## 与 LLM Provider 代理的关系
 
 如果某个 AgentScope 应用无法使用 middleware（例如旧版本或受限运行时），仍可通过
-[LLM Provider 代理](llm-provider-proxy_zh.md) 修改模型端点来透明地获得压缩能力。
+Tokenless LLM Provider 代理修改模型端点来透明地获得压缩能力。
 在 middleware 可用时，本适配器是首选集成方式。
