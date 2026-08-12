@@ -53,9 +53,9 @@ fn test_array_truncation() {
     let result = compressor.compress(&json!(arr));
 
     let arr_result = result.as_array().unwrap();
-    // 3 items + 1 truncation marker = 4
+    // 2 head items + 1 marker + 1 tail item = 4
     assert_eq!(arr_result.len(), 4);
-    assert!(arr_result[3].as_str().unwrap().contains("truncated"));
+    assert!(arr_result[2].as_str().unwrap().contains("truncated"));
 }
 
 #[test]
@@ -237,14 +237,14 @@ fn test_array_with_objects() {
     let result = compressor.compress(&arr);
     let arr_result = result.as_array().unwrap();
 
-    // 2 items + truncation marker
+    // 1 head item + 1 marker + 1 tail item
     assert_eq!(arr_result.len(), 3);
 
     // Head+tail: kept item[0] (compressed: debug and null stripped)
     // and item[3] (no debug/null to strip).
     assert!(!arr_result[0].as_object().unwrap().contains_key("debug"));
     assert!(!arr_result[0].as_object().unwrap().contains_key("value"));
-    assert_eq!(arr_result[1]["id"], json!(4));
+    assert_eq!(arr_result[2]["id"], json!(4));
 }
 
 #[test]
@@ -278,12 +278,12 @@ fn test_array_truncation_without_stash_is_lossy() {
     let arr: Vec<i32> = (1..=10).collect();
     let result = compressor.compress(&json!(arr));
     let arr_result = result.as_array().unwrap();
-    // Head+tail: 2 head items + 1 tail item + 1 marker.
+    // Head+tail: 2 head items + 1 marker + 1 tail item.
     assert_eq!(arr_result.len(), 4);
     assert_eq!(arr_result[0], json!(1));
     assert_eq!(arr_result[1], json!(2));
-    assert_eq!(arr_result[2], json!(10));
-    let marker = arr_result[3].as_str().unwrap();
+    assert_eq!(arr_result[3], json!(10));
+    let marker = arr_result[2].as_str().unwrap();
     assert!(marker.contains("more items truncated"));
     assert!(marker.contains("7")); // 10 - 3 dropped
     assert!(!marker.contains("tokenless:"));
@@ -301,13 +301,13 @@ fn test_array_truncation_with_stash_round_trip() {
     let arr: Vec<i32> = (1..=10).collect();
     let result = compressor.compress(&json!(arr));
     let arr_result = result.as_array().unwrap();
-    // 2 head + 1 tail + 1 marker
+    // 2 head + 1 marker + 1 tail
     assert_eq!(arr_result.len(), 4);
     // Head+tail: kept items are first 2 and last 1.
     assert_eq!(arr_result[0], json!(1));
     assert_eq!(arr_result[1], json!(2));
-    assert_eq!(arr_result[2], json!(10));
-    let marker = arr_result[3].as_str().unwrap();
+    assert_eq!(arr_result[3], json!(10));
+    let marker = arr_result[2].as_str().unwrap();
     assert!(marker.contains("retrieve with"));
     let hash = extract_hash(marker).expect("marker should embed a hash");
 
@@ -359,12 +359,11 @@ fn test_array_truncation_with_failing_stash_falls_back_to_lossy() {
     let arr: Vec<i32> = (1..=10).collect();
     let result = compressor.compress(&json!(arr));
     let result_arr = result.as_array().unwrap();
-    // Head+tail: 2 head + 1 tail + 1 marker = 4.
+    // Head+tail: 2 head + 1 marker + 1 tail = 4.
     assert_eq!(result_arr.len(), 4);
-    let marker = result_arr.last().unwrap();
-    let s = marker.as_str().unwrap();
-    assert!(s.contains("more items truncated"));
-    assert!(!s.contains("tokenless:"));
+    let marker = result_arr[2].as_str().unwrap();
+    assert!(marker.contains("more items truncated"));
+    assert!(!marker.contains("tokenless:"));
     // The failed write is surfaced via the error counter so a persistent
     // backend failure isn't invisible.
     assert_eq!(compressor.stash_errors(), 1);
@@ -434,9 +433,9 @@ fn test_stash_round_trip_with_cjk_items() {
     let arr_result = result.as_array().unwrap();
     // Head+tail: kept items are first 1 and last 1.
     assert_eq!(arr_result[0], json!("你好世界"));
-    assert_eq!(arr_result[1], json!("第四个条目"));
-    let marker = arr_result.last().unwrap();
-    let hash = extract_hash(marker.as_str().unwrap()).unwrap();
+    assert_eq!(arr_result[2], json!("第四个条目"));
+    let marker = arr_result[1].as_str().unwrap();
+    let hash = extract_hash(marker).unwrap();
     let retrieved = store.retrieve(hash).unwrap().unwrap();
     let recovered: Vec<String> = serde_json::from_str(&retrieved).unwrap();
     assert_eq!(recovered, vec!["第二个条目", "第三个条目"]);
@@ -469,8 +468,8 @@ fn test_stash_round_trip_with_object_array() {
         arr_result[0].get("debug").is_none(),
         "kept items must be compressed (debug stripped)"
     );
-    let marker = arr_result.last().unwrap();
-    let hash = extract_hash(marker.as_str().unwrap()).unwrap();
+    let marker = arr_result[1].as_str().unwrap();
+    let hash = extract_hash(marker).unwrap();
     let retrieved = store.retrieve(hash).unwrap().unwrap();
     let recovered: Vec<Value> = serde_json::from_str(&retrieved).unwrap();
     // Stashed items are raw (pre-compression): debug survives.
@@ -636,4 +635,37 @@ fn test_stash_dropped_empty_not_engaged() {
     let result = compressor.compress(&arr);
     assert_eq!(result.as_array().unwrap().len(), 3);
     assert_eq!(store.len(), 0);
+}
+
+#[test]
+fn test_array_truncation_remaining_count_with_drop_nulls() {
+    // When drop_nulls removes items from the head or tail slices, the
+    // remaining count must reflect actual kept items, not the raw dropped
+    // slice length.
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(3)
+        .with_drop_nulls(true);
+
+    // 10 items, 2 are null (one in head slice, one in dropped slice).
+    // head_budget=2, tail_budget=1, tail_start=9.
+    // head: [1, null] → kept: [1] (1 item after drop_nulls)
+    // dropped: [3, 4, 5, 6, 7, 8, null] (7 raw items)
+    // tail: [10] → kept: [10] (1 item)
+    // remaining = 10 - 1 - 1 = 8 (not 7).
+    let arr = json!([1, null, 3, 4, 5, 6, 7, 8, null, 10]);
+    let result = compressor.compress(&arr);
+    let arr_result = result.as_array().unwrap();
+
+    // 1 head item + 1 marker + 1 tail item = 3
+    assert_eq!(arr_result.len(), 3);
+    assert_eq!(arr_result[0], json!(1));
+    assert_eq!(arr_result[2], json!(10));
+
+    let marker = arr_result[1].as_str().unwrap();
+    assert!(
+        marker.contains("8"),
+        "remaining count should be 8 (arr.len() - kept), got: {}",
+        marker
+    );
+    assert!(marker.contains("more items truncated"));
 }

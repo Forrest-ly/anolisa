@@ -321,6 +321,7 @@ impl ResponseCompressor {
         };
 
         // Compress kept head items.
+        let result_len_before_head = result.len();
         for item in arr.iter().take(head_end) {
             let compressed = self.compress_value(item, depth + 1);
             if self.drop_nulls && compressed.is_null() {
@@ -331,22 +332,11 @@ impl ResponseCompressor {
             }
             result.push(compressed);
         }
+        let head_kept = result.len() - result_len_before_head;
 
-        // Compress kept tail items.
-        for item in arr.iter().skip(tail_start) {
-            let compressed = self.compress_value(item, depth + 1);
-            if self.drop_nulls && compressed.is_null() {
-                continue;
-            }
-            if self.drop_empty_fields && self.is_empty_value(&compressed) {
-                continue;
-            }
-            result.push(compressed);
-        }
-
-        // Add truncation marker if array was truncated.
+        // Add truncation marker between head and tail samples so the output
+        // preserves the original ordering: [head…, marker, tail…].
         if truncate && self.add_truncation_marker {
-            let remaining = tail_start - head_end;
             // NOTE: the dropped slice is captured BEFORE compress_value runs,
             // so stashed items preserve fields the compressor would otherwise
             // strip (drop_fields like `debug`/`stacktrace`, nulls, depth
@@ -355,6 +345,24 @@ impl ResponseCompressor {
             // data-hygiene purpose for stashed content; if a field must not
             // survive in the stash DB, strip it upstream of the compressor.
             let dropped = &arr[head_end..tail_start];
+            let tail_items = arr.len() - tail_start;
+
+            // Compress tail items into a temporary buffer so we can count how
+            // many survive filtering before computing the remaining tally.
+            let mut tail_result = Vec::with_capacity(tail_items);
+            for item in arr.iter().skip(tail_start) {
+                let compressed = self.compress_value(item, depth + 1);
+                if self.drop_nulls && compressed.is_null() {
+                    continue;
+                }
+                if self.drop_empty_fields && self.is_empty_value(&compressed) {
+                    continue;
+                }
+                tail_result.push(compressed);
+            }
+            let tail_kept = tail_result.len();
+
+            let remaining = arr.len() - head_kept - tail_kept;
             let marker = match self.stash_dropped(dropped) {
                 Some(key) => format!(
                     "<... {} items truncated, retrieve with {}>",
@@ -364,8 +372,24 @@ impl ResponseCompressor {
                 None => format!("<... {} more items truncated>", remaining),
             };
             result.push(Value::String(marker));
-        } else if truncate && self.stash_store.is_some() {
-            self.mark_unrecoverable_truncation();
+            result.extend(tail_result);
+        } else {
+            // No truncation marker — append tail items directly. Truncating
+            // without an embedded marker while a stash is attached leaves the
+            // dropped middle unretrievable, so surface it as unrecoverable.
+            if truncate && self.stash_store.is_some() {
+                self.mark_unrecoverable_truncation();
+            }
+            for item in arr.iter().skip(tail_start) {
+                let compressed = self.compress_value(item, depth + 1);
+                if self.drop_nulls && compressed.is_null() {
+                    continue;
+                }
+                if self.drop_empty_fields && self.is_empty_value(&compressed) {
+                    continue;
+                }
+                result.push(compressed);
+            }
         }
 
         Value::Array(result)
