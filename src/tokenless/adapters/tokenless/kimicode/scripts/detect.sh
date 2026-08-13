@@ -36,10 +36,10 @@ else
     note_prereq_missing "kimi CLI"
 fi
 
-# Kimi Code stores global config under ~/.kimi-code/ (upstream default).
-# Can be overridden via KIMI_CODE_HOME environment variable.
+# Kimi Code stores global config under ~/.kimi/ (upstream default via
+# get_share_dir() / KIMI_SHARE_DIR).
 # Absence is not a prerequisite failure — created on first run.
-KIMI_HOME="${KIMI_CODE_HOME:-${HOME}/.kimi-code}"
+KIMI_HOME="${KIMI_SHARE_DIR:-${HOME}/.kimi}"
 if [ -d "$KIMI_HOME" ]; then
     field "kimi config dir"     "present ($KIMI_HOME)"
 else

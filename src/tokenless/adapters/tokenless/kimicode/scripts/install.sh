@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — Register tokenless hooks for Kimi Code in ~/.kimi-code/config.toml.
+# install.sh — Register tokenless hooks for Kimi Code in ~/.kimi/config.toml.
 #
 # Kimi Code uses a flat TOML config with [[hooks]] entries rather than a
 # plugin manifest. This script injects hook definitions that point to
@@ -10,7 +10,7 @@ AGENT="${ANOLISA_TARGET:-kimicode}"
 COMPONENT="${ANOLISA_COMPONENT:-tokenless}"
 ADAPTER_DIR="${ANOLISA_ADAPTER_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
-KIMI_HOME="${KIMI_CODE_HOME:-${HOME}/.kimi-code}"
+KIMI_HOME="${KIMI_SHARE_DIR:-${HOME}/.kimi}"
 CONFIG_FILE="${KIMI_HOME}/config.toml"
 
 DRY_RUN="${ANOLISA_DRY_RUN:-0}"

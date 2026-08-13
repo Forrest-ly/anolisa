@@ -10,10 +10,10 @@ TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
 export HOME="$TEST_DIR/home"
-export KIMI_CODE_HOME=""
-mkdir -p "$HOME/.kimi-code"
+export KIMI_SHARE_DIR=""
+mkdir -p "$HOME/.kimi"
 
-KIMI_CONFIG="$HOME/.kimi-code/config.toml"
+KIMI_CONFIG="$HOME/.kimi/config.toml"
 
 # Prepare a minimal PATH for forcing the awk fallback (no python3).
 FAKE_BIN="$TEST_DIR/fake-bin"

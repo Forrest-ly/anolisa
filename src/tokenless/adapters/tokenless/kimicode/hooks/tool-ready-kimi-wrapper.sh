@@ -46,6 +46,11 @@ CONTEXT="$(jq -r '.hookSpecificOutput.additionalContext // .systemMessage // emp
 [ -n "$REASON" ] || REASON="tokenless: tool not ready"
 [ -n "$CONTEXT" ] || CONTEXT="$REASON"
 
+# Kimi runner generates the Agent-visible reason from stderr, not from the
+# JSON stdout field. Write the diagnostic there so the Agent sees the actual
+# missing-dependency detail instead of a generic "Blocked by PreToolUse hook".
+echo "$REASON" >&2
+
 jq -n --arg reason "$REASON" --arg context "$CONTEXT" '{
   "permissionDecision": "deny",
   "reason": $reason,

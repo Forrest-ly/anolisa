@@ -34,8 +34,9 @@ JSON
 [ "$output" = "{}" ]
 
 # --- Blocking case: required dependency missing ---
+STDERR_FILE="$TEST_DIR/stderr.txt"
 set +e
-output=$(TOKENLESS_TOOL_READY_SPEC="$SPEC_FILE" bash "$WRAPPER" <<'JSON'
+output=$(TOKENLESS_TOOL_READY_SPEC="$SPEC_FILE" bash "$WRAPPER" 2>"$STDERR_FILE" <<'JSON'
 {"tool_name":"TestBlocked","tool_input":{"command":"echo ok"}}
 JSON
 )
@@ -46,5 +47,11 @@ set -e
 printf '%s' "$output" | jq -e '.permissionDecision == "deny"' >/dev/null
 printf '%s' "$output" | jq -e '.reason != ""' >/dev/null
 printf '%s' "$output" | jq -e '.hookSpecificOutput.additionalContext != ""' >/dev/null
+
+# Verify the reason was also written to stderr (Kimi runner reads from stderr).
+if ! grep -q 'tokenless' "$STDERR_FILE"; then
+    echo "FAIL: stderr missing deny reason (Kimi runner needs it for Agent diagnostic)"
+    exit 1
+fi
 
 echo "kimicode tool-ready wrapper test passed"

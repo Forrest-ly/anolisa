@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# uninstall.sh — Remove tokenless hooks from Kimi Code config (~/.kimi-code/config.toml).
+# uninstall.sh — Remove tokenless hooks from Kimi Code config (~/.kimi/config.toml).
 # Removes all [[hooks]] entries that reference tokenless hooks.
 set -euo pipefail
 
 AGENT="${ANOLISA_TARGET:-kimicode}"
 COMPONENT="${ANOLISA_COMPONENT:-tokenless}"
 
-KIMI_HOME="${KIMI_CODE_HOME:-${HOME}/.kimi-code}"
+KIMI_HOME="${KIMI_SHARE_DIR:-${HOME}/.kimi}"
 CONFIG_FILE="${KIMI_HOME}/config.toml"
 
 echo "[${COMPONENT}] Uninstalling ${AGENT} adapter..."

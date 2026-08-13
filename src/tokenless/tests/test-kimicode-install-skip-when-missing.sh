@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression test: kimicode install must not create/modify ~/.kimi-code/config.toml
+# Regression test: kimicode install must not create/modify ~/.kimi/config.toml
 # when the kimi CLI is not installed (detect.sh exits 2).
 set -euo pipefail
 
@@ -9,8 +9,8 @@ TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
 export HOME="$TEST_DIR/home"
-export KIMI_CODE_HOME=""
-mkdir -p "$HOME/.kimi-code"
+export KIMI_SHARE_DIR=""
+mkdir -p "$HOME/.kimi"
 
 # Ensure kimi is not on PATH.
 export PATH="/usr/bin:/bin"
@@ -19,7 +19,7 @@ if command -v kimi >/dev/null 2>&1; then
     exit 0
 fi
 
-KIMI_CONFIG="$HOME/.kimi-code/config.toml"
+KIMI_CONFIG="$HOME/.kimi/config.toml"
 
 # Pre-create some existing content to prove it is not touched.
 echo "[existing]" >"$KIMI_CONFIG"
