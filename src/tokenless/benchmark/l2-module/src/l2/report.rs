@@ -89,7 +89,9 @@ pub struct SideAggregate {
     pub retention_total: usize,
     /// Deduplicated descriptions of ground-truth items lost during
     /// compression, pooled over independent observations. Capped at 10
-    /// entries to prevent report bloat.
+    /// entries to prevent report bloat; this is a sampled display list,
+    /// not a raw failure count (use `retention_passed` / `retention_total`
+    /// for statistics).
     pub retention_failures: Vec<String>,
     /// Wilson 95% interval over the pooled retention counts.
     pub retention_ci: (f64, f64),
