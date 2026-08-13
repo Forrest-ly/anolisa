@@ -4,8 +4,11 @@ Integrates tokenless compression strategies into AgentScope's middleware
 onion so that tool calls and their results are optimized before they reach
 the model context window:
 
-  1. **Tool Ready** — pre-checks the execution environment and blocks calls
-     that cannot succeed, returning "Skip retry" guidance.
+  1. **Tool Ready (legacy, hard-disabled)** — registered but unconditionally
+     bypassed: release builds of ``tokenless env-check`` return
+     ``UNKNOWN``/``enabled:false`` and the middleware passes through. The
+     dormant check/fix path is retained while the readiness model is
+     redesigned.
   2. **Command rewriting** — for shell-style tools, blocks the original
      command and suggests an RTK-rewritten equivalent.
   3. **Response compression** — runs ``tokenless compress-response`` on
@@ -308,7 +311,11 @@ async def _encode_toon(
 
 
 async def _env_check(tool_name: str) -> str | None:
-    """Run tool-ready env-check and return feedback if the tool is not ready."""
+    """Dormant tool-ready env-check; returns feedback only if not ready.
+
+    Release builds of ``tokenless env-check`` are hard-disabled and report
+    ``UNKNOWN``/``enabled:false``, so this path passes through without any
+    check, repair, or block. Retained for the future readiness redesign."""
     tokenless_bin = _resolve_binary("tokenless", _TOKENLESS_FALLBACK)
     if not tokenless_bin:
         return None
@@ -476,8 +483,8 @@ async def tokenless_middleware(
 ) -> AsyncGenerator[Any, None]:
     """AgentScope middleware entry point.
 
-    Applies Tool Ready env-check, RTK command rewriting, response compression,
-    and TOON encoding around tool execution.
+    Applies the registered but hard-disabled Tool Ready env-check, RTK command
+    rewriting, response compression, and TOON encoding around tool execution.
     """
     tool_call = kwargs.get("tool_call")
     tool_name = _tool_name(tool_call)
@@ -488,7 +495,9 @@ async def tokenless_middleware(
     if session_id:
         os.environ["TOKENLESS_SESSION_ID"] = str(session_id)
 
-    # Step 1: Tool Ready env-check
+    # Step 1: Registered hard-disabled Tool Ready env-check. Release builds of
+    # `tokenless env-check` return UNKNOWN/enabled:false, which _env_check
+    # treats as pass-through; no check, repair, or block can run.
     if _have("tokenless", _TOKENLESS_FALLBACK):
         feedback = await _env_check(tool_name)
         if feedback:
@@ -570,7 +579,7 @@ def register(toolkit: Any) -> None:
 
     features: list[str] = []
     if _have("tokenless", _TOKENLESS_FALLBACK):
-        features.extend(["response-compression", "toon-encoding", "tool-ready"])
+        features.extend(["response-compression", "toon-encoding"])
     if _have("rtk", _RTK_FALLBACK):
         features.append("rtk-rewrite")
 
