@@ -6,7 +6,6 @@
 //! are never held across `.await` boundaries.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use blaze_core::backend::BackendKind;
@@ -25,6 +24,7 @@ use crate::sandbox::template::TemplateCatalog;
 use crate::sandbox::template::validate_template_roots;
 use crate::sandbox::{SandboxManager, SandboxManagerInit};
 use crate::spawner::SpawnerRegistry;
+use crate::state_store::StateStore;
 
 /// All daemon mutable state. Cloning is via `Arc` (see the `state.clone()`
 /// idiom in `daemon.rs`); the struct itself is never `Clone`.
@@ -40,7 +40,7 @@ pub struct ServerState {
     /// backend rather than reporting all configured binaries.
     pub active_backend: BackendKind,
     pub storage: Arc<dyn StorageProvider>,
-    pub state_dir: PathBuf,
+    pub state_store: StateStore,
     pub metrics: Arc<Metrics>,
 }
 
@@ -49,7 +49,32 @@ impl ServerState {
     /// `instances` map from previous runs (best-effort; corrupt entries
     /// are skipped with a warning).
     #[allow(clippy::too_many_arguments)]
+    pub fn build_with_store(
+        config: DaemonConfig,
+        policy: PolicyEngine,
+        pool: PoolManager,
+        hook: HookRegistry,
+        spawners: SpawnerRegistry,
+        active_backend: BackendKind,
+        storage: Arc<dyn StorageProvider>,
+        template_catalog: TemplateCatalog,
+        state_store: StateStore,
+    ) -> Result<Self> {
+        Self::assemble(
+            config,
+            policy,
+            pool,
+            hook,
+            spawners,
+            active_backend,
+            storage,
+            template_catalog,
+            state_store,
+        )
+    }
+
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         config: DaemonConfig,
         policy: PolicyEngine,
@@ -70,7 +95,8 @@ impl ServerState {
             None,
         )?;
         let template_catalog = TemplateCatalog::open_validated(&config.template, template_roots)?;
-        Self::build_with_template_catalog(
+        let state_store = StateStore::new(config.daemon.state_dir.clone());
+        Self::assemble(
             config,
             policy,
             pool,
@@ -79,11 +105,12 @@ impl ServerState {
             active_backend,
             storage,
             template_catalog,
+            state_store,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn build_with_template_catalog(
+    fn assemble(
         config: DaemonConfig,
         policy: PolicyEngine,
         pool: PoolManager,
@@ -92,9 +119,9 @@ impl ServerState {
         active_backend: BackendKind,
         storage: Arc<dyn StorageProvider>,
         template_catalog: TemplateCatalog,
+        state_store: StateStore,
     ) -> Result<Self> {
-        let state_dir = config.daemon.state_dir.clone();
-        let instances = scan_state_dir(&state_dir).unwrap_or_else(|err| {
+        let instances = state_store.scan().unwrap_or_else(|err| {
             tracing::warn!(error = %err, "failed to scan state_dir, starting empty");
             HashMap::new()
         });
@@ -104,7 +131,7 @@ impl ServerState {
             spawners,
             active_backend,
             storage: storage.clone(),
-            state_dir: state_dir.clone(),
+            state_store: state_store.clone(),
             rootfs_size: config.storage.rootfs_size,
             mem_size: config.storage.mem_size,
             template_catalog,
@@ -119,7 +146,7 @@ impl ServerState {
             manager: Arc::new(manager),
             active_backend,
             storage,
-            state_dir,
+            state_store,
             metrics: resources.metrics,
         })
     }
@@ -130,34 +157,99 @@ impl ServerState {
     }
 }
 
-/// Best-effort: walk `{state_dir}/<uuid>/state.json` and rebuild the
-/// instance map. Used both at boot and (in the future) by `daemon doctor`.
-fn scan_state_dir(state_dir: &Path) -> Result<HashMap<Uuid, SandboxInstance>> {
-    let mut out = HashMap::new();
-    if !state_dir.exists() {
-        return Ok(out);
-    }
-    for entry in std::fs::read_dir(state_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
+#[cfg(test)]
+mod tests {
+    use blaze_core::lifecycle::StartPath;
+    use blaze_core::policy::WorkloadClass;
+
+    use crate::file_provider::FileStorageProvider;
+    use crate::spawner::{MockSpawner, SpawnerRegistry};
+
+    use super::*;
+
+    #[test]
+    fn builder_uses_the_preopened_state_store_after_path_replacement() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let configured_root = temporary.path().join("state");
+        let retained_root = temporary.path().join("retained-state");
+        let images = temporary.path().join("images");
+        let instances = temporary.path().join("instances");
+        for directory in [&configured_root, &images, &instances] {
+            std::fs::create_dir(directory).expect("test directory");
         }
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        let Ok(id) = Uuid::parse_str(name_str) else {
-            continue;
-        };
-        match SandboxInstance::load(state_dir, id) {
-            Ok(inst) => {
-                out.insert(id, inst);
-            }
-            Err(err) => {
-                tracing::warn!(instance = %id, error = %err, "skipping corrupt instance state");
-            }
-        }
+
+        let mut config = DaemonConfig::default();
+        config.daemon.state_dir = configured_root.clone();
+        config.storage.images_dir = images.clone();
+        config.storage.instances_dir = instances.clone();
+        config.template.dir = temporary.path().join("templates");
+        config.template.import_root = Some(temporary.path().join("template-imports"));
+        std::fs::create_dir(
+            config
+                .template
+                .import_root
+                .as_ref()
+                .expect("template import root"),
+        )
+        .expect("template import directory");
+        let template_catalog = TemplateCatalog::open(&config.template).expect("template catalog");
+        let existing = SandboxInstance::new(
+            BackendKind::Mock,
+            WorkloadClass::AgentTool,
+            "sha256:existing".into(),
+            StartPath::Cold,
+            "default".into(),
+        );
+        existing
+            .persist(&configured_root)
+            .expect("persist existing fixture");
+        let state_store = StateStore::new(configured_root.clone());
+
+        std::fs::rename(&configured_root, &retained_root).expect("move opened state root");
+        std::fs::create_dir(&configured_root).expect("replacement state root");
+
+        let mut spawners = SpawnerRegistry::new();
+        spawners.insert(BackendKind::Mock, Arc::new(MockSpawner));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(FileStorageProvider::with_images(images, instances));
+        let state = ServerState::build_with_store(
+            config,
+            PolicyEngine::new(),
+            PoolManager::new(),
+            HookRegistry::new(),
+            spawners,
+            BackendKind::Mock,
+            storage,
+            template_catalog,
+            state_store,
+        )
+        .expect("server state");
+
+        assert!(
+            state
+                .instances
+                .lock()
+                .expect("instances")
+                .contains_key(&existing.id)
+        );
+        let new_instance = SandboxInstance::new(
+            BackendKind::Mock,
+            WorkloadClass::AgentTool,
+            "sha256:new".into(),
+            StartPath::Cold,
+            "default".into(),
+        );
+        state
+            .state_store
+            .persist(&new_instance)
+            .expect("persist through retained store");
+
+        assert!(
+            retained_root
+                .join(new_instance.id.to_string())
+                .join("state.json")
+                .is_file()
+        );
+        assert!(!configured_root.join(new_instance.id.to_string()).exists());
     }
-    tracing::info!(instances = out.len(), "rehydrated instances from state_dir");
-    Ok(out)
 }

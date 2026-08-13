@@ -191,9 +191,38 @@ Tokenless 默认将统计数据和可逆压缩数据分别存储在
 export TOKENLESS_DATA_DIR="$HOME/path/to/tokenless-data"
 ```
 
-该目录必须是位于真实用户 home 下的绝对路径。若只需自定义一个数据库，
-现有的 `TOKENLESS_STATS_DB`、`TOKENLESS_STASH_DB` 和 `--stash-db` 覆盖项
-优先级更高。配置文件仍位于 `~/.tokenless/config.json`。
+该目录可以是当前用户有权访问的任意绝对路径，包括 `/var/lib` 下由服务管理
+的目录；文件系统根目录、相对路径和父目录遍历会被拒绝。若只需自定义一个
+数据库，现有的 `TOKENLESS_STATS_DB`、`TOKENLESS_STASH_DB` 和 `--stash-db`
+覆盖项优先级更高，但必须位于真实用户 home 或选定的数据目录下。配置文件
+仍位于 `~/.tokenless/config.json`。
+
+## Tool Ready
+
+Tool Ready 在工具调用前预检环境依赖（来自 `tool-ready-spec.json`），缺失时
+报告 `NOT_READY` 并提示跳过重试，避免浪费 Token 重试必然失败的命令；调用失败
+后再做错误归因。
+
+```bash
+# 检查单个工具
+tokenless env-check --tool Shell
+
+# 检查全部工具
+tokenless env-check --all
+
+# 生成清单
+tokenless env-check --checklist
+
+# 机器可读清单（单个 JSON 对象，tools 按名称排序）
+tokenless env-check --checklist --json
+
+# 检查并自动修复缺失依赖
+tokenless env-check --tool Shell --fix
+```
+
+`--checklist --json` 输出单个 `{tools, summary}` 对象，顺序稳定，供 Hook、
+插件和 CI 门禁消费；完整 schema 见
+[CLI 参考](../../docs/user-guide/zh/token-saving/tokenless/cli-reference.md#env-check)。
 
 ## 架构
 

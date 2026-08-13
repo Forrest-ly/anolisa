@@ -5,11 +5,13 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::cli::CliArgs;
 use crate::compaction::{ContextBudget, ModelCapability};
+#[cfg(test)]
+use crate::config::ApprovalMode;
 use crate::config::CoreConfig;
 use crate::core::{AgentTurnOutcome, CoshCore};
 use crate::extension::{ExtensionManager, RuntimeSnapshotBuilder};
 use crate::metrics::TurnMetrics;
-use crate::protocol::{InputMessage, OutputMessage, ShellControlRequest};
+use crate::protocol::{InputMessage, OutputMessage, ShellControlRequest, CONTROL_PROTOCOL_VERSION};
 use crate::session::{PersistedSession, ProviderSessionId, SessionError, SessionStore};
 use crate::sls;
 use crate::tool::SessionWorkspace;
@@ -24,6 +26,7 @@ use auth::request_auth;
 /// the child exits non-zero, and stderr carries the reason. Staying alive on a
 /// transport we cannot write to would only reproduce the #1994 hang.
 const EXIT_CONTROL_TRANSPORT_FAILURE: i32 = 74;
+const EXIT_PROTOCOL_MISMATCH: i32 = 65;
 
 pub async fn run(
     args: &CliArgs,
@@ -130,6 +133,7 @@ pub async fn run(
         project_root,
         workspace,
     );
+    engine.set_session_resumed(session.resumed);
     let live_extension_runtime = crate::registry::LiveExtensionRuntime::new(
         engine.extension_generation.clone(),
         args.enable_shell_evidence_tool,
@@ -224,6 +228,10 @@ pub async fn run(
                 engine.shutdown_extension_runtime().await;
                 return Ok(1);
             }
+            InputLineResult::ProtocolMismatch => {
+                engine.shutdown_extension_runtime().await;
+                return Ok(EXIT_PROTOCOL_MISMATCH);
+            }
         }
         if engine.control_transport_failure().is_some() {
             engine.shutdown_extension_runtime().await;
@@ -257,6 +265,10 @@ pub async fn run(
                 engine.shutdown_extension_runtime().await;
                 return Ok(1);
             }
+            InputLineResult::ProtocolMismatch => {
+                engine.shutdown_extension_runtime().await;
+                return Ok(EXIT_PROTOCOL_MISMATCH);
+            }
         }
         // Checked after every line, not only after a turn: once the transport
         // is gone the process can neither answer nor be answered.
@@ -273,6 +285,7 @@ enum InputLineResult {
     Continue,
     Shutdown,
     InvalidJson,
+    ProtocolMismatch,
 }
 
 /// Processes a single JSONL input line.
@@ -326,7 +339,19 @@ where
             request_id,
             request,
         } => match request {
-            ShellControlRequest::Initialize { fire_session_start } => {
+            ShellControlRequest::Initialize {
+                fire_session_start,
+                protocol_version,
+            } => {
+                if let Some(received_version) = protocol_version {
+                    if received_version != CONTROL_PROTOCOL_VERSION {
+                        engine.emit(
+                            writer,
+                            &OutputMessage::initialize_version_error(&request_id, received_version),
+                        );
+                        return InputLineResult::ProtocolMismatch;
+                    }
+                }
                 engine.emit(
                     writer,
                     &OutputMessage::initialize_success(
@@ -760,7 +785,7 @@ fn apply_cli_overrides(args: &CliArgs, config: &mut CoreConfig) {
         config.ai.active_model = Some(model.clone());
     }
     if let Some(ref mode) = args.approval_mode {
-        config.agent.approval_mode = mode.clone();
+        config.agent.approval_mode = *mode;
     }
     if let Some(ref tools) = args.allowed_tools {
         config.agent.allowed_tools = tools
@@ -828,7 +853,7 @@ mod tests {
 
         let config = load_runtime_config(&args, workspace.path());
 
-        assert_ne!(config.agent.approval_mode, "project-only-mode");
+        assert_eq!(config.agent.approval_mode, ApprovalMode::Recommend);
         assert!(!config.session.auto_persist);
     }
 }

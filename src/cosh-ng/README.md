@@ -52,13 +52,17 @@ Then mix shell commands and Agent requests in the same session:
 ```text
 $ git status
 $ explain why this service keeps restarting and show me the evidence
+$ /agent
 $ /skills list
 $ /session status
 ```
 
 Use `/auth` to choose a supported provider plan, `/help` to list current slash
 commands, and `/mode approval recommend` when every Agent tool call should wait
-for confirmation.
+for confirmation. Approval settings use `recommend`, `auto`, or `trust` across
+the shell and Core. With the cosh-core runtime, `/agent` opens a one-shot
+Composer that accepts a leading `/skill:<name>` and validated workspace-local
+`@path` references.
 
 ## Documentation
 

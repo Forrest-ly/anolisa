@@ -9,6 +9,38 @@
 
 ## [未发布]
 
+## [0.3.0] - 2026-08-12
+
+### 修复
+
+- Adapter enable、status 和 update 现基于 ANOLISA-owned Raw file 或 native
+  package metadata 派生 adapter revision，不再对整个 resource tree 计算 hash。
+  Runtime cache 与其他 unowned file 不再造成错误 drift，也不会被复制到 framework；
+  已变化的 package-owned input 会在 framework mutation 前阻止 enable，metadata
+  不可用时则报告为 `unknown` 状态
+  ([#2419](https://github.com/alibaba/anolisa/pull/2419))。
+- Re-enable adapter 现仅删除旧 receipt 记录的 stale materialized file，保留
+  runtime-created file，通过 `--dry-run` 预览 cleanup，并在 directory-to-file
+  replacement 会丢弃 runtime data 时保留旧 receipt
+  ([#2438](https://github.com/alibaba/anolisa/pull/2438))。
+
+## [0.2.20] - 2026-08-11
+
+### 变更
+
+- `anolisa list` 现显示检测到的 host platform，并在 human-readable output 中以
+  component availability 取代 backend 和 ownership column。不支持当前 host 的
+  component 仍会显示其支持的 platform，且不提供 install action；JSON 新增
+  `platforms` 和 `platform_available`，同时保留 backend 与 ownership metadata
+  ([#2367](https://github.com/alibaba/anolisa/pull/2367))。
+
+### 修复
+
+- npm 安装现由 `@anolisa/cli` 独占公开的 `anolisa` executable。在 npm 10 下，
+  本地安装可稳定创建 `node_modules/.bin/anolisa`，不再因 platform package 参与
+  链接而丢失该 command
+  ([#2345](https://github.com/alibaba/anolisa/pull/2345))。
+
 ## [0.2.19] - 2026-08-10
 
 ### 修复

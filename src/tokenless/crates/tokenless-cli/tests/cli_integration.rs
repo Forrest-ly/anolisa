@@ -73,19 +73,25 @@ struct TempDataDir {
 impl TempDataDir {
     fn new() -> Option<Self> {
         let home = get_home_dir();
-        if home.is_empty() {
-            return None;
-        }
         let unique = format!(
-            ".tokenless-data-dir-integration-{}-{}",
+            "tokenless-external-data-dir-integration-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()?
                 .as_nanos()
         );
-        let root = std::path::PathBuf::from(home).join(unique);
+        let root = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&root).ok()?;
+        if !home.is_empty()
+            && root
+                .canonicalize()
+                .ok()?
+                .starts_with(std::path::Path::new(&home).canonicalize().ok()?)
+        {
+            std::fs::remove_dir_all(&root).ok();
+            return None;
+        }
         let data_dir = root.join("databases");
         Some(Self { root, data_dir })
     }
@@ -123,7 +129,16 @@ fn data_dir_env_routes_stats_and_stash_databases() {
         "stats command failed: {}",
         String::from_utf8_lossy(&stats_output.stderr)
     );
+    assert!(!String::from_utf8_lossy(&stats_output.stderr).contains("ignoring TOKENLESS_DATA_DIR"));
     assert!(fixture.data_dir.join("stats.db").is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fixture.data_dir.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 
     let stash_output = fixture
         .command()
@@ -140,7 +155,7 @@ fn stats_db_env_takes_precedence_over_data_dir() {
         Some(fixture) => fixture,
         None => return,
     };
-    let explicit_dir = fixture.root.join("explicit");
+    let explicit_dir = fixture.data_dir.join("explicit");
     std::fs::create_dir_all(&explicit_dir).unwrap();
     let explicit_db = explicit_dir.join("stats.db");
 
@@ -165,7 +180,7 @@ fn stash_db_env_takes_precedence_over_data_dir() {
         Some(fixture) => fixture,
         None => return,
     };
-    let explicit_dir = fixture.root.join("explicit");
+    let explicit_dir = fixture.data_dir.join("explicit");
     std::fs::create_dir_all(&explicit_dir).unwrap();
     let explicit_db = explicit_dir.join("stash.db");
 
@@ -178,6 +193,71 @@ fn stash_db_env_takes_precedence_over_data_dir() {
     assert!(!output.status.success());
     assert!(explicit_db.is_file());
     assert!(!fixture.data_dir.join("stash.db").exists());
+}
+
+#[test]
+fn invalid_explicit_data_dir_does_not_fall_back_to_home() {
+    let output = tokenless_bin()
+        .env("TOKENLESS_DATA_DIR", "relative/data")
+        .env_remove("TOKENLESS_STATS_DB")
+        .args(["stats", "summary"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("path 'relative/data' is not absolute"));
+}
+
+#[test]
+fn invalid_explicit_data_dir_does_not_block_stats_status() {
+    let output = tokenless_bin()
+        .env("TOKENLESS_DATA_DIR", "relative/data")
+        .env_remove("TOKENLESS_STATS_DB")
+        .args(["stats", "status"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Stats recording:"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn valid_stats_db_override_wins_over_invalid_data_dir() {
+    let fixture = match TempStatsDb::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let output = fixture
+        .command()
+        .env("TOKENLESS_DATA_DIR", "relative/data")
+        .args(["stats", "summary"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(fixture.path.is_file());
+}
+
+#[test]
+fn stats_db_override_cannot_escape_selected_data_dir() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let outside_db = fixture.root.join("outside-stats.db");
+    let output = fixture
+        .command()
+        .env("TOKENLESS_STATS_DB", &outside_db)
+        .args(["stats", "summary"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(!outside_db.exists());
+    assert!(fixture.data_dir.join("stats.db").is_file());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ignoring TOKENLESS_STATS_DB"));
 }
 
 #[test]
@@ -323,6 +403,76 @@ fn retrieve_invalid_hash() {
         .output()
         .unwrap();
     assert!(!output.status.success());
+}
+
+#[test]
+fn retrieve_stdout_is_byte_exact_without_extra_trailing_newline() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let stash_db = fixture.data_dir.join("stash.db");
+    // Long string forces reversible truncation + stash. The stored payload is
+    // this string value (not the whole JSON document) and has no trailing `\n`.
+    let stashed_string = format!("HELLO_RETRIEVE_EXACT_{}", "X".repeat(200));
+    let original = format!("{{\"s\":\"{stashed_string}\"}}");
+
+    let compressed = fixture
+        .command()
+        // Force compression on so a caller/home config with
+        // TOKENLESS_COMPRESSION_ENABLED=0 (or compression_enabled:false)
+        // cannot dry-run this subprocess and skip the stash marker.
+        .env("TOKENLESS_COMPRESSION_ENABLED", "1")
+        .env("TOKENLESS_STATS_ENABLED", "0")
+        .args([
+            "compress-response",
+            "--truncate-strings-at",
+            "80",
+            "--stash-db",
+        ])
+        .arg(&stash_db)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(original.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(
+        compressed.status.success(),
+        "compress-response failed: {}",
+        String::from_utf8_lossy(&compressed.stderr)
+    );
+    let compressed_text = String::from_utf8_lossy(&compressed.stdout);
+    let marker_start = compressed_text
+        .find("<<tokenless:")
+        .expect("compressed output should contain a stash marker");
+    let marker_end = compressed_text[marker_start..]
+        .find(">>")
+        .map(|i| marker_start + i + 2)
+        .expect("stash marker should be closed");
+    let marker = &compressed_text[marker_start..marker_end];
+
+    let retrieved = fixture
+        .command()
+        .args(["retrieve", marker, "--stash-db"])
+        .arg(&stash_db)
+        .output()
+        .unwrap();
+    assert!(
+        retrieved.status.success(),
+        "retrieve failed: {}",
+        String::from_utf8_lossy(&retrieved.stderr)
+    );
+    assert_eq!(
+        retrieved.stdout.as_slice(),
+        stashed_string.as_bytes(),
+        "retrieve must restore the stashed payload byte-for-byte; \
+         an extra trailing newline breaks end-to-end lossless recovery"
+    );
 }
 
 #[test]
@@ -532,4 +682,145 @@ fn stats_diff_invalid_scope_and_missing_record_use_expected_exit_codes() {
         .output()
         .unwrap();
     assert_eq!(missing.status.code(), Some(1));
+}
+
+fn write_checklist_spec(dir: &std::path::Path) -> std::path::PathBuf {
+    // Config file that reliably exists for the config-file check.
+    let config_path = dir.join("present.conf");
+    std::fs::write(&config_path, "").unwrap();
+    let spec = serde_json::json!({
+        "_comment": "comment keys must be skipped",
+        "Write": {
+            "required": ["nonexistent_binary_xyz_98"],
+            "recommended": [],
+            "config_files": [],
+            "permissions": [],
+            "network": []
+        },
+        "Shell": {
+            "required": ["bash"],
+            "recommended": [],
+            "config_files": [],
+            "permissions": [],
+            "network": []
+        },
+        "WebFetch": {
+            "required": [],
+            "recommended": ["nonexistent_binary_xyz_99"],
+            "config_files": [],
+            "permissions": [],
+            "network": ["lan_probe"]
+        },
+        "Read": {
+            "required": ["bash"],
+            "recommended": [],
+            "config_files": [config_path],
+            "permissions": ["exec_shell"],
+            "network": []
+        }
+    });
+    let spec_path = dir.join("checklist-spec.json");
+    std::fs::write(&spec_path, spec.to_string()).unwrap();
+    spec_path
+}
+
+#[test]
+fn env_check_checklist_json_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = write_checklist_spec(dir.path());
+
+    let output = tokenless_bin()
+        .args(["env-check", "--checklist", "--json"])
+        .env("TOKENLESS_TOOL_READY_SPEC", &spec_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "env-check --checklist --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect(
+        "--checklist --json must print one JSON object on stdout (text output would not parse)",
+    );
+
+    // Tools are ordered by tool name so the array is stable across runs.
+    let tools = value["tools"].as_array().expect("tools must be an array");
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Read", "Shell", "WebFetch", "Write"]);
+
+    // Every tool entry carries the status label plus all five categories.
+    for tool in tools {
+        assert!(tool["status"].is_string());
+        for category in [
+            "required",
+            "recommended",
+            "config",
+            "permissions",
+            "network",
+        ] {
+            assert!(
+                tool[category].is_array(),
+                "tool {} must serialize category {}",
+                tool["tool"],
+                category
+            );
+        }
+    }
+
+    // READY tool: required dep installed, config present, permission granted.
+    let read = &tools[0];
+    assert_eq!(read["status"], "READY");
+    assert_eq!(read["required"][0]["binary"], "bash");
+    assert_eq!(read["required"][0]["status"], "INSTALLED");
+    assert_eq!(read["config"][0]["ok"], true);
+    assert_eq!(read["permissions"][0]["name"], "exec_shell");
+    assert_eq!(read["permissions"][0]["ok"], true);
+
+    // PARTIAL tool: only a recommended dep missing.
+    let web_fetch = &tools[2];
+    assert_eq!(web_fetch["status"], "PARTIAL");
+    assert_eq!(web_fetch["recommended"][0]["status"], "MISSING");
+    assert_eq!(web_fetch["network"][0]["ok"], true);
+
+    // NOT_READY tool: required dep missing.
+    let write = &tools[3];
+    assert_eq!(write["status"], "NOT_READY");
+    assert_eq!(write["required"][0]["status"], "MISSING");
+
+    // Summary counts must agree with the tools array.
+    assert_eq!(value["summary"]["ready"], 2);
+    assert_eq!(value["summary"]["partial"], 1);
+    assert_eq!(value["summary"]["not_ready"], 1);
+    assert_eq!(value["summary"]["unknown"], 0);
+    assert_eq!(value["summary"]["total"], 4);
+}
+
+#[test]
+fn env_check_checklist_json_stable_across_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = write_checklist_spec(dir.path());
+
+    let mut outputs = Vec::new();
+    for _ in 0..8 {
+        let output = tokenless_bin()
+            .args(["env-check", "--checklist", "--json"])
+            .env("TOKENLESS_TOOL_READY_SPEC", &spec_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        outputs.push(output.stdout);
+    }
+
+    for (index, stdout) in outputs.iter().enumerate().skip(1) {
+        assert_eq!(
+            stdout,
+            &outputs[0],
+            "checklist JSON must be byte-identical across processes (run {})",
+            index + 1
+        );
+    }
 }

@@ -13,10 +13,10 @@ use cosh_types::audit::{AuditOutcomeStatus, AuditProviderData, AuditToolData, Ou
 use crate::audit::{CoreAuditRecorder, CoreAuditScope};
 use crate::auth::is_auth_error;
 use crate::compaction::{CompactionRuntime, ModelCapability};
-use crate::config::{self, CoreConfig};
+use crate::config::{self, ApprovalMode, CoreConfig};
 use crate::context::ContextBuilder;
 use crate::extension::{GenerationController, RuntimeGeneration, RuntimeSnapshot};
-use crate::hook::{HookDecision, HookNotification, HookSystem};
+use crate::hook::{HookDecision, HookNotification, HookSystem, PreToolUseResult};
 use crate::loop_detect::LoopDetector;
 use crate::metrics::TurnMetrics;
 use crate::protocol::{InputMessage, OutputMessage, ShellContext, ShellControlRequest};
@@ -24,7 +24,9 @@ use crate::provider::{
     ContentGenerator, GenerateConfig, GenerateEvent, Message, MAX_TOOL_CALL_INDEX,
 };
 use crate::tool::ask_user_question;
-use crate::tool::{SessionWorkspace, ToolContext, ToolKind, ToolRegistry, ToolResult};
+use crate::tool::{
+    SessionWorkspace, ToolContext, ToolKind, ToolRegistry, ToolResult, ToolRuntimeContext,
+};
 use crate::truncator::OutputTruncator;
 
 use self::tool_execution::{
@@ -36,6 +38,14 @@ use self::tool_execution::{
 mod auth;
 mod extensions;
 mod tool_execution;
+
+fn is_sensitive_write(tool_name: &str, params: &serde_json::Value) -> bool {
+    tool_name == "write_file"
+        && params
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(crate::redaction::contains_sensitive_text)
+}
 
 /// Typed terminal state for one user-request loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +67,7 @@ pub struct CoshCore {
     /// sees the projected effective context.
     pub compaction: CompactionRuntime,
     pub model: String,
+    session_resumed: bool,
     pub shell_context: Option<ShellContext>,
     project_root: PathBuf,
     workspace: SessionWorkspace,
@@ -82,6 +93,23 @@ pub struct CoshCore {
 impl CoshCore {
     pub fn tool_names(&self) -> Vec<String> {
         self.tools.names()
+    }
+
+    pub(crate) fn set_session_resumed(&mut self, resumed: bool) {
+        self.session_resumed = resumed;
+    }
+
+    fn tool_runtime_context(&self) -> ToolRuntimeContext {
+        let snapshot = self.extension_generation.current();
+        ToolRuntimeContext {
+            model: self.model.clone(),
+            approval_mode: self.config.agent.approval_mode.to_string(),
+            session_resumed: self.session_resumed,
+            compaction_revision: self.compaction.revision(),
+            compacted_through: self.compaction.state().map(|state| state.compacted_through),
+            tools: self.tool_names(),
+            active_extensions: snapshot.active_extensions.iter().cloned().collect(),
+        }
     }
 
     pub fn emit<W: Write>(&self, writer: &mut W, msg: &OutputMessage) {
@@ -207,7 +235,7 @@ impl CoshCore {
             &self.cwd(),
             &self.tool_names(),
             &[],
-            &self.config.agent.approval_mode,
+            self.config.agent.approval_mode.label(),
             self.config.ai.output_language.as_deref(),
             self.extension_context.as_deref(),
         );
@@ -221,58 +249,35 @@ impl CoshCore {
             .effective_history_tokens(&self.messages, prefix_tokens)
     }
 
-    fn classify_tool(&self, tool_name: &str, _params: &serde_json::Value) -> Outcome {
-        let mode = self.config.agent.approval_mode.as_str();
-
-        if mode == "trust" {
-            return Outcome::Allow;
-        }
+    fn classify_tool(&self, tool_name: &str, params: &serde_json::Value) -> Outcome {
+        let mode = self.config.agent.approval_mode;
 
         let tool = match self.tools.get(tool_name) {
             Some(t) => t,
             None => return Outcome::Deny,
         };
 
+        if mode == ApprovalMode::Trust {
+            return Outcome::Allow;
+        }
+
         if self.config.agent.allowed_tools.contains(tool_name) {
             return Outcome::Allow;
         }
 
-        let kind = tool.kind();
-
-        if kind == ToolKind::ReadOnly {
-            return Outcome::Allow;
-        }
-
-        if kind == ToolKind::Network {
+        if is_sensitive_write(tool_name, params) && mode == ApprovalMode::Auto {
             return Outcome::RequireApproval;
         }
 
-        // MCP servers are external programs. Do not infer their side effects
-        // from a server-provided description or schema.
-        if kind == ToolKind::Mcp {
-            return Outcome::RequireApproval;
-        }
-
-        if kind == ToolKind::External {
-            return Outcome::RequireApproval;
-        }
-
-        if mode == "suggest" {
-            return Outcome::RequireApproval;
-        }
-
-        if kind == ToolKind::ShellExec {
-            return Outcome::RequireApproval;
-        }
-
-        if kind == ToolKind::FileEdit && mode == "auto" {
-            return Outcome::Allow;
-        }
-
-        if mode == "auto" {
-            Outcome::Allow
-        } else {
-            Outcome::RequireApproval
+        match (mode, tool.kind()) {
+            (_, ToolKind::ReadOnly) => Outcome::Allow,
+            (
+                ApprovalMode::Auto,
+                ToolKind::FileEdit | ToolKind::ShellEvidence | ToolKind::Other,
+            ) => Outcome::Allow,
+            // MCP, network, and extension tools are external boundaries. Do
+            // not infer their side effects from descriptions or schemas.
+            _ => Outcome::RequireApproval,
         }
     }
 
@@ -486,7 +491,7 @@ impl CoshCore {
             &self.cwd(),
             &self.tool_names(),
             &skill_summaries,
-            &self.config.agent.approval_mode,
+            self.config.agent.approval_mode.label(),
             self.config.ai.output_language.as_deref(),
             self.extension_context.as_deref(),
         );
@@ -990,11 +995,12 @@ impl CoshCore {
             self.messages
                 .push(Message::assistant_with_tool_calls(&text_buf, tc_infos));
 
-            let ctx = ToolContext::with_workspace(
+            let ctx = ToolContext::with_runtime(
                 self.cwd(),
                 self.session_id.clone(),
                 self.project_root.clone(),
                 self.workspace.clone(),
+                self.tool_runtime_context(),
             );
 
             let mut interrupted = false;
@@ -1069,6 +1075,11 @@ impl CoshCore {
                         Ok(params) => hash_json(params),
                         Err(_) => hash_bytes(tc.arguments.as_bytes()),
                     }),
+                    execution_path: parsed_params
+                        .as_ref()
+                        .ok()
+                        .filter(|params| is_sensitive_write(&tc.name, params))
+                        .map(|_| "sensitive_write".to_string()),
                     ..AuditToolData::default()
                 };
                 self.audit
@@ -1198,15 +1209,16 @@ impl CoshCore {
                     )
                     .await;
                 self.emit_hook_notifications(writer, &hook_result.notifications, Some(&tc.id));
+                let (hook_status, hook_decision) = pre_tool_hook_audit(&hook_result);
                 self.audit.record_hook_decision(
                     tool_scope,
                     "pre_tool_use",
-                    hook_outcome(&hook_result.decision),
-                    hook_decision_name(&hook_result.decision),
+                    hook_status,
+                    hook_decision,
                 );
 
                 let (outcome, params) = match hook_result.decision {
-                    HookDecision::Block(reason) => {
+                    HookDecision::Block(reason) | HookDecision::HookFailure(reason) => {
                         // ─── SLS: hook-blocked tool call counts as total + fail ───
                         self.metrics.tool_calls_total += 1;
                         self.metrics.tool_calls_fail += 1;
@@ -2206,8 +2218,26 @@ fn hook_decision_name(decision: &HookDecision) -> &'static str {
     match decision {
         HookDecision::Allow => "allow",
         HookDecision::Block(_) => "block",
+        HookDecision::HookFailure(_) => "hook_failure",
         HookDecision::Ask => "ask",
         HookDecision::Passthrough => "passthrough",
+    }
+}
+
+fn pre_tool_hook_audit(result: &PreToolUseResult) -> (AuditOutcomeStatus, &'static str) {
+    if !result.hook_failures.is_empty()
+        && matches!(
+            result.decision,
+            HookDecision::Allow | HookDecision::Passthrough
+        )
+    {
+        // A fail-open hook failed and no stronger decision stopped the tool.
+        (AuditOutcomeStatus::Failed, "hook_failure")
+    } else {
+        (
+            hook_outcome(&result.decision),
+            hook_decision_name(&result.decision),
+        )
     }
 }
 
@@ -2215,6 +2245,7 @@ fn hook_outcome(decision: &HookDecision) -> AuditOutcomeStatus {
     match decision {
         HookDecision::Allow | HookDecision::Passthrough => AuditOutcomeStatus::Allowed,
         HookDecision::Block(_) => AuditOutcomeStatus::Denied,
+        HookDecision::HookFailure(_) => AuditOutcomeStatus::Failed,
         HookDecision::Ask => AuditOutcomeStatus::Started,
     }
 }

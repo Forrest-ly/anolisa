@@ -14,9 +14,58 @@ async fn empty_reader() -> tokio::io::Lines<BufReader<&'static [u8]>> {
 
 fn make_core(provider: MockProvider) -> CoshCore {
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::new();
     CoshCore::new(config, Box::new(provider), tools)
+}
+
+#[test]
+fn hook_failure_audit_is_distinct_from_real_allow() {
+    let allow = crate::hook::PreToolUseResult {
+        decision: crate::hook::HookDecision::Allow,
+        tool_input_patch: None,
+        notifications: Vec::new(),
+        hook_failures: Vec::new(),
+    };
+    assert_eq!(
+        pre_tool_hook_audit(&allow),
+        (cosh_types::audit::AuditOutcomeStatus::Allowed, "allow")
+    );
+
+    let fail_open = crate::hook::PreToolUseResult {
+        decision: crate::hook::HookDecision::Allow,
+        tool_input_patch: None,
+        notifications: Vec::new(),
+        hook_failures: vec![crate::hook::HookFailure {
+            hook_name: "probe".to_string(),
+            kind: crate::hook::HookFailureKind::InvalidJson,
+        }],
+    };
+    assert_eq!(
+        pre_tool_hook_audit(&fail_open),
+        (
+            cosh_types::audit::AuditOutcomeStatus::Failed,
+            "hook_failure"
+        )
+    );
+
+    let blocked_with_fail_open_failure = crate::hook::PreToolUseResult {
+        decision: crate::hook::HookDecision::Block("policy denied".to_string()),
+        ..fail_open.clone()
+    };
+    assert_eq!(
+        pre_tool_hook_audit(&blocked_with_fail_open_failure),
+        (cosh_types::audit::AuditOutcomeStatus::Denied, "block")
+    );
+
+    let ask_with_fail_open_failure = crate::hook::PreToolUseResult {
+        decision: crate::hook::HookDecision::Ask,
+        ..fail_open
+    };
+    assert_eq!(
+        pre_tool_hook_audit(&ask_with_fail_open_failure),
+        (cosh_types::audit::AuditOutcomeStatus::Started, "ask")
+    );
 }
 
 struct CountingShellTool {
@@ -59,7 +108,7 @@ async fn requested_and_reserved_output_tokens(
         configs: Arc::clone(&configs),
     };
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     config.session.compaction = compaction.clone();
     let session_token_limit = config.agent.session_token_limit;
     let mut core = CoshCore::new(config, Box::new(provider), ToolRegistry::new());
@@ -167,7 +216,7 @@ impl Tool for ExternalTool {
 #[test]
 fn allowlisted_tools_bypass_strict_approval() {
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "strict".to_string();
+    config.agent.approval_mode = ApprovalMode::Recommend;
     config.agent.allowed_tools.insert("shell".to_string());
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(CountingShellTool {
@@ -182,10 +231,124 @@ fn allowlisted_tools_bypass_strict_approval() {
 }
 
 #[test]
-fn mcp_tools_require_approval_outside_trust_mode() {
-    for mode in ["auto", "balanced", "suggest", "strict"] {
+fn sensitive_write_requires_auto_approval_but_preserves_bypass_modes() {
+    let sensitive = serde_json::json!({
+        "path": "settings.env",
+        "content": "AWS_ACCESS_KEY_ID=AKIA1234567890ABCDEF"
+    });
+    let ordinary = serde_json::json!({"path": "settings.env", "content": "safe=true"});
+
+    for (mode, expected) in [
+        ("trust", Outcome::Allow),
+        ("auto", Outcome::RequireApproval),
+        ("balanced", Outcome::RequireApproval),
+        ("suggest", Outcome::RequireApproval),
+        ("strict", Outcome::RequireApproval),
+    ] {
         let mut config = CoreConfig::default();
-        config.agent.approval_mode = mode.to_string();
+        config.agent.approval_mode = ApprovalMode::from_config(mode);
+        let core = CoshCore::new(
+            config,
+            Box::new(MockProvider::new(Vec::new())),
+            ToolRegistry::with_defaults_for_test(),
+        );
+
+        assert_eq!(
+            core.classify_tool("write_file", &sensitive),
+            expected,
+            "unexpected sensitive write policy in {mode} mode"
+        );
+    }
+
+    let mut config = CoreConfig::default();
+    config.agent.approval_mode = ApprovalMode::Auto;
+    let core = CoshCore::new(
+        config,
+        Box::new(MockProvider::new(Vec::new())),
+        ToolRegistry::with_defaults_for_test(),
+    );
+    assert_eq!(
+        core.classify_tool("write_file", &ordinary),
+        Outcome::Allow,
+        "ordinary auto-mode writes remain allowed"
+    );
+
+    let mut config = CoreConfig::default();
+    config.agent.approval_mode = ApprovalMode::Recommend;
+    config.agent.allowed_tools.insert("write_file".to_string());
+    let core = CoshCore::new(
+        config,
+        Box::new(MockProvider::new(Vec::new())),
+        ToolRegistry::with_defaults_for_test(),
+    );
+    assert_eq!(
+        core.classify_tool("write_file", &sensitive),
+        Outcome::Allow,
+        "explicit allowlist entries remain authoritative"
+    );
+}
+
+#[tokio::test]
+async fn sensitive_write_audit_uses_generic_execution_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = "AKIA1234567890ABCDEF";
+    let provider = MockProvider::new(vec![
+        vec![
+            GenerateEvent::ToolCallStart {
+                index: 0,
+                id: "call-sensitive-write".to_string(),
+                name: "write_file".to_string(),
+            },
+            GenerateEvent::ToolCallDelta {
+                index: 0,
+                arguments_delta: format!(
+                    r#"{{"path":"settings.env","content":"AWS_ACCESS_KEY_ID={secret}"}}"#
+                ),
+            },
+            GenerateEvent::ToolCallEnd { index: 0 },
+            GenerateEvent::MessageEnd,
+        ],
+        vec![
+            GenerateEvent::TextDelta("done".to_string()),
+            GenerateEvent::MessageEnd,
+        ],
+    ]);
+    let mut config = CoreConfig::default();
+    config.agent.approval_mode = ApprovalMode::Trust;
+    let mut core = CoshCore::new(
+        config,
+        Box::new(provider),
+        ToolRegistry::with_defaults_for_test(),
+    );
+    core.project_root = dir.path().to_path_buf();
+    core.workspace = crate::tool::SessionWorkspace::new(dir.path());
+    core.audit = CoreAuditRecorder::test_capture(&core.session_id);
+
+    let mut reader = empty_reader().await;
+    let mut output = Vec::new();
+    core.handle_user_message("write the file", &mut reader, &mut output)
+        .await
+        .expect("sensitive write turn");
+
+    let event = core
+        .audit
+        .captured_events()
+        .iter()
+        .find(|event| {
+            event.event_type.as_str() == "tool.requested"
+                && event.identity.tool_use_id.as_deref() == Some("call-sensitive-write")
+        })
+        .expect("sensitive write audit event");
+    let serialized = serde_json::to_value(event).unwrap();
+    assert_eq!(serialized["data"]["execution_path"], "sensitive_write");
+    assert!(!serialized.to_string().contains(secret));
+}
+
+#[test]
+fn mcp_tools_require_approval_outside_trust_mode() {
+    for mode in [ApprovalMode::Auto, ApprovalMode::Recommend] {
+        let mut config = CoreConfig::default();
+        config.agent.approval_mode = mode;
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(TestMcpTool));
         let core = CoshCore::new(config, Box::new(MockProvider::new(Vec::new())), tools);
@@ -201,7 +364,7 @@ fn mcp_tools_require_approval_outside_trust_mode() {
 #[test]
 fn exact_mcp_allowlist_entry_bypasses_approval() {
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "strict".to_string();
+    config.agent.approval_mode = ApprovalMode::Recommend;
     config
         .agent
         .allowed_tools
@@ -219,22 +382,141 @@ fn exact_mcp_allowlist_entry_bypasses_approval() {
 #[test]
 fn external_tools_require_approval_outside_trust_mode() {
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(ExternalTool));
     let mut core = CoshCore::new(config, Box::new(MockProvider::text_only("unused")), tools);
-    for mode in ["auto", "balanced", "suggest"] {
-        core.config.agent.approval_mode = mode.to_string();
+    for mode in [ApprovalMode::Auto, ApprovalMode::Recommend] {
+        core.config.agent.approval_mode = mode;
         assert_eq!(
             core.classify_tool("example.ops/mcp/server/tool", &serde_json::json!({})),
             Outcome::RequireApproval
         );
     }
-    core.config.agent.approval_mode = "trust".to_string();
+    core.config.agent.approval_mode = ApprovalMode::Trust;
     assert_eq!(
         core.classify_tool("example.ops/mcp/server/tool", &serde_json::json!({})),
         Outcome::Allow
     );
+}
+
+#[test]
+fn approval_mode_covers_every_registered_tool_kind() {
+    for mode in [
+        ApprovalMode::Recommend,
+        ApprovalMode::Auto,
+        ApprovalMode::Trust,
+    ] {
+        let mut config = CoreConfig::default();
+        config.agent.approval_mode = mode;
+        let mut tools = ToolRegistry::with_defaults_for_test().with_shell_evidence();
+        tools.register(Box::new(TestMcpTool));
+        tools.register(Box::new(ExternalTool));
+        let core = CoshCore::new(config, Box::new(MockProvider::new(Vec::new())), tools);
+
+        for (name, kind, recommend, auto) in [
+            (
+                "read_file",
+                ToolKind::ReadOnly,
+                Outcome::Allow,
+                Outcome::Allow,
+            ),
+            ("grep", ToolKind::ReadOnly, Outcome::Allow, Outcome::Allow),
+            (
+                "web_fetch",
+                ToolKind::Network,
+                Outcome::RequireApproval,
+                Outcome::RequireApproval,
+            ),
+            (
+                "edit",
+                ToolKind::FileEdit,
+                Outcome::RequireApproval,
+                Outcome::Allow,
+            ),
+            (
+                "save_memory",
+                ToolKind::FileEdit,
+                Outcome::RequireApproval,
+                Outcome::Allow,
+            ),
+            (
+                "shell",
+                ToolKind::ShellExec,
+                Outcome::RequireApproval,
+                Outcome::RequireApproval,
+            ),
+            (
+                "cosh_shell_evidence",
+                ToolKind::ShellEvidence,
+                Outcome::RequireApproval,
+                Outcome::Allow,
+            ),
+            (
+                "mcp__remote__search",
+                ToolKind::Mcp,
+                Outcome::RequireApproval,
+                Outcome::RequireApproval,
+            ),
+            (
+                "example.ops/mcp/server/tool",
+                ToolKind::External,
+                Outcome::RequireApproval,
+                Outcome::RequireApproval,
+            ),
+            (
+                "todo",
+                ToolKind::Other,
+                Outcome::RequireApproval,
+                Outcome::Allow,
+            ),
+            (
+                "skill",
+                ToolKind::Other,
+                Outcome::RequireApproval,
+                Outcome::Allow,
+            ),
+        ] {
+            assert_eq!(core.tools.get(name).expect("registered tool").kind(), kind);
+            let expected = match mode {
+                ApprovalMode::Recommend => recommend,
+                ApprovalMode::Auto => auto,
+                ApprovalMode::Trust => Outcome::Allow,
+            };
+            assert_eq!(
+                core.classify_tool(name, &serde_json::json!({})),
+                expected,
+                "unexpected {kind:?} policy in {mode} mode"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_tools_are_denied_in_every_approval_mode() {
+    for mode in [
+        ApprovalMode::Recommend,
+        ApprovalMode::Auto,
+        ApprovalMode::Trust,
+    ] {
+        let mut config = CoreConfig::default();
+        config.agent.approval_mode = mode;
+        config
+            .agent
+            .allowed_tools
+            .insert("unknown_provider_tool".to_string());
+        let core = CoshCore::new(
+            config,
+            Box::new(MockProvider::new(Vec::new())),
+            ToolRegistry::with_defaults_for_test(),
+        );
+
+        assert_eq!(
+            core.classify_tool("unknown_provider_tool", &serde_json::json!({})),
+            Outcome::Deny,
+            "unknown tool must fail closed in {mode} mode"
+        );
+    }
 }
 
 #[test]
@@ -265,14 +547,12 @@ fn safe_reload_rebinds_the_complete_snapshot_before_the_next_run() {
 #[test]
 fn web_fetch_requires_approval_outside_trust_mode() {
     for (mode, expected) in [
-        ("trust", Outcome::Allow),
-        ("auto", Outcome::RequireApproval),
-        ("balanced", Outcome::RequireApproval),
-        ("suggest", Outcome::RequireApproval),
-        ("strict", Outcome::RequireApproval),
+        (ApprovalMode::Trust, Outcome::Allow),
+        (ApprovalMode::Auto, Outcome::RequireApproval),
+        (ApprovalMode::Recommend, Outcome::RequireApproval),
     ] {
         let mut config = CoreConfig::default();
-        config.agent.approval_mode = mode.to_string();
+        config.agent.approval_mode = mode;
         let tools = ToolRegistry::with_defaults_for_test();
         let core = CoshCore::new(config, Box::new(MockProvider::new(Vec::new())), tools);
 
@@ -296,7 +576,7 @@ async fn project_context_reaches_the_provider_boundary() {
         ..RecordingProvider::default()
     };
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let mut core = CoshCore::new(config, Box::new(provider), ToolRegistry::new());
     core.shell_context = Some(ShellContext {
         cwd: dir.path().to_path_buf(),
@@ -321,6 +601,86 @@ async fn project_context_reaches_the_provider_boundary() {
 }
 
 #[tokio::test]
+async fn provider_session_identity_stays_out_of_the_system_prompt() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        messages: Arc::clone(&captured),
+        ..RecordingProvider::default()
+    };
+    let mut config = CoreConfig::default();
+    config.agent.approval_mode = ApprovalMode::Trust;
+    let mut core = CoshCore::new(config, Box::new(provider), ToolRegistry::new());
+    let provider_session_id = core.session_id.clone();
+    let mut reader = empty_reader().await;
+    let mut output = Vec::new();
+
+    core.handle_user_message("hello", &mut reader, &mut output)
+        .await
+        .unwrap();
+
+    let messages = captured.lock().unwrap();
+    let prompt = messages
+        .first()
+        .expect("provider system message")
+        .content
+        .as_text();
+    assert!(!prompt.contains(&provider_session_id));
+    assert!(!prompt.contains("provider_session_id"));
+}
+
+#[tokio::test]
+async fn runtime_context_tool_reads_live_core_state_on_demand() {
+    let mut config = CoreConfig::default();
+    config.agent.approval_mode = ApprovalMode::Recommend;
+    config.hooks.enabled = true;
+    config.ai.active_provider = Some("coding".to_string());
+    config.ai.providers.insert(
+        "coding".to_string(),
+        crate::config::ProviderConfig {
+            provider_type: Some("dashscope".to_string()),
+            model: Some("qwen-test".to_string()),
+            ..Default::default()
+        },
+    );
+    let tools = ToolRegistry::with_defaults_for_test();
+    let mut core = CoshCore::new(config, Box::new(MockProvider::new(Vec::new())), tools);
+    core.set_session_resumed(true);
+    core.compaction.load_state(None, 7);
+    // Config reload does not rebuild the bound provider or hook system. The
+    // runtime contract therefore omits those config-only identities.
+    core.config.ai.active_provider = Some("reloaded-provider".to_string());
+    core.config.hooks.enabled = false;
+    let context = ToolContext::with_runtime(
+        core.cwd(),
+        core.session_id.clone(),
+        core.project_root.clone(),
+        core.workspace.clone(),
+        core.tool_runtime_context(),
+    );
+
+    let result = core
+        .tools
+        .get("runtime_context")
+        .expect("default runtime_context tool")
+        .invoke(serde_json::json!({}), &context)
+        .await
+        .expect("runtime context output");
+    let output: serde_json::Value =
+        serde_json::from_str(&result.output).expect("runtime context JSON");
+
+    assert_eq!(output["provider_session_id"], core.session_id);
+    assert_eq!(output["model"], "qwen-test");
+    assert!(output.get("provider").is_none());
+    assert_eq!(output["approval_mode"], "recommend");
+    assert_eq!(output["session"]["resumed"], true);
+    assert_eq!(output["compaction"]["revision"], 7);
+    assert!(output["capabilities"]["tools"]
+        .as_array()
+        .is_some_and(|tools| tools.iter().any(|name| name == "runtime_context")));
+    assert!(output["capabilities"].get("hooks_enabled").is_none());
+}
+
+#[tokio::test]
 async fn raw_shell_input_reaches_prompt_hook_without_changing_provider_content() {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let provider = RecordingProvider {
@@ -328,7 +688,7 @@ async fn raw_shell_input_reaches_prompt_hook_without_changing_provider_content()
         ..RecordingProvider::default()
     };
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     config.hooks.enabled = true;
     config.hooks.user_prompt_submit = vec![crate::config::HookDefinition {
         command: r#"python3 -c 'import json,sys; p=json.load(sys.stdin)["prompt"]; expected="user_input: marker\nruntime_frame: marker\ncosh-shell Agent contract: marker\napi_key=<redacted>"; print(json.dumps({"decision":"allow" if p == expected and not p.startswith("Handle this natural-language shell prompt") else "block"}))'"#
@@ -337,6 +697,7 @@ async fn raw_shell_input_reaches_prompt_hook_without_changing_provider_content()
         matcher: None,
         timeout: Some(5_000),
         sequential: None,
+        fail_open: false,
         env: Default::default(),
     }];
     let mut core = CoshCore::new(config, Box::new(provider), ToolRegistry::new());
@@ -365,7 +726,7 @@ async fn prompt_hook_falls_back_to_content_without_raw_shell_input() {
         ..RecordingProvider::default()
     };
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     config.hooks.enabled = true;
     config.hooks.user_prompt_submit = vec![crate::config::HookDefinition {
         command: r#"python3 -c 'import json,sys; p=json.load(sys.stdin)["prompt"]; print(json.dumps({"decision":"allow" if p == "legacy\nuser_input: marker" else "block"}))'"#
@@ -374,6 +735,7 @@ async fn prompt_hook_falls_back_to_content_without_raw_shell_input() {
         matcher: None,
         timeout: Some(5_000),
         sequential: None,
+        fail_open: false,
         env: Default::default(),
     }];
     let mut core = CoshCore::new(config, Box::new(provider), ToolRegistry::new());
@@ -435,7 +797,7 @@ async fn user_provided_secret_reaches_the_provider_boundary() {
         ..RecordingProvider::default()
     };
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let mut core = CoshCore::new(config, Box::new(provider), ToolRegistry::new());
     let mut reader = empty_reader().await;
     let mut output = Vec::new();
@@ -476,6 +838,7 @@ fn compress_schema_hook(command: &str) -> crate::config::HookDefinition {
         matcher: None,
         timeout: Some(10_000),
         sequential: None,
+        fail_open: false,
         env: Default::default(),
     }
 }
@@ -488,7 +851,7 @@ async fn before_model_hook_rewrites_tool_declarations_for_one_provider_call() {
         ..RecordingProvider::default()
     };
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     config.hooks.enabled = true;
     config.hooks.before_model = vec![compress_schema_hook(
         r#"python3 -c '
@@ -535,7 +898,7 @@ async fn before_model_hook_rejecting_tool_set_changes_keeps_originals() {
         ..RecordingProvider::default()
     };
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     config.hooks.enabled = true;
     // Appending an undeclared tool changes tool-selection semantics, so the
     // whole array is discarded rather than partially applied.
@@ -687,10 +1050,10 @@ fn mcp_tool_provider() -> MockProvider {
 
 #[tokio::test]
 async fn mcp_tools_do_not_execute_before_approval() {
-    for mode in ["auto", "balanced", "suggest", "strict"] {
+    for mode in [ApprovalMode::Auto, ApprovalMode::Recommend] {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut config = CoreConfig::default();
-        config.agent.approval_mode = mode.to_string();
+        config.agent.approval_mode = mode;
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(CountingMcpTool {
             calls: Arc::clone(&calls),
@@ -846,7 +1209,7 @@ async fn multi_turn_with_tool() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
     let mut output = Vec::new();
@@ -953,7 +1316,7 @@ async fn text_after_tool_call_is_not_visible_before_tool_result() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
     let mut output = Vec::new();
@@ -1001,7 +1364,7 @@ async fn tool_call_block_is_closed_when_stream_ends_without_tool_call_end() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
     let mut output = Vec::new();
@@ -1051,7 +1414,7 @@ async fn multiple_tool_call_blocks_are_closed_with_distinct_indexes_without_tool
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::new();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
     let mut output = Vec::new();
@@ -1124,7 +1487,7 @@ async fn approval_flow_allow() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "suggest".to_string();
+    config.agent.approval_mode = ApprovalMode::Recommend;
     let tools = ToolRegistry::with_defaults_for_test();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
 
@@ -1165,7 +1528,7 @@ async fn approval_flow_deny() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "suggest".to_string();
+    config.agent.approval_mode = ApprovalMode::Recommend;
     let tools = ToolRegistry::with_defaults_for_test();
 
     let deny_response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"deny","message":"Too dangerous"}}}"#;
@@ -1394,7 +1757,7 @@ async fn approval_timeout_fails_the_turn_without_a_second_generation() {
         ],
     ]);
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "suggest".to_string();
+    config.agent.approval_mode = ApprovalMode::Recommend;
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(CountingShellTool {
         calls: Arc::clone(&shell_calls),
@@ -1462,6 +1825,7 @@ fn sandbox_bypass_hook(marker: &std::path::Path) -> crate::config::HookDefinitio
         matcher: None,
         timeout: Some(10_000),
         sequential: None,
+        fail_open: false,
         env: Default::default(),
     }
 }
@@ -1504,7 +1868,7 @@ async fn approval_timeout_suppresses_the_sandbox_bypass_reprompt() {
         ],
     ]);
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "suggest".to_string();
+    config.agent.approval_mode = ApprovalMode::Recommend;
     config.hooks.enabled = true;
     config.hooks.post_tool_use_failure = vec![sandbox_bypass_hook(&hook_marker)];
     let mut tools = ToolRegistry::new();
@@ -1570,7 +1934,7 @@ async fn approval_flow_host_executed_shell_uses_tool_result() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "suggest".to_string();
+    config.agent.approval_mode = ApprovalMode::Recommend;
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(CountingShellTool {
         calls: Arc::clone(&shell_calls),
@@ -1639,7 +2003,7 @@ async fn approval_flow_rejects_host_executed_for_non_shell_tool() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "suggest".to_string();
+    config.agent.approval_mode = ApprovalMode::Recommend;
     let tools = ToolRegistry::with_defaults_for_test();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
 
@@ -1689,7 +2053,7 @@ async fn ask_user_question_flow() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
 
@@ -1736,7 +2100,7 @@ async fn cosh_shell_evidence_read_output_uses_control_protocol_result() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::new().with_shell_evidence();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
 
@@ -1791,6 +2155,53 @@ async fn cosh_shell_evidence_read_output_uses_control_protocol_result() {
 }
 
 #[tokio::test]
+async fn cosh_shell_evidence_uses_its_control_protocol_in_every_mode() {
+    for mode in [
+        ApprovalMode::Recommend,
+        ApprovalMode::Auto,
+        ApprovalMode::Trust,
+    ] {
+        let provider = MockProvider::new(vec![
+            vec![
+                GenerateEvent::ToolCallStart {
+                    index: 0,
+                    id: "call-evidence".to_string(),
+                    name: "cosh_shell_evidence".to_string(),
+                },
+                GenerateEvent::ToolCallDelta {
+                    index: 0,
+                    arguments_delta: r#"{"action":"list_commands","limit":1}"#.to_string(),
+                },
+                GenerateEvent::ToolCallEnd { index: 0 },
+                GenerateEvent::MessageEnd,
+            ],
+            vec![GenerateEvent::MessageEnd],
+        ]);
+        let mut config = CoreConfig::default();
+        config.agent.approval_mode = mode;
+        let tools = ToolRegistry::new().with_shell_evidence();
+        let mut core = CoshCore::new(config, Box::new(provider), tools);
+        let response = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-0","response":{"behavior":"shell_evidence","result":{"llmContent":"ShellEvidenceCommandIndex\ncommand_id: cmd-1","returnDisplay":null,"metadata":{"action":"list_commands","is_error":false}}}}}"#;
+        let mut reader = BufReader::new(response.as_bytes()).lines();
+        let mut output = Vec::new();
+
+        core.handle_user_message("list commands", &mut reader, &mut output)
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains(r#""subtype":"shell_evidence""#),
+            "{mode}: {output}"
+        );
+        assert!(
+            !output.contains(r#""subtype":"can_use_tool""#),
+            "{mode}: {output}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn cosh_shell_evidence_list_commands_uses_control_protocol_result() {
     let provider = MockProvider::new(vec![
         vec![
@@ -1813,7 +2224,7 @@ async fn cosh_shell_evidence_list_commands_uses_control_protocol_result() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::new().with_shell_evidence();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
 
@@ -1880,7 +2291,7 @@ async fn cosh_shell_evidence_preserves_error_result() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::new().with_shell_evidence();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
 
@@ -1998,7 +2409,7 @@ async fn cosh_shell_evidence_bypasses_normal_tool_hooks() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     config.hooks = config::HooksConfig {
         enabled: true,
         pre_tool_use: vec![config::HookDefinition {
@@ -2008,6 +2419,7 @@ async fn cosh_shell_evidence_bypasses_normal_tool_hooks() {
             matcher: Some("cosh_shell_evidence".to_string()),
             timeout: Some(5000),
             sequential: None,
+            fail_open: false,
             env: Default::default(),
         }],
         post_tool_use: vec![config::HookDefinition {
@@ -2017,6 +2429,7 @@ async fn cosh_shell_evidence_bypasses_normal_tool_hooks() {
             matcher: Some("cosh_shell_evidence".to_string()),
             timeout: Some(5000),
             sequential: None,
+            fail_open: false,
             env: Default::default(),
         }],
         ..Default::default()
@@ -2240,7 +2653,7 @@ async fn run_shell_turns(
     turns: Vec<Vec<GenerateEvent>>,
 ) -> (Result<AgentTurnOutcome, String>, String) {
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
     let mut core = CoshCore::new(config, Box::new(MockProvider::new(turns)), tools);
     let mut reader = empty_reader().await;
@@ -2318,7 +2731,7 @@ async fn three_consecutive_argument_rejections_stop_the_run() {
 #[tokio::test]
 async fn stopping_on_exhaustion_still_answers_every_call_in_the_batch() {
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
     let mut core = CoshCore::new(
         config,
@@ -2471,7 +2884,7 @@ async fn run_ask_user_turn(arguments: Option<&str>) -> (String, CoshCore) {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
     core.audit = CoreAuditRecorder::test_capture(&core.session_id);
@@ -2693,7 +3106,7 @@ async fn valid_ask_user_arguments_still_produce_a_question_and_answer() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
     core.audit = CoreAuditRecorder::test_capture(&core.session_id);
@@ -2771,7 +3184,7 @@ async fn malformed_tool_arguments_fail_without_executing_the_tool() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(CountingShellTool {
         calls: Arc::clone(&calls),
@@ -2823,7 +3236,7 @@ async fn empty_arguments_still_invoke_a_regular_tool() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(CountingShellTool {
         calls: Arc::clone(&calls),
@@ -2870,7 +3283,7 @@ async fn cosh_question_text_with_unsupported_schema_fails_visibly() {
         ]]);
 
         let mut config = CoreConfig::default();
-        config.agent.approval_mode = "trust".to_string();
+        config.agent.approval_mode = ApprovalMode::Trust;
         let tools = ToolRegistry::with_defaults_for_test();
         let mut core = CoshCore::new(config, Box::new(provider), tools);
         core.audit = CoreAuditRecorder::test_capture(&core.session_id);
@@ -2921,7 +3334,7 @@ async fn cosh_question_text_stays_visible_when_questions_are_disabled() {
     ]]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(CountingShellTool {
         calls: Arc::new(AtomicUsize::new(0)),
@@ -2966,7 +3379,7 @@ async fn cosh_question_text_with_valid_schema_still_asks() {
     ]);
 
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let tools = ToolRegistry::with_defaults_for_test();
     let mut core = CoshCore::new(config, Box::new(provider), tools);
     let input = "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"req-0\",\"response\":{\"answer\":\"main\"}}}\n";
@@ -3103,7 +3516,7 @@ fn approval_provider() -> MockProvider {
 
 fn approval_core(calls: Arc<AtomicUsize>) -> CoshCore {
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "suggest".to_string();
+    config.agent.approval_mode = ApprovalMode::Recommend;
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(CountingShellTool { calls }));
     let mut core = CoshCore::new(config, Box::new(approval_provider()), tools);
@@ -3216,6 +3629,7 @@ fn ask_hook(name: &str) -> crate::config::HookDefinition {
         matcher: None,
         timeout: Some(10_000),
         sequential: None,
+        fail_open: false,
         env: Default::default(),
     }
 }
@@ -3230,7 +3644,7 @@ async fn hook_ask_writes_a_complete_can_use_tool_line_to_a_real_pipe() {
     let mut config = CoreConfig::default();
     // Trust mode: only the hook asks, so this also pins that a hook `ask`
     // cannot be auto-approved away.
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     config.hooks.enabled = true;
     config.hooks.pre_tool_use = vec![ask_hook("ask-hook")];
     let calls = Arc::new(AtomicUsize::new(0));
@@ -3346,7 +3760,7 @@ async fn evidence_emit_failure_ends_the_turn_and_pairs_the_history() {
         GenerateEvent::MessageEnd,
     ]]);
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(crate::tool::shell_evidence::ShellEvidenceTool));
     let mut core = CoshCore::new(config, Box::new(provider), tools);
@@ -3374,7 +3788,7 @@ async fn user_prompt_submit_ask_emit_failure_never_waits_for_a_response() {
     // The prompt-level hook panel gates a wait exactly like the tool-level one,
     // and it happens before any transcript entry exists.
     let mut config = CoreConfig::default();
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     config.hooks.enabled = true;
     config.hooks.user_prompt_submit = vec![ask_hook("prompt-ask-hook")];
     let mut core = CoshCore::new(
@@ -3440,7 +3854,7 @@ async fn transport_failure_on_one_call_skips_the_rest_of_the_batch() {
     let mut config = CoreConfig::default();
     // Trust mode: the shell call would otherwise stop at an approval instead of
     // proving that a skipped call is what kept it from running.
-    config.agent.approval_mode = "trust".to_string();
+    config.agent.approval_mode = ApprovalMode::Trust;
     let calls = Arc::new(AtomicUsize::new(0));
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(crate::tool::shell_evidence::ShellEvidenceTool));

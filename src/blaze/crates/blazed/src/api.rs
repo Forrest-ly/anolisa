@@ -354,7 +354,7 @@ async fn checkpoint(state: &Arc<ServerState>, id: &str) -> Result<Response<Full<
         inst.transition(SandboxState::Paused)?;
     }
     inst.transition(SandboxState::Checkpointed)?;
-    inst.persist(&state.state_dir)?;
+    state.state_store.persist(inst)?;
 
     let checkpoint_id = format!("ckpt-{}-{}", inst.id, chrono::Utc::now().timestamp());
     json_ok(&json!({
@@ -379,7 +379,7 @@ async fn reset_instance(state: &Arc<ServerState>, id: &str) -> Result<Response<F
     // pool. Current implementation is control-plane state only.
     inst.transition(SandboxState::Reset)?;
     inst.transition(SandboxState::Warm)?;
-    inst.persist(&state.state_dir)?;
+    state.state_store.persist(inst)?;
 
     // return to pool keyed on (backend, class, image_digest)
     let key = PoolKey::new(inst.backend, inst.workload_class, inst.image_digest.clone());
@@ -778,7 +778,7 @@ mod tests {
 
     use async_trait::async_trait;
     use blaze_core::BlazeError;
-    use blaze_core::backend::{BackendKind, SpawnRequest};
+    use blaze_core::backend::BackendKind;
     use blaze_core::config::DaemonConfig;
     use blaze_core::kernel::HookRegistry;
     use blaze_core::lifecycle::{BackendOwnership, OperationKind};
@@ -795,10 +795,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::spawner::BubblewrapSpawner;
     use crate::spawner::{
-        BackendInstance, BackendSpawner, DynBackendInstance, DynSpawner, GuestMockSpawner,
-        MockSpawner, SpawnFailure, SpawnResult, SpawnerRegistry,
+        BackendInstance, BackendSpawnRequest, BackendSpawner, DynBackendInstance, DynSpawner,
+        GuestMockSpawner, MockSpawner, SpawnFailure, SpawnResult, SpawnerRegistry,
     };
     use crate::state::ServerState;
+    use crate::state_store::OwnedRunDir;
     #[cfg(target_os = "linux")]
     use tokio::sync::Notify;
 
@@ -1114,7 +1115,7 @@ mod tests {
     impl BackendSpawner for PartialSpawnSpawner {
         async fn spawn(
             &self,
-            request: SpawnRequest,
+            request: BackendSpawnRequest,
         ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
             let owner: DynBackendInstance = Arc::new(FailOnceOwner {
                 instance_id: request.instance_id,
@@ -1135,7 +1136,7 @@ mod tests {
         async fn cleanup_orphan(
             &self,
             _instance_id: Uuid,
-            _run_dir: &Path,
+            _run_dir: &OwnedRunDir,
         ) -> blaze_core::Result<()> {
             Err(BlazeError::BackendError {
                 msg: "partial owner must remain registered".into(),
@@ -1151,13 +1152,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[async_trait]
     impl BackendSpawner for PreSpawnBoundarySpawner {
-        async fn prepare_spawn(&self, run_dir: &Path) -> blaze_core::Result<()> {
+        async fn prepare_spawn(&self, run_dir: &OwnedRunDir) -> blaze_core::Result<()> {
             BubblewrapSpawner.prepare_spawn(run_dir).await
         }
 
         async fn spawn(
             &self,
-            _request: SpawnRequest,
+            _request: BackendSpawnRequest,
         ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
             self.reached.notify_one();
             std::future::pending().await
@@ -1170,7 +1171,7 @@ mod tests {
         async fn cleanup_orphan(
             &self,
             instance_id: Uuid,
-            run_dir: &Path,
+            run_dir: &OwnedRunDir,
         ) -> blaze_core::Result<()> {
             BubblewrapSpawner.cleanup_orphan(instance_id, run_dir).await
         }
@@ -1184,7 +1185,7 @@ mod tests {
     impl BackendSpawner for RecordingSpawner {
         async fn spawn(
             &self,
-            _request: SpawnRequest,
+            _request: BackendSpawnRequest,
         ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
             Err(SpawnFailure::clean(BlazeError::BackendError {
                 msg: "spawn not used".into(),
@@ -1198,7 +1199,7 @@ mod tests {
         async fn cleanup_orphan(
             &self,
             _instance_id: Uuid,
-            _run_dir: &Path,
+            _run_dir: &OwnedRunDir,
         ) -> blaze_core::Result<()> {
             self.cleanup_count.fetch_add(1, Ordering::AcqRel);
             Ok(())
@@ -1214,7 +1215,7 @@ mod tests {
     impl BackendSpawner for SelectiveCleanupSpawner {
         async fn spawn(
             &self,
-            request: SpawnRequest,
+            request: BackendSpawnRequest,
         ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
             MockSpawner.spawn(request).await
         }
@@ -1226,7 +1227,7 @@ mod tests {
         async fn cleanup_orphan(
             &self,
             instance_id: Uuid,
-            _run_dir: &Path,
+            _run_dir: &OwnedRunDir,
         ) -> blaze_core::Result<()> {
             self.cleanup_count.fetch_add(1, Ordering::AcqRel);
             if instance_id == self.failed_id {
@@ -1275,7 +1276,7 @@ mod tests {
     impl BackendSpawner for CountingSpawner {
         async fn spawn(
             &self,
-            request: SpawnRequest,
+            request: BackendSpawnRequest,
         ) -> std::result::Result<DynBackendInstance, SpawnFailure> {
             Ok(Arc::new(CountingOwner {
                 instance_id: request.instance_id,
@@ -1291,7 +1292,7 @@ mod tests {
         async fn cleanup_orphan(
             &self,
             _instance_id: Uuid,
-            _run_dir: &Path,
+            _run_dir: &OwnedRunDir,
         ) -> blaze_core::Result<()> {
             self.orphan_cleanup_count.fetch_add(1, Ordering::AcqRel);
             Ok(())
@@ -1500,6 +1501,10 @@ mod tests {
                 state.manager.get(id).expect("destroyed state").state,
                 SandboxState::Destroyed
             );
+            assert!(matches!(
+                state.state_store.run_dir(id),
+                Err(BlazeDaemonError::NotFound(_))
+            ));
         }
     }
 
@@ -2171,6 +2176,10 @@ mod tests {
                 .is_file()
         );
         assert!(!pid_file.exists());
+        assert!(matches!(
+            recovered.state_store.run_dir(instance.id),
+            Err(BlazeDaemonError::NotFound(_))
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -2198,10 +2207,12 @@ mod tests {
             .expect("creating");
         instance.begin_operation(OperationKind::Create);
         let run_dir = config.daemon.state_dir.join(instance.id.to_string());
+        let run_dir_owner = OwnedRunDir::for_test(instance.id, run_dir.clone());
         BubblewrapSpawner
-            .prepare_spawn(&run_dir)
+            .prepare_spawn(&run_dir_owner)
             .await
             .expect("prepare PID handoff");
+        drop(run_dir_owner);
         instance.backend_ownership = BackendOwnership::Starting;
         instance
             .persist(&config.daemon.state_dir)
@@ -2255,6 +2266,7 @@ mod tests {
                 .is_dir()
         );
         assert!(!run_dir.join("backend.stopped").exists());
+        assert!(state.state_store.run_dir(instance.id).is_ok());
 
         drop(handoff);
         let retry = state.manager.reconcile_startup().await;
@@ -2279,6 +2291,10 @@ mod tests {
         );
         assert!(run_dir.join("backend.stopped").is_file());
         assert!(!pid_file.exists());
+        assert!(matches!(
+            state.state_store.run_dir(instance.id),
+            Err(BlazeDaemonError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -2350,11 +2366,17 @@ mod tests {
         );
         assert!(instances_dir.join(instance.id.to_string()).is_dir());
         assert!(state.manager.backend_owner(instance.id).is_some());
+        assert!(state.state_store.run_dir(instance.id).is_ok());
 
         destroy_instance(&state, &instance.id.to_string())
             .await
             .expect("retry destroy");
         assert!(!instances_dir.join(instance.id.to_string()).exists());
+        assert!(state.manager.backend_owner(instance.id).is_none());
+        assert!(matches!(
+            state.state_store.run_dir(instance.id),
+            Err(BlazeDaemonError::NotFound(_))
+        ));
         assert_eq!(
             state.instances.lock().expect("instances")[&instance.id].state,
             SandboxState::Destroyed
@@ -2597,10 +2619,84 @@ mod tests {
         assert_ne!(replacement["instance"]["id"], id);
         assert_eq!(replacement["start_path"], "cold");
         let uuid = Uuid::parse_str(&id).expect("uuid");
+        let replacement_id = Uuid::parse_str(
+            replacement["instance"]["id"]
+                .as_str()
+                .expect("replacement id"),
+        )
+        .expect("replacement uuid");
         assert_eq!(
             state.instances.lock().expect("instances")[&uuid].state,
             SandboxState::Destroyed
         );
+        assert!(matches!(
+            state.state_store.run_dir(uuid),
+            Err(BlazeDaemonError::NotFound(_))
+        ));
+        assert!(state.state_store.run_dir(replacement_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn warm_quarantine_cleanup_failure_retains_resources_for_destroy_retry() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = test_config(&temp);
+        let instances_dir = config.storage.instances_dir.clone();
+        let storage: Arc<dyn StorageProvider> = Arc::new(FileStorageProvider::with_images(
+            config.storage.images_dir.clone(),
+            instances_dir.clone(),
+        ));
+        let state = build_test_state(
+            config,
+            test_policy(BackendKind::Mock, true),
+            spawners(BackendKind::Mock, Arc::new(MockSpawner)),
+            BackendKind::Mock,
+            storage,
+        );
+        let request = test_request();
+        let cold = created_json(&state, &request).await;
+        let id = cold["instance"]["id"].as_str().expect("id").to_string();
+        let uuid = Uuid::parse_str(&id).expect("uuid");
+        reset_instance(&state, &id).await.expect("warm");
+        state
+            .manager
+            .insert_backend_owner(
+                uuid,
+                Arc::new(FailOnceOwner {
+                    instance_id: uuid,
+                    attempts: AtomicUsize::new(0),
+                }),
+            )
+            .expect("replace backend owner");
+        std::fs::remove_file(instances_dir.join(&id).join("mem.bin")).expect("remove artifact");
+
+        let replacement = created_json(&state, &request).await;
+
+        assert_ne!(replacement["instance"]["id"], id);
+        let retained = state.instances.lock().expect("instances")[&uuid].clone();
+        assert_eq!(retained.state, SandboxState::RecoveryRequired);
+        assert_eq!(retained.backend_ownership, BackendOwnership::Running);
+        assert_eq!(
+            retained.operation.as_ref().map(|operation| operation.kind),
+            Some(OperationKind::Destroy)
+        );
+        assert!(state.manager.backend_owner(uuid).is_some());
+        assert!(state.state_store.run_dir(uuid).is_ok());
+        assert!(instances_dir.join(&id).is_dir());
+
+        destroy_instance(&state, &id)
+            .await
+            .expect("retry quarantined destroy");
+
+        assert_eq!(
+            state.instances.lock().expect("instances")[&uuid].state,
+            SandboxState::Destroyed
+        );
+        assert!(state.manager.backend_owner(uuid).is_none());
+        assert!(matches!(
+            state.state_store.run_dir(uuid),
+            Err(BlazeDaemonError::NotFound(_))
+        ));
+        assert!(!instances_dir.join(&id).exists());
     }
 
     #[cfg(feature = "test-failpoints")]
@@ -2629,8 +2725,7 @@ mod tests {
         let restored = state.instances.lock().expect("instances")[&uuid].clone();
         assert_eq!(restored.state, SandboxState::Warm);
         assert!(restored.operation.is_none());
-        let persisted =
-            SandboxInstance::load(&state.state_dir, uuid).expect("persisted warm state");
+        let persisted = state.state_store.load(uuid).expect("persisted warm state");
         assert_eq!(persisted.state, SandboxState::Warm);
         assert_eq!(persisted.backend_ownership, BackendOwnership::Running);
         assert!(persisted.operation.is_none());
@@ -2642,8 +2737,10 @@ mod tests {
         let retried = created_json(&state, &request).await;
         assert_eq!(retried["instance"]["id"], id);
         assert_eq!(retried["start_path"], "warm");
-        let persisted =
-            SandboxInstance::load(&state.state_dir, uuid).expect("persisted running state");
+        let persisted = state
+            .state_store
+            .load(uuid)
+            .expect("persisted running state");
         assert_eq!(persisted.state, SandboxState::Running);
         assert_eq!(persisted.backend_ownership, BackendOwnership::Running);
         assert!(persisted.operation.is_none());
@@ -2788,6 +2885,288 @@ mod tests {
     }
 
     #[cfg(feature = "test-failpoints")]
+    async fn assert_create_rollback_commit_failure_is_retryable(
+        failpoints: &'static [&'static str],
+    ) {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let hook = crate::failpoint::TestFailpoint::new(failpoints);
+
+        let error = hook
+            .run(create_instance(&state, &test_request()))
+            .await
+            .expect_err("rollback terminal commit failure");
+
+        assert!(matches!(error, BlazeDaemonError::RecoveryRequired(_)));
+        let instance = state
+            .instances
+            .lock()
+            .expect("instances")
+            .values()
+            .next()
+            .cloned()
+            .expect("recovery record");
+        assert_eq!(instance.state, SandboxState::RecoveryRequired);
+        assert_eq!(instance.backend_ownership, BackendOwnership::Stopped);
+        assert_eq!(
+            instance.operation.as_ref().map(|operation| operation.kind),
+            Some(OperationKind::Create)
+        );
+        assert_eq!(
+            state
+                .state_store
+                .load(instance.id)
+                .expect("persisted recovery record")
+                .state,
+            SandboxState::RecoveryRequired
+        );
+        assert!(state.state_store.run_dir(instance.id).is_ok());
+        assert!(
+            !temp
+                .path()
+                .join("instances")
+                .join(instance.id.to_string())
+                .exists()
+        );
+
+        destroy_instance(&state, &instance.id.to_string())
+            .await
+            .expect("destroy retry");
+
+        assert_eq!(
+            state.instances.lock().expect("instances")[&instance.id].state,
+            SandboxState::Destroyed
+        );
+        assert!(matches!(
+            state.state_store.run_dir(instance.id),
+            Err(BlazeDaemonError::NotFound(_))
+        ));
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn initial_publication_failure_before_publish_touches_no_resources() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let hook = crate::failpoint::TestFailpoint::new(&["state-before-first-publication"]);
+
+        hook.run(create_instance(&state, &test_request()))
+            .await
+            .expect_err("pre-publication failure");
+
+        assert!(state.instances.lock().expect("instances").is_empty());
+        assert_eq!(state.state_store.retained_run_dir_count(), 0);
+        assert!(
+            std::fs::read_dir(temp.path().join("state"))
+                .expect("state directory")
+                .next()
+                .is_none()
+        );
+        assert!(
+            std::fs::read_dir(temp.path().join("instances"))
+                .expect("instance directory")
+                .next()
+                .is_none()
+        );
+
+        let created = created_json(&state, &test_request()).await;
+        assert_eq!(created["instance"]["state"], "running");
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn initial_publication_sync_failure_is_rolled_back_terminally() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let hook = crate::failpoint::TestFailpoint::new(&["state-first-publication-root-sync"]);
+
+        hook.run(create_instance(&state, &test_request()))
+            .await
+            .expect_err("initial state publication sync failure");
+
+        let instance = state
+            .instances
+            .lock()
+            .expect("instances")
+            .values()
+            .next()
+            .cloned()
+            .expect("terminal rollback record");
+        assert_eq!(instance.state, SandboxState::Destroyed);
+        assert_eq!(instance.backend_ownership, BackendOwnership::Stopped);
+        assert!(instance.operation.is_none());
+        assert_eq!(
+            state
+                .state_store
+                .load(instance.id)
+                .expect("persisted terminal record")
+                .state,
+            SandboxState::Destroyed
+        );
+        assert!(matches!(
+            state.state_store.run_dir(instance.id),
+            Err(BlazeDaemonError::NotFound(_))
+        ));
+        assert!(
+            !temp
+                .path()
+                .join("instances")
+                .join(instance.id.to_string())
+                .exists()
+        );
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn unconfirmed_initial_publication_is_retained_for_recovery() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let hook = crate::failpoint::TestFailpoint::new(&["state-post-publication-identity"]);
+
+        let error = hook
+            .run(create_instance(&state, &test_request()))
+            .await
+            .expect_err("unconfirmed publication");
+
+        assert!(matches!(error, BlazeDaemonError::RecoveryRequired(_)));
+        let instance = state
+            .instances
+            .lock()
+            .expect("instances")
+            .values()
+            .next()
+            .cloned()
+            .expect("recovery record");
+        assert_eq!(instance.state, SandboxState::RecoveryRequired);
+        assert_eq!(instance.backend_ownership, BackendOwnership::Stopped);
+        assert_eq!(
+            instance.operation.as_ref().map(|operation| operation.kind),
+            Some(OperationKind::Create)
+        );
+        assert!(
+            state
+                .state_store
+                .has_run_dir_residual(instance.id)
+                .expect("publication residual")
+        );
+        assert!(matches!(
+            state.state_store.run_dir(instance.id),
+            Err(BlazeDaemonError::RecoveryRequired(_))
+        ));
+        assert!(
+            !temp
+                .path()
+                .join("instances")
+                .join(instance.id.to_string())
+                .exists()
+        );
+
+        destroy_instance(&state, &instance.id.to_string())
+            .await
+            .expect("destroy revalidates the publication");
+        assert_eq!(
+            state.instances.lock().expect("instances")[&instance.id].state,
+            SandboxState::Destroyed
+        );
+        assert_eq!(
+            state
+                .state_store
+                .load(instance.id)
+                .expect("persisted terminal record")
+                .state,
+            SandboxState::Destroyed
+        );
+        assert!(
+            !state
+                .state_store
+                .has_run_dir_residual(instance.id)
+                .expect("released publication residual")
+        );
+        assert!(matches!(
+            state.state_store.run_dir(instance.id),
+            Err(BlazeDaemonError::NotFound(_))
+        ));
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn unconfirmed_publication_rejects_a_replaced_directory_on_retry() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = mock_state(&temp, false);
+        let hook = crate::failpoint::TestFailpoint::new(&["state-post-publication-identity"]);
+
+        hook.run(create_instance(&state, &test_request()))
+            .await
+            .expect_err("unconfirmed publication");
+        let instance = state
+            .instances
+            .lock()
+            .expect("instances")
+            .values()
+            .next()
+            .cloned()
+            .expect("recovery record");
+        let configured = temp.path().join("state").join(instance.id.to_string());
+        let retained = temp.path().join("retained-state-directory");
+        std::fs::rename(&configured, &retained).expect("move retained state directory");
+        std::fs::create_dir(&configured).expect("replacement state directory");
+
+        let error = destroy_instance(&state, &instance.id.to_string())
+            .await
+            .expect_err("replacement must keep recovery fail-closed");
+
+        assert!(matches!(error, BlazeDaemonError::RecoveryRequired(_)));
+        assert_eq!(
+            state.instances.lock().expect("instances")[&instance.id].state,
+            SandboxState::RecoveryRequired
+        );
+        assert!(
+            state
+                .state_store
+                .has_run_dir_residual(instance.id)
+                .expect("publication residual")
+        );
+        assert!(
+            configured
+                .read_dir()
+                .expect("replacement directory")
+                .next()
+                .is_none()
+        );
+        assert!(retained.join("state.json").is_file());
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn spawn_failure_rollback_commit_failure_remains_retryable() {
+        assert_create_rollback_commit_failure_is_retryable(&[
+            "create-spawn",
+            "create-rollback-final-state-commit",
+        ])
+        .await;
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn clean_acquire_failure_rollback_commit_failure_remains_retryable() {
+        assert_create_rollback_commit_failure_is_retryable(&[
+            "storage-acquire",
+            "create-rollback-final-state-commit",
+        ])
+        .await;
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn initial_publication_and_rollback_failures_remain_retryable() {
+        assert_create_rollback_commit_failure_is_retryable(&[
+            "state-first-publication-root-sync",
+            "create-rollback-final-state-commit",
+        ])
+        .await;
+    }
+
+    #[cfg(feature = "test-failpoints")]
     #[tokio::test]
     async fn destroy_intent_failure_does_not_touch_owned_resources() {
         let temp = tempfile::tempdir().expect("temp");
@@ -2809,12 +3188,15 @@ mod tests {
         let retained = state.instances.lock().expect("instances")[&uuid].clone();
         assert_eq!(retained.state, SandboxState::RecoveryRequired);
         assert!(retained.operation.is_none());
-        let persisted =
-            SandboxInstance::load(&state.state_dir, uuid).expect("persisted recovery state");
+        let persisted = state
+            .state_store
+            .load(uuid)
+            .expect("persisted recovery state");
         assert_eq!(persisted.state, SandboxState::RecoveryRequired);
         assert_eq!(persisted.backend_ownership, BackendOwnership::Running);
         assert!(persisted.operation.is_none());
         assert!(temp.path().join("instances").join(&id).is_dir());
+        assert!(state.state_store.run_dir(uuid).is_ok());
 
         destroy_instance(&state, &id).await.expect("destroy retry");
         assert_eq!(kill_count.load(Ordering::Acquire), 1);
@@ -2823,10 +3205,16 @@ mod tests {
             state.instances.lock().expect("instances")[&uuid].state,
             SandboxState::Destroyed
         );
-        let persisted =
-            SandboxInstance::load(&state.state_dir, uuid).expect("persisted destroyed state");
+        let persisted = state
+            .state_store
+            .load(uuid)
+            .expect("persisted destroyed state");
         assert_eq!(persisted.state, SandboxState::Destroyed);
         assert!(persisted.operation.is_none());
+        assert!(matches!(
+            state.state_store.run_dir(uuid),
+            Err(BlazeDaemonError::NotFound(_))
+        ));
     }
 
     #[cfg(feature = "test-failpoints")]
@@ -2855,8 +3243,10 @@ mod tests {
             retained.operation.as_ref().map(|operation| operation.kind),
             Some(OperationKind::Destroy)
         );
-        let persisted =
-            SandboxInstance::load(&state.state_dir, uuid).expect("persisted recovery state");
+        let persisted = state
+            .state_store
+            .load(uuid)
+            .expect("persisted recovery state");
         assert_eq!(persisted.state, SandboxState::RecoveryRequired);
         assert_eq!(persisted.backend_ownership, BackendOwnership::Stopped);
         assert_eq!(
@@ -2864,14 +3254,21 @@ mod tests {
             Some(OperationKind::Destroy)
         );
         assert!(temp.path().join("instances").join(&id).is_dir());
+        assert!(state.state_store.run_dir(uuid).is_ok());
 
         destroy_instance(&state, &id).await.expect("destroy retry");
         assert_eq!(kill_count.load(Ordering::Acquire), 1);
         assert_eq!(release_count.load(Ordering::Acquire), 1);
-        let persisted =
-            SandboxInstance::load(&state.state_dir, uuid).expect("persisted destroyed state");
+        let persisted = state
+            .state_store
+            .load(uuid)
+            .expect("persisted destroyed state");
         assert_eq!(persisted.state, SandboxState::Destroyed);
         assert!(persisted.operation.is_none());
+        assert!(matches!(
+            state.state_store.run_dir(uuid),
+            Err(BlazeDaemonError::NotFound(_))
+        ));
     }
 
     #[cfg(feature = "test-failpoints")]
@@ -2901,14 +3298,17 @@ mod tests {
             retained.operation.as_ref().map(|operation| operation.kind),
             Some(OperationKind::Destroy)
         );
-        let persisted =
-            SandboxInstance::load(&state.state_dir, uuid).expect("persisted recovery state");
+        let persisted = state
+            .state_store
+            .load(uuid)
+            .expect("persisted recovery state");
         assert_eq!(persisted.state, SandboxState::RecoveryRequired);
         assert_eq!(persisted.backend_ownership, BackendOwnership::Stopped);
         assert_eq!(
             persisted.operation.as_ref().map(|operation| operation.kind),
             Some(OperationKind::Destroy)
         );
+        assert!(state.state_store.run_dir(uuid).is_ok());
 
         destroy_instance(&state, &id).await.expect("destroy retry");
         assert_eq!(kill_count.load(Ordering::Acquire), 1);
@@ -2916,10 +3316,16 @@ mod tests {
         let destroyed = state.instances.lock().expect("instances")[&uuid].clone();
         assert_eq!(destroyed.state, SandboxState::Destroyed);
         assert!(destroyed.operation.is_none());
-        let persisted =
-            SandboxInstance::load(&state.state_dir, uuid).expect("persisted destroyed state");
+        let persisted = state
+            .state_store
+            .load(uuid)
+            .expect("persisted destroyed state");
         assert_eq!(persisted.state, SandboxState::Destroyed);
         assert!(persisted.operation.is_none());
+        assert!(matches!(
+            state.state_store.run_dir(uuid),
+            Err(BlazeDaemonError::NotFound(_))
+        ));
     }
 
     #[cfg(feature = "test-failpoints")]
@@ -3186,6 +3592,11 @@ mod tests {
                 .join(completed_id.to_string())
                 .exists()
         );
+        assert!(state.state_store.run_dir(failed_id).is_ok());
+        assert!(matches!(
+            state.state_store.run_dir(completed_id),
+            Err(BlazeDaemonError::NotFound(_))
+        ));
         let created = created_json(&state, &test_request()).await;
         assert_eq!(created["instance"]["state"], "running");
     }

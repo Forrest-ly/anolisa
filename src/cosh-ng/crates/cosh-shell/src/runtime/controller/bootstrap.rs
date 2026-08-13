@@ -16,7 +16,7 @@ use crate::runtime::prelude::*;
 use crate::runtime::startup::bootstrap_process_path_from_shell;
 use crate::runtime::state::{AnalysisMode, InlineState};
 
-use super::{approval_mode_from_config, render_raw_inline_events};
+use super::render_raw_inline_events;
 
 fn build_adapter(kind: AdapterKind) -> AdapterInstance {
     match adapter_for_kind(kind) {
@@ -206,13 +206,27 @@ pub(crate) fn run_raw(
         .unwrap_or_default();
     // #2025: the relay renders the input-wait hint card itself.
     config.hint_language = inline_state.language;
+    // #2179: inject the panel-family framing so the relay-side hint card
+    // shares the NoticePanel width contract, closed borders, and plain
+    // fallback with every other panel. `for_terminal()` re-reads the
+    // terminal width per emission, so resizes are picked up for free.
+    let hint_card_language = inline_state.language;
+    config.set_hint_card_renderer(move |title, body| {
+        crate::ui::agent_render::RatatuiInlineRenderer::for_terminal()
+            .with_language(hint_card_language)
+            .notice_panel_lines(crate::ui::agent_render::NoticePanelModel {
+                title,
+                body,
+                footer: None,
+            })
+    });
     match cosh_config.analysis_mode.as_str() {
         "auto" => inline_state.analysis_mode = AnalysisMode::Auto,
         "manual" => inline_state.analysis_mode = AnalysisMode::Manual,
         _ => {}
     }
     inline_state.debug = cosh_config.debug;
-    inline_state.approval_mode = approval_mode_from_config(&cosh_config.approval_mode);
+    inline_state.approval_mode = cosh_config.approval_mode;
     for cmd in &cosh_config.trusted_commands {
         if let Some(key) = trust_key_from_command(cmd) {
             inline_state.control.trust.trust_session_command(key);

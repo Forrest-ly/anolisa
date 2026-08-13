@@ -155,6 +155,10 @@ turns=0
 reloads=0
 while IFS= read -r line; do
   case "$line" in
+    *'"subtype":"initialize"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"subtype":"initialize","protocol_version":1,"capabilities":{}}}}\n' "$request_id"
+      ;;
     *'"type":"user"'*)
       turns=$((turns + 1))
       if [ "$turns" -eq 1 ] && [ ! -f "__GATE__" ]; then
@@ -244,7 +248,7 @@ fn agent_request_does_not_serialize_internal_context_binding() {
 #[test]
 fn prepare_invocation_approval_modes() {
     let recommend = test_adapter().prepare_invocation(&test_request(), CoshApprovalMode::Recommend);
-    assert!(recommend.args.contains(&"strict".to_string()));
+    assert!(recommend.args.contains(&"recommend".to_string()));
 
     let auto = test_adapter().prepare_invocation(&test_request(), CoshApprovalMode::Auto);
     assert!(auto.args.contains(&"auto".to_string()));
@@ -254,7 +258,7 @@ fn prepare_invocation_approval_modes() {
 }
 
 #[test]
-fn shell_handoff_continuation_keeps_strict_args_without_recommend_claim() {
+fn shell_handoff_continuation_keeps_recommend_args_without_recommend_claim() {
     let mut request = test_request();
     request.context_hints = vec![
         crate::types::SHELL_HANDOFF_CONTINUATION_HINT.to_string(),
@@ -262,7 +266,7 @@ fn shell_handoff_continuation_keeps_strict_args_without_recommend_claim() {
     ];
     let inv = test_adapter().prepare_invocation(&request, CoshApprovalMode::Recommend);
 
-    assert!(inv.args.contains(&"strict".to_string()));
+    assert!(inv.args.contains(&"recommend".to_string()));
     assert!(!inv.prompt.contains("recommend mode"), "{}", inv.prompt);
     assert!(
         inv.prompt
@@ -652,6 +656,10 @@ if [ "$1" = "--session-control" ]; then
 fi
 while IFS= read -r line; do
   case "$line" in
+    *'"subtype":"initialize"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      printf '{{"type":"control_response","response":{{"subtype":"success","request_id":"%s","response":{{"subtype":"initialize","protocol_version":1,"capabilities":{{}}}}}}}}\n' "$request_id"
+      ;;
     *'"type":"user"'*)
       printf '%s\n' '{{"type":"result","subtype":"success","session_id":"00000000-0000-4000-8000-000000000000","is_error":false,"duration_ms":1,"result":"done"}}'
       ;;
@@ -1139,6 +1147,10 @@ turns=0
 reloads=0
 while IFS= read -r line; do
   case "$line" in
+    *'"subtype":"initialize"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"subtype":"initialize","protocol_version":1,"capabilities":{}}}}\n' "$request_id"
+      ;;
     *'"type":"user"'*)
       turns=$((turns + 1))
       printf '{"type":"result","subtype":"success","session_id":"00000000-0000-4000-8000-000000000000","is_error":false,"result":"done-r%s"}\n' "$reloads"

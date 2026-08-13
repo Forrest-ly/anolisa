@@ -1,11 +1,15 @@
 // Owner: shell_host. Routing marker handling is isolated in osc/routing.rs;
 // the pending-handoff claim slot (#2142) is owned by osc/handoff_claim.rs;
-// alt-screen tracking (#2025) is owned by osc/alt_screen.rs.
+// alt-screen tracking (#2025) is owned by osc/alt_screen.rs; CurrentCommand
+// state and the display-window helpers are owned by osc/command.rs.
 mod alt_screen;
+mod command;
 mod handoff_claim;
 mod routing;
 
 use alt_screen::AltScreenTracker;
+use command::CurrentCommand;
+pub(crate) use command::{VisibleTailTracker, VISIBLE_TAIL_MAX_CHARS};
 use handoff_claim::{
     claim_pending_command_origin, pending_origin_for_request, PendingCommandOrigin,
 };
@@ -41,19 +45,6 @@ const ERASE_TO_END_OF_LINE: &[u8] = b"\x1b[K";
 const BEL: u8 = b'\x07';
 const SHELL_PATH_MAX_BYTES: usize = 8 * 1024;
 const SHELL_HISTORY_FILE_MAX_BYTES: usize = 4 * 1024;
-
-#[derive(Debug)]
-struct CurrentCommand {
-    id: String,
-    command: String,
-    cwd: String,
-    origin: CommandOrigin,
-    audit_identity: Option<ShellCommandAuditIdentity>,
-    started_at_ms: u64,
-    output_start: usize,
-    attempt_generation: Option<u64>,
-    shell_environment_generation: Option<u64>,
-}
 
 /// Why a display cut was recorded, so consumers can tell an intercepted
 /// input (shell has not painted a prompt for it yet) apart from a real
@@ -101,6 +92,9 @@ pub(super) struct OscParser {
     /// invalidation barrier; a fresh command-less prompt report
     /// (`ShellReady`) re-arms it.
     pty_input_barrier_pushed: bool,
+    /// #2196 R7: bounded last-visible-line tracker for the active command,
+    /// fed incrementally per PTY chunk; owned by osc/command.rs.
+    visible_tail: VisibleTailTracker,
     /// #2025: alternate-screen tracking, owned by osc/alt_screen.rs.
     alt_screen: AltScreenTracker,
 }
@@ -147,6 +141,7 @@ impl OscParser {
             history_file_observer: None,
             main_prompt_gate: crate::raw_input::MainPromptGate::default(),
             pty_input_barrier_pushed: false,
+            visible_tail: VisibleTailTracker::default(),
             alt_screen: AltScreenTracker::default(),
         }
     }
@@ -279,6 +274,10 @@ impl OscParser {
             }
             "preexec" => {
                 self.main_prompt_gate.set_at_prompt(false);
+                // #2196 R7: the visible-tail window starts at the command
+                // boundary, so earlier output can never resurface as the
+                // prompt tail.
+                self.visible_tail.reset();
                 let command = marker.command.unwrap_or_default();
                 self.command_seq += 1;
                 let command_id = format!("cmd-{}", self.command_seq);
@@ -484,6 +483,7 @@ impl OscParser {
             return;
         }
         self.alt_screen.observe(&data);
+        self.visible_tail.feed(&data);
         self.display.extend_from_slice(&data);
         self.append_clean(&data);
     }
@@ -492,12 +492,6 @@ impl OscParser {
     /// alternate screen (fullscreen TUI classification input).
     pub(crate) fn alt_screen_active(&self) -> bool {
         self.alt_screen.active()
-    }
-
-    /// #2025: origin of the command currently tracked between preexec and
-    /// precmd, used by the interactive sentinel's trigger gate.
-    pub(super) fn active_command_origin(&self) -> Option<CommandOrigin> {
-        self.current.as_ref().map(|current| current.origin)
     }
 
     fn filter_pending_handoff_echo(&mut self, data: &[u8]) -> Vec<u8> {
@@ -665,29 +659,6 @@ impl OscParser {
 
     pub(super) fn drain_intervention_display_cuts(&mut self) -> Vec<(usize, DisplayCutKind)> {
         std::mem::take(&mut self.intervention_display_cuts)
-    }
-
-    /// True while a marker-tracked foreground command is running (between
-    /// its preexec and precmd markers).
-    pub(super) fn has_active_foreground_command(&self) -> bool {
-        self.current.is_some()
-    }
-
-    pub(super) fn last_prompt_display(&self) -> &[u8] {
-        let Some(start) = self.last_prompt_display_start else {
-            return &[];
-        };
-        if start >= self.display.len() {
-            return &[];
-        }
-        &self.display[start..]
-    }
-
-    /// True after the shell's post-hook marker is followed by visible prompt
-    /// bytes, excluding output produced by user prompt hooks.
-    pub(super) fn has_prompt_painted_since_ready(&self) -> bool {
-        self.prompt_ready_display_start
-            .is_some_and(|start| start < self.display.len())
     }
 
     /// Arms the one-shot blank-echo drop for the synthetic PS1 repaint
