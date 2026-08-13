@@ -199,6 +199,10 @@ test-adapters:
 	@echo "==> Testing OpenCode adapter..."
 	bash tests/test-opencode-adapter-install.sh
 	node tests/test-opencode-plugin.mjs
+	@echo "==> Testing Kimi Code adapter..."
+	bash tests/test-kimicode-tool-ready-wrapper.sh
+	bash tests/test-kimicode-uninstall-boundaries.sh
+	bash tests/test-kimicode-install-skip-when-missing.sh
 
 # Lint (rtk excluded — vendored third-party source)
 lint:

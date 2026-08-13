@@ -24,22 +24,29 @@ if ! command -v python3 &>/dev/null; then
     # Fallback: use awk to remove [[hooks]] blocks containing tokenless hooks.
     # Any TOML table header (plain [table] or array [[table]]) ends the current
     # hook block, so we do not accidentally consume provider/API-key configs
-    # that follow a tokenless hook.
+    # that follow a tokenless hook. Rule order matters: the table-header
+    # boundary rule must run before the in-hook append rule, otherwise the
+    # header line is appended to the buffered hook and emitted twice on flush
+    # (duplicate table headers are invalid TOML).
     awk '
     /^\[\[hooks\]\]/ {
         if (in_hook && !is_tokenless) printf "%s", hook_lines
-        in_hook=1; hook_lines=""; is_tokenless=0
+        in_hook=1; hook_lines = $0 "\n"; is_tokenless=0
+        next
+    }
+    /^\[/ {
+        if (in_hook && !is_tokenless) printf "%s", hook_lines
+        in_hook=0; hook_lines=""
+        print
+        next
     }
     in_hook {
         hook_lines = hook_lines $0 "\n"
         if (/adapters\/tokenless\/kimicode\/hooks\//) is_tokenless=1
         if (/tokenless-tool-ready/) is_tokenless=1
+        next
     }
-    /^\[/ && !/^\[\[hooks\]\]/ {
-        if (in_hook && !is_tokenless) printf "%s", hook_lines
-        in_hook=0; hook_lines=""; print; next
-    }
-    !in_hook { print }
+    { print }
     END { if (in_hook && !is_tokenless) printf "%s", hook_lines }
     ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
     echo "[${COMPONENT}] awk-based cleanup complete"

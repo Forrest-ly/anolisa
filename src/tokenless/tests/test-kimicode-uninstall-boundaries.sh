@@ -107,7 +107,24 @@ assert_tokenless_removed
 # provider should still be there
 [ "$(grep -c '^\[providers\.kimi\]' "$KIMI_CONFIG")" -eq 1 ]
 
-# --- Case 4: same scenarios via Python path (when python3 is available) ---
+# --- Case 4: NON-tokenless hook followed by plain table header (awk) ---
+# The header must be emitted exactly once (duplicate TOML tables are invalid)
+# and the unrelated hook block must be preserved untouched.
+write_config - <<'EOF'
+[[hooks]]
+event = "Notification"
+command = "bash /some/other/hook.sh"
+[providers.kimi]
+api_key = "secret"
+EOF
+
+run_uninstall_awk_fallback
+[ "$(grep -c '^\[\[hooks\]\]' "$KIMI_CONFIG")" -eq 1 ] || { echo "FAIL: unrelated hook block was not preserved"; exit 1; }
+grep -q 'other/hook\.sh' "$KIMI_CONFIG" || { echo "FAIL: unrelated hook command was removed"; exit 1; }
+[ "$(grep -c '^\[providers\.kimi\]' "$KIMI_CONFIG")" -eq 1 ] || { echo "FAIL: provider table header duplicated or missing"; exit 1; }
+grep -q '^api_key' "$KIMI_CONFIG" || { echo "FAIL: api_key was removed"; exit 1; }
+
+# --- Case 5: same scenarios via Python path (when python3 is available) ---
 if command -v python3 >/dev/null 2>&1; then
     write_config - <<'EOF'
 [[hooks]]
