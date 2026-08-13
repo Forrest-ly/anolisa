@@ -388,6 +388,12 @@ class TokenlessRuntimeTests(unittest.TestCase):
                 session_id=f"session-{index}",
                 tool_use_id=f"tool-{index}",
             )
+            # Head+tail truncation keeps the head items (truncate_arrays_at=2)
+            # and the default 8 tail items inline with the truncation marker
+            # in between, so cross-call contamination surfaces at both ends.
+            self.assertIn(f"SENTINEL-{index}-record-0000", result.output)
+            self.assertIn(f"SENTINEL-{index}-record-0199", result.output)
+            self.assertIn("190 items truncated", result.output)
             match = re.search(r"<<tokenless:([0-9a-f]{24})>>", result.output)
             self.assertIsNotNone(match)
             assert match is not None
@@ -396,8 +402,15 @@ class TokenlessRuntimeTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as executor:
             recovered = list(executor.map(compress, range(16)))
         for index, payload in enumerate(recovered):
-            self.assertIn(f"SENTINEL-{index}-record-0002", payload)
-            self.assertIn(f"SENTINEL-{index}-record-0199", payload)
+            # The stash holds only the dropped middle segment
+            # (records 0002..0191); head and tail items stay inline.
+            self.assertEqual(
+                json.loads(payload),
+                [
+                    f"SENTINEL-{index}-record-{record:04d}"
+                    for record in range(2, 192)
+                ],
+            )
 
         with sqlite3.connect(f"{self.temporary_directory.name}/stats.db") as connection:
             rows = connection.execute(
