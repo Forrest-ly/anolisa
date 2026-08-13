@@ -426,7 +426,6 @@ pub fn compress_response_with_store(
     let stash_writes = attached_store.map(|_| compressor.stash_writes());
     let stash_errors = attached_store.map(|_| compressor.stash_errors());
     let unrecoverable_truncations = attached_store.map(|_| compressor.unrecoverable_truncations());
-    let stash_size = attached_store.map(|store| store.len());
 
     let disposition = if after_tokens >= before_tokens {
         CompressionDisposition::NoSavings
@@ -440,6 +439,23 @@ pub fn compress_response_with_store(
     } else {
         CompressionDisposition::Applied
     };
+
+    // No-savings rollback: when the compressed candidate is discarded
+    // (no-savings or reversibility-unavailable), stash entries written while
+    // building it would be orphaned — their `<<tokenless:KEY>>` markers live
+    // in `compressed_output`, which never reaches the caller. Delete them so
+    // the stash only holds entries reachable from the returned output.
+    if matches!(
+        disposition,
+        CompressionDisposition::NoSavings | CompressionDisposition::ReversibilityUnavailable
+    ) && let Some(store) = attached_store
+    {
+        for key in compressor.stash_keys() {
+            let _ = store.remove(&key);
+        }
+    }
+    let stash_size = attached_store.map(|store| store.len());
+
     let output = if disposition == CompressionDisposition::Applied {
         compressed_output.clone()
     } else {
@@ -509,6 +525,10 @@ mod tests {
 
         fn retrieve(&self, _hash: &str) -> Result<Option<String>, StashError> {
             Ok(None)
+        }
+
+        fn remove(&self, _hash: &str) -> Result<bool, StashError> {
+            Ok(false)
         }
 
         fn len(&self) -> usize {
@@ -700,6 +720,36 @@ mod tests {
             compress_response_with_store(input, &CompressOptions::default(), true, None).unwrap();
         assert_eq!(result.disposition, CompressionDisposition::NoSavings);
         assert_eq!(result.output, input);
+    }
+
+    #[test]
+    fn no_savings_rolls_back_stash_entries() {
+        // The array is truncated and its dropped tail stashed, but the
+        // retrieval marker is larger than the tiny dropped item, so the
+        // candidate does not reduce the estimated token count and
+        // compression falls back to the original. The stash entry written
+        // while building the discarded candidate must be rolled back — its
+        // marker never reaches the caller, so keeping it would orphan it.
+        let input = r#"{"items":[100000,200000,300000,1]}"#;
+        let store = Arc::new(InMemoryStore::new()) as Arc<dyn StashStore>;
+        let result = compress_response_with_store(
+            &input,
+            &CompressOptions {
+                truncate_arrays_at: Some(3),
+                ..CompressOptions::default()
+            },
+            true,
+            Some(&store),
+        )
+        .unwrap();
+
+        assert_eq!(result.disposition, CompressionDisposition::NoSavings);
+        assert_eq!(result.output, input);
+        // The write happened and was observable...
+        assert_eq!(result.stash_writes, Some(1));
+        // ...but the orphaned entry was rolled back before reporting size.
+        assert_eq!(store.len(), 0);
+        assert_eq!(result.stash_size, Some(0));
     }
 
     #[test]

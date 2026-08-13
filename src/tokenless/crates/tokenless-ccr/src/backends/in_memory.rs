@@ -122,6 +122,19 @@ impl StashStore for InMemoryStore {
         }
     }
 
+    fn remove(&self, hash: &str) -> Result<bool, StashError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StashError::Backend(format!("in_memory mutex poisoned: {e}")))?;
+        let key = hash.to_ascii_lowercase();
+        let existed = inner.map.remove(&key).is_some();
+        if existed {
+            inner.order.retain(|k| k != &key);
+        }
+        Ok(existed)
+    }
+
     fn len(&self) -> usize {
         let now = Instant::now();
         let inner = match self.inner.lock() {

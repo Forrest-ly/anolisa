@@ -1,5 +1,6 @@
 use regex::Regex;
 use serde_json::Value;
+use std::cell::RefCell;
 use std::sync::{Arc, LazyLock};
 use tokenless_ccr::StashStore;
 
@@ -31,6 +32,10 @@ pub struct SchemaCompressor {
     /// full original. When `None`, truncation is lossy — the pre-stash
     /// behavior. Mirrors `ResponseCompressor::stash_store`.
     stash_store: Option<Arc<dyn StashStore>>,
+    /// Stash keys written during the last `compress()` call. Used by the CLI
+    /// to rollback orphaned entries when compression falls back to original
+    /// output (no net savings).
+    stash_keys: RefCell<Vec<String>>,
 }
 
 impl Default for SchemaCompressor {
@@ -51,6 +56,7 @@ impl Default for SchemaCompressor {
             // ~1024-frame default stack while leaving real schemas intact.
             max_depth: 32,
             stash_store: None,
+            stash_keys: RefCell::new(Vec::new()),
         }
     }
 }
@@ -108,6 +114,8 @@ impl SchemaCompressor {
 
     /// Compress an OpenAI Function Calling schema
     pub fn compress(&self, tool: &Value) -> Value {
+        // Reset stash tracking so keys reflect this call only.
+        self.stash_keys.borrow_mut().clear();
         let original_text = serde_json::to_string(tool).unwrap_or_default();
 
         let mut result = tool.clone();
@@ -155,6 +163,13 @@ impl SchemaCompressor {
         }
 
         result
+    }
+
+    /// Stash keys written during the last `compress()` call. Used by the CLI
+    /// to rollback orphaned entries when compression falls back to original
+    /// output (no net savings).
+    pub fn stash_keys(&self) -> Vec<String> {
+        self.stash_keys.borrow().clone()
     }
 
     /// Recursively compress a JSON Schema
@@ -289,6 +304,7 @@ impl SchemaCompressor {
             self.stash_store
                 .as_ref()
                 .and_then(|store| store.stash(desc).ok())
+                .inspect(|key| self.stash_keys.borrow_mut().push(key.clone()))
         } else {
             None
         };

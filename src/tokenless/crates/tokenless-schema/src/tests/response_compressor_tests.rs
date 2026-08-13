@@ -13,6 +13,10 @@ impl StashStore for AlwaysFail {
         Ok(None)
     }
 
+    fn remove(&self, _hash: &str) -> Result<bool, StashError> {
+        Ok(false)
+    }
+
     fn len(&self) -> usize {
         0
     }

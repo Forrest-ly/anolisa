@@ -512,16 +512,22 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                 compressor = compressor.with_stash_store(store.clone());
             }
 
-            let after_compact = if batch || value.is_array() {
+            let (after_compact, all_stash_keys) = if batch || value.is_array() {
                 let arr = value
                     .as_array()
                     .ok_or_else(|| ("Expected a JSON array for --batch mode".to_string(), 1))?;
-                let results: Vec<serde_json::Value> =
-                    arr.iter().map(|item| compressor.compress(item)).collect();
-                serde_json::to_string(&results).unwrap_or_default()
+                let mut results = Vec::with_capacity(arr.len());
+                let mut keys = Vec::new();
+                for item in arr {
+                    let compressed = compressor.compress(item);
+                    keys.extend(compressor.stash_keys());
+                    results.push(compressed);
+                }
+                (serde_json::to_string(&results).unwrap_or_default(), keys)
             } else {
                 let result = compressor.compress(&value);
-                serde_json::to_string(&result).unwrap_or_default()
+                let keys = compressor.stash_keys();
+                (serde_json::to_string(&result).unwrap_or_default(), keys)
             };
 
             let before_tokens = estimate_tokens(&input);
@@ -531,11 +537,14 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     "tokenless: schema compression did not reduce size ({} -> {} est. tokens), outputting original",
                     before_tokens, after_tokens
                 );
-                // No-savings discard edge: if a stash was attached and a
-                // description was truncated, those writes orphan (markers
-                // live in `after_compact`, which is discarded). Truncation
-                // almost always yields savings, so this is rare; orphaned
-                // entries are TTL-cleaned.
+                // No-savings rollback: stash entries written during compress()
+                // would be orphaned (markers live in `after_compact`, which is
+                // discarded). Delete them so stash.db stays clean.
+                if let Some(ref store) = stash {
+                    for key in &all_stash_keys {
+                        let _ = store.remove(key);
+                    }
+                }
                 input.clone()
             } else {
                 after_compact.clone()

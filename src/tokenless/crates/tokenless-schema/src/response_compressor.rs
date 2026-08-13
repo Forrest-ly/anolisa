@@ -1,5 +1,5 @@
 use serde_json::{Map, Value};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokenless_ccr::{StashStore, marker_for};
@@ -49,6 +49,10 @@ pub struct ResponseCompressor {
     /// the last `compress()` call. Includes backend failures and marker-budget
     /// limits without conflating the two causes.
     unrecoverable_truncations: Cell<usize>,
+    /// Stash keys written during the last `compress()` call. Used by the CLI
+    /// to rollback orphaned entries when compression falls back to original
+    /// output (no net savings).
+    stash_keys: RefCell<Vec<String>>,
 }
 
 impl Default for ResponseCompressor {
@@ -81,6 +85,7 @@ impl Default for ResponseCompressor {
             stash_writes: Cell::new(0),
             stash_errors: Cell::new(0),
             unrecoverable_truncations: Cell::new(0),
+            stash_keys: RefCell::new(Vec::new()),
         }
     }
 }
@@ -150,6 +155,7 @@ impl ResponseCompressor {
         self.stash_writes.set(0);
         self.stash_errors.set(0);
         self.unrecoverable_truncations.set(0);
+        self.stash_keys.borrow_mut().clear();
         let original_text = serde_json::to_string(response).unwrap_or_default();
         let result = self.compress_value(response, 0);
 
@@ -179,6 +185,13 @@ impl ResponseCompressor {
     /// attached stash. A non-zero value means the candidate is partly lossy.
     pub fn unrecoverable_truncations(&self) -> usize {
         self.unrecoverable_truncations.get()
+    }
+
+    /// Stash keys written during the last `compress()` call. Used by the CLI
+    /// to rollback orphaned entries when compression falls back to original
+    /// output (no net savings).
+    pub fn stash_keys(&self) -> Vec<String> {
+        self.stash_keys.borrow().clone()
     }
 
     /// Recursively compress a JSON value
@@ -372,6 +385,7 @@ impl ResponseCompressor {
         match stash.stash(payload) {
             Ok(k) => {
                 self.stash_writes.set(self.stash_writes.get() + 1);
+                self.stash_keys.borrow_mut().push(k.clone());
                 Some(k)
             }
             Err(_) => {

@@ -19,6 +19,12 @@ pub trait StashStore: Send + Sync {
     /// absent or the entry has expired.
     fn retrieve(&self, hash: &str) -> Result<Option<String>, StashError>;
 
+    /// Remove a specific entry by hash. Returns `Ok(true)` if the entry
+    /// existed and was removed, `Ok(false)` if absent or already expired.
+    /// Used to rollback orphaned stash entries when compression falls back
+    /// to original output (no net savings).
+    fn remove(&self, hash: &str) -> Result<bool, StashError>;
+
     /// Number of live (non-expired) entries. For observability/stats only.
     fn len(&self) -> usize;
 
