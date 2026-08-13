@@ -1,5 +1,6 @@
 use std::process::Command;
 
+use tokenless_ccr::{SqliteStore, StashStore};
 use tokenless_stats::{OperationType, StatsRecord, StatsRecorder, estimate_tokens, get_home_dir};
 
 use tokenless_runtime::{CompressOptions, compress_response_with_store};
@@ -508,6 +509,51 @@ fn compress_response_no_stash() {
         })
         .unwrap();
     assert!(output.status.success());
+}
+
+#[test]
+fn compress_response_rollback_orphan_stash_on_no_savings() {
+    let fixture = match TempDataDir::new() {
+        Some(f) => f,
+        None => return,
+    };
+
+    let output = fixture
+        .command()
+        .env("TOKENLESS_COMPRESSION_ENABLED", "1")
+        .env("TOKENLESS_STATS_ENABLED", "0")
+        .env("TOKENLESS_SLS_ENABLED", "0")
+        .args(["compress-response", "--truncate-arrays-at", "1"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(b"[\"a\",\"b\"]")?;
+            child.wait_with_output()
+        })
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[\"a\",\"b\"]\n",
+        "stdout must be the original input when compression does not save tokens"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("outputting original"),
+        "stderr must report no-savings fallback"
+    );
+
+    let stash_db = fixture.data_dir.join("stash.db");
+    let store = SqliteStore::new(&stash_db).unwrap();
+    assert_eq!(
+        store.len(),
+        0,
+        "no-savings fallback must roll back stash writes so the DB has no orphan entries"
+    );
 }
 
 #[test]

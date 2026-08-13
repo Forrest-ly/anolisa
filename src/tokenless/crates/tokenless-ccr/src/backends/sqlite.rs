@@ -189,6 +189,13 @@ impl StashStore for SqliteStore {
         .unwrap_or(0) as usize
     }
 
+    fn delete(&self, hash: &str) -> Result<(), StashError> {
+        let key = hash.to_ascii_lowercase();
+        let conn = self.lock_conn();
+        conn.execute("DELETE FROM stash WHERE hash = ?", [key])?;
+        Ok(())
+    }
+
     fn evict_expired(&self) -> Result<usize, StashError> {
         let now = now_unix();
         let conn = self.lock_conn();

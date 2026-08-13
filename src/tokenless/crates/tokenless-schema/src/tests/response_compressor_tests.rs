@@ -20,6 +20,10 @@ impl StashStore for AlwaysFail {
     fn evict_expired(&self) -> Result<usize, StashError> {
         Ok(0)
     }
+
+    fn delete(&self, _hash: &str) -> Result<(), StashError> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -631,4 +635,30 @@ fn test_stash_dropped_empty_not_engaged() {
     let result = compressor.compress(&arr);
     assert_eq!(result.as_array().unwrap().len(), 3);
     assert_eq!(store.len(), 0);
+}
+
+#[test]
+fn test_rollback_stash_removes_orphan_entries() {
+    // When the compressed output is discarded because it does not reduce token
+    // count, the stash entries written during compression must be rolled back.
+    use std::sync::Arc;
+    use tokenless_ccr::InMemoryStore;
+
+    let store = Arc::new(InMemoryStore::new());
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(1)
+        .with_stash_store(store.clone());
+    let arr = json!(["a", "b"]);
+    compressor.compress(&arr);
+
+    // Truncation wrote one stash entry for the dropped tail.
+    assert_eq!(compressor.stash_writes(), 1);
+    assert_eq!(store.len(), 1);
+
+    let removed = compressor.rollback_stash().unwrap();
+    assert_eq!(removed, 1);
+    assert_eq!(store.len(), 0);
+
+    // A second rollback is idempotent: no store and no keys remain.
+    assert_eq!(compressor.rollback_stash().unwrap(), 0);
 }

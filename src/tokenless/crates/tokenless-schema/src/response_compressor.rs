@@ -1,5 +1,5 @@
 use serde_json::{Map, Value};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokenless_ccr::{StashStore, marker_for};
@@ -45,6 +45,10 @@ pub struct ResponseCompressor {
     /// can surface persistent backend failures instead of silently degrading
     /// to the lossy marker.
     stash_errors: Cell<usize>,
+    /// Keys written during the last `compress()` call. Tracked so callers can
+    /// roll back stash entries when the compressed output is discarded (e.g.
+    /// no token savings).
+    stash_keys: RefCell<Vec<String>>,
     /// Number of truncations that could not embed a retrievable marker during
     /// the last `compress()` call. Includes backend failures and marker-budget
     /// limits without conflating the two causes.
@@ -80,6 +84,7 @@ impl Default for ResponseCompressor {
             stash_store: None,
             stash_writes: Cell::new(0),
             stash_errors: Cell::new(0),
+            stash_keys: RefCell::new(Vec::new()),
             unrecoverable_truncations: Cell::new(0),
         }
     }
@@ -150,6 +155,7 @@ impl ResponseCompressor {
         self.stash_writes.set(0);
         self.stash_errors.set(0);
         self.unrecoverable_truncations.set(0);
+        self.stash_keys.borrow_mut().clear();
         let original_text = serde_json::to_string(response).unwrap_or_default();
         let result = self.compress_value(response, 0);
 
@@ -173,6 +179,39 @@ impl ResponseCompressor {
     /// I/O) — the caller should log it so the failure isn't invisible.
     pub fn stash_errors(&self) -> usize {
         self.stash_errors.get()
+    }
+
+    /// Delete all stash entries written during the last `compress()` call.
+    /// Returns `Ok(removed)` on full success, or `Err` with a summary of the
+    /// per-key failures (the loop still attempts every delete before returning).
+    /// The caller is responsible for logging the error — the library does not
+    /// print to stderr directly, so all stash-related diagnostics flow through
+    /// the CLI layer with a consistent prefix.
+    pub fn rollback_stash(&self) -> Result<usize, String> {
+        let store = match self.stash_store.as_ref() {
+            Some(s) => s.clone(),
+            None => return Ok(0),
+        };
+        let keys: Vec<String> = self.stash_keys.borrow().clone();
+        let mut removed = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        for key in &keys {
+            match store.delete(key) {
+                Ok(()) => removed += 1,
+                Err(e) => errors.push(format!("{key}: {e}")),
+            }
+        }
+        self.stash_keys.borrow_mut().clear();
+        if errors.is_empty() {
+            Ok(removed)
+        } else {
+            Err(format!(
+                "{} of {} key(s) failed: {}",
+                errors.len(),
+                keys.len(),
+                errors.join("; ")
+            ))
+        }
     }
 
     /// Number of truncations that lacked a retrievable marker despite an
@@ -372,6 +411,7 @@ impl ResponseCompressor {
         match stash.stash(payload) {
             Ok(k) => {
                 self.stash_writes.set(self.stash_writes.get() + 1);
+                self.stash_keys.borrow_mut().push(k.clone());
                 Some(k)
             }
             Err(_) => {

@@ -139,7 +139,15 @@ pub struct CompressResult {
     /// store was attached.
     pub unrecoverable_truncations: Option<usize>,
     /// Live stash entry count after compression, or `None` without a store.
+    /// Reflects the post-rollback state when the compressed output was
+    /// discarded.
     pub stash_size: Option<usize>,
+    /// Outcome of rolling back stash entries when the compressed output was
+    /// discarded (no savings or reversibility unavailable). `None` when the
+    /// output was applied or no store was attached; `Some(Ok(removed))` when
+    /// cleanup succeeded; `Some(Err(summary))` when at least one delete
+    /// failed and orphan rows may remain until TTL eviction.
+    pub stash_rollback: Option<Result<usize, String>>,
 }
 
 impl CompressResult {
@@ -426,7 +434,6 @@ pub fn compress_response_with_store(
     let stash_writes = attached_store.map(|_| compressor.stash_writes());
     let stash_errors = attached_store.map(|_| compressor.stash_errors());
     let unrecoverable_truncations = attached_store.map(|_| compressor.unrecoverable_truncations());
-    let stash_size = attached_store.map(|store| store.len());
 
     let disposition = if after_tokens >= before_tokens {
         CompressionDisposition::NoSavings
@@ -440,6 +447,20 @@ pub fn compress_response_with_store(
     } else {
         CompressionDisposition::Applied
     };
+    // Roll back stash entries whose markers are about to be discarded: every
+    // disposition other than `Applied` emits the original input, so entries
+    // written during compression would become unretrievable orphans. DryRun
+    // never attaches a store, so this fires for NoSavings and
+    // ReversibilityUnavailable only.
+    let stash_rollback =
+        if attached_store.is_some() && disposition != CompressionDisposition::Applied {
+            Some(compressor.rollback_stash())
+        } else {
+            None
+        };
+    // Count live entries after rollback so stats reflect the net effect.
+    let stash_size = attached_store.map(|store| store.len());
+
     let output = if disposition == CompressionDisposition::Applied {
         compressed_output.clone()
     } else {
@@ -456,6 +477,7 @@ pub fn compress_response_with_store(
         stash_errors,
         unrecoverable_truncations,
         stash_size,
+        stash_rollback,
     })
 }
 
@@ -517,6 +539,10 @@ mod tests {
 
         fn evict_expired(&self) -> Result<usize, StashError> {
             Ok(0)
+        }
+
+        fn delete(&self, _hash: &str) -> Result<(), StashError> {
+            Ok(())
         }
     }
 
@@ -700,6 +726,26 @@ mod tests {
             compress_response_with_store(input, &CompressOptions::default(), true, None).unwrap();
         assert_eq!(result.disposition, CompressionDisposition::NoSavings);
         assert_eq!(result.output, input);
+    }
+
+    #[test]
+    fn no_savings_rolls_back_orphan_stash_entries() {
+        let store = std::sync::Arc::new(InMemoryStore::new());
+        // Truncating this tiny array writes one stash entry but cannot reduce
+        // the token count, so the output is discarded and the entry must be
+        // rolled back instead of orphaned.
+        let input = r#"["a","b"]"#;
+        let options = CompressOptions {
+            truncate_arrays_at: Some(1),
+            ..CompressOptions::default()
+        };
+        let store_ref: std::sync::Arc<dyn StashStore> = store.clone();
+        let result = compress_response_with_store(input, &options, true, Some(&store_ref)).unwrap();
+        assert_eq!(result.disposition, CompressionDisposition::NoSavings);
+        assert_eq!(result.output, input);
+        assert_eq!(result.stash_writes, Some(1));
+        assert_eq!(result.stash_rollback, Some(Ok(1)));
+        assert_eq!(store.len(), 0, "orphan stash entries must be rolled back");
     }
 
     #[test]

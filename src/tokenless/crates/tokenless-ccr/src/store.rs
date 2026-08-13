@@ -29,6 +29,12 @@ pub trait StashStore: Send + Sync {
 
     /// Drop all expired entries and return how many were removed.
     fn evict_expired(&self) -> Result<usize, StashError>;
+
+    /// Delete a live entry by key. Used to roll back stash writes that were
+    /// only made to produce a compressed output that is later discarded (for
+    /// example, when the compressed form does not actually reduce token count).
+    /// Backends may treat a missing or already-expired key as a success.
+    fn delete(&self, hash: &str) -> Result<(), StashError>;
 }
 
 /// Errors a stash backend can surface. Kept minimal: backends map their

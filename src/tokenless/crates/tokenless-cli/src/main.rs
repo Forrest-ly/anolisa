@@ -632,6 +632,12 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     result.before_tokens, result.after_tokens
                 );
             }
+            // The runtime rolls back stash entries whose markers were
+            // discarded with the compressed output; surface cleanup failures
+            // so orphaned rows don't accumulate silently.
+            if let Some(Err(summary)) = result.stash_rollback.as_ref() {
+                eprintln!("[tokenless] failed to roll back stash entries: {}", summary);
+            }
 
             let mode = resolve_mode(compression_on, result.before_tokens, result.after_tokens);
             let output_text = if result.disposition == CompressionDisposition::NoSavings {
