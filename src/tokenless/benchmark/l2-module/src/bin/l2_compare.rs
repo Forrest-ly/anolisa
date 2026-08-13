@@ -135,6 +135,7 @@ struct Measure {
     hr_tokens_after: Option<u64>,
     retention_passed: usize,
     retention_total: usize,
+    retention_failures: Vec<String>,
 }
 
 /// `1 - after/before` guarded against an empty input.
@@ -573,6 +574,7 @@ fn measure_tokenless(record: &SampleRecord) -> Result<(Measure, String, String),
         hr_tokens_after: None,
         retention_passed: ret.passed,
         retention_total: ret.total,
+        retention_failures: ret.failures,
     };
     Ok((measure, before_wire, output.compressed))
 }
@@ -604,6 +606,7 @@ fn measure_headroom(
         hr_tokens_after: resp.hr_tokens_after,
         retention_passed: ret.passed,
         retention_total: ret.total,
+        retention_failures: ret.failures,
     };
     Ok((measure, content.to_string(), compressed))
 }
@@ -630,6 +633,7 @@ fn measure_rtk(
         hr_tokens_after: None,
         retention_passed: ret.passed,
         retention_total: ret.total,
+        retention_failures: ret.failures,
     })
 }
 
@@ -685,6 +689,14 @@ fn aggregate_side(
         .collect();
     let retention_passed: usize = obs.iter().map(|m| m.retention_passed).sum();
     let retention_total: usize = obs.iter().map(|m| m.retention_total).sum();
+
+    let mut seen = std::collections::HashSet::new();
+    let retention_failures: Vec<String> = obs
+        .iter()
+        .flat_map(|m| m.retention_failures.iter().cloned())
+        .filter(|f| seen.insert(f.clone()))
+        .take(10)
+        .collect();
 
     // Semantic score is pooled over samples (sum of per-question outcomes)
     // rather than averaged per sample, so samples with few answerable
@@ -743,6 +755,7 @@ fn aggregate_side(
         compression_ci_cl100k: stats::bootstrap_ci_mean(&rates_cl100k),
         retention_passed,
         retention_total,
+        retention_failures,
         retention_ci: stats::wilson_interval(retention_passed, retention_total, 1.96),
         semantic_score,
         latency_ms: stats::latency_percentiles(&latencies_ms),
@@ -970,6 +983,7 @@ mod tests {
             hr_tokens_after: None,
             retention_passed: 8,
             retention_total: 11,
+            retention_failures: Vec::new(),
         }
     }
 
@@ -1059,5 +1073,77 @@ mod tests {
         let gap = compression_gap(&tl, &hr).expect("both samples must still pair");
         // One pair per sample after payload-pair dedup: a (rep 1) and b.
         assert_eq!(gap.n_pairs, 2);
+    }
+
+    /// Retention failures from independent observations must be collected,
+    /// deduplicated, and surfaced in the aggregate so the report can show
+    /// *which* ground-truth items were lost — not just how many.
+    #[test]
+    fn retention_failures_aggregate_dedup_and_cap() {
+        let mut series = SideSeries::default();
+        let mk = |id: &str, failures: Vec<&str>| -> Measure {
+            Measure {
+                sample_id: id.to_string(),
+                rep: 0,
+                payload_hash: payload_hash(id),
+                compression_rate: 0.4,
+                compression_rate_cl100k: 0.4,
+                latency_s: 0.001,
+                latency_basis: "in-process",
+                tokens_before: 100,
+                tokens_after: 60,
+                hr_tokens_before: None,
+                hr_tokens_after: None,
+                retention_passed: 7,
+                retention_total: 10,
+                retention_failures: failures.into_iter().map(String::from).collect(),
+            }
+        };
+        // sample "a": lost E_TIMEOUT and deadline exceeded
+        series.record(
+            mk(
+                "a",
+                vec![
+                    "substring not retained: \"E_TIMEOUT\"",
+                    "substring not retained: \"deadline exceeded\"",
+                ],
+            ),
+            "o",
+            "c",
+        );
+        // sample "b": lost E_TIMEOUT (duplicate) and retry_limit regex
+        series.record(
+            mk(
+                "b",
+                vec![
+                    "substring not retained: \"E_TIMEOUT\"",
+                    "regex not matched: \"retry_limit\\\\d*7\"",
+                ],
+            ),
+            "o",
+            "c",
+        );
+
+        let agg = aggregate_side(&series, 1, None, None).expect("non-empty series");
+        assert_eq!(
+            agg.retention_failures.len(),
+            3,
+            "dedup leaves 3 unique failures"
+        );
+        assert!(
+            agg.retention_failures
+                .iter()
+                .any(|f| f.contains("E_TIMEOUT"))
+        );
+        assert!(
+            agg.retention_failures
+                .iter()
+                .any(|f| f.contains("deadline exceeded"))
+        );
+        assert!(
+            agg.retention_failures
+                .iter()
+                .any(|f| f.contains("retry_limit"))
+        );
     }
 }

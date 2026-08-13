@@ -87,6 +87,10 @@ pub struct SideAggregate {
     /// observations (see [`Self::n`]).
     pub retention_passed: usize,
     pub retention_total: usize,
+    /// Deduplicated descriptions of ground-truth items lost during
+    /// compression, pooled over independent observations. Capped at 10
+    /// entries to prevent report bloat.
+    pub retention_failures: Vec<String>,
     /// Wilson 95% interval over the pooled retention counts.
     pub retention_ci: (f64, f64),
     /// Semantic probe score: the share of questions answerable on the original
@@ -270,6 +274,7 @@ impl Report {
                         "category": cat.category.name(),
                         "side": side,
                         "semantic_score": s,
+                        "retention_failures": agg.retention_failures,
                     }));
                 }
                 let budget = cat.category.p99_budget_ms();
