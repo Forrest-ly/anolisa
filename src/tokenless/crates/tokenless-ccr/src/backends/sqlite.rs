@@ -180,8 +180,12 @@ impl StashStore for SqliteStore {
 
     fn remove(&self, hash: &str) -> Result<bool, StashError> {
         let key = hash.to_ascii_lowercase();
+        let now = now_unix();
         let conn = self.lock_conn();
-        let deleted = conn.execute("DELETE FROM stash WHERE hash = ?", [&key])?;
+        let deleted = conn.execute(
+            "DELETE FROM stash WHERE hash = ? AND expires_at >= ?",
+            rusqlite::params![key, now as i64],
+        )?;
         Ok(deleted > 0)
     }
 

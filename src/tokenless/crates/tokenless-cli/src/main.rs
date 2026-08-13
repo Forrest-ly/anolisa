@@ -523,6 +523,11 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     keys.extend(compressor.stash_keys());
                     results.push(compressed);
                 }
+                // Deduplicate: content-addressable keys collide when multiple
+                // schema items share identical descriptions, and redundant
+                // remove() calls on rollback are wasteful (though harmless).
+                keys.sort_unstable();
+                keys.dedup();
                 (serde_json::to_string(&results).unwrap_or_default(), keys)
             } else {
                 let result = compressor.compress(&value);

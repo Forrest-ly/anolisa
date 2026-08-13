@@ -128,11 +128,16 @@ impl StashStore for InMemoryStore {
             .lock()
             .map_err(|e| StashError::Backend(format!("in_memory mutex poisoned: {e}")))?;
         let key = hash.to_ascii_lowercase();
-        let existed = inner.map.remove(&key).is_some();
+        let now = Instant::now();
+        let removed = inner.map.remove(&key);
+        let existed = removed.is_some();
+        let was_live = removed
+            .map(|entry| now.duration_since(entry.inserted_at) < inner.ttl)
+            .unwrap_or(false);
         if existed {
             inner.order.retain(|k| k != &key);
         }
-        Ok(existed)
+        Ok(was_live)
     }
 
     fn len(&self) -> usize {
