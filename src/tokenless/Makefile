@@ -62,6 +62,7 @@ PYPROJECT_BUILD ?= uvx --from 'build>=1,<2' pyproject-build
         codex-install codex-uninstall \
         opencode-install opencode-uninstall \
         qwencode-install qwencode-uninstall \
+        trae-install trae-uninstall \
         setup help \
         npm-package npm-package-all npm-publish prepare-npm-native-binaries \
         python-wheel test-python-runtime agentscope-wheel \
@@ -281,6 +282,8 @@ test-adapters: build-openclaw-plugin build-dsh-plugin
 	@echo "==> Testing OpenCode adapter..."
 	bash tests/test-opencode-adapter-install.sh
 	node tests/test-opencode-plugin.mjs
+	@echo "==> Testing Trae adapter installer..."
+	bash tests/test-trae-adapter-install.sh
 
 # Build the abi3 extension with unwind semantics so a Rust panic cannot abort
 # the embedding Python interpreter. The wheel remains platform-specific, but
@@ -392,9 +395,9 @@ ADAPTER_ENV = ANOLISA_PREFIX=$(HOME)/.local \
               ANOLISA_COMPONENT=tokenless \
               ANOLISA_VERSION=$(VERSION)
 
-adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install opencode-install qwencode-install
+adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install opencode-install qwencode-install trae-install
 
-adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall opencode-uninstall qwencode-uninstall
+adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall opencode-uninstall qwencode-uninstall trae-uninstall
 
 adapter-scan:
 	@echo "=== Tokenless Adapter Manifest ==="
@@ -509,6 +512,21 @@ qwencode-uninstall:
 	@echo "==> Uninstalling Qwen Code plugin..."
 	@$(ADAPTER_ENV) ANOLISA_TARGET=qwencode bash $(QWENCODE_ADAPTER_DIR)/scripts/uninstall.sh
 
+# --- Trae (TraeCode) ---
+# Trae has no plugin system for hooks: install.sh merges the tokenless hook
+# groups into the edition's global hooks.json (~/.trae-cn or ~/.trae). The
+# scripts gracefully no-op when no Trae edition home exists.
+TRAE_ADAPTER_DIR = $(SHARE_DIR)/trae
+
+trae-install:
+	@echo "==> Installing tokenless Trae hooks..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=trae bash $(TRAE_ADAPTER_DIR)/scripts/detect.sh || true
+	@$(ADAPTER_ENV) ANOLISA_TARGET=trae bash $(TRAE_ADAPTER_DIR)/scripts/install.sh
+
+trae-uninstall:
+	@echo "==> Uninstalling tokenless Trae hooks..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=trae bash $(TRAE_ADAPTER_DIR)/scripts/uninstall.sh
+
 # One-step setup: build + install + all adapters
 setup: install adapter-install
 	@echo ""
@@ -523,7 +541,7 @@ setup: install adapter-install
 	@echo "  Adapter (FHS):"
 	@echo "    $(SHARE_DIR)/"
 	@echo "  Registered:"
-	@echo "    cosh, openclaw, hermes, qoder, claude-code, codex, opencode, qwencode"
+	@echo "    cosh, openclaw, hermes, qoder, claude-code, codex, opencode, qwencode, trae"
 	@echo ""
 	@echo "Verify:"
 	@echo "  tokenless --version"
@@ -596,7 +614,7 @@ help:
 	@echo "  agentscope-wheel  Build the AgentScope integration wheel"
 	@echo "  test-agentscope-integration  Test the integration with supported AgentScope versions"
 	@echo "  adapter-scan      List registered adapter capabilities"
-	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+qoder+claude-code+codex+opencode+qwencode)"
+	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+qoder+claude-code+codex+opencode+qwencode+trae)"
 	@echo "  adapter-uninstall Unregister all adapters"
 	@echo "  cosh-extension-install  Install cosh extension"
 	@echo "  cosh-extension-uninstall Uninstall cosh extension"
@@ -614,6 +632,8 @@ help:
 	@echo "  opencode-uninstall Unregister OpenCode local plugin"
 	@echo "  qwencode-install  Register Qwen Code plugin via qwen CLI"
 	@echo "  qwencode-uninstall Unregister Qwen Code plugin"
+	@echo "  trae-install      Merge tokenless hooks into Trae hooks.json"
+	@echo "  trae-uninstall    Remove tokenless hooks from Trae hooks.json"
 	@echo "  setup             Full setup: build + install + register adapters"
 	@echo "  npm-package       Build and package the current host"
 	@echo "  npm-package-all   Package target/npm-prebuilt target directories"

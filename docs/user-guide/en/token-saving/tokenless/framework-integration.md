@@ -16,6 +16,7 @@ product adapters. The Python SDK and its AgentScope-specific child document live
 | Qoder | `qoder` | Hard-disabled | Emits rewritten shell input | Replaces output through `updatedToolOutput` | Pipeline-selected for replaceable text | — |
 | Claude Code | `claude-code` | Hard-disabled | Replaces Bash input | Replaces output on 2.1.121 or later; otherwise passes through | Pipeline-selected for replaceable text | — |
 | Codex | `codex` | Hard-disabled | Replaces supported shell input | Keeps the original; adds context only for classified environment failures | — | — |
+| Trae | `trae` | Hard-disabled | Replaces RunCommand input | Emits `additionalContext` | Attempted after response compression | — |
 | DeepSeek Harness | `dsh` | — | — | Replaces an accepted single-text JSON result when the replacement is smaller | — | — |
 | OpenCode | `opencode` | Hard-disabled | Replaces Bash input | Replaces tool output | Pipeline-selected for replaceable text | ✅ |
 | Qwen Code | `qwencode` | Hard-disabled | Emits rewritten shell input | Passes through because the host has no replacement field | — | — |
@@ -30,6 +31,9 @@ Tool Ready remains registered by these adapters but is unconditionally hard-disa
 there because the original would remain visible and total context would grow. It uses that field
 only for additive environment-error guidance. A statistics record proves that a candidate became
 smaller, not by itself that the host removed the original from its model request.
+
+Trae currently uses the bundled lifecycle scripts documented below and is not registered with the
+`anolisa adapter enable` driver set in this release.
 
 ## Adapter processing rules
 
@@ -328,6 +332,21 @@ OpenCode discovers global local plugins at startup. Use the bundled Tokenless li
 ### Qwen Code
 
 The extension loads in a new Qwen Code session. Restart and run one tool call to verify it.
+
+### Trae
+
+Trae (TraeCode) has no plugin system for hooks. The bundled lifecycle script merges the Tokenless hook groups into the global `hooks.json` of every installed Trae edition (`~/.trae-cn/hooks.json` for the CN edition, `~/.trae/hooks.json` for the international edition):
+
+```bash
+# After `make -C src/tokenless install` (or the RPM) staged the adapter resources:
+make -C src/tokenless trae-install
+# or run the script directly:
+bash ~/.local/share/anolisa/adapters/tokenless/trae/scripts/install.sh
+# remove again:
+bash ~/.local/share/anolisa/adapters/tokenless/trae/scripts/uninstall.sh
+```
+
+User-configured hooks are preserved; the uninstall script removes only the Tokenless-owned entries. Trae standardizes the terminal tool name to `RunCommand`, so the rewrite hook matches that name. Response compression is delivered through `additionalContext` because Trae's PostToolUse does not support tool-output replacement. Restart Trae after installing or removing.
 
 ## AgentScope framework integration
 
