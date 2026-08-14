@@ -203,5 +203,46 @@ class RewriteAnchorTest(unittest.TestCase):
         )
 
 
+class RewriteDeepseekHarnessGuardTest(unittest.TestCase):
+    """The dsh Claude Code hook bridge parses updatedInput but does not
+    honor it, so the rewrite hook must fail open for deepseek-harness
+    instead of spending an rtk round-trip and recording savings that
+    cannot take effect.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        share = self.home / ".local" / "share" / "anolisa" / "tokenless"
+        _write_exec(share / "rtk", FAKE_RTK)
+        _write_exec(share / "tokenless", FAKE_TOKENLESS)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_dsh_rewrite_disabled(self) -> None:
+        env = os.environ.copy()
+        env["HOME"] = str(self.home)
+        env["PATH"] = "/usr/bin:/bin"
+        env["TOKENLESS_AGENT_ID"] = "deepseek-harness"
+        proc = subprocess.run(
+            [sys.executable, str(HOOK)],
+            input=json.dumps(
+                # FAKE_RTK would rewrite this command for other agents.
+                {"tool_name": "bash", "tool_input": {"command": "grep foo bar"}}
+            ),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=15,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout or "{}")
+        self.assertNotIn(
+            "hookSpecificOutput", out,
+            f"dsh must fail open without emitting a rewrite: {out}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

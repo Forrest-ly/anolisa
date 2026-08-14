@@ -151,6 +151,7 @@ Command rewriting also changes the shell command submitted by the host. Most ada
 | Codex | Plugin | Hard-disabled Tool Ready, rewrite, response/TOON analysis added as context; the original result is retained; no Schema |
 | OpenCode | Plugin | Hard-disabled Tool Ready, Bash rewrite, tool-output replacement with response + TOON, Schema |
 | Qwen Code | Extension | Hard-disabled Tool Ready, rewrite, response + TOON through `additionalContext`, Schema |
+| DeepSeek Harness (dsh) | Hook bridge plugin | Hard-disabled Tool Ready; rewrite and response compression are wired but fail open until dsh honors `updatedInput`/`updatedToolOutput`; stats attribution active |
 
 ## Supported Agent development frameworks
 

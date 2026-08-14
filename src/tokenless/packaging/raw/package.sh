@@ -96,6 +96,7 @@ stage_payload() {
         claude-code/.claude-plugin/marketplace.json \
         claude-code/.claude-plugin/plugin.json \
         claude-code/hooks/run-hook.sh \
+        deepseek-harness/hooks/run-hook.sh \
         codex/.codex-plugin/plugin.json \
         qwencode/qwen-extension.json \
         qwencode/hooks/run-hook.sh \
@@ -125,6 +126,7 @@ stage_payload() {
     # ANOLISA intentionally ignores archive symlinks. The source tree shares
     # these dispatchers by symlink, so raw packages must carry regular files.
     materialize_hook "$stage" "claude-code/hooks/run-hook.sh"
+    materialize_hook "$stage" "deepseek-harness/hooks/run-hook.sh"
     materialize_hook "$stage" "qwencode/hooks/run-hook.sh"
 
     install -p -m 0644 \

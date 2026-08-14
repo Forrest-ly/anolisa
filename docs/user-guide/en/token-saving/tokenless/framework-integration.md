@@ -18,6 +18,7 @@ Python framework package that application developers install and register explic
 | Codex | `codex` | Hard-disabled | Replaces supported shell input | Keeps the original and adds analysis or a compressed alternative | Used to build that alternative | — |
 | OpenCode | `opencode` | Hard-disabled | Replaces Bash input | Replaces tool output | Attempted after response compression | ✅ |
 | Qwen Code | `qwencode` | Hard-disabled | Emits rewritten shell input | Emits `additionalContext` | Attempted after response compression | ✅ |
+| DeepSeek Harness | `deepseek-harness` | Hard-disabled | Wired, fails open: the hook bridge does not honor `updatedInput` | Wired, fails open: the bridge lacks `updatedToolOutput`/`suppressOutput` | — | — |
 
 “—” means that the current adapter does not register that capability. The corresponding Tokenless CLI command may still be available.
 
@@ -83,6 +84,7 @@ anolisa adapter enable tokenless qoder
 anolisa adapter enable tokenless claude-code
 anolisa adapter enable tokenless codex
 anolisa adapter enable tokenless qwencode
+anolisa adapter enable tokenless deepseek-harness
 ```
 
 Enable only Agent products that you use. When enabling more than one, run and verify each command separately.
@@ -203,6 +205,26 @@ OpenCode discovers global local plugins at startup. Use the bundled Tokenless li
 ### Qwen Code
 
 The extension loads in a new Qwen Code session. Restart and run one tool call to verify it.
+
+### DeepSeek Harness (dsh)
+
+The bridge-mode adapter registers the official
+`@deepseek-ai/dsh-hooks-claude-code` plugin in `$DSH_HOME/cordis.patch.yml`
+(`~/.dsh` by default), the user patch layer dsh applies over every profile.
+Restart dsh after installing or removing the bridge.
+
+The Claude Code hook bridge does not honor `updatedInput` and supports
+neither `updatedToolOutput` nor `suppressOutput`, so the rewrite and
+compress hooks fail open and the adapter declares only the `tool-ready`
+capability. Hook runs are still attributed through
+`TOKENLESS_AGENT_ID=deepseek-harness`, and the same `hooks.json` delivers
+the full pipeline once dsh honors input/output rewriting.
+
+The installer is fail-open: it no-ops without a `dsh` CLI, and when the
+bridge package cannot be installed it registers nothing, because an
+unresolvable plugin entry would fail dsh boot. dsh is in developer preview
+and may break compatibility between releases; re-verify the bridge after
+upgrading dsh.
 
 ## AgentScope framework integration
 

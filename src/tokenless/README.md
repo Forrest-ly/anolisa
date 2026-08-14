@@ -104,7 +104,8 @@ Token-Less/
 │   ├── qoder/                   # Qoder CLI plugin + scripts
 │   ├── claude-code/             # Claude Code plugin + marketplace + hooks
 │   ├── codex/                   # Codex plugin + scripts
-│   └── opencode/                # OpenCode local plugin + scripts
+│   ├── opencode/                # OpenCode local plugin + scripts
+│   └── deepseek-harness/        # deepseek-harness (dsh) hook-bridge adapter + scripts
 ├── third_party/rtk/           # RTK vendored source (justfile clone+patch from GitHub)
 ├── third_party/patches/      # Patches for vendored third_party sources
 ├── Makefile                   # Unified build system
@@ -525,6 +526,37 @@ The installer creates a `tokenless.js` symbolic link in OpenCode's global
 `OPENCODE_CONFIG_DIR`, `XDG_CONFIG_HOME`, and the explicit
 `TOKENLESS_OPENCODE_CONFIG_DIR` override.
 
+## DeepSeek Harness (dsh) Bridge
+
+deepseek-harness (`dsh`) is Cordis-based and plugin-only. Tokenless attaches
+through the official `@deepseek-ai/dsh-hooks-claude-code` bridge, which runs
+this adapter's Claude-Code-shaped `hooks.json` on the harness's canonical
+interception points. The installer registers a managed `insert` block in
+`$DSH_HOME/cordis.patch.yml` (the user patch layer dsh applies over every
+profile) and installs the bridge package under `$DSH_HOME/node_modules` when
+it is missing.
+
+| Strategy | Event | Action | Status |
+|---|---|---|---|
+| Tool Ready | `PreToolUse` | Registered silent pass-through; no check, repair, context, or block | ⛔ Hard-disabled |
+| Command rewriting | `PreToolUse` (bash/pwsh) | Wired, but the bridge parses `updatedInput` without honoring it — the hook fails open | ⏸️ Degraded |
+| Response compression | `PostToolUse` | Wired, but the bridge supports neither `updatedToolOutput` nor `suppressOutput` — the hook fails open instead of duplicating the payload | ⏸️ Degraded |
+| Stats attribution | all hooks | Hook runs are attributed via `TOKENLESS_AGENT_ID=deepseek-harness` | ✅ Active |
+
+The manifest therefore declares only the `tool-ready` capability. Once dsh
+honors input/output rewriting (tracked upstream), the same `hooks.json`
+delivers the full pipeline without adapter changes.
+
+### Install
+
+```bash
+make deepseek-harness-install
+```
+
+The installer is fail-open: without a `dsh` CLI it no-ops, and when the
+bridge package cannot be installed it registers nothing (an unresolvable
+plugin entry would fail dsh boot).
+
 ## AgentScope Framework Integration
 
 AgentScope 2.0 applications install two same-version Python wheels explicitly.
@@ -616,6 +648,8 @@ under `python/agentscope/` for independent wheel distribution.
 | `make codex-uninstall` | Remove Codex plugin |
 | `make opencode-install` | Install OpenCode local plugin |
 | `make opencode-uninstall` | Remove OpenCode local plugin |
+| `make deepseek-harness-install` | Install deepseek-harness (dsh) hook bridge |
+| `make deepseek-harness-uninstall` | Remove deepseek-harness (dsh) hook bridge |
 | `make setup` | Full setup: build + install + all adapters |
 
 Override install paths:
@@ -672,6 +706,7 @@ layout and single-target interface.
 | `adapters/tokenless/claude-code/` | Claude Code adapter — marketplace + plugin + hooks dispatcher |
 | `adapters/tokenless/codex/` | Codex adapter — plugin + Python hook scripts |
 | `adapters/tokenless/opencode/` | OpenCode adapter — local JavaScript plugin + lifecycle scripts |
+| `adapters/tokenless/deepseek-harness/` | deepseek-harness (dsh) adapter — hook-bridge hooks.json + lifecycle scripts |
 | `third_party/rtk/` | RTK vendored source — command rewriting engine (justfile clone+patch) |
 | `third_party/patches/` | Patches for vendored third_party sources |
 | `packaging/raw/` | Component-owned ANOLISA raw packer and target validation |

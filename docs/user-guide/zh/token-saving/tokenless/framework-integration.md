@@ -18,6 +18,7 @@ Python 框架包。
 | Codex | `codex` | 已硬关闭 | 替换受支持的 Shell 输入 | 保留原文，追加分析或压缩备选内容 | 用于生成该备选内容 | — |
 | OpenCode | `opencode` | 已硬关闭 | 替换 Bash 输入 | 替换工具输出 | 在响应压缩后尝试 | ✅ |
 | Qwen Code | `qwencode` | 已硬关闭 | 输出改写后的 Shell 输入 | 输出 `additionalContext` | 在响应压缩后尝试 | ✅ |
+| DeepSeek Harness | `deepseek-harness` | 已硬关闭 | 已接线但失败放行：钩子桥接不应用 `updatedInput` | 已接线但失败放行：桥接不支持 `updatedToolOutput`/`suppressOutput` | — | — |
 
 “—”表示当前 Adapter 没有注册此能力；对应的 Tokenless CLI 命令仍可能可用。
 
@@ -82,6 +83,7 @@ anolisa adapter enable tokenless qoder
 anolisa adapter enable tokenless claude-code
 anolisa adapter enable tokenless codex
 anolisa adapter enable tokenless qwencode
+anolisa adapter enable tokenless deepseek-harness
 ```
 
 只需启用实际使用的 Agent 产品。启用多个产品时，应逐个执行并分别验证。
@@ -210,6 +212,22 @@ OpenCode 启动时会自动加载配置目录下的 Plugin。使用上述 Tokenl
 ### Qwen Code
 
 Extension 在新的 Qwen Code 会话中加载。重启后执行一次工具调用验证。
+
+### DeepSeek Harness (dsh)
+
+桥接模式 adapter 会在 `$DSH_HOME/cordis.patch.yml`（默认 `~/.dsh`）注册官方
+`@deepseek-ai/dsh-hooks-claude-code` 插件——即 dsh 对每个 profile 应用的用户
+patch 层。安装或移除桥接后请重启 dsh。
+
+Claude Code 钩子桥接不应用 `updatedInput`，也不支持
+`updatedToolOutput`/`suppressOutput`，因此 rewrite 与 compress 钩子失败放行，
+adapter 只声明 `tool-ready` 能力。钩子运行仍通过
+`TOKENLESS_AGENT_ID=deepseek-harness` 归属统计；待 dsh 支持输入/输出改写后，
+同一份 `hooks.json` 即可恢复完整管线。
+
+安装器失败放行：未找到 `dsh` CLI 时直接跳过；桥接包无法安装时不注册任何条目
+（无法解析的插件条目会导致 dsh 启动失败）。dsh 处于开发者预览阶段，版本间可能
+破坏兼容；升级 dsh 后请重新验证桥接。
 
 ## AgentScope 框架集成
 

@@ -166,6 +166,31 @@ make opencode-install
 `XDG_CONFIG_HOME` 和显式的 `TOKENLESS_OPENCODE_CONFIG_DIR` 覆盖。
 安装后重启 OpenCode 即可加载插件。
 
+### DeepSeek Harness (dsh) 桥接安装
+
+deepseek-harness（`dsh`）基于 Cordis，只接受插件扩展。Tokenless 通过官方
+`@deepseek-ai/dsh-hooks-claude-code` 桥接插件接入：它把本 adapter 的
+Claude Code 形态 `hooks.json` 映射到 harness 的标准拦截点。安装器会在
+`$DSH_HOME/cordis.patch.yml`（dsh 对每个 profile 应用的用户 patch 层）注册
+带标记的 `insert` 块，并在桥接包缺失时将其安装到 `$DSH_HOME/node_modules`。
+
+| 策略 | 事件 | 行为 | 状态 |
+|---|---|---|---|
+| Tool Ready | `PreToolUse` | 注册为静默直通；不检查、不修复、不注入、不拦截 | ⛔ 硬关闭 |
+| 命令重写 | `PreToolUse`（bash/pwsh） | 已接线，但桥接只解析 `updatedInput` 并不生效，钩子失败放行 | ⏸️ 降级 |
+| 响应压缩 | `PostToolUse` | 已接线，但桥接不支持 `updatedToolOutput`/`suppressOutput`，钩子失败放行以免重复注入 | ⏸️ 降级 |
+| 统计归属 | 全部钩子 | 钩子运行通过 `TOKENLESS_AGENT_ID=deepseek-harness` 归属 | ✅ 生效 |
+
+因此 manifest 只声明 `tool-ready` 能力。待 dsh 上游支持输入/输出改写后，
+同一份 `hooks.json` 无需改动即可恢复完整管线。
+
+```bash
+make deepseek-harness-install
+```
+
+安装器失败放行：未找到 `dsh` CLI 时直接跳过；桥接包安装失败时不注册任何
+条目（无法解析的插件条目会导致 dsh 启动失败）。
+
 ### AgentScope 框架集成
 
 AgentScope 2.0 应用需要显式安装两个相同版本的 Python Wheel。框架集成直接调用

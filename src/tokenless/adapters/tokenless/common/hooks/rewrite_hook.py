@@ -10,6 +10,10 @@ Hook point: **PreToolUse** — matcher: ``Shell``
 The agent ID is read from the TOKENLESS_AGENT_ID environment variable
 (set by the install action script).  Fallback paths follow the ANOLISA
 FHS spec: /usr/libexec/anolisa/tokenless/rtk.
+
+deepseek-harness note: the dsh Claude Code hook bridge parses but does
+not honor ``updatedInput``, so for that agent the hook fails open
+(no rewrite) instead of recording savings that cannot take effect.
 """
 
 import json
@@ -41,6 +45,13 @@ from hook_utils import (
 
 _MIN_RTK_VERSION = (0, 35, 0)
 _AGENT_ID = resolve_agent_id()
+
+# The deepseek-harness Claude Code hook bridge parses ``updatedInput`` but
+# does not honor it (upstream tracks this as proposed feature
+# 2026-06-30-pre-tool-input-rewrite), so a rewrite can never take effect
+# through the bridge. Guard instead of spending an rtk round-trip per Bash
+# call and recording savings that cannot apply.
+_DSH_AGENT_ID = "deepseek-harness"
 
 # Shell connectives that terminate a command-list / pipeline segment.
 # A bare `rtk` wrapper can appear at command start or right after one.
@@ -114,6 +125,14 @@ def _anchor_rtk_prefix(rewritten: str, rtk_bin: str) -> str:
 
 
 def main() -> None:
+    # 0. deepseek-harness bridge guard (fail open): see _DSH_AGENT_ID note.
+    if _AGENT_ID == _DSH_AGENT_ID:
+        warn(
+            "deepseek-harness hook bridge does not honor updatedInput; "
+            "rewrite disabled (fail open)."
+        )
+        skip()
+
     # 1. Resolve rtk binary
     rtk_bin = resolve_binary(
         "rtk", _RTK_FALLBACK, _RTK_LOCAL_SHARE, _RTK_LOCAL_LIB

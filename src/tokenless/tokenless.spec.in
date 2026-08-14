@@ -221,6 +221,15 @@ install -m 0755 adapters/tokenless/qwencode/scripts/detect.sh %{buildroot}%{_dat
 install -m 0755 adapters/tokenless/qwencode/scripts/install.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/qwencode/scripts/
 install -m 0755 adapters/tokenless/qwencode/scripts/uninstall.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/qwencode/scripts/
 
+# Install DeepSeek Harness (dsh) adapter (bridge-mode hooks + scripts).
+# run-hook.sh is a source-tree symlink to common/hooks/run-hook.sh; install(1)
+# dereferences it, shipping a regular file like the claude-code/qwencode pairs.
+install -m 0644 adapters/tokenless/deepseek-harness/hooks/hooks.json %{buildroot}%{_datadir}/anolisa/adapters/tokenless/deepseek-harness/hooks/
+install -m 0755 adapters/tokenless/deepseek-harness/hooks/run-hook.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/deepseek-harness/hooks/
+install -m 0755 adapters/tokenless/deepseek-harness/scripts/detect.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/deepseek-harness/scripts/
+install -m 0755 adapters/tokenless/deepseek-harness/scripts/install.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/deepseek-harness/scripts/
+install -m 0755 adapters/tokenless/deepseek-harness/scripts/uninstall.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/deepseek-harness/scripts/
+
 # Install cosh extension for auto-discovery at /usr/share/anolisa/extensions/tokenless/
 mkdir -p %{buildroot}%{_datadir}/anolisa/extensions/tokenless/hooks
 mkdir -p %{buildroot}%{_datadir}/anolisa/extensions/tokenless/commands
@@ -331,6 +340,12 @@ install -m 0644 adapters/tokenless/common/commands/tokenless-stats.toml %{buildr
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/qwencode/scripts/detect.sh
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/qwencode/scripts/install.sh
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/qwencode/scripts/uninstall.sh
+# DeepSeek Harness (dsh) adapter — bridge-mode hooks + lifecycle scripts.
+%attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/deepseek-harness/hooks/hooks.json
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/deepseek-harness/hooks/run-hook.sh
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/deepseek-harness/scripts/detect.sh
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/deepseek-harness/scripts/install.sh
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/deepseek-harness/scripts/uninstall.sh
 # Cosh extension — auto-discovered from /usr/share/anolisa/extensions/
 %dir %{_datadir}/anolisa/extensions
 %dir %{_datadir}/anolisa/extensions/tokenless

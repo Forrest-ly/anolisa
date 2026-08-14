@@ -39,6 +39,11 @@ Output contract per agent:
     from wrapped responses; never include ``returnDisplay``.  Keep
     environment/error attribution in ``additionalContext`` (additive).
     Unsupported Cosh-NG versions fail open with compression disabled.
+  - deepseek-harness: the Claude Code hook bridge honors neither
+    ``updatedToolOutput`` nor ``suppressOutput``, and its
+    ``additionalContext`` is additive — compression is disabled (fail open,
+    like pre-2.1.121 Claude Code) and only environment attribution is
+    emitted.
   - other agents: the compressed payload is injected via
     ``additionalContext`` per each runtime's hook contract.
 
@@ -88,6 +93,12 @@ _CLAUDE_AGENT_ID = "claude-code"
 _CLAUDE_MIN_REPLACE_VERSION = (2, 1, 121)
 _QODER_AGENT_ID = "qoder-cli"
 _OPENCODE_AGENT_ID = "opencode"
+# The deepseek-harness Claude Code hook bridge honors neither
+# ``updatedToolOutput`` nor ``suppressOutput``; its ``additionalContext`` is
+# additive, so a compressed payload would sit beside the original tool result
+# and increase token use. Until dsh honors output replacement, this agent
+# takes the same fail-open path as pre-2.1.121 Claude Code.
+_DSH_AGENT_ID = "deepseek-harness"
 
 # Cache for `claude --version`, keyed on binary path+mtime+size so upgrades
 # invalidate it. Hooks run as a fresh process per tool call and spawning the
@@ -334,6 +345,16 @@ def main() -> None:
             f"[tokenless:env] {tool_name} failed: "
             f"{attr_category} ({attr_fix_hint}). Skip retry."
         )
+
+    # 12.5. deepseek-harness bridge guard (fail open): replacement is not
+    # honored by the bridge, so keep only the genuinely additive env
+    # attribution and skip compression entirely (see _DSH_AGENT_ID note).
+    if agent_id == _DSH_AGENT_ID:
+        warn(
+            "deepseek-harness hook bridge does not honor updatedToolOutput; "
+            "response compression disabled (fail open)."
+        )
+        _emit_attribution_or_skip(env_attribution)
 
     # 13. Content retrieval -- skip entirely (preserve integrity)
     if tool_name in SKIP_TOOLS:

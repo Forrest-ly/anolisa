@@ -635,5 +635,79 @@ class TestNonReplacementAdapters(unittest.TestCase):
                          "Non-replacement adapters should not use updatedToolOutput")
 
 
+class TestDeepseekHarnessBridge(unittest.TestCase):
+    """deepseek-harness (dsh) bridge guard.
+
+    The dsh Claude Code hook bridge honors neither updatedToolOutput nor
+    suppressOutput, and its additionalContext is additive. The hook must
+    fail open (like pre-2.1.121 Claude Code): keep genuinely additive env
+    attribution, never inject the compressed payload beside the original
+    tool result (that would increase token use).
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.isolated_home = tempfile.mkdtemp(prefix="test_hook_home_")
+        self.mock_bin = _create_mock_tokenless(self.tmpdir, "compress")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        shutil.rmtree(self.isolated_home, ignore_errors=True)
+
+    def test_dsh_large_response_not_duplicated(self):
+        """A compressible response must not be re-injected on dsh."""
+        large_payload = _make_large_json_payload()
+
+        result = _run_hook(
+            {
+                "tool_name": "bash",
+                "tool_response": large_payload,
+                "session_id": "s",
+                "tool_use_id": "t",
+            },
+            agent_id="deepseek-harness",
+            mock_tokenless_path=self.mock_bin,
+            isolated_home=self.isolated_home,
+        )
+
+        self.assertNotIn("_subprocess_error", result,
+                         f"Hook subprocess failed: {result}")
+        hso = result.get("hookSpecificOutput", {})
+        self.assertNotIn("updatedToolOutput", hso,
+                         "dsh bridge does not honor updatedToolOutput")
+        context = hso.get("additionalContext", "")
+        self.assertNotIn("x" * 100, context,
+                         "compressed payload must not duplicate the original "
+                         "tool result via additionalContext")
+
+    def test_dsh_env_attribution_still_emitted(self):
+        """Environment-error attribution is additive and must survive."""
+        error_payload = {
+            "stdout": "",
+            "stderr": "bash: pytest: command not found",
+            "exit_code": 127,
+        }
+
+        result = _run_hook(
+            {
+                "tool_name": "bash",
+                "tool_response": error_payload,
+                "session_id": "s",
+                "tool_use_id": "t",
+            },
+            agent_id="deepseek-harness",
+            mock_tokenless_path=self.mock_bin,
+            isolated_home=self.isolated_home,
+        )
+
+        self.assertNotIn("_subprocess_error", result,
+                         f"Hook subprocess failed: {result}")
+        hso = result.get("hookSpecificOutput", {})
+        self.assertNotIn("updatedToolOutput", hso)
+        context = hso.get("additionalContext", "")
+        self.assertIn("[tokenless:env]", context,
+                      "env attribution should remain on dsh")
+
+
 if __name__ == "__main__":
     unittest.main()

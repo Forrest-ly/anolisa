@@ -149,6 +149,7 @@ Stash 并不能让所有压缩都可逆。被移除的 `debug`/`trace` 字段、
 | Codex | Plugin | Tool Ready（已硬关闭）、命令重写；把响应/TOON 分析追加为上下文，保留原始结果；无 Schema |
 | OpenCode | Plugin | Tool Ready（已硬关闭）、Bash 命令重写、用响应压缩 + TOON 替换工具输出、Schema |
 | Qwen Code | Extension | Tool Ready（已硬关闭）、命令重写、通过 `additionalContext` 交付响应压缩 + TOON、Schema |
+| DeepSeek Harness (dsh) | 钩子桥接插件 | Tool Ready（已硬关闭）；命令重写与响应压缩已接线但失败放行，待 dsh 支持 `updatedInput`/`updatedToolOutput`；统计归属生效 |
 
 ## 支持的 Agent 开发框架
 

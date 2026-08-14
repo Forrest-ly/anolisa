@@ -9,6 +9,15 @@ Tokenless 的所有重要变更都会记录在此文件中。
 
 ## [未发布]
 
+### 新增
+
+- 新增 `deepseek-harness`（dsh）桥接模式 adapter：在 `$DSH_HOME/cordis.patch.yml`
+  注册官方 `@deepseek-ai/dsh-hooks-claude-code` 桥接插件，加载 Claude Code 形态的
+  adapter hooks，钩子运行通过 `TOKENLESS_AGENT_ID=deepseek-harness` 归属统计。
+  manifest 仅声明 `tool-ready`：桥接只解析 `updatedInput` 并不生效，也不支持
+  `updatedToolOutput`/`suppressOutput`，因此 rewrite 与 compress 钩子失败放行，
+  不记录、不注入无法节省 token 的内容。
+
 ## [0.7.6] - 2026-08-13
 
 ### 变更

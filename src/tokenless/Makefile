@@ -58,6 +58,7 @@ PYPROJECT_BUILD ?= uvx --from 'build>=1,<2' pyproject-build
         codex-install codex-uninstall \
         opencode-install opencode-uninstall \
         qwencode-install qwencode-uninstall \
+        deepseek-harness-install deepseek-harness-uninstall \
         setup help \
         npm-package npm-package-all npm-publish prepare-npm-native-binaries \
         python-wheel test-python-runtime agentscope-wheel \
@@ -216,6 +217,8 @@ test-adapters: build-openclaw-plugin
 	node --test tests/test-openclaw-rtk-context.mjs
 	@echo "==> Testing qoder adapter installer..."
 	bash tests/test-qoder-adapter-install.sh
+	@echo "==> Testing deepseek-harness adapter installer..."
+	bash tests/test-dsh-adapter-install.sh
 	@echo "==> Testing OpenCode adapter..."
 	bash tests/test-opencode-adapter-install.sh
 	node tests/test-opencode-plugin.mjs
@@ -316,9 +319,9 @@ ADAPTER_ENV = ANOLISA_PREFIX=$(HOME)/.local \
               ANOLISA_COMPONENT=tokenless \
               ANOLISA_VERSION=$(VERSION)
 
-adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install opencode-install qwencode-install
+adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install opencode-install qwencode-install deepseek-harness-install
 
-adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall opencode-uninstall qwencode-uninstall
+adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall opencode-uninstall qwencode-uninstall deepseek-harness-uninstall
 
 adapter-scan:
 	@echo "=== Tokenless Adapter Manifest ==="
@@ -431,6 +434,22 @@ qwencode-uninstall:
 	@echo "==> Uninstalling Qwen Code plugin..."
 	@$(ADAPTER_ENV) ANOLISA_TARGET=qwencode bash $(QWENCODE_ADAPTER_DIR)/scripts/uninstall.sh
 
+# --- DeepSeek Harness (dsh) ---
+# Bridge-mode adapter: registers the official @deepseek-ai/dsh-hooks-claude-code
+# plugin in $DSH_HOME/cordis.patch.yml, pointed at this adapter's hooks.json.
+# The scripts gracefully no-op when dsh (or npm) is unavailable so
+# `make adapter-install` stays usable on machines without deepseek-harness.
+DSH_ADAPTER_DIR = $(SHARE_DIR)/deepseek-harness
+
+deepseek-harness-install:
+	@echo "==> Installing DeepSeek Harness (dsh) hook bridge..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=deepseek-harness bash $(DSH_ADAPTER_DIR)/scripts/detect.sh || true
+	@$(ADAPTER_ENV) ANOLISA_TARGET=deepseek-harness bash $(DSH_ADAPTER_DIR)/scripts/install.sh
+
+deepseek-harness-uninstall:
+	@echo "==> Uninstalling DeepSeek Harness (dsh) hook bridge..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=deepseek-harness bash $(DSH_ADAPTER_DIR)/scripts/uninstall.sh
+
 # One-step setup: build + install + all adapters
 setup: install adapter-install
 	@echo ""
@@ -446,7 +465,8 @@ setup: install adapter-install
 	@echo "  Adapter (FHS):"
 	@echo "    $(SHARE_DIR)/"
 	@echo "  Registered:"
-	@echo "    cosh, openclaw, hermes, qoder, claude-code, codex, opencode, qwencode"
+	@echo "    cosh, openclaw, hermes, qoder, claude-code, codex, opencode, qwencode,"
+	@echo "    deepseek-harness"
 	@echo ""
 	@echo "Verify:"
 	@echo "  tokenless --version"

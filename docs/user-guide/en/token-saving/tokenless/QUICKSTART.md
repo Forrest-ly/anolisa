@@ -122,6 +122,7 @@ anolisa adapter scan
 | Codex | `anolisa adapter enable tokenless codex` |
 | OpenCode | Lifecycle script (see below) |
 | Qwen Code | `anolisa adapter enable tokenless qwencode` |
+| DeepSeek Harness (dsh) | `anolisa adapter enable tokenless deepseek-harness` |
 
 Restart the Agent CLI or IDE after setting it up. OpenClaw also requires
 `openclaw gateway restart`; if its security check rejects the plugin, follow

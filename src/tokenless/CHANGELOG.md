@@ -9,6 +9,17 @@ Releases from 0.7.2 onward follow
 
 ## [Unreleased]
 
+### Added
+
+- New `deepseek-harness` (dsh) bridge-mode adapter: registers the official
+  `@deepseek-ai/dsh-hooks-claude-code` plugin in `$DSH_HOME/cordis.patch.yml`
+  with the adapter's Claude-Code-shaped hooks, attributing hook runs via
+  `TOKENLESS_AGENT_ID=deepseek-harness`. The manifest declares only
+  `tool-ready`: the bridge parses `updatedInput` without honoring it and
+  supports neither `updatedToolOutput` nor `suppressOutput`, so the rewrite
+  and compress hooks fail open instead of recording or injecting payloads
+  that cannot save tokens.
+
 ## [0.7.6] - 2026-08-13
 
 ### Changed

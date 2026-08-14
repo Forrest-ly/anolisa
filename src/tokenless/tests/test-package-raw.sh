@@ -20,6 +20,7 @@ mkdir -p \
     "$ADAPTERS/qoder/.qoder-plugin" \
     "$ADAPTERS/claude-code/.claude-plugin" \
     "$ADAPTERS/claude-code/hooks" \
+    "$ADAPTERS/deepseek-harness/hooks" \
     "$ADAPTERS/codex/.codex-plugin" \
     "$ADAPTERS/agentscope/build/lib/tokenless_agentscope" \
     "$ADAPTERS/agentscope/src/anolisa_tokenless_agentscope.egg-info" \
@@ -70,6 +71,7 @@ chmod 0755 \
     "$ADAPTERS/common/tokenless-env-fix.sh" \
     "$ADAPTERS/common/hooks/run-hook.sh"
 ln -s ../../common/hooks/run-hook.sh "$ADAPTERS/claude-code/hooks/run-hook.sh"
+ln -s ../../common/hooks/run-hook.sh "$ADAPTERS/deepseek-harness/hooks/run-hook.sh"
 ln -s ../../common/hooks/run-hook.sh "$ADAPTERS/qwencode/hooks/run-hook.sh"
 
 make_binaries() {
@@ -156,6 +158,7 @@ cmp "$LINUX_X64/toon" "$EXTRACTED/libexec/anolisa/tokenless/toon"
 
 for relative in \
     adapters/claude-code/hooks/run-hook.sh \
+    adapters/deepseek-harness/hooks/run-hook.sh \
     adapters/qwencode/hooks/run-hook.sh; do
     test -f "$EXTRACTED/$relative"
     test ! -L "$EXTRACTED/$relative"
