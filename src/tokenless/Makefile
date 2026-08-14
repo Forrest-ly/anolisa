@@ -58,6 +58,7 @@ PYPROJECT_BUILD ?= uvx --from 'build>=1,<2' pyproject-build
         codex-install codex-uninstall \
         opencode-install opencode-uninstall \
         qwencode-install qwencode-uninstall \
+        deepseek-harness-install deepseek-harness-uninstall \
         setup help \
         npm-package npm-package-all npm-publish prepare-npm-native-binaries \
         python-wheel test-python-runtime agentscope-wheel \
@@ -219,6 +220,8 @@ test-adapters: build-openclaw-plugin
 	@echo "==> Testing OpenCode adapter..."
 	bash tests/test-opencode-adapter-install.sh
 	node tests/test-opencode-plugin.mjs
+	@echo "==> Testing DeepSeek Harness adapter..."
+	bash tests/test-deepseek-harness-adapter-install.sh
 
 # Build the abi3 extension with unwind semantics so a Rust panic cannot abort
 # the embedding Python interpreter. The wheel remains platform-specific, but
@@ -316,9 +319,9 @@ ADAPTER_ENV = ANOLISA_PREFIX=$(HOME)/.local \
               ANOLISA_COMPONENT=tokenless \
               ANOLISA_VERSION=$(VERSION)
 
-adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install opencode-install qwencode-install
+adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install opencode-install qwencode-install deepseek-harness-install
 
-adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall opencode-uninstall qwencode-uninstall
+adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall opencode-uninstall qwencode-uninstall deepseek-harness-uninstall
 
 adapter-scan:
 	@echo "=== Tokenless Adapter Manifest ==="
@@ -431,6 +434,21 @@ qwencode-uninstall:
 	@echo "==> Uninstalling Qwen Code plugin..."
 	@$(ADAPTER_ENV) ANOLISA_TARGET=qwencode bash $(QWENCODE_ADAPTER_DIR)/scripts/uninstall.sh
 
+# --- DeepSeek Harness (dsh) ---
+# Registers the upstream @deepseek-ai/dsh-hooks-claude-code bridge against
+# each dsh profile. When dsh is absent the scripts gracefully no-op so
+# `make adapter-install` stays usable on machines without dsh.
+DEEPSEEK_HARNESS_ADAPTER_DIR = $(SHARE_DIR)/deepseek-harness
+
+deepseek-harness-install:
+	@echo "==> Installing DeepSeek Harness (dsh) hook bridge..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=deepseek-harness bash $(DEEPSEEK_HARNESS_ADAPTER_DIR)/scripts/detect.sh || true
+	@$(ADAPTER_ENV) ANOLISA_TARGET=deepseek-harness bash $(DEEPSEEK_HARNESS_ADAPTER_DIR)/scripts/install.sh
+
+deepseek-harness-uninstall:
+	@echo "==> Uninstalling DeepSeek Harness (dsh) hook bridge..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=deepseek-harness bash $(DEEPSEEK_HARNESS_ADAPTER_DIR)/scripts/uninstall.sh
+
 # One-step setup: build + install + all adapters
 setup: install adapter-install
 	@echo ""
@@ -522,7 +540,7 @@ help:
 	@echo "  agentscope-wheel  Build the AgentScope integration wheel"
 	@echo "  test-agentscope-integration  Test the integration with supported AgentScope versions"
 	@echo "  adapter-scan      List registered adapter capabilities"
-	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+qoder+claude-code+codex+opencode+qwencode)"
+	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+qoder+claude-code+codex+opencode+qwencode+deepseek-harness)"
 	@echo "  adapter-uninstall Unregister all adapters"
 	@echo "  cosh-extension-install  Install cosh extension"
 	@echo "  cosh-extension-uninstall Uninstall cosh extension"

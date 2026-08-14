@@ -395,6 +395,39 @@ class TestReplacementProtocol(unittest.TestCase):
         self.assertNotIn("additionalContext", hso,
                          "OpenCode compressed content must not be additive")
 
+    def test_deepseek_harness_uses_updated_tool_output(self):
+        """deepseek-harness must take the replacement path, not the additive one.
+
+        The dsh CC bridge ignores suppressOutput, so the additive
+        additionalContext fallback used for unknown agents would duplicate
+        the payload. The replacement emission degrades to an untouched
+        pass-through on today's bridge and starts saving tokens once dsh
+        honors updatedToolOutput.
+        """
+        large_payload = _make_large_json_payload()
+
+        result = _run_hook(
+            {
+                "tool_name": "Bash",
+                "tool_response": large_payload,
+                "session_id": "test-session",
+                "tool_use_id": "toolu_test",
+            },
+            agent_id="deepseek-harness",
+            mock_tokenless_path=self.mock_bin,
+            isolated_home=self.isolated_home,
+        )
+
+        self.assertNotIn("_subprocess_error", result,
+                         f"Hook subprocess failed: {result}")
+        hso = result.get("hookSpecificOutput", {})
+        self.assertEqual(hso.get("hookEventName"), "PostToolUse")
+        self.assertIn("updatedToolOutput", hso,
+                      "deepseek-harness should use updatedToolOutput for replacement")
+        self.assertNotIn("additionalContext", hso,
+                         "deepseek-harness compressed content must not be additive "
+                         "(the dsh bridge ignores suppressOutput)")
+
     def test_replacement_is_smaller(self):
         """The replacement output should be smaller than the original."""
         large_payload = _make_large_json_payload(1000)

@@ -104,7 +104,8 @@ Token-Less/
 │   ├── qoder/                   # Qoder CLI plugin + scripts
 │   ├── claude-code/             # Claude Code plugin + marketplace + hooks
 │   ├── codex/                   # Codex plugin + scripts
-│   └── opencode/                # OpenCode local plugin + scripts
+│   ├── opencode/                # OpenCode local plugin + scripts
+│   └── deepseek-harness/        # DeepSeek Harness (dsh) hook-bridge adapter + scripts
 ├── third_party/rtk/           # RTK vendored source (justfile clone+patch from GitHub)
 ├── third_party/patches/      # Patches for vendored third_party sources
 ├── Makefile                   # Unified build system
@@ -616,6 +617,8 @@ under `python/agentscope/` for independent wheel distribution.
 | `make codex-uninstall` | Remove Codex plugin |
 | `make opencode-install` | Install OpenCode local plugin |
 | `make opencode-uninstall` | Remove OpenCode local plugin |
+| `make deepseek-harness-install` | Register DeepSeek Harness (dsh) hook bridge |
+| `make deepseek-harness-uninstall` | Remove DeepSeek Harness (dsh) hook bridge |
 | `make setup` | Full setup: build + install + all adapters |
 
 Override install paths:
@@ -672,6 +675,7 @@ layout and single-target interface.
 | `adapters/tokenless/claude-code/` | Claude Code adapter — marketplace + plugin + hooks dispatcher |
 | `adapters/tokenless/codex/` | Codex adapter — plugin + Python hook scripts |
 | `adapters/tokenless/opencode/` | OpenCode adapter — local JavaScript plugin + lifecycle scripts |
+| `adapters/tokenless/deepseek-harness/` | DeepSeek Harness (dsh) adapter — CC hook-bridge wiring + lifecycle scripts |
 | `third_party/rtk/` | RTK vendored source — command rewriting engine (justfile clone+patch) |
 | `third_party/patches/` | Patches for vendored third_party sources |
 | `packaging/raw/` | Component-owned ANOLISA raw packer and target validation |

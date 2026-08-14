@@ -18,6 +18,7 @@ Python 框架包。
 | Codex | `codex` | 已硬关闭 | 替换受支持的 Shell 输入 | 保留原文，追加分析或压缩备选内容 | 用于生成该备选内容 | — |
 | OpenCode | `opencode` | 已硬关闭 | 替换 Bash 输入 | 替换工具输出 | 在响应压缩后尝试 | ✅ |
 | Qwen Code | `qwencode` | 已硬关闭 | 输出改写后的 Shell 输入 | 输出 `additionalContext` | 在响应压缩后尝试 | ✅ |
+| DeepSeek Harness | `deepseek-harness` | 已硬关闭 | 输出改写后的 Shell 输入（CC 桥接尚未应用） | 输出替换结果（CC 桥接尚未应用），原文透传且不产生重复 | — | — |
 
 “—”表示当前 Adapter 没有注册此能力；对应的 Tokenless CLI 命令仍可能可用。
 
@@ -25,7 +26,7 @@ Python 框架包。
 
 `additionalContext` 是追加型 Hook 字段。在这些路径上，Tokenless 源码本身不会删除原始结果，最终处理方式还取决于宿主实现。统计记录只能证明压缩候选内容变小了，不能证明宿主已经从模型请求中移除原文。
 
-OpenCode 当前使用下文说明的随附生命周期脚本，本版本尚未把它注册到
+OpenCode 和 DeepSeek Harness 当前使用下文说明的随附生命周期脚本，本版本尚未把它们注册到
 `anolisa adapter enable` 的驱动集合。
 
 ## Adapter 处理规则
@@ -130,7 +131,7 @@ npm 的 postinstall 脚本会尝试把 Adapter 资源复制到：
 
 应确认该目录确实存在。Adapter 复制属于补充步骤，失败时只输出警告，不会让二进制安装失败；因此可能出现命令可用但这里没有资源副本的情况。目录缺失时应检查 npm postinstall 警告，并优先改用 anolisa 管理的安装。
 
-npm 安装不会创建 anolisa 组件安装记录，因此不要假设 `anolisa adapter enable` 能管理这次安装。OpenClaw、Hermes、Qoder、Claude Code、Codex、OpenCode 和 Qwen Code 可以运行各自的安装脚本：
+npm 安装不会创建 anolisa 组件安装记录，因此不要假设 `anolisa adapter enable` 能管理这次安装。OpenClaw、Hermes、Qoder、Claude Code、Codex、OpenCode、Qwen Code 和 DeepSeek Harness 可以运行各自的安装脚本：
 
 ```bash
 bash ~/.local/share/anolisa/adapters/tokenless/<framework>/scripts/install.sh
@@ -141,6 +142,7 @@ bash ~/.local/share/anolisa/adapters/tokenless/<framework>/scripts/install.sh
 ```bash
 bash ~/.local/share/anolisa/adapters/tokenless/claude-code/scripts/install.sh
 bash ~/.local/share/anolisa/adapters/tokenless/opencode/scripts/install.sh
+bash ~/.local/share/anolisa/adapters/tokenless/deepseek-harness/scripts/install.sh
 ```
 
 卸载相同 Adapter：
@@ -206,6 +208,22 @@ OpenCode 启动时会自动加载配置目录下的 Plugin。使用上述 Tokenl
 
 安装过程中，脚本只会创建由 Tokenless 管理的 `plugins/tokenless.js` 符号链接。
 如果目标路径已经存在但不由 Tokenless 管理，安装会停止，原有内容不会被覆盖。
+
+### DeepSeek Harness (dsh)
+
+dsh 通过上游 `@deepseek-ai/dsh-hooks-claude-code` 桥接插件运行 Claude Code
+风格的 Hooks。安装脚本会在 `$DSH_HOME/profiles`（默认 `~/.dsh`）下的每个 dsh
+profile 中注册该桥接：把桥接包安装进 profile，并在 profile 的
+`cordis.patch.yml` 中追加一段带标记的受管配置块。完成后请重启 dsh。设置
+`TOKENLESS_DSH_PROFILE` 可以只注册指定 profile。只有当桥接包在 profile 中
+可解析时才写入配置项，因此包安装失败不会破坏 dsh 启动。
+
+dsh 项目文档明确了桥接的能力缺口：桥接会解析但尚未应用
+`updatedInput`（PreToolUse）和
+`updatedToolOutput`/`suppressOutput`（PostToolUse）。Tool Ready 与统计归因
+（`TOKENLESS_AGENT_ID=deepseek-harness`）当前可用；重写与响应压缩在上游
+应用这些字段之前不会带来 token 节省。Hooks 保持注册，上游支持落地后节省
+会自动生效。
 
 ### Qwen Code
 

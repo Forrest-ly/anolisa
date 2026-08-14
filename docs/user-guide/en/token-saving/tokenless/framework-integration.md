@@ -18,6 +18,7 @@ Python framework package that application developers install and register explic
 | Codex | `codex` | Hard-disabled | Replaces supported shell input | Keeps the original and adds analysis or a compressed alternative | Used to build that alternative | — |
 | OpenCode | `opencode` | Hard-disabled | Replaces Bash input | Replaces tool output | Attempted after response compression | ✅ |
 | Qwen Code | `qwencode` | Hard-disabled | Emits rewritten shell input | Emits `additionalContext` | Attempted after response compression | ✅ |
+| DeepSeek Harness | `deepseek-harness` | Hard-disabled | Emits rewritten shell input (the CC bridge does not honor it yet) | Emits a replacement the CC bridge does not honor yet; the original passes through without duplication | — | — |
 
 “—” means that the current adapter does not register that capability. The corresponding Tokenless CLI command may still be available.
 
@@ -25,8 +26,8 @@ Tool Ready remains registered by these adapters but is unconditionally hard-disa
 
 `additionalContext` is an additive hook field. The Tokenless source does not remove the original result on those paths; the final treatment also depends on the host implementation. A statistics record proves that a candidate became smaller, not that the host removed the original from its model request.
 
-OpenCode currently uses the bundled lifecycle scripts documented below and is not registered with
-the `anolisa adapter enable` driver set in this release.
+OpenCode and DeepSeek Harness currently use the bundled lifecycle scripts documented below and are
+not registered with the `anolisa adapter enable` driver set in this release.
 
 ## Adapter processing rules
 
@@ -133,7 +134,7 @@ The npm postinstall script attempts to copy adapter resources under:
 
 Confirm that this directory exists. Adapter copying is supplementary and fails open with a warning; a successful binary install can therefore exist without this copy. If it is absent, review the npm postinstall warning and prefer an anolisa-managed installation.
 
-An npm install does not create an anolisa component installation record, so do not assume that `anolisa adapter enable` can manage it. OpenClaw, Hermes, Qoder, Claude Code, Codex, OpenCode, and Qwen Code provide their own install scripts:
+An npm install does not create an anolisa component installation record, so do not assume that `anolisa adapter enable` can manage it. OpenClaw, Hermes, Qoder, Claude Code, Codex, OpenCode, Qwen Code, and DeepSeek Harness provide their own install scripts:
 
 ```bash
 bash ~/.local/share/anolisa/adapters/tokenless/<framework>/scripts/install.sh
@@ -144,6 +145,7 @@ For example:
 ```bash
 bash ~/.local/share/anolisa/adapters/tokenless/claude-code/scripts/install.sh
 bash ~/.local/share/anolisa/adapters/tokenless/opencode/scripts/install.sh
+bash ~/.local/share/anolisa/adapters/tokenless/deepseek-harness/scripts/install.sh
 ```
 
 Uninstall the same adapter with:
@@ -199,6 +201,26 @@ The plugin loads in a new Codex session. Close the old session and start a new o
 ### OpenCode
 
 OpenCode discovers global local plugins at startup. Use the bundled Tokenless lifecycle script described above, restart OpenCode after installation or removal, then run a tool call and inspect `tokenless stats list`. The script resolves the configuration directory from `TOKENLESS_OPENCODE_CONFIG_DIR`, then `OPENCODE_CONFIG_DIR`, then `XDG_CONFIG_HOME/opencode`, and finally `~/.config/opencode`. Installation creates only `plugins/tokenless.js` as a managed symlink and refuses to replace an unrelated file at that path.
+
+### DeepSeek Harness (dsh)
+
+dsh runs the Claude-Code-dialect hooks through the upstream
+`@deepseek-ai/dsh-hooks-claude-code` bridge plugin. The install script
+registers that bridge in each dsh profile under `$DSH_HOME/profiles`
+(default `~/.dsh`): it installs the bridge package into the profile and
+appends a marked managed block to the profile's `cordis.patch.yml`.
+Restart dsh afterwards. Set `TOKENLESS_DSH_PROFILE` to register a single
+profile. The patch entry is only written when the bridge package is
+resolvable in the profile, so a failed package install cannot break dsh
+boot.
+
+Bridge capability gaps are documented by the dsh project: the bridge parses
+but does not yet honor `updatedInput` (PreToolUse) or
+`updatedToolOutput`/`suppressOutput` (PostToolUse). Tool Ready and
+statistics attribution (`TOKENLESS_AGENT_ID=deepseek-harness`) work today;
+rewriting and response compression deliver no token savings until dsh honors
+those fields. The hooks stay registered so the savings start automatically
+once upstream support lands.
 
 ### Qwen Code
 
