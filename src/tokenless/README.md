@@ -130,6 +130,7 @@ Token-Less/
 │   ├── claude-code/             # Claude Code plugin + marketplace + hooks
 │   ├── codex/                   # Codex plugin + scripts
 │   ├── opencode/                # OpenCode local plugin + scripts
+│   ├── trae/                    # Trae (TraeCode) hooks template + scripts
 │   └── dsh/                     # Native DeepSeek Harness bundle
 ├── third_party/rtk/           # RTK vendored source (justfile clone+patch from GitHub)
 ├── third_party/patches/      # Patches for vendored third_party sources
@@ -629,6 +630,30 @@ The installer creates a `tokenless.js` symbolic link in OpenCode's global
 `OPENCODE_CONFIG_DIR`, `XDG_CONFIG_HOME`, and the explicit
 `TOKENLESS_OPENCODE_CONFIG_DIR` override.
 
+## Trae (TraeCode) Adapter
+
+Trae has no plugin CLI, so the adapter merges the tokenless hook groups
+directly into each edition's global `hooks.json` (`~/.trae-cn/hooks.json` for
+the CN edition, `~/.trae/hooks.json` for the international edition).
+User-configured hooks are preserved; tokenless entries carry the
+`TOKENLESS_AGENT_ID=trae` command marker so uninstall removes exactly what
+install wrote.
+
+| Strategy | Event | Action | Status |
+|---|---|---|---|
+| Tool Ready | `PreToolUse` (all tools) | Registered silent pass-through; no check, repair, context, or block | ⛔ Hard-disabled |
+| Command rewriting | `PreToolUse` (`RunCommand`) | Rewrites shell input via `hookSpecificOutput.updatedInput` | ✅ Active |
+| Response + TOON compression | `PostToolUse` | Emits the compressed payload via `additionalContext` (Trae cannot replace tool output) | ✅ Active |
+
+Install or remove the hooks (no-op when no Trae edition home exists):
+
+```bash
+make trae-install
+make trae-uninstall
+```
+
+Restart Trae after either operation.
+
 ## DeepSeek Harness Plugin
 
 The native DSH bundle compresses successful single-block JSON tool results
@@ -793,6 +818,8 @@ transformed. Tool Ready remains hard-disabled.
 | `make codex-uninstall` | Remove Codex plugin |
 | `make opencode-install` | Install OpenCode local plugin |
 | `make opencode-uninstall` | Remove OpenCode local plugin |
+| `make trae-install` | Merge tokenless hooks into Trae hooks.json |
+| `make trae-uninstall` | Remove tokenless hooks from Trae hooks.json |
 | `make setup` | Full setup: build + install + all adapters |
 
 Override install paths:
@@ -849,6 +876,7 @@ layout and single-target interface.
 | `adapters/tokenless/claude-code/` | Claude Code adapter — marketplace + plugin + hooks dispatcher |
 | `adapters/tokenless/codex/` | Codex adapter — plugin + Python hook scripts |
 | `adapters/tokenless/opencode/` | OpenCode adapter — local JavaScript plugin + lifecycle scripts |
+| `adapters/tokenless/trae/` | Trae (TraeCode) adapter — hooks template + detect/install/uninstall scripts |
 | `third_party/rtk/` | RTK vendored source — command rewriting engine (justfile clone+patch) |
 | `third_party/patches/` | Patches for vendored third_party sources |
 | `packaging/raw/` | Component-owned ANOLISA raw packer and target validation |

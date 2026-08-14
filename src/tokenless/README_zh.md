@@ -82,6 +82,7 @@ tokenless 优化进入 LLM 上下文前、由它实际处理的工具相关内�
 - **Codex 插件** — Tool Ready（已硬关闭）+ RTK 命令重写 + 环境失败诊断；Codex
   协议不支持替换原始输出，因此不追加压缩副本
 - **OpenCode 插件** — Tool Ready（已硬关闭）+ 命令重写 + Schema/响应压缩 + TOON
+- **Trae (TraeCode) 适配器** — Tool Ready（已硬关闭）+ `RunCommand` 命令重写 + 响应/TOON 压缩（经 `additionalContext` 下发）
 - **DeepSeek Harness 插件**。通过 DSH 原生 `tools/post-execute` 接入响应压缩和环境错误归因
 - **Qwen Code Extension** — Tool Ready（已硬关闭）+ 命令重写；当前宿主不支持工具后输出替换，并跳过声明的 Schema 事件
 
@@ -256,6 +257,21 @@ make opencode-install
 不会覆盖同名的非托管文件。配置目录支持 `OPENCODE_CONFIG_DIR`、
 `XDG_CONFIG_HOME` 和显式的 `TOKENLESS_OPENCODE_CONFIG_DIR` 覆盖。
 安装后重启 OpenCode 即可加载插件。
+
+### Trae (TraeCode) 安装
+
+Trae 没有插件 CLI：适配器会把 tokenless Hook 组合并入每个已安装版本的全局
+`hooks.json`（国内版 `~/.trae-cn/hooks.json`，国际版 `~/.trae/hooks.json`）。
+PreToolUse 阶段通过 `hookSpecificOutput.updatedInput` 改写 `RunCommand` 输入；
+由于 Trae 的 PostToolUse 不支持替换工具输出，压缩结果通过 `additionalContext`
+追加给模型。用户自行配置的 Hook 会被保留，tokenless 条目以命令中的
+`TOKENLESS_AGENT_ID=trae` 标记识别，卸载只移除安装写入的内容。
+
+```bash
+make trae-install
+```
+
+不存在任何 Trae 版本目录时该命令安全跳过。安装或卸载后重启 Trae 生效。
 
 ### DeepSeek Harness 插件
 
