@@ -26,7 +26,7 @@ Python 框架包。
 
 `additionalContext` 是追加型 Hook 字段。在这些路径上，Tokenless 源码本身不会删除原始结果，最终处理方式还取决于宿主实现。统计记录只能证明压缩候选内容变小了，不能证明宿主已经从模型请求中移除原文。
 
-OpenCode 当前使用下文说明的随附生命周期脚本，本版本尚未把它注册到
+OpenCode 和 DeepSeek Harness 当前使用下文说明的随附生命周期脚本，本版本尚未把它们注册到
 `anolisa adapter enable` 的驱动集合。
 
 ## Adapter 处理规则
@@ -83,12 +83,11 @@ anolisa adapter enable tokenless qoder
 anolisa adapter enable tokenless claude-code
 anolisa adapter enable tokenless codex
 anolisa adapter enable tokenless qwencode
-anolisa adapter enable tokenless deepseek-harness
 ```
 
 只需启用实际使用的 Agent 产品。启用多个产品时，应逐个执行并分别验证。
 
-OpenCode 应使用 [npm 安装后的手动接入](#npm-安装后的手动接入)中的随附安装脚本。
+OpenCode 和 DeepSeek Harness 应使用 [npm 安装后的手动接入](#npm-安装后的手动接入)中的随附安装脚本。
 
 对于 OpenClaw，anolisa 会先尝试普通安装，默认不会加入 unsafe-install 覆盖参数。如果 OpenClaw 的安全扫描拒绝此 Plugin，应先阅读其报告；确认接受风险后，才显式重试：
 
@@ -132,7 +131,7 @@ npm 的 postinstall 脚本会尝试把 Adapter 资源复制到：
 
 应确认该目录确实存在。Adapter 复制属于补充步骤，失败时只输出警告，不会让二进制安装失败；因此可能出现命令可用但这里没有资源副本的情况。目录缺失时应检查 npm postinstall 警告，并优先改用 anolisa 管理的安装。
 
-npm 安装不会创建 anolisa 组件安装记录，因此不要假设 `anolisa adapter enable` 能管理这次安装。OpenClaw、Hermes、Qoder、Claude Code、Codex、OpenCode 和 Qwen Code 可以运行各自的安装脚本：
+npm 安装不会创建 anolisa 组件安装记录，因此不要假设 `anolisa adapter enable` 能管理这次安装。OpenClaw、Hermes、Qoder、Claude Code、Codex、OpenCode、Qwen Code 和 DeepSeek Harness 可以运行各自的安装脚本：
 
 ```bash
 bash ~/.local/share/anolisa/adapters/tokenless/<framework>/scripts/install.sh
@@ -143,6 +142,7 @@ bash ~/.local/share/anolisa/adapters/tokenless/<framework>/scripts/install.sh
 ```bash
 bash ~/.local/share/anolisa/adapters/tokenless/claude-code/scripts/install.sh
 bash ~/.local/share/anolisa/adapters/tokenless/opencode/scripts/install.sh
+bash ~/.local/share/anolisa/adapters/tokenless/deepseek-harness/scripts/install.sh
 ```
 
 卸载相同 Adapter：
@@ -215,9 +215,9 @@ Extension 在新的 Qwen Code 会话中加载。重启后执行一次工具调�
 
 ### DeepSeek Harness (dsh)
 
-桥接模式 adapter 会在 `$DSH_HOME/cordis.patch.yml`（默认 `~/.dsh`）注册官方
-`@deepseek-ai/dsh-hooks-claude-code` 插件——即 dsh 对每个 profile 应用的用户
-patch 层。安装或移除桥接后请重启 dsh。
+使用上文说明的随附生命周期脚本。安装脚本会在 `$DSH_HOME/cordis.patch.yml`
+（默认 `~/.dsh`）注册官方 `@deepseek-ai/dsh-hooks-claude-code` 插件——即 dsh
+对每个 profile 应用的用户 patch 层。安装或移除桥接后请重启 dsh。
 
 Claude Code 钩子桥接不应用 `updatedInput`，也不支持
 `updatedToolOutput`/`suppressOutput`，因此 rewrite 与 compress 钩子失败放行，

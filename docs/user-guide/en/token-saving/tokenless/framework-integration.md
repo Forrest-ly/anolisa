@@ -26,8 +26,8 @@ Tool Ready remains registered by these adapters but is unconditionally hard-disa
 
 `additionalContext` is an additive hook field. The Tokenless source does not remove the original result on those paths; the final treatment also depends on the host implementation. A statistics record proves that a candidate became smaller, not that the host removed the original from its model request.
 
-OpenCode currently uses the bundled lifecycle scripts documented below and is not registered with
-the `anolisa adapter enable` driver set in this release.
+OpenCode and DeepSeek Harness currently use the bundled lifecycle scripts documented below and are
+not registered with the `anolisa adapter enable` driver set in this release.
 
 ## Adapter processing rules
 
@@ -84,12 +84,11 @@ anolisa adapter enable tokenless qoder
 anolisa adapter enable tokenless claude-code
 anolisa adapter enable tokenless codex
 anolisa adapter enable tokenless qwencode
-anolisa adapter enable tokenless deepseek-harness
 ```
 
 Enable only Agent products that you use. When enabling more than one, run and verify each command separately.
 
-OpenCode uses its bundled install script under
+OpenCode and DeepSeek Harness use their bundled install scripts under
 [Manual integration after npm installation](#manual-integration-after-npm-installation).
 
 For OpenClaw, anolisa first attempts a normal install and does not add an unsafe-install bypass by default. If OpenClaw rejects the plugin on its safety scan, read the reported findings. Only after accepting them, retry explicitly:
@@ -135,7 +134,7 @@ The npm postinstall script attempts to copy adapter resources under:
 
 Confirm that this directory exists. Adapter copying is supplementary and fails open with a warning; a successful binary install can therefore exist without this copy. If it is absent, review the npm postinstall warning and prefer an anolisa-managed installation.
 
-An npm install does not create an anolisa component installation record, so do not assume that `anolisa adapter enable` can manage it. OpenClaw, Hermes, Qoder, Claude Code, Codex, OpenCode, and Qwen Code provide their own install scripts:
+An npm install does not create an anolisa component installation record, so do not assume that `anolisa adapter enable` can manage it. OpenClaw, Hermes, Qoder, Claude Code, Codex, OpenCode, Qwen Code, and DeepSeek Harness provide their own install scripts:
 
 ```bash
 bash ~/.local/share/anolisa/adapters/tokenless/<framework>/scripts/install.sh
@@ -146,6 +145,7 @@ For example:
 ```bash
 bash ~/.local/share/anolisa/adapters/tokenless/claude-code/scripts/install.sh
 bash ~/.local/share/anolisa/adapters/tokenless/opencode/scripts/install.sh
+bash ~/.local/share/anolisa/adapters/tokenless/deepseek-harness/scripts/install.sh
 ```
 
 Uninstall the same adapter with:
@@ -208,10 +208,11 @@ The extension loads in a new Qwen Code session. Restart and run one tool call to
 
 ### DeepSeek Harness (dsh)
 
-The bridge-mode adapter registers the official
-`@deepseek-ai/dsh-hooks-claude-code` plugin in `$DSH_HOME/cordis.patch.yml`
-(`~/.dsh` by default), the user patch layer dsh applies over every profile.
-Restart dsh after installing or removing the bridge.
+Use the bundled Tokenless lifecycle script described above. The install
+script registers the official `@deepseek-ai/dsh-hooks-claude-code` plugin in
+`$DSH_HOME/cordis.patch.yml` (`~/.dsh` by default), the user patch layer dsh
+applies over every profile. Restart dsh after installing or removing the
+bridge.
 
 The Claude Code hook bridge does not honor `updatedInput` and supports
 neither `updatedToolOutput` nor `suppressOutput`, so the rewrite and
