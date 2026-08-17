@@ -208,6 +208,58 @@ tokenless stats summary \
 
 例如，Payload 压缩率为 60%，但工具 Payload 只占会话总 Token 的 20%，则总体估算收益约为 12%。这个结果仍不是提供商账单保证值。
 
+## 压缩率的适用场景
+
+Tokenless 的压缩率取决于 Payload 中可精简成分的多少，不同场景差异很大。使用下文的标准测试负载测得的参考值（测量于 commit `2e7d69f1`，升级后请在本地重新运行确认）：
+
+| 场景 | 参考节省率（估算 Token） | 说明 |
+|------|--------------------------|------|
+| 结构化 JSON 响应（统一记录 + 冗余字段），单路响应压缩 | 约 66% | 黑名单字段、空值被移除，超长字符串/数组被截断 |
+| 函数调用 Schema（长描述），单路 Schema 压缩 | 约 47% | 描述截断，移除 `title`/`examples` 与代码块 |
+| 混合负载（响应 + Schema）：仅响应压缩 | 约 62% | 响应是主要收益来源 |
+| 混合负载：Schema + 响应压缩叠加 | 约 65% | 两类 Payload 同时精简 |
+| 混合负载：全栈叠加（Schema + 响应 + TOON） | 约 63% | 响应压缩后再叠加 TOON 收益空间很小 |
+| 仅 TOON 编码 | 约 16% | 表格化、规整的 JSON 才有明显收益 |
+
+按场景归纳：
+
+- **收益高**：工具返回大量统一结构的记录（列表、表格、搜索结果），或携带 `debug`/`trace`/`logs` 等冗余字段，或 Schema 描述冗长。
+- **收益中等**：Shell 输出中超过 Layer 2 阈值（字符串 65,536 字符、数组 128 项、深度 8）的部分会被截断；未超阈值的输出基本保持原样。
+- **收益接近零**：短于最小触发长度的响应（共享 Adapter 200 字符、Codex 500 字符）；本身已经紧凑、无冗余的 JSON；任何压缩后不比原文更小的输入（尺寸保护会保留原文）。
+- **不参与压缩**：内容读取类工具（Read/Glob/Grep 等）的输出、非 JSON 文本、带 YAML frontmatter 的 Skill 文本。触发条件详见[用户手册 · 压缩的触发条件与阈值](user-manual.md#压缩的触发条件与阈值)。
+
+实际会话收益还要乘以工具 Payload 在会话总 Token 中的占比，见上文[正确解释节省率](#正确解释节省率)。
+
+## 标准测试负载
+
+仓库内置了确定性的标准测试负载，位于 `src/tokenless/benchmark/l1-compressor`（独立 Cargo workspace，仅支持 Linux）。负载由 `python/gen_fixtures.py` 生成，不含随机数，字节级可复现，并已提交在仓库中：
+
+| 负载文件 | 内容 |
+|----------|------|
+| `fixtures/records.json` | 1,000 条统一结构记录 |
+| `fixtures/tool_response.json` | 典型工具响应（外层信封 + 60 条记录 + `trace`/`logs` 冗余字段） |
+| `fixtures/schema_search.json` | 典型函数调用 Schema |
+
+快速运行压缩率报告（需要先构建，输出包括单路压缩率、各压缩组合的叠加结果与成本估算）：
+
+```bash
+cd src/tokenless/benchmark/l1-compressor
+cargo run --release --bin compression_rate        # 加 --json 输出机器可读格式
+```
+
+运行完整质量/对抗测试 + 压缩率报告（跳过 criterion 性能基准，耗时数分钟）：
+
+```bash
+cd src/tokenless/benchmark/l1-compressor
+./run-benchmarks.sh --quick
+```
+
+使用标准负载时请注意：
+
+- Token 数使用字节/4 启发式估算，适合版本间相对比较，绝对值不代表真实计费 Token。
+- 压缩率随版本演进可能变化，引用数字时请注明对应的 commit 或版本号。
+- 标准负载用于横向对比，不代表你的业务数据；评估真实收益仍应使用[双跑对比](#用-dry-run-做双跑对比)在自己的工作负载上测量。
+
 ## AgentSight 本地展示
 
 AgentSight 的 Token savings 页面可以只读聚合 `~/.tokenless/stats.db`。两者由同一用户运行，且 AgentSight 能访问该数据库时，不需要通过 SLS 才能看到本地 Tokenless 统计。
