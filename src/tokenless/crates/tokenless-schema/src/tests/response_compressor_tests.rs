@@ -371,6 +371,7 @@ fn test_rollback_stash_writes_removes_created_entries() {
     let store = Arc::new(InMemoryStore::new());
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let arr: Vec<i32> = (1..=5).collect();
     let _ = compressor.compress(&json!(arr));
@@ -396,6 +397,7 @@ fn test_rollback_preserves_preexisting_same_payload_entry() {
     let store = Arc::new(InMemoryStore::new());
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let arr = json!([1, 2, 3, 4, 5]);
     let first = compressor.compress(&arr);
@@ -425,9 +427,11 @@ fn test_rollback_does_not_delete_key_adopted_by_another_compressor() {
     let store = Arc::new(InMemoryStore::new());
     let a = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let b = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let arr = json!([1, 2, 3, 4, 5]);
     let _ = a.compress(&arr);
@@ -453,6 +457,7 @@ fn test_rollback_updates_generation_after_in_compress_refresh() {
     let store = Arc::new(InMemoryStore::new());
     let compressor = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(store.clone());
     let value = json!({"a": [1, 2, 3, 4, 5], "b": [1, 2, 3, 4, 5]});
     let _ = compressor.compress(&value);
@@ -511,6 +516,7 @@ fn test_rollback_does_not_re_adopt_after_intervening_foreign_refresh() {
     });
     let a = ResponseCompressor::new()
         .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(0)
         .with_stash_store(wrapped);
     let value = json!({"a": [1, 2, 3, 4, 5], "b": [1, 2, 3, 4, 5]});
     let compressed = a.compress(&value);
