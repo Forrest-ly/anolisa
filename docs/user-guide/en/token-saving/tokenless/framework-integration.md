@@ -18,9 +18,11 @@ Python framework package that application developers install and register explic
 | Codex | `codex` | Hard-disabled | Replaces supported shell input | Keeps the original and adds analysis or a compressed alternative | Used to build that alternative | — |
 | DeepSeek Harness | `dsh` | — | — | Replaces an accepted single-text JSON result when the replacement is smaller | — | — |
 | OpenCode | `opencode` | Hard-disabled | Replaces Bash input | Replaces tool output | Attempted after response compression | ✅ |
-| Qwen Code | `qwencode` | Hard-disabled | Emits rewritten shell input | Emits `additionalContext` | Attempted after response compression | ✅ |
+| Qwen Code | `qwencode` | Hard-disabled | Emits rewritten shell input | Emits `additionalContext` | Attempted after response compression | — |
 
-“—” means that the current adapter does not register that capability. The corresponding Tokenless CLI command may still be available.
+“—” means that the capability is not available: the current adapter does not register it, or current host releases do not run it. The corresponding Tokenless CLI command may still be available.
+
+Schema compression reaches the model path differently per host: cosh and Cosh-NG fire the `BeforeModel` hook; OpenCode compresses each tool definition through its `tool.definition` plugin hook (MCP tools do not pass through that hook); Qwen Code's manifest declares a `BeforeModel` hook, but current Qwen Code releases skip that unknown event name at registration, so the schema hook does not run there and the matrix marks it unavailable. The entry stays registered, so a future Qwen Code release that implements the event picks it up automatically.
 
 Tool Ready remains registered by these adapters but is unconditionally hard-disabled before checking, repair, or blocking. No runtime setting can re-enable it. Post-tool failure attribution is independent.
 
