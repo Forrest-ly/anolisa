@@ -53,6 +53,7 @@ const DEFAULT_SHELL_TOOLS = new Set([
   'run_in_terminal',
   'get_terminal_output',
   'execute_command',
+  'RunCommand',
   'process',
 ])
 
