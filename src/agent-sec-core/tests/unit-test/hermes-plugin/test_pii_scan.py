@@ -187,9 +187,14 @@ class TestPiiScanCapability:
         )
 
         assert output is not None
-        assert "token=[REDACTED]" in output
+        assert "检测到 1 项高风险敏感信息" in output
+        assert "token=[REDACTED]" not in output
         assert output.endswith("\n\nassistant reply")
         assert "blocked" not in output.lower()
+        if policy == "warn":
+            assert "本次仅提醒，未触发确认或阻断" in output
+        else:
+            assert "当前环节不支持确认/阻断，本次仅提醒，不会阻断" in output
 
     @patch("hermes_plugin_src.capabilities.pii_scan.call_agent_sec_cli")
     def test_empty_input_passthrough(self, mock_cli, capability):
@@ -248,7 +253,7 @@ class TestPiiScanCapability:
 
     @patch("hermes_plugin_src.capabilities.pii_scan.call_agent_sec_cli")
     def test_warn_verdict_prepends_warning_once(self, mock_cli, capability):
-        """Warn verdict should prepend one redacted warning to final output."""
+        """Warn verdict should prepend one concise warning to final output."""
         mock_cli.side_effect = [
             _scan_result(
                 "warn",
@@ -281,9 +286,11 @@ class TestPiiScanCapability:
         assert first is not None
         assert first.endswith("\n\nassistant reply")
         assert "[pii-checker]" in first
-        assert "敏感信息" in first
-        assert "email" in first
-        assert "a***@example.com" in first
+        assert "检测到 1 项一般风险敏感信息" in first
+        assert "本次仅提醒，未触发确认或阻断" in first
+        assert "email" not in first
+        assert "a***@example.com" not in first
+        assert "severity" not in first
         assert "alice@example.com" not in first
         assert "raw_evidence" not in first
         assert second is None
@@ -315,9 +322,39 @@ class TestPiiScanCapability:
         )
 
         assert result is not None
-        assert "高风险敏感信息" in result
-        assert "password=[REDACTED]" in result
+        assert "检测到 1 项高风险敏感信息" in result
+        assert "本次仅提醒，未触发确认或阻断" in result
+        assert "generic_secret_field" not in result
+        assert "password=[REDACTED]" not in result
         assert "assistant reply" in result
+
+    def test_mixed_risk_summary_uses_each_finding_severity(self, capability):
+        """Mixed findings should use per-finding severity with verdict fallback."""
+        message = capability._format_pii_message(
+            "deny",
+            [
+                {
+                    "type": "email",
+                    "severity": "warn",
+                    "evidence_redacted": "a***@example.com",
+                },
+                {
+                    "type": "api_key",
+                    "severity": "deny",
+                    "evidence_redacted": "sk-***",
+                },
+                {
+                    "type": "custom",
+                    "severity": "unknown",
+                    "evidence_redacted": "custom-***",
+                },
+            ],
+        )
+
+        assert "检测到 3 项敏感信息（高风险 2、一般风险 1）" in message
+        assert "email" not in message
+        assert "deny" not in message
+        assert "a***@example.com" not in message
 
     @patch("hermes_plugin_src.capabilities.pii_scan.call_agent_sec_cli")
     def test_include_low_confidence_adds_cli_arg(self, mock_cli):
@@ -557,6 +594,12 @@ class TestPiiScanCapability:
         )
 
         assert result is not None
+        warning, redacted_output = result.split("\n\n", 1)
+        assert "检测到 1 项一般风险敏感信息" in warning
+        assert "模型输出中的敏感信息已脱敏，本次回复继续交付" in warning
+        assert "email" not in warning
+        assert "a***@example.com" not in warning
+        assert redacted_output == "Contact a***@example.com"
         assert "Contact a***@example.com" in result
         assert "alice@example.com" not in result
         assert mock_cli.call_args.args[0] == [
@@ -599,7 +642,10 @@ class TestPiiScanCapability:
 
         assert result is not None
         assert "[pii-checker]" in result
-        assert "a***@example.com" in result
+        assert "检测到 1 项一般风险敏感信息" in result
+        assert "原始模型输出已停止交付" in result
+        assert "本次仅显示提醒" in result
+        assert "a***@example.com" not in result
         assert "alice@example.com" not in result
         assert "Contact " not in result
 
@@ -632,8 +678,10 @@ class TestPiiScanCapability:
         )
 
         assert result is not None
-        assert "高风险敏感信息" in result
-        assert "sk-a...[REDACTED]...1234" in result
+        assert "检测到 1 项高风险敏感信息" in result
+        assert "本次仅提醒，未触发确认或阻断" in result
+        assert "api_key" not in result
+        assert "sk-a...[REDACTED]...1234" not in result
         assert result.endswith("\n\nassistant reply")
         assert mock_cli.call_args_list[0].args[0] == [
             "scan-pii",
@@ -675,7 +723,10 @@ class TestPiiScanCapability:
 
         assert result is not None
         assert result["action"] == "block"
-        assert "sk-a...[REDACTED]...1234" in result["message"]
+        assert "检测到 1 项高风险敏感信息" in result["message"]
+        assert "当前策略已阻断本次工具调用" in result["message"]
+        assert "api_key" not in result["message"]
+        assert "sk-a...[REDACTED]...1234" not in result["message"]
         assert "sk-abcdefghijklmnop1234" not in result["message"]
         assert "raw_evidence" not in result["message"]
         assert "继续处理" not in result["message"]
@@ -708,7 +759,10 @@ class TestPiiScanCapability:
 
         assert result is not None
         assert result["action"] == "block"
-        assert "token=[REDACTED]" in result["message"]
+        assert "检测到 1 项高风险敏感信息" in result["message"]
+        assert "当前策略已阻断本次工具调用" in result["message"]
+        assert "credential" not in result["message"]
+        assert "token=[REDACTED]" not in result["message"]
         assert "raw-secret-value" not in result["message"]
         assert capability._warnings_by_key == {}
         mock_cli.assert_called_once()
@@ -748,9 +802,11 @@ class TestPiiScanCapability:
 
         assert pre_result is None
         assert output is not None
-        assert "a***@example.com" in output
+        assert "检测到 1 项一般风险敏感信息" in output
+        assert "本次仅提醒，未触发确认或阻断" in output
+        assert "email" not in output
+        assert "a***@example.com" not in output
         assert "alice@example.com" not in output
-        assert "继续处理" in output
 
     @patch("hermes_plugin_src.capabilities.pii_scan.call_agent_sec_cli")
     def test_ask_deny_pre_tool_falls_back_to_cached_warning(
@@ -787,9 +843,11 @@ class TestPiiScanCapability:
 
         assert pre_result is None
         assert output is not None
-        assert "token=[REDACTED]" in output
+        assert "检测到 1 项高风险敏感信息" in output
+        assert "当前环节不支持确认/阻断，本次仅提醒，不会阻断" in output
+        assert "credential" not in output
+        assert "token=[REDACTED]" not in output
         assert "raw-secret-value" not in output
-        assert "继续处理" in output
 
     @patch("hermes_plugin_src.capabilities.pii_scan.call_agent_sec_cli")
     def test_runtime_hermes_session_context_bridges_missing_tool_session_id(
@@ -831,7 +889,8 @@ class TestPiiScanCapability:
         )
 
         assert output is not None
-        assert "a***@example.com" in output
+        assert "检测到 1 项一般风险敏感信息" in output
+        assert "a***@example.com" not in output
         assert output.endswith("\n\nassistant response")
         assert second is None
 
@@ -856,7 +915,8 @@ class TestPiiScanCapability:
 
         assert output is not None
         assert output.startswith("[pii-checker]")
-        assert "a***" in output
+        assert "检测到 1 项一般风险敏感信息" in output
+        assert "a***" not in output
         assert "\n\n" not in output
         assert second is None
         assert mock_cli.call_count == 1
@@ -891,8 +951,14 @@ class TestPiiScanCapability:
         )
 
         assert result is not None
-        assert "phone_cn" in result
-        assert "138****8000" in result
+        assert "检测到 1 项一般风险敏感信息" in result
+        assert "工具已经执行" in result
+        assert "本次仅提醒，未触发确认或阻断" in result
+        assert "当前环节不支持" not in result
+        assert "工具结果仍会进入模型上下文" in result
+        assert "已发生的外部副作用不会撤销" in result
+        assert "phone_cn" not in result
+        assert "138****8000" not in result
         assert mock_cli.call_args_list[0].args[0] == [
             "scan-pii",
             "--stdin",

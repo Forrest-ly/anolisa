@@ -21,8 +21,6 @@ from .base import AgentSecCoreCapability
 logger = logging.getLogger("agent-sec-core")
 
 _DEFAULT_WARNING_TTL_SECONDS = 300.0
-_MAX_EVIDENCE_ITEMS = 3
-_MAX_EVIDENCE_CHARS = 80
 _USER_INPUT_SOURCE = "user_input"
 _TOOL_INPUT_SOURCE = "tool_input"
 _TOOL_OUTPUT_SOURCE = "tool_output"
@@ -208,18 +206,25 @@ class PiiScanCapability(AgentSecCoreCapability):
                             f"[agent-sec-core] {self.id} {verdict.upper()} model output observed"
                         )
                         return None
-                    warnings.append(self._format_pii_message(verdict, findings))
                     redacted_text = self._safe_string(scan.get("redacted_text"))
                     if redacted_text:
                         output_text = redacted_text
+                        outcome = "模型输出中的敏感信息已脱敏，本次回复继续交付。"
                         logger.warning(
                             f"[agent-sec-core] {self.id} {verdict.upper()} model output redacted"
                         )
                     else:
                         output_text = ""
+                        outcome = (
+                            "未提供可用的脱敏结果，原始模型输出已停止交付，"
+                            "本次仅显示提醒。"
+                        )
                         logger.warning(
                             f"[agent-sec-core] {self.id} {verdict.upper()} model output redaction missing redacted_text; dropping raw output"
                         )
+                    warnings.append(
+                        self._format_pii_message(verdict, findings, outcome=outcome)
+                    )
                 elif verdict not in {"pass", "warn", "deny"}:
                     logger.warning(
                         f"[agent-sec-core] {self.id} UNKNOWN model output verdict={verdict}, fail-open"
@@ -329,7 +334,7 @@ class PiiScanCapability(AgentSecCoreCapability):
             message = self._format_pii_message(
                 verdict,
                 findings,
-                outcome="本次工具调用已被阻断。",
+                outcome="当前策略已阻断本次工具调用。",
             )
             logger.warning(
                 f"[agent-sec-core] {self.id} {verdict.upper()} blocked source={source}"
@@ -342,7 +347,11 @@ class PiiScanCapability(AgentSecCoreCapability):
             )
             return None
 
-        warning = self._format_pii_message(verdict, findings)
+        warning = self._format_pii_message(
+            verdict,
+            findings,
+            outcome=self._warning_outcome(verdict, source),
+        )
         self._push_warning(cache_key, warning)
         logger.warning(
             f"[agent-sec-core] {self.id} {verdict.upper()} warning cached key={cache_key} source={source}"
@@ -416,50 +425,52 @@ class PiiScanCapability(AgentSecCoreCapability):
         verdict: str,
         findings: list[Any],
         *,
-        outcome: str = "本轮请求将继续处理。",
+        outcome: str = "本次仅提醒，未触发确认或阻断。",
     ) -> str:
-        """Build a minimal-disclosure message from structured PII findings."""
+        """Build a concise warning without exposing scanner-internal fields."""
         typed_findings = [item for item in findings if isinstance(item, dict)]
-        pii_types = sorted(
-            {
-                finding_type
-                for finding in typed_findings
-                if (finding_type := self._safe_string(finding.get("type")))
-            }
-        )
-        severities = sorted(
-            {
-                severity
-                for finding in typed_findings
-                if (severity := self._safe_string(finding.get("severity")))
-            }
-        )
-        redacted_evidence: list[str] = []
-        for finding in typed_findings:
-            evidence = self._safe_string(finding.get("evidence_redacted"))
-            if evidence and evidence not in redacted_evidence:
-                redacted_evidence.append(self._shorten(evidence))
-            if len(redacted_evidence) >= _MAX_EVIDENCE_ITEMS:
-                break
+        return f"[pii-checker] {self._risk_summary(verdict, typed_findings)}；{outcome}"
 
-        risk = "高风险敏感信息" if verdict == "deny" else "敏感信息"
-        parts = [
-            f"[pii-checker] 检测到 {len(typed_findings)} 项{risk}",
-            f"类型：{', '.join(pii_types) if pii_types else 'unknown'}",
-        ]
-        if severities:
-            parts.append(f"严重级别：{', '.join(severities)}")
-        if redacted_evidence:
-            parts.append(f"脱敏示例：{', '.join(redacted_evidence)}")
-        parts.append(outcome)
-        return "；".join(parts)
+    def _warning_outcome(self, verdict: str, source: str) -> str:
+        """Describe the action Hermes actually took at a hook boundary."""
+        if source == _TOOL_OUTPUT_SOURCE:
+            if verdict == "deny" and self._policy in {"ask", "block"}:
+                return (
+                    "工具已经执行；当前环节不支持确认/阻断，本次仅提醒，"
+                    "工具结果仍会进入模型上下文，已发生的外部副作用不会撤销。"
+                )
+            return (
+                "工具已经执行；本次仅提醒，未触发确认或阻断，"
+                "工具结果仍会进入模型上下文，已发生的外部副作用不会撤销。"
+            )
+        if verdict == "deny" and self._policy in {"ask", "block"}:
+            return "当前环节不支持确认/阻断，本次仅提醒，不会阻断。"
+        return "本次仅提醒，未触发确认或阻断。"
 
-    def _shorten(self, value: str, limit: int = _MAX_EVIDENCE_CHARS) -> str:
-        """Shorten evidence for display."""
-        normalized = " ".join(value.split())
-        if len(normalized) <= limit:
-            return normalized
-        return normalized[: limit - 1] + "…"
+    def _risk_summary(self, verdict: str, findings: list[dict[str, Any]]) -> str:
+        """Summarize per-finding risk without exposing internal labels."""
+        high_count = sum(
+            1 for finding in findings if self._finding_risk(finding, verdict) == "high"
+        )
+        general_count = len(findings) - high_count
+
+        if high_count and general_count:
+            return (
+                f"检测到 {len(findings)} 项敏感信息"
+                f"（高风险 {high_count}、一般风险 {general_count}）"
+            )
+        if high_count:
+            return f"检测到 {high_count} 项高风险敏感信息"
+        return f"检测到 {general_count} 项一般风险敏感信息"
+
+    def _finding_risk(self, finding: dict[str, Any], verdict: str) -> str:
+        """Map a finding severity to its user-facing risk bucket."""
+        severity = self._safe_string(finding.get("severity"))
+        if severity == "deny":
+            return "high"
+        if severity == "warn":
+            return "general"
+        return "high" if verdict == "deny" else "general"
 
     def _as_list(self, value) -> list[Any]:
         return value if isinstance(value, list) else []

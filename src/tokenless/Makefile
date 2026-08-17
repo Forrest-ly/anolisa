@@ -20,10 +20,12 @@ BIN_DIR ?= $(BINDIR)
 LIB_DIR ?= $(LIBEXECDIR)
 ADAPTER_SRC_DIR := adapters/tokenless
 OPENCLAW_PLUGIN_SRC_DIR := $(ADAPTER_SRC_DIR)/openclaw
+DSH_PLUGIN_SRC_DIR := $(ADAPTER_SRC_DIR)/dsh
 ADAPTER_TEMPLATES := \
     $(ADAPTER_SRC_DIR)/manifest.json \
     $(ADAPTER_SRC_DIR)/openclaw/package.json \
     $(ADAPTER_SRC_DIR)/openclaw/openclaw.plugin.json \
+    $(ADAPTER_SRC_DIR)/dsh/package.json \
     $(ADAPTER_SRC_DIR)/hermes/plugin.yaml \
     $(ADAPTER_SRC_DIR)/qoder/.qoder-plugin/plugin.json \
     $(ADAPTER_SRC_DIR)/claude-code/.claude-plugin/plugin.json \
@@ -44,7 +46,7 @@ PYTHON_WHEEL_DIR := $(CURDIR)/target/wheels
 MATURIN ?= uvx --from 'maturin>=1.9,<2.0' maturin
 PYPROJECT_BUILD ?= uvx --from 'build>=1,<2' pyproject-build
 
-.PHONY: build build-tokenless build-toon build-openclaw-plugin \
+.PHONY: build build-tokenless build-toon build-openclaw-plugin build-dsh-plugin \
         stamp-adapter-templates stamp-python-packages generate-component-contract \
         install uninstall test lint clean package-raw stage-raw \
         test-raw-package test-npm-package \
@@ -62,13 +64,13 @@ PYPROJECT_BUILD ?= uvx --from 'build>=1,<2' pyproject-build
         setup help \
         npm-package npm-package-all npm-publish prepare-npm-native-binaries \
         python-wheel test-python-runtime agentscope-wheel \
-        test-agentscope-integration test-hooks
+        test-agentscope-integration test-hooks test-claude-code-detect
 
 # Default target
 all: build
 
 # Build both projects
-build: build-tokenless build-toon build-openclaw-plugin
+build: build-tokenless build-toon build-openclaw-plugin build-dsh-plugin
 
 build-tokenless:
 	@echo "==> Building tokenless + rtk..."
@@ -102,6 +104,10 @@ $(ADAPTER_SRC_DIR)/openclaw/package.json: $(ADAPTER_SRC_DIR)/openclaw/package.js
 
 $(ADAPTER_SRC_DIR)/openclaw/openclaw.plugin.json: $(ADAPTER_SRC_DIR)/openclaw/openclaw.plugin.json.in Cargo.toml
 	@echo "==> Generating openclaw/openclaw.plugin.json (version=$(VERSION))..."
+	sed 's/@VERSION@/$(VERSION)/g' $< > $@
+
+$(ADAPTER_SRC_DIR)/dsh/package.json: $(ADAPTER_SRC_DIR)/dsh/package.json.in Cargo.toml
+	@echo "==> Generating dsh/package.json (version=$(VERSION))..."
 	sed 's/@VERSION@/$(VERSION)/g' $< > $@
 
 $(ADAPTER_SRC_DIR)/hermes/plugin.yaml: $(ADAPTER_SRC_DIR)/hermes/plugin.yaml.in Cargo.toml
@@ -143,6 +149,19 @@ build-openclaw-plugin: stamp-adapter-templates
 	@test -f $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js \
 	    || { echo "ERROR: $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js was not produced"; exit 1; }
 
+# The dsh entry is deliberately plain ESM and has no build-time dependency on
+# the dsh SDK.  Keep this target as an explicit bundle validation seam so raw,
+# RPM, and npm packaging all fail before shipping an incomplete native plugin.
+build-dsh-plugin: stamp-adapter-templates
+	@echo "==> Validating native dsh plugin bundle..."
+	@test -f $(DSH_PLUGIN_SRC_DIR)/package.json \
+	    || { echo "ERROR: $(DSH_PLUGIN_SRC_DIR)/package.json is missing"; exit 1; }
+	@test -f $(DSH_PLUGIN_SRC_DIR)/cordis.patch.yml \
+	    || { echo "ERROR: $(DSH_PLUGIN_SRC_DIR)/cordis.patch.yml is missing"; exit 1; }
+	@test -f $(DSH_PLUGIN_SRC_DIR)/dist/index.js \
+	    || { echo "ERROR: $(DSH_PLUGIN_SRC_DIR)/dist/index.js is missing"; exit 1; }
+	@cd $(DSH_PLUGIN_SRC_DIR) && node --input-type=module -e "import('./dist/index.js').then((plugin) => { if (typeof plugin.apply !== 'function' || plugin.name !== 'anolisa-tokenless') process.exit(1) })"
+
 # Install binaries + adapter resources per FHS spec.
 install: build install-binaries install-helpers install-adapter-resources install-cosh-extension
 
@@ -159,7 +178,7 @@ install-helpers:
 	ln -sf $(LIBEXECDIR)/rtk $(DESTDIR)$(BINDIR)/rtk
 	ln -sf $(LIBEXECDIR)/toon $(DESTDIR)$(BINDIR)/toon
 
-install-adapter-resources: build-openclaw-plugin
+install-adapter-resources: build-openclaw-plugin build-dsh-plugin
 	@echo "==> Installing adapter resources to $(DESTDIR)$(SHARE_DIR)..."
 	rm -rf $(DESTDIR)$(SHARE_DIR)
 	install -d -m 0755 $(DESTDIR)$(SHARE_DIR)
@@ -172,6 +191,12 @@ install-adapter-resources: build-openclaw-plugin
 	find $(DESTDIR)$(SHARE_DIR) -type f \( -name '*.py' -o -name '*.sh' \) -exec chmod 0755 {} +
 	@test -f $(DESTDIR)$(SHARE_DIR)/openclaw/dist/index.js \
 	    || { echo "ERROR: $(DESTDIR)$(SHARE_DIR)/openclaw/dist/index.js missing after install-adapter-resources"; exit 1; }
+	@test -f $(DESTDIR)$(SHARE_DIR)/dsh/package.json \
+	    || { echo "ERROR: $(DESTDIR)$(SHARE_DIR)/dsh/package.json missing after install-adapter-resources"; exit 1; }
+	@test -f $(DESTDIR)$(SHARE_DIR)/dsh/cordis.patch.yml \
+	    || { echo "ERROR: $(DESTDIR)$(SHARE_DIR)/dsh/cordis.patch.yml missing after install-adapter-resources"; exit 1; }
+	@test -f $(DESTDIR)$(SHARE_DIR)/dsh/dist/index.js \
+	    || { echo "ERROR: $(DESTDIR)$(SHARE_DIR)/dsh/dist/index.js missing after install-adapter-resources"; exit 1; }
 
 install-cosh-extension:
 	@echo "==> Installing tokenless cosh extension to $(DESTDIR)$(COSH_EXTENSION_DIR)..."
@@ -191,7 +216,7 @@ uninstall:
 
 # Run tests
 test: test-tokenless test-hooks test-integration test-adapters \
-      test-raw-package test-npm-package
+      test-claude-code-detect test-raw-package test-npm-package
 
 test-tokenless:
 	@echo "==> Testing tokenless..."
@@ -203,18 +228,25 @@ test-hooks:
 	bash tests/test-tool-ready-readable-fixer.sh
 	bash tests/run-all-tests.sh
 
+test-claude-code-detect:
+	@echo "==> Testing claude-code detect.sh first-run retry..."
+	bash tests/test-claude-code-detect-retry.sh
+
 test-integration:
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_compress_response_hook.py
 	python3 tests/test_compress_schema_hook.py
 	python3 tests/test_hermes_plugin_import.py
 	python3 tests/test_agentscope_middleware.py
+	python3 tests/test_agentscope_v1.py
 	python3 tests/test_rewrite_hook.py
 	python3 tests/test_resolve_agent_id.py
 
-test-adapters: build-openclaw-plugin
+test-adapters: build-openclaw-plugin build-dsh-plugin
 	@echo "==> Testing openclaw RTK context propagation..."
 	node --test tests/test-openclaw-rtk-context.mjs
+	@echo "==> Testing native dsh adapter bundle..."
+	bash tests/test-dsh-adapter.sh
 	@echo "==> Testing qoder adapter installer..."
 	bash tests/test-qoder-adapter-install.sh
 	@echo "==> Testing deepseek-harness adapter installer..."
@@ -252,12 +284,12 @@ test-agentscope-integration: python-wheel agentscope-wheel
 # into the portable raw-package contract maintained by this component.
 package-raw:
 	@$(MAKE) -B stamp-adapter-templates
-	@$(MAKE) build-openclaw-plugin
+	@$(MAKE) build-openclaw-plugin build-dsh-plugin
 	@./packaging/raw/package.sh package
 
 stage-raw:
 	@$(MAKE) -B stamp-adapter-templates
-	@$(MAKE) build-openclaw-plugin
+	@$(MAKE) build-openclaw-plugin build-dsh-plugin
 	@./packaging/raw/package.sh stage
 
 test-raw-package:
@@ -391,7 +423,9 @@ claude-code-install:
 	@echo "==> Installing Claude Code plugin..."
 	@# detect.sh exits 1 (installable) or 2 (missing prereq); we tolerate both
 	@# and let install.sh make the final call (it gracefully no-ops without claude CLI).
-	@$(ADAPTER_ENV) ANOLISA_TARGET=claude-code bash $(CLAUDE_CODE_ADAPTER_DIR)/scripts/detect.sh || true
+	@# This pre-install probe runs on a steady-state machine and its output is
+	@# informational only, so skip detect.sh's first-run settling retries.
+	@$(ADAPTER_ENV) ANOLISA_TARGET=claude-code TOKENLESS_DETECT_RETRIES=0 bash $(CLAUDE_CODE_ADAPTER_DIR)/scripts/detect.sh || true
 	@$(ADAPTER_ENV) ANOLISA_TARGET=claude-code bash $(CLAUDE_CODE_ADAPTER_DIR)/scripts/install.sh
 
 claude-code-uninstall:

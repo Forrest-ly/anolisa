@@ -286,12 +286,84 @@ from conflating them:
 | Socket | Listener | Default path | Purpose |
 |---|---|---|---|
 | daemon socket | agent-sec-core daemon | `$XDG_RUNTIME_DIR/agent-sec-core/daemon.sock` (override with `AGENT_SEC_DAEMON_SOCKET`) | SkillFS points `--notify-socket` here to send change notifications |
-| control socket | SkillFS | `/run/user/<uid>/skillfs/control.sock` | The daemon queries `skill.resolveLiveSource` back through it and writes activation metadata |
+| control socket | SkillFS | `/run/user/<uid>/skillfs/control.sock` (override on the Ledger side with `AGENT_SEC_SKILLFS_CONTROL_SOCKET`) | The daemon queries `skill.resolveLiveSource` back through it and writes activation metadata |
 
-Do **not** customize the control socket path. The Ledger resolver client only
-probes the default path above; no configuration key makes it follow a path given
-to `--control-socket`, and changing it makes Ledger silently fall back to host
-mode. SkillFS and the daemon must also run under the same effective UID.
+The resolver chooses the control endpoint in this order: an explicit
+`socket_path` supplied by an embedding caller, `AGENT_SEC_SKILLFS_CONTROL_SOCKET`,
+then the per-effective-UID default above. The selected path must match the
+SkillFS control socket. A complete ACS deployment should run SkillFS and the
+daemon with the same numeric UID so the default endpoint and key ownership
+checks agree across containers.
+
+#### HMAC-Authenticated Joint Deployment
+
+The HMAC integration is optional for legacy deployments but should be enabled
+in both directions for a complete ACS deployment:
+
+| Variable | Reader | Purpose |
+|---|---|---|
+| `AGENT_SEC_SKILLFS_CONTROL_SOCKET` | Ledger resolver | Select the SkillFS control socket |
+| `AGENT_SEC_SKILLFS_CONTROL_AUTH_KEY_FILE` | Ledger resolver | Authenticate control requests and responses |
+| `AGENT_SEC_SKILLFS_NOTIFY_AUTH_KEY_FILE` | agent-sec-core daemon | Authenticate incoming SkillFS notifications |
+
+For example, provide these variables to the agent-sec-core daemon and any CLI
+process that resolves SkillFS paths, and configure SkillFS with the matching
+socket and key material:
+
+```bash
+export AGENT_SEC_SKILLFS_CONTROL_SOCKET="/run/user/$(id -u)/skillfs/control.sock"
+export AGENT_SEC_SKILLFS_CONTROL_AUTH_KEY_FILE="/run/agent-sec-keys/skillfs-control.key"
+export AGENT_SEC_SKILLFS_NOTIFY_AUTH_KEY_FILE="/run/agent-sec-keys/skillfs-notify.key"
+
+skillfs mount /path/to/skills /mnt/skillfs \
+  --security --activation-mode file \
+  --notify-socket "$XDG_RUNTIME_DIR/agent-sec-core/daemon.sock" \
+  --notify-auth-key-file "$AGENT_SEC_SKILLFS_NOTIFY_AUTH_KEY_FILE" \
+  --control-socket "$AGENT_SEC_SKILLFS_CONTROL_SOCKET" \
+  --trusted-peer-key-file "$AGENT_SEC_SKILLFS_CONTROL_AUTH_KEY_FILE"
+```
+
+The control and notify variables may point to the same key file, but separate
+direction-specific keys are recommended. The control key is loaded on the first
+resolve and cached for that resolver client's lifetime; it is not hot-reloaded.
+The daemon loads the notify key before binding its socket, so an invalid notify
+key prevents daemon startup.
+
+Each key file must satisfy all of these checks:
+
+- the configured path is absolute;
+- the target is a regular file, not a symlink, directory, FIFO, or device;
+- the file owner is the reader's effective UID;
+- no group or other permission bits are set (mode `0600` is recommended);
+- the unmodified file content is between 32 and 4096 bytes.
+
+Control resolution deliberately distinguishes legacy availability from an
+authenticated deployment requirement:
+
+| Control key | Socket `ENOENT` | Other connection, authentication, or protocol failures |
+|---|---|---|
+| Not configured | Fall back to the canonical host path | Fail with `skill_root_resolve_failed` |
+| Configured | Fail with `skill_root_resolve_failed` | Fail with `skill_root_resolve_failed` |
+
+An authenticated `managed=false` response remains a trusted uncovered result
+and uses the canonical host path. After a control key is configured, Ledger
+never retries the request as plaintext.
+
+Notify handling follows the same downgrade boundary:
+
+| Notify key | Behavior |
+|---|---|
+| Not configured | Legacy plaintext notify remains available; an authentication handshake is rejected |
+| Configured | `skill_ledger.skillfs_notify_change` must use HMAC; plaintext notify is rejected, while other daemon methods keep their existing plaintext protocol |
+
+For containerized ACS deployments, share the two Unix socket directories and
+the required key material between the corresponding containers. Use the same
+numeric UID and ensure each mounted key is owned by that UID. Kubernetes Secret
+volumes use symlink-based projections, which the key loader intentionally
+rejects. Copy each Secret into a private shared volume such as `emptyDir`, set
+the owner and mode there, and point the environment variables at the resulting
+regular, non-symlink files. Do not point them directly at the projected Secret
+paths.
 
 Under the Hermes layout the activation flow carries nested identities
 (`category/skill`) rather than flat skill names, and `skillId` keeps both

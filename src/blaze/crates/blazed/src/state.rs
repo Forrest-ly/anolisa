@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Daemon-wide shared state: configuration, policy engine, pool, hook registry,
+//! Daemon-wide shared state: configuration, policy engine, hook registry,
 //! and the in-memory instance map. All API handlers
 //! receive an [`Arc<ServerState>`] and acquire the relevant `Mutex<...>`
 //! lock just long enough to read or mutate the piece they need — locks
 //! are never held across `.await` boundaries.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+use std::collections::HashMap;
 
 use blaze_core::backend::BackendKind;
 use blaze_core::config::DaemonConfig;
 use blaze_core::kernel::HookRegistry;
+#[cfg(test)]
 use blaze_core::lifecycle::SandboxInstance;
 use blaze_core::policy::PolicyEngine;
-use blaze_core::pool::PoolManager;
 use blaze_core::storage::StorageProvider;
+#[cfg(test)]
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -31,8 +34,8 @@ use crate::state_store::StateStore;
 pub struct ServerState {
     pub config: Mutex<DaemonConfig>,
     pub policy: Mutex<PolicyEngine>,
-    pub pool: Arc<Mutex<PoolManager>>,
     pub hook: Mutex<HookRegistry>,
+    #[cfg(test)]
     pub instances: Arc<Mutex<HashMap<Uuid, SandboxInstance>>>,
     pub manager: Arc<SandboxManager>,
     /// The backend kind that `build_spawner` actually probed and selected.
@@ -40,6 +43,7 @@ pub struct ServerState {
     /// backend rather than reporting all configured binaries.
     pub active_backend: BackendKind,
     pub storage: Arc<dyn StorageProvider>,
+    #[cfg(test)]
     pub state_store: StateStore,
     pub metrics: Arc<Metrics>,
 }
@@ -50,7 +54,6 @@ impl ServerState {
     pub fn build_with_store(
         config: DaemonConfig,
         policy: PolicyEngine,
-        pool: PoolManager,
         hook: HookRegistry,
         spawners: SpawnerRegistry,
         active_backend: BackendKind,
@@ -61,7 +64,6 @@ impl ServerState {
         Self::assemble(
             config,
             policy,
-            pool,
             hook,
             spawners,
             active_backend,
@@ -76,7 +78,6 @@ impl ServerState {
     pub fn build(
         config: DaemonConfig,
         policy: PolicyEngine,
-        pool: PoolManager,
         hook: HookRegistry,
         spawners: SpawnerRegistry,
         active_backend: BackendKind,
@@ -97,7 +98,6 @@ impl ServerState {
         Self::assemble(
             config,
             policy,
-            pool,
             hook,
             spawners,
             active_backend,
@@ -111,7 +111,6 @@ impl ServerState {
     fn assemble(
         config: DaemonConfig,
         policy: PolicyEngine,
-        pool: PoolManager,
         hook: HookRegistry,
         spawners: SpawnerRegistry,
         active_backend: BackendKind,
@@ -122,7 +121,6 @@ impl ServerState {
         let instances = state_store.scan()?;
         let (manager, resources) = SandboxManager::new(SandboxManagerInit {
             instances,
-            pool,
             spawners,
             active_backend,
             storage: storage.clone(),
@@ -135,26 +133,22 @@ impl ServerState {
         Ok(Self {
             config: Mutex::new(config),
             policy: Mutex::new(policy),
-            pool: resources.pool,
             hook: Mutex::new(hook),
+            #[cfg(test)]
             instances: resources.instances,
             manager: Arc::new(manager),
             active_backend,
             storage,
+            #[cfg(test)]
             state_store,
             metrics: resources.metrics,
         })
-    }
-
-    /// Return the async operation lock that serializes one sandbox mutation.
-    pub fn operation_lock(&self, id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
-        self.manager.operation_lock(id)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use blaze_core::lifecycle::{BackendOwnership, SandboxState, StartPath};
+    use blaze_core::lifecycle::{BackendOwnership, SandboxState};
     use blaze_core::policy::WorkloadClass;
 
     use crate::file_provider::FileStorageProvider;
@@ -195,7 +189,6 @@ mod tests {
         ServerState::build_with_store(
             config,
             PolicyEngine::new(),
-            PoolManager::new(),
             HookRegistry::new(),
             spawners,
             BackendKind::Mock,
@@ -235,7 +228,6 @@ mod tests {
             BackendKind::Mock,
             WorkloadClass::AgentTool,
             "sha256:existing".into(),
-            StartPath::Cold,
             "default".into(),
         );
         existing
@@ -253,7 +245,6 @@ mod tests {
         let state = ServerState::build_with_store(
             config,
             PolicyEngine::new(),
-            PoolManager::new(),
             HookRegistry::new(),
             spawners,
             BackendKind::Mock,
@@ -274,7 +265,6 @@ mod tests {
             BackendKind::Mock,
             WorkloadClass::AgentTool,
             "sha256:new".into(),
-            StartPath::Cold,
             "default".into(),
         );
         state
@@ -318,7 +308,6 @@ mod tests {
             BackendKind::Mock,
             WorkloadClass::AgentTool,
             "sha256:terminal".into(),
-            StartPath::Cold,
             "default".into(),
         );
         stored

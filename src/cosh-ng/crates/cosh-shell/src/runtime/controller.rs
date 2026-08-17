@@ -69,7 +69,7 @@ fn render_raw_inline_events<W: Write>(
             ghost_route: std::mem::take(&mut inline_state.pending_input_ghost_route),
         });
     }
-    let shell_busy = shell_has_active_foreground_command(snapshot.events());
+    let shell_busy = inline_state.control.shell_busy();
     if let Some(action) =
         shell_handoff_timeout_recovery_action(inline_state, shell_busy, &mut terminal_output)?
     {
@@ -254,6 +254,12 @@ pub(crate) fn pending_card_capture(state: &InlineState) -> Option<RawInputCaptur
                 id: consultation.card_id.clone(),
             });
         }
+    }
+
+    // Hook-action disambiguation panel (#1629): when a hook id collides
+    // between shell and agent layers, capture input for the question panel.
+    if let Some(capture) = crate::slash::hooks::pending_hook_action_capture(state) {
+        return Some(capture);
     }
 
     if let Some(capture) = pending_question_capture(state) {

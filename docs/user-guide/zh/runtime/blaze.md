@@ -74,6 +74,12 @@ Blaze 会在绑定 Unix listener 或可选 TCP listener 之前完成清单校验
 ID。Blaze 会保留被拒绝的记录。修复或恢复该记录后，重新启动 service，并确认
 `/v1/health` 可以响应。
 
+## 沙箱 API
+
+Blaze 通过 `/v1/sandboxes` 提供沙箱生命周期和客户机操作。客户端使用该
+命名空间列出、创建、查看和删除沙箱，以及在沙箱内执行命令、读取文件和写入
+文件。销毁沙箱使用 `DELETE /v1/sandboxes/{id}`。
+
 ## 主机集成边界
 
 Blaze 负责配置 sandbox 本地的网络路径。主机以外的路由和 DNS 仍由主机运维方
@@ -81,18 +87,14 @@ Blaze 负责配置 sandbox 本地的网络路径。主机以外的路由和 DNS 
 环境中验证 guest 连通性。
 
 如需关闭该能力，将 `enable_network` 设置为 `false` 或删除该配置项，再通过
-正常的 instance API 销毁已经启用网络的 sandbox。
+沙箱 API 销毁已经启用网络的 sandbox。
 
 ## Guest 操作
 
 只有 sandbox 处于 `Running` 且 backend 报告兼容的 guest endpoint 时，
 才能执行 guest 操作。冷启动 backend 如果报告了该 endpoint，创建流程会在
 发布 `Running` 前等待 guest agent。没有 endpoint 的 backend（包括生产环境
-mock fallback）会跳过等待，guest 操作返回 HTTP 409。当前从 warm pool 激活
-实例时，manager 会先验证保留的 backend owner 和 storage，再发布 `Running`，
-但不会再次执行 guest readiness 探测。因此 warm 路径的 `Running` 不保证 guest
-endpoint 仍然可响应；第一次 guest 请求仍会执行有界连接，并可能返回 guest
-错误。调用方应对第一次请求采用下文说明的重试和结果判定规则。
+mock fallback）会跳过等待，guest 操作返回 HTTP 409。
 
 Guest 操作和 lifecycle 变更使用同一个 sandbox operation lock。取得锁后，
 manager 会再次检查 `Running`，避免并发 lifecycle 变更后请求仍访问旧 runtime。
@@ -103,7 +105,7 @@ Sandbox 路由包括：
 - `POST /v1/sandboxes/{id}/read` — 读取一个文件；
 - `POST /v1/sandboxes/{id}/write` — 替换一个文件。
 
-对应的 `/v1/instances/{id}/...` 路由提供相同行为。Exec 请求格式如下：
+Exec 请求格式如下：
 
 ```json
 {"cmd":"uname -a","cwd":"/","env":{"LANG":"C"},"timeout":10}
@@ -133,6 +135,49 @@ read 响应过大时返回 HTTP 502 和
 [issue #2223](https://github.com/alibaba/anolisa/issues/2223) 解决前，生产配置应
 保持 `listen.http_addr` 关闭。Daemon 停止时也不会等待全部 HTTP handler 或
 释放所有 runtime owner，因此正在执行的请求可能看到连接关闭。
+
+## 可复用实例管理
+
+四个 `/v1/pools` 管理接口同样返回 HTTP 501。`storage.pool_size` 和
+`storage.prefork` 始终会被拒绝；除历史软件包的精确默认值外，任何 `[pool]`
+配置段也会失败。软件包升级时，只会临时接受并忽略旧版守护进程配置和两份默认策略
+原样附带的 `[pool]` 默认值，同时记录警告。这项例外用于避免 RPM 通过
+`%config(noreplace)` 保留的管理员自定义文件阻止新版服务启动，并不会启用
+可复用实例。管理员应合并每个 `.rpmnew` 文件，或删除旧配置段；后续版本可能
+取消这项兼容。其他策略 `[pool]` 配置会导致策略加载失败。启动时，
+`policy.on_load_error = "fail"` 会让守护进程停止，`"warn"` 则会使用空策略集
+继续启动。通过管理接口或信号重新加载策略失败时，当前生效的策略保持不变。
+
+可以接受的 daemon `[pool]` 配置段必须恰好包含以下两个键值：
+
+```toml
+[pool]
+default_warm_ttl = "30m"
+gc_interval = "5m"
+```
+
+可以接受的策略配置必须恰好包含六个字段，并且属于以下两个软件包内置策略之一：
+
+| 策略名称 | 工作负载类型 | `min` | `target` | `max` |
+|---|---|---:|---:|---:|
+| `agent-rl-default` | `agent-rl` | 4 | 16 | 64 |
+| `agent-tool-default` | `agent-tool` | 2 | 8 | 32 |
+
+两行都要求 `enabled = true`、`warm_ttl = "30m"` 和
+`reset_mode = "full-recreate"`。缺少或增加字段、改变值或类型、策略名称或工作
+负载类型不同，或者出现任何其他 `[pool]` 配置，都会被拒绝。接受的兼容值会被
+忽略，序列化配置时也会省略。
+
+Blaze 仍可读取旧版本写入的 `Reset`、`Warm` 和 `start_path = "warm"` 持久化
+值。启动恢复会把包含这些值的未终止记录作为清理对象，且不会复用这些记录。
+清理失败时，内存记录会保留为 `RecoveryRequired`，并尝试持久化该状态。如果
+持久化也失败，启动警告会记录附加错误，磁盘上的记录可能仍是先前状态。其他已通过
+校验的记录仍会继续恢复。监控接口不再输出 `blaze_instances_resets_total`、
+`blaze_pool_hits_total` 和 `blaze_pool_misses_total`。
+
+这些兼容响应背后的生命周期约束记录在
+[生命周期状态一致性与兼容性设计](../../../../src/blaze/docs/design/lifecycle-state-consistency_zh.md)
+中。
 
 ## 存储制品同步
 

@@ -16,6 +16,7 @@ Python framework package that application developers install and register explic
 | Qoder | `qoder` | Hard-disabled | Emits rewritten shell input | Emits `additionalContext` | Attempted after response compression | — |
 | Claude Code | `claude-code` | Hard-disabled | Replaces Bash input | Replaces output on 2.1.121 or later; otherwise passes through | Used only when the replacement can remain text | — |
 | Codex | `codex` | Hard-disabled | Replaces supported shell input | Keeps the original and adds analysis or a compressed alternative | Used to build that alternative | — |
+| DeepSeek Harness | `dsh` | — | — | Replaces an accepted single-text JSON result when the replacement is smaller | — | — |
 | OpenCode | `opencode` | Hard-disabled | Replaces Bash input | Replaces tool output | Attempted after response compression | ✅ |
 | Qwen Code | `qwencode` | Hard-disabled | Emits rewritten shell input | Emits `additionalContext` | Attempted after response compression | ✅ |
 | DeepSeek Harness | `deepseek-harness` | Hard-disabled | Wired, fails open: the hook bridge does not honor `updatedInput` | Wired, fails open: the bridge lacks `updatedToolOutput`/`suppressOutput` | — | — |
@@ -26,8 +27,9 @@ Tool Ready remains registered by these adapters but is unconditionally hard-disa
 
 `additionalContext` is an additive hook field. The Tokenless source does not remove the original result on those paths; the final treatment also depends on the host implementation. A statistics record proves that a candidate became smaller, not that the host removed the original from its model request.
 
-OpenCode and DeepSeek Harness currently use the bundled lifecycle scripts documented below and are
-not registered with the `anolisa adapter enable` driver set in this release.
+OpenCode and the DeepSeek Harness hook-bridge adapter (`deepseek-harness`) currently use the
+bundled lifecycle scripts documented below and are not registered with the
+`anolisa adapter enable` driver set in this release.
 
 ## Adapter processing rules
 
@@ -42,6 +44,83 @@ The standalone `compress-response` defaults are not the defaults used by most ad
 The shared response hook, OpenClaw, and Hermes skip inputs shorter than 200 characters. Codex skips inputs shorter than 500 characters; it includes compressed content only for inputs of at least 4,000 characters and otherwise adds diagnostics or a summary. Skill-like text with YAML frontmatter is also skipped by the shared paths.
 
 Claude Code requires version 2.1.121 or later for `updatedToolOutput`. On older or unknown versions, response compression is disabled to avoid duplicating the original. Structured tool outputs preserve their host schema and do not switch to textual TOON; JSON carried as a string can use TOON when it is smaller.
+
+### DeepSeek Harness native processing
+
+The DSH bundle requires Node.js 22 or later and a compatible DSH profile. Pass
+all desired profile names in the same enable command, then start DSH with one
+of those names:
+
+```bash
+anolisa adapter enable tokenless dsh \
+  --profile web \
+  --profile headless
+dsh --profile web
+```
+
+`--profile` is required and repeatable. Each enable or re-enable treats its
+arguments as the complete desired profile set. It removes the bundle from any
+profile recorded by the prior receipt but omitted from the new command, so
+always include every profile that should retain Tokenless. ANOLISA records the
+selected profiles and their resolved DSH home in the adapter receipt, so later
+status, disable, and re-enable operations continue to address the same profile
+tree.
+
+The plugin runs on DSH's `tools/post-execute` waterfall. It attempts
+`tokenless compress-response` only for a successful result containing one text
+block whose text is a JSON object or array. It replaces the content only when
+the CLI returns valid JSON that is strictly shorter. Multiple blocks, images,
+plain text, invalid JSON, errored results, Code Mode child executions, and the
+default content-retrieval tools are not compressed. A missing, failing, or
+timed-out CLI also preserves the original content. This native path does not
+run the TOON second stage and has no pre-spawn minimum-size gate.
+
+Add an override for the installed row to
+`$DSH_HOME/profiles/<profile>/cordis.patch.yml`, then restart that DSH profile:
+
+```yaml
+- id: anolisa-tokenless
+  config:
+    responseCompressionEnabled: true
+    timeoutMs: 5000
+    maxBuffer: 4194304
+    noStash: false
+```
+
+Later DSH patch layers replace the row's complete `config` value. The plugin
+supplies defaults for omitted keys, so the override may contain only the keys
+that need to differ.
+
+| Option | Default | Behavior |
+|--------|---------|----------|
+| `responseCompressionEnabled` | `true` | Enables response compression. Setting it to `false` does not disable environment-error attribution. |
+| `tokenlessBin` | `$TOKENLESS_BIN`, then `tokenless` | Selects the Tokenless CLI executable. A non-empty plugin value takes precedence over the environment variable. |
+| `skipTools` | Content-retrieval set below | Skips compression for matching tool names. A configured array replaces the default set; an empty array skips none. Attribution remains active. |
+| `shellTools` | Shell/process set below | Selects shell thresholds and the tools whose structured `value` may be interpreted for failure attribution. A configured array replaces the default set. |
+| `truncateStringsAt` | Shell `65536`; other `1048576` | Overrides the maximum retained string length for every tool class. Only a positive integer is accepted. |
+| `truncateArraysAt` | Shell `128`; other `65536` | Overrides the maximum retained array length for every tool class. Only a positive integer is accepted. |
+| `maxDepth` | Shell `8`; other `32` | Overrides maximum JSON depth for every tool class. Only a positive integer is accepted. |
+| `timeoutMs` | `3000` | Bounds one Tokenless child process in milliseconds. Only a positive integer is accepted. |
+| `maxBuffer` | `2097152` | Bounds captured child-process output in bytes. Only a positive integer is accepted. |
+| `agentId` | `dsh` | Sets the `--agent-id` recorded by Tokenless statistics. |
+| `noStash` | `false` | Passes `--no-stash` when `true`; dropped array items are otherwise eligible for Stash storage. |
+
+The default `skipTools` set is `Read`, `read`, `read_file`, `read_many_files`,
+`Glob`, `glob`, `search_file`, `list_directory`, `list_dir`, `Grep`, `grep`,
+`grep_code`, `grep_search`, `search_files`, `Lsp`, `lsp`, `NotebookRead`,
+`notebook_read`, and `notebookread`.
+
+The default `shellTools` set is `Bash`, `bash`, `Shell`, `shell`, `exec`,
+`terminal`, `run_shell_command`, `run_in_terminal`, `get_terminal_output`,
+`execute_command`, and `process`.
+
+Raw DSH failures marked with `isError` may receive dependency, permission,
+path, network, or package attribution for any tool. Structured output is
+classified only for `shellTools`. Attribution is independent of compression,
+so it remains active when compression is disabled, skipped, or produces no
+smaller result. When a later waterfall listener replaces the canonical
+`value`, Tokenless classifies that replacement and does not carry attribution
+from the superseded result.
 
 ## Manage adapters with anolisa (recommended)
 
@@ -84,9 +163,19 @@ anolisa adapter enable tokenless qoder
 anolisa adapter enable tokenless claude-code
 anolisa adapter enable tokenless codex
 anolisa adapter enable tokenless qwencode
+anolisa adapter enable tokenless dsh \
+  --profile web \
+  --profile headless
 ```
 
-Enable only Agent products that you use. When enabling more than one, run and verify each command separately.
+Enable only Agent products that you use. Run and verify each product's command
+separately. For DSH, include every desired profile in its single enable
+command.
+
+DeepSeek Harness is profile-scoped and therefore requires at least one
+`--profile`. Each name must match one passed to `dsh --profile <profile>`; the
+generic command without a profile is rejected. A later enable or re-enable
+must repeat every profile that should remain registered.
 
 OpenCode and DeepSeek Harness use their bundled install scripts under
 [Manual integration after npm installation](#manual-integration-after-npm-installation).
@@ -198,6 +287,14 @@ The marketplace plugin takes effect after restarting Claude Code. The install sc
 
 The plugin loads in a new Codex session. Close the old session and start a new one before verifying statistics. Its PostToolUse hook is additive: use statistics as candidate-compression telemetry, not as proof that the original Codex tool output left the prompt.
 
+### DeepSeek Harness
+
+The native bundle loads when the selected DSH profile starts. After enabling
+or changing its profile patch, restart `dsh --profile <profile>`, run a tool
+that returns compressible JSON, and inspect `tokenless stats list`. Disable the
+adapter with `anolisa adapter disable tokenless dsh`; the receipt already
+records the profile names, so disable does not accept another `--profile`.
+
 ### OpenCode
 
 OpenCode discovers global local plugins at startup. Use the bundled Tokenless lifecycle script described above, restart OpenCode after installation or removal, then run a tool call and inspect `tokenless stats list`. The script resolves the configuration directory from `TOKENLESS_OPENCODE_CONFIG_DIR`, then `OPENCODE_CONFIG_DIR`, then `XDG_CONFIG_HOME/opencode`, and finally `~/.config/opencode`. Installation creates only `plugins/tokenless.js` as a managed symlink and refuses to replace an unrelated file at that path.
@@ -229,11 +326,18 @@ upgrading dsh.
 
 ## AgentScope framework integration
 
-The Python package supports `agentscope>=2.0.5,<2.1`. The native
-`anolisa-tokenless` runtime wheel and AgentScope integration wheel are not
-currently published to a Python package index. The currently supported
-installation path is to build and install both same-version wheels from a
-source checkout:
+The Python package supports AgentScope 1.0.11 through 1.0.x and AgentScope
+2.0.x. Choose the attachment point for the installed framework version:
+
+| AgentScope version | Supported entry point |
+|---|---|
+| 1.0.11 through 1.0.x | Direct Agent through `integration.install(agent)` |
+| 2.0.0 | Direct Agent construction with `integration.tools` and `integration.middlewares` |
+| 2.0.1 through 2.0.x | Direct Agent construction or App through `integration.app_options()` |
+
+The native `anolisa-tokenless` runtime wheel and AgentScope integration wheel
+are not currently published to a Python package index. Build and install both
+same-version wheels from a source checkout:
 
 ```bash
 make python-wheel agentscope-wheel
@@ -242,67 +346,71 @@ python -m pip install \
   target/wheels/anolisa_tokenless_agentscope-*.whl
 ```
 
-For a high-code Agent, register the same middleware instance with its Toolkit
-and Agent:
+Both major versions use `TokenlessAgentScope` and `TokenlessConfig`; only the
+final attachment step differs. In AgentScope 1.x, create the Agent and all tool
+functions before installing the integration. Tools registered afterward are
+not wrapped:
+
+```python
+from agentscope.agent import ReActAgent
+from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig
+
+integration = TokenlessAgentScope(
+    TokenlessConfig(
+        mode="balanced",
+        data_dir="/absolute/path/to/tenant-tokenless-data",
+    ),
+)
+agent = ReActAgent(..., toolkit=toolkit)
+integration.install(agent)
+```
+
+In AgentScope 2.x, pass the retrieval Tool and middleware when constructing the
+Toolkit and Agent. This works from 2.0.0 and does not depend on mutable Toolkit
+APIs introduced in later patch releases:
 
 ```python
 from agentscope.agent import Agent
 from agentscope.tool import Toolkit
-from tokenless_agentscope import TokenlessMiddleware
+from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig
 
-toolkit = Toolkit()
-middleware = TokenlessMiddleware(
-    mode="balanced",
-    data_dir="/absolute/path/to/tenant-tokenless-data",
-    min_chars=200,
+integration = TokenlessAgentScope(
+    TokenlessConfig(
+        mode="balanced",
+        data_dir="/absolute/path/to/tenant-tokenless-data",
+        # retrieve_tool_name="tenant_tokenless_retrieve",
+    ),
 )
-await middleware.register_tools(toolkit)
+toolkit = Toolkit(tools=[*application_tools, *integration.tools])
 
 agent = Agent(
     ...,
     toolkit=toolkit,
-    middlewares=[middleware],
+    middlewares=integration.middlewares,
 )
 ```
 
-AgentScope App accepts a per-request middleware factory. Its toolkit assembly
-calls `list_tools()` automatically, so do not also register the retrieval Tool:
+AgentScope App is supported from 2.0.1. `app_options()` derives an isolated
+Tokenless data directory for every user/agent/session below the configured
+absolute base directory:
 
 ```python
-from hashlib import sha256
-from pathlib import Path
-
 from agentscope.app import create_app
-from tokenless_agentscope import TokenlessMiddleware
+from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig
 
-tenant_root = Path("/srv/tokenless-tenants")
-
-async def tokenless_middlewares(user_id, agent_id, session_id):
-    del agent_id, session_id
-    tenant_key = sha256(user_id.encode("utf-8")).hexdigest()
-    return [TokenlessMiddleware(data_dir=tenant_root / tenant_key)]
-
-app = create_app(
-    ...,
-    extra_agent_middlewares=tokenless_middlewares,
+integration = TokenlessAgentScope(
+    TokenlessConfig(data_dir="/srv/tokenless-tenants"),
 )
+app = create_app(..., **integration.app_options())
 ```
 
-AgentScope resolves duplicate Tool names by keeping the last Tool, while
-`list_tools()` does not receive the other App tools. If the App already has a
-`tokenless_retrieve` Tool, or installs multiple Tokenless middleware instances,
-assign each Tokenless Tool a unique name:
-
-```python
-TokenlessMiddleware(
-    data_dir=tenant_root / tenant_key,
-    retrieve_tool_name="tenant_tokenless_retrieve",
-)
-```
-
-The middleware uses the configured name for `list_tools()`, high-code
-registration, and permanent compression exclusion. High-code
-`register_tools()` still rejects an existing Tool with that configured name.
+Set a unique `retrieve_tool_name` in `TokenlessConfig` if the application
+already defines `tokenless_retrieve`; App assembly does not expose other tools
+to its factory for a preflight collision check. AgentScope 2.0.0 does not
+provide App-level Agent middleware or Tool injection, so it supports direct
+Agent construction only. The existing `TokenlessMiddleware` 2.x API remains
+available for compatibility; new code should use `TokenlessAgentScope` to
+avoid patch-specific Toolkit mutation and automatic Tool collection behavior.
 
 Choose a mode according to how much inline truncation the application accepts:
 
@@ -312,22 +420,22 @@ Choose a mode according to how much inline truncation the application accepts:
 | `balanced` (default) | Skip | Shell: 65,536 / 128 / depth 8; others: conservative limits |
 | `aggressive` | Skip | CLI defaults: 4,096 / 32 / depth 8 |
 
-The middleware passes streaming chunks through unchanged. It only replaces a
+The integration passes intermediate streaming chunks through unchanged and only replaces a
 successful final `ToolResponse`, preserves response and block identifiers and
 metadata, and keeps the original whenever Tokenless fails or does not make the
 UTF-8 result strictly smaller. JSON objects and arrays remain JSON; ordinary
 text remains text. `DataBlock` values are never changed.
 
-The middleware also exposes a read-only, concurrency-safe retrieval Tool named
-`tokenless_retrieve` by default. It is auto-allowed only for an exact
-24-character hexadecimal hash whose `<<tokenless:HASH>>` marker is present in
-the current AgentScope context or summary. The Tool is permanently excluded
-from compression. This narrow permission still depends on storage isolation:
-pass a separate absolute `data_dir` for every user or tenant. If `data_dir` is
-omitted, `TOKENLESS_DATA_DIR` is only a process-wide fallback and must not be
-shared by multiple tenants. Retrieval does not work across nodes. Stash entries
-expire after the current fixed one-hour TTL, so the Agent should retrieve
-necessary content before that boundary.
+The integration also exposes a retrieval Tool named `tokenless_retrieve` by
+default. It returns content only for an exact 24-character hexadecimal hash
+whose `<<tokenless:HASH>>` marker is visible in AgentScope 1.x memory or the
+AgentScope 2.x context/summary. The Tool is permanently excluded from
+compression. This narrow permission still depends on storage isolation: pass a
+separate absolute `data_dir` for every user or tenant. If `data_dir` is omitted,
+`TOKENLESS_DATA_DIR` is only a process-wide fallback and must not be shared by
+multiple tenants. Retrieval does not work across nodes. Stash entries expire
+after the current fixed one-hour TTL, so the Agent should retrieve necessary
+content before that boundary.
 
 Compression and retrieval call the in-process `anolisa-tokenless` runtime from
 an async worker thread; the integration does not start a CLI process or grant Shell

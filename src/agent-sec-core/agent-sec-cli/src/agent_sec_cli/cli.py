@@ -36,7 +36,7 @@ try:
 
     __version__ = get_version("agent-sec-cli")
 except Exception:
-    __version__ = "0.10.0"  # pragma: no cover
+    __version__ = "0.10.1"  # pragma: no cover
 
 app = typer.Typer(
     name="agent-sec-cli",
@@ -532,6 +532,18 @@ def events(
             err=True,
         )
         # Don't reject — allow future categories, just warn
+
+    if last_hours is not None and last_hours < 0:
+        typer.echo("Error: --last-hours must be non-negative.", err=True)
+        raise typer.Exit(code=1)
+
+    if limit <= 0:
+        typer.echo("Error: --limit must be positive.", err=True)
+        raise typer.Exit(code=1)
+
+    if offset < 0:
+        typer.echo("Error: --offset must be non-negative.", err=True)
+        raise typer.Exit(code=1)
 
     if last_hours is not None and (since is not None or until is not None):
         typer.echo(

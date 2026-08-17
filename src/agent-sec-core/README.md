@@ -365,6 +365,29 @@ agent-sec-cli skill-ledger scan /path/to/skill
 agent-sec-cli skill-ledger status
 ```
 
+### SkillFS Peer Authentication
+
+Skill Ledger can authenticate both directions of its SkillFS integration with
+HMAC-SHA256. The agent-sec-core side uses these environment variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `AGENT_SEC_SKILLFS_CONTROL_SOCKET` | Override the SkillFS control socket queried by the Ledger resolver |
+| `AGENT_SEC_SKILLFS_CONTROL_AUTH_KEY_FILE` | Authenticate resolver requests and responses on the control socket |
+| `AGENT_SEC_SKILLFS_NOTIFY_AUTH_KEY_FILE` | Authenticate SkillFS change notifications received by the daemon |
+
+Without a control authentication key, a missing control socket (`ENOENT`) keeps
+the legacy host-path fallback. Once a control key is configured, a missing
+socket, connection failure, or authentication failure is fail-closed and never
+falls back to the host path or plaintext. Configuring the notify key similarly
+requires HMAC for `skill_ledger.skillfs_notify_change`; other daemon methods
+remain compatible with their existing plaintext protocol.
+
+Authentication key paths must be absolute and refer to regular, non-symlink
+files owned by the effective user, with no group or other permission bits. The
+raw key file must contain 32–4096 bytes. See the Skill Ledger user guide for the
+full two-key deployment and container volume requirements.
+
 The bundled Qoder CLI plugin registers a `PreToolUse` hook for the `Skill`
 tool. It resolves user Skills from `~/.qoder/skills/` before project Skills
 from `<cwd>/.qoder/skills/`, runs a read-only `skill-ledger check`, and applies the

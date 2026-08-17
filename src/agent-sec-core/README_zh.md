@@ -360,6 +360,26 @@ agent-sec-cli skill-ledger scan /path/to/skill
 agent-sec-cli skill-ledger status
 ```
 
+### SkillFS 对等认证
+
+Skill Ledger 可使用 HMAC-SHA256 认证 SkillFS 集成的两个通信方向。agent-sec-core
+侧使用以下环境变量：
+
+| 环境变量 | 用途 |
+|----------|------|
+| `AGENT_SEC_SKILLFS_CONTROL_SOCKET` | 覆盖 Ledger resolver 查询的 SkillFS control socket |
+| `AGENT_SEC_SKILLFS_CONTROL_AUTH_KEY_FILE` | 认证 control socket 上的 resolver 请求与响应 |
+| `AGENT_SEC_SKILLFS_NOTIFY_AUTH_KEY_FILE` | 认证 daemon 接收的 SkillFS 变更通知 |
+
+未配置 control 认证 key 时，control socket 不存在（`ENOENT`）仍保留 legacy host path
+回退。配置 control key 后，socket 缺失、连接失败或认证失败都会 fail-closed，不会回退到
+host path 或明文协议。配置 notify key 后，`skill_ledger.skillfs_notify_change` 同样必须使用
+HMAC；daemon 的其他 method 继续兼容现有明文协议。
+
+认证 key 路径必须是绝对路径，并指向 effective user 所有的普通非 symlink 文件，且不得
+设置任何 group/other 权限位。key 文件原始长度必须为 32–4096 bytes。完整的双 key 部署和
+容器卷要求见 Skill Ledger 用户手册。
+
 内置 Qoder CLI plugin 为 `Skill` tool 注册 `PreToolUse` hook。hook 先从
 `~/.qoder/skills/` 解析用户级 Skill，再从 `<cwd>/.qoder/skills/` 解析项目级
 Skill，随后执行只读的 `skill-ledger check`，并按

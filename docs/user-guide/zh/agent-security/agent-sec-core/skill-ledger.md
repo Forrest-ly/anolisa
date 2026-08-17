@@ -275,11 +275,73 @@ payload 只有 `canonicalSkillDir`、`skillId`、`eventKind` 和 `paths` 四个�
 | Socket | 谁监听 | 默认路径 | 用途 |
 |---|---|---|---|
 | daemon socket | agent-sec-core daemon | `$XDG_RUNTIME_DIR/agent-sec-core/daemon.sock`（`AGENT_SEC_DAEMON_SOCKET` 可覆盖） | SkillFS 用 `--notify-socket` 指向这里，发送变更通知 |
-| control socket | SkillFS | `/run/user/<uid>/skillfs/control.sock` | daemon 反向查询 `skill.resolveLiveSource`，并写 activation 元数据 |
+| control socket | SkillFS | `/run/user/<uid>/skillfs/control.sock`（Ledger 侧可用 `AGENT_SEC_SKILLFS_CONTROL_SOCKET` 覆盖） | daemon 反向查询 `skill.resolveLiveSource`，并写 activation 元数据 |
 
-control socket 的路径**不要自定义**。Ledger 的 resolver 客户端只探测上表中的默认路径，
-没有配置项可以让它跟随 `--control-socket` 指定的其他路径；改了之后 Ledger 会静默按
-host 模式处理。SkillFS 与 daemon 还必须运行在相同 effective UID 下。
+resolver 按以下顺序选择 control endpoint：embedding caller 显式传入的 `socket_path`、
+`AGENT_SEC_SKILLFS_CONTROL_SOCKET`、上表中的 per-effective-UID 默认路径。最终路径必须与
+SkillFS control socket 一致。完整 ACS 部署应让 SkillFS 与 daemon 使用相同 numeric UID，
+确保跨容器的默认 endpoint 和 key owner 校验一致。
+
+#### 使用 HMAC 的联合部署
+
+legacy 部署可不启用 HMAC；完整 ACS 部署应在两个方向同时启用：
+
+| 环境变量 | 读取方 | 用途 |
+|---|---|---|
+| `AGENT_SEC_SKILLFS_CONTROL_SOCKET` | Ledger resolver | 选择 SkillFS control socket |
+| `AGENT_SEC_SKILLFS_CONTROL_AUTH_KEY_FILE` | Ledger resolver | 认证 control 请求与响应 |
+| `AGENT_SEC_SKILLFS_NOTIFY_AUTH_KEY_FILE` | agent-sec-core daemon | 认证收到的 SkillFS 通知 |
+
+例如，将以下环境变量提供给 agent-sec-core daemon 以及需要解析 SkillFS path 的 CLI
+进程，并在 SkillFS 侧配置匹配的 socket 与 key 内容：
+
+```bash
+export AGENT_SEC_SKILLFS_CONTROL_SOCKET="/run/user/$(id -u)/skillfs/control.sock"
+export AGENT_SEC_SKILLFS_CONTROL_AUTH_KEY_FILE="/run/agent-sec-keys/skillfs-control.key"
+export AGENT_SEC_SKILLFS_NOTIFY_AUTH_KEY_FILE="/run/agent-sec-keys/skillfs-notify.key"
+
+skillfs mount /path/to/skills /mnt/skillfs \
+  --security --activation-mode file \
+  --notify-socket "$XDG_RUNTIME_DIR/agent-sec-core/daemon.sock" \
+  --notify-auth-key-file "$AGENT_SEC_SKILLFS_NOTIFY_AUTH_KEY_FILE" \
+  --control-socket "$AGENT_SEC_SKILLFS_CONTROL_SOCKET" \
+  --trusted-peer-key-file "$AGENT_SEC_SKILLFS_CONTROL_AUTH_KEY_FILE"
+```
+
+control 与 notify 环境变量可以指向同一个 key 文件，但推荐为两个方向使用独立 key。
+control key 在第一次 resolve 时加载，并缓存到该 resolver client 生命周期结束；不支持
+热更新。daemon 在 bind socket 前加载 notify key，因此非法 notify key 会阻止 daemon 启动。
+
+每个 key 文件都必须通过以下校验：
+
+- 配置路径是绝对路径；
+- 目标是普通文件，而不是 symlink、目录、FIFO 或 device；
+- 文件 owner 是读取进程的 effective UID；
+- 不设置任何 group/other 权限位（推荐 mode `0600`）；
+- 未经修改的文件内容长度为 32–4096 bytes。
+
+control resolver 会明确区分 legacy 可用性回退和已认证部署要求：
+
+| Control key | Socket `ENOENT` | 其他连接、认证或协议错误 |
+|---|---|---|
+| 未配置 | 回退到 canonical host path | 返回 `skill_root_resolve_failed` |
+| 已配置 | 返回 `skill_root_resolve_failed` | 返回 `skill_root_resolve_failed` |
+
+通过认证的 `managed=false` 仍是可信的未覆盖结果，会使用 canonical host path。配置 control
+key 后，Ledger 不会再以明文重试请求。
+
+notify 处理遵循相同的防降级边界：
+
+| Notify key | 行为 |
+|---|---|
+| 未配置 | 保留 legacy 明文 notify；收到认证握手时拒绝 |
+| 已配置 | `skill_ledger.skillfs_notify_change` 必须使用 HMAC；拒绝明文 notify，daemon 其他 method 继续使用现有明文协议 |
+
+容器化 ACS 部署需要在对应容器间共享两个 Unix socket 目录和所需 key 内容。各进程使用
+相同 numeric UID，并确保挂载后的 key 由该 UID 所有。Kubernetes Secret volume 使用基于
+symlink 的 projection，key loader 会有意拒绝这种路径。应将各 Secret 复制到 `emptyDir`
+等私有共享卷，在那里设置 owner 和 mode，再让环境变量指向生成的普通非 symlink 文件；
+不要直接指向 projected Secret 路径。
 
 Hermes 布局下 activation 流程携带的是嵌套身份（`category/skill`），而非扁平 skill 名；
 `skillId` 会保留两个分量。
