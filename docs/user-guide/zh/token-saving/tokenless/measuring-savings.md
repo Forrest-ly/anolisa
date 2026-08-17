@@ -218,7 +218,7 @@ Tokenless 的压缩率取决于 Payload 中可精简成分的多少，不同场�
 | 函数调用 Schema（长描述），单路 Schema 压缩 | 约 47% | 描述截断，移除 `title`/`examples` 与代码块 |
 | 混合负载（响应 + Schema）：仅响应压缩 | 约 62% | 响应是主要收益来源 |
 | 混合负载：Schema + 响应压缩叠加 | 约 65% | 两类 Payload 同时精简 |
-| 混合负载：全栈叠加（Schema + 响应 + TOON） | 约 63% | 响应压缩后再叠加 TOON 收益空间很小 |
+| 混合负载：全栈叠加（Schema + 响应 + TOON，部署门控） | 约 65% | 部署路径的 `compress-toon` 尺寸保护会在 TOON 不能减少估算 Token 时保留原输入；本负载下响应/Schema 压缩后再做 TOON 反而膨胀，因此部署后的节省率与上一行叠加结果相同。基准报告中未加门控的 `full_stack` 组合测得约 63%，但部署路径不会输出该结果 |
 | 仅 TOON 编码 | 约 16% | 表格化、规整的 JSON 才有明显收益 |
 
 按场景归纳：
@@ -232,7 +232,7 @@ Tokenless 的压缩率取决于 Payload 中可精简成分的多少，不同场�
 
 ## 标准测试负载
 
-仓库内置了确定性的标准测试负载，位于 `src/tokenless/benchmark/l1-compressor`（独立 Cargo workspace，仅支持 Linux）。负载由 `python/gen_fixtures.py` 生成，不含随机数，字节级可复现，并已提交在仓库中：
+仓库内置了确定性的标准测试负载，位于 `src/tokenless/benchmark/l1-compressor`（独立 Cargo workspace；仅支持 Linux，不支持 macOS/Windows）。负载由 `python/gen_fixtures.py` 生成，不含随机数，字节级可复现，并已提交在仓库中：
 
 | 负载文件 | 内容 |
 |----------|------|
@@ -244,7 +244,8 @@ Tokenless 的压缩率取决于 Payload 中可精简成分的多少，不同场�
 
 ```bash
 cd src/tokenless/benchmark/l1-compressor
-cargo run --release --bin compression_rate        # 加 --json 输出机器可读格式
+cargo run --release --bin compression_rate            # 人类可读报告
+cargo run --release --bin compression_rate -- --json  # 机器可读 JSON；二进制参数必须放在 `--` 之后
 ```
 
 运行完整质量/对抗测试 + 压缩率报告（跳过 criterion 性能基准，耗时数分钟）：
