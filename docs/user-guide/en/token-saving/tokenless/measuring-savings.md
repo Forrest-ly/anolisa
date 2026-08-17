@@ -80,6 +80,9 @@ Tokenless always expresses a saving rate as “saved tokens as a share of the or
 | `chars_saved_percent` | `stats summary --json` | (before_chars − after_chars) ÷ before_chars × 100% | Character-level compression rate for payloads handled by Tokenless |
 | `tokens_saved_percent` | `stats summary --json` | (before_tokens − after_tokens) ÷ before_tokens × 100% | Token-level compression rate for payloads handled by Tokenless |
 | `saved_percent` | `stats summary --compare --json` | (baseline_tokens − tokenless_tokens) ÷ baseline_tokens × 100% | Saving rate of the compression-on run in a dry-run comparison |
+| `saved_percent` | `stats diff --json` (every chain and stage) | (before_tokens − after_tokens) ÷ before_tokens × 100% | Saving rate of one chain or stage in a diff report; computed from that object's own `before_tokens` and `after_tokens`, not the run totals used by `--compare` |
+
+`saved_percent` appears in two schemas with the same formula but different scopes: the `--compare` value is computed from the two runs' totals (`baseline_tokens` and `tokenless_tokens`), while `stats diff --json` reports one `saved_percent` for every chain and every stage, each computed from that object's own `before_tokens` and `after_tokens`.
 
 `Saved: N tokens (X%)` in the text output corresponds to `tokens_saved_percent`: the denominator is the sum of `before_tokens` over the same records — the original, uncompressed size — not the session's total consumption and not any provider-side cache metric. In other words, Tokenless saving rates follow exactly the “saved tokens ÷ original uncompressed tokens” definition: the numerator is `before − after` (the tokens actually saved) and the denominator is `before` (the original uncompressed tokens).
 

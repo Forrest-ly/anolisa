@@ -80,6 +80,9 @@ Tokenless 统一把“节省率”表达为“节省 Token 数占原始未压缩
 | `chars_saved_percent` | `stats summary --json` | (before_chars − after_chars) ÷ before_chars × 100% | Tokenless 经手 Payload 的字符级压缩率 |
 | `tokens_saved_percent` | `stats summary --json` | (before_tokens − after_tokens) ÷ before_tokens × 100% | Tokenless 经手 Payload 的 Token 级压缩率 |
 | `saved_percent` | `stats summary --compare --json` | (baseline_tokens − tokenless_tokens) ÷ baseline_tokens × 100% | 双跑对比中“开启压缩”一侧的节省率 |
+| `saved_percent` | `stats diff --json`（每个 chain 和 stage） | (before_tokens − after_tokens) ÷ before_tokens × 100% | Diff 报告中单个 chain 或 stage 的节省率；使用该对象自身的 `before_tokens`、`after_tokens` 计算，而非 `--compare` 的运行级总量 |
+
+`saved_percent` 在两种输出中公式相同、口径不同：`--compare` 的值按两次运行的总量（`baseline_tokens` 与 `tokenless_tokens`）计算；`stats diff --json` 则为每个 chain 和每个 stage 各输出一个 `saved_percent`，均按该对象自身的 `before_tokens`、`after_tokens` 计算。
 
 文本输出中的 `Saved: N tokens (X%)` 对应 `tokens_saved_percent`：分母是同一批记录的 `before_tokens` 之和，即原始未压缩大小，既不是会话总消耗，也不是任何提供商侧缓存指标。也就是说，Tokenless 的节省率就是“节省 Token 数占原始未压缩总 Token 数的比例”这一定义：分子是 `before − after`（实际节省的 Token），分母是 `before`（原始未压缩 Token）。
 
