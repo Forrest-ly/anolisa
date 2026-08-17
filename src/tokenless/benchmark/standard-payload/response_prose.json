@@ -1,0 +1,33 @@
+{
+  "source": "web_search",
+  "query": "capacity planning best practices",
+  "total_results": 3,
+  "results": [
+    {
+      "title": "Capacity Planning Basics for Agent Platforms",
+      "url": "https://example.com/articles/capacity-planning-basics",
+      "published_at": "2026-03-18",
+      "summary": "A practical introduction to capacity planning for platforms that serve agent workloads, covering workload characterization, headroom policy and percentile-based latency budgets.",
+      "content": "Capacity planning starts with characterizing the workload. For agent platforms this means measuring not only request rates but also the shape of each session: how many tool calls a typical session makes, how large the tool responses are, and how long sessions stay active. Two platforms with identical requests-per-second can differ by an order of magnitude in token throughput if their session shapes differ.\n\nOnce the workload is characterized, define a headroom policy. A common starting point is to provision for the 95th percentile day plus thirty percent spare capacity, then adjust after observing at least two full weekly cycles. Headroom is cheapest when bought before the traffic arrives; emergency capacity during an incident always costs more in both money and reliability.\n\nFinally, track latency budgets by percentile rather than by average. Average latency hides the long sessions that matter most, because agent sessions are heavy-tailed: a small number of sessions consume most of the tokens. Budgeting against the 90th or 95th percentile keeps the system sized for the sessions users actually notice.",
+      "highlights": []
+    },
+    {
+      "title": "Observability for Batch Pipelines",
+      "url": "https://example.com/articles/batch-pipeline-observability",
+      "published_at": "2026-05-02",
+      "summary": "How to instrument batch pipelines so failures are attributable to a single stage, with guidance on metrics, structured logs and trace propagation across queued work.",
+      "content": "Batch pipelines fail differently from request-driven services. A web service either answers or times out, but a batch pipeline can silently drop work, duplicate work, or fall behind without any visible error. Observability for batch systems therefore starts with accounting: every unit of work that enters the pipeline must be traceable to exactly one terminal state, either completed, failed or expired.\n\nStructured logs are the backbone of that accounting. Each stage should emit one structured record per unit of work, carrying a stable work identifier, the stage name, and the outcome. Free-form logging makes it impossible to answer the simplest operational question, which is how many units are currently stuck between two stages.\n\nTraces add the time dimension. Propagating a trace identifier through queue metadata lets operators see how long a unit of work waited in each queue, which is usually where batch latency actually goes. The metric to alert on is end-to-end age of the oldest incomplete unit, not the duration of individual stages.",
+      "highlights": []
+    },
+    {
+      "title": "Load Testing Strategies That Predict Production",
+      "url": "https://example.com/articles/load-testing-strategies",
+      "published_at": "2026-06-21",
+      "summary": "Why constant-rate load tests mislead, and how ramp profiles, soak tests and saturation-point measurement produce numbers that actually predict production behavior.",
+      "content": "A constant-rate load test answers one question: does the system survive this exact rate? Production traffic never looks like that. Real traffic ramps, spikes, and recovers, and most production failures happen on the ramp rather than at steady state. A useful load test therefore includes a ramp profile that exceeds the fastest growth observed in production, so the test exposes queue buildup and cache warm-up behavior before users do.\n\nSoak tests answer a different question: does the system leak? Memory leaks, connection pool exhaustion and file descriptor growth only show up after hours of steady operation. Running the representative workload at seventy percent of the target rate for at least eight hours, while watching resource counters, catches most of these defects.\n\nThe most valuable number a load test produces is the saturation point: the rate at which latency stops scaling linearly and starts climbing sharply. Measure it by increasing the rate in steps and recording the 95th percentile latency at each step. The saturation point, not the failure point, is what capacity plans should be built on.",
+      "highlights": []
+    }
+  ],
+  "next_cursor": null,
+  "suggestions": []
+}

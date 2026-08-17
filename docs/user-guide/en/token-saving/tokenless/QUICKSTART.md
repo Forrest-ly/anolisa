@@ -165,5 +165,6 @@ standalone CLI from source, see
 - [User manual](user-manual.md): behavior boundaries and documentation map
 - [CLI reference](cli-reference.md): all subcommands and options
 - [Measuring savings](measuring-savings.md): statistics, dual runs, and AgentSight/SLS
+- [Compression rates and applicable scenarios](compression-scenarios.md): expected rates per scenario and the standard test payloads
 - [Configuration and data privacy](configuration-and-privacy.md): toggles, storage, and sensitive data
 - [Troubleshooting](troubleshooting.md): common errors, upgrades, and uninstall

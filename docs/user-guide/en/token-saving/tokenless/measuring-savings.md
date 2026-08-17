@@ -173,6 +173,8 @@ Estimated overall saving rate
 
 For example, a 60% payload compression rate with tool payloads representing 20% of the session gives an estimated overall saving of about 12%. This is still not a provider billing guarantee.
 
+For expected rates per scenario and the standard test payloads used to verify them locally, see [Compression rates and applicable scenarios](compression-scenarios.md).
+
 ## Local AgentSight display
 
 AgentSight's Token savings view can aggregate `~/.tokenless/stats.db` read-only. When both run as the same user and AgentSight can access that database, SLS is not required to display local Tokenless statistics.

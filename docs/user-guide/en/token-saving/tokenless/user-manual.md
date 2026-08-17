@@ -168,6 +168,7 @@ Command rewriting also changes the shell command submitted by the host. Most ada
 | Connect an Agent product or integrate AgentScope | [Agent and framework integration](framework-integration.md) |
 | Compress, retrieve, or run MCP manually | [CLI reference](cli-reference.md) |
 | Inspect savings or content changes, or run a dual comparison | [Measuring savings](measuring-savings.md) |
+| Understand compression-rate scenarios or verify with standard payloads | [Compression rates and applicable scenarios](compression-scenarios.md) |
 | Change settings or understand local data | [Configuration and data privacy](configuration-and-privacy.md) |
 | Fix missing statistics, adapter, or Stash issues | [Troubleshooting](troubleshooting.md) |
 | Upgrade or uninstall | [Troubleshooting · Upgrade and uninstall](troubleshooting.md#upgrade-and-uninstall) |

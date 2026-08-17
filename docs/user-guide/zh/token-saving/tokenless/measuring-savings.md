@@ -173,6 +173,8 @@ tokenless stats summary \
 
 例如，Payload 压缩率为 60%，但工具 Payload 只占会话总 Token 的 20%，则总体估算收益约为 12%。这个结果仍不是提供商账单保证值。
 
+不同场景下的预期压缩率，以及用于本地验证的标准测试负载，见[压缩率与适用场景](compression-scenarios.md)。
+
 ## AgentSight 本地展示
 
 AgentSight 的 Token savings 页面可以只读聚合 `~/.tokenless/stats.db`。两者由同一用户运行，且 AgentSight 能访问该数据库时，不需要通过 SLS 才能看到本地 Tokenless 统计。

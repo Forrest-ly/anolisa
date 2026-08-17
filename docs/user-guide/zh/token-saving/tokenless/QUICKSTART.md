@@ -158,5 +158,6 @@ tokenless stats list --limit 1
 - [用户手册](user-manual.md)：能力边界和文档导航
 - [CLI 参考](cli-reference.md)：全部子命令和参数
 - [效果度量](measuring-savings.md)：统计、双跑对比和 AgentSight/SLS
+- [压缩率与适用场景](compression-scenarios.md)：各场景预期压缩率与标准测试负载
 - [配置与数据隐私](configuration-and-privacy.md)：开关、存储和敏感数据
 - [故障排查](troubleshooting.md)：常见错误、升级和卸载

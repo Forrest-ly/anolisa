@@ -26,6 +26,11 @@ Each subdirectory is a standalone workspace (its own `Cargo.toml` with an empty
 `[workspace]` table) kept out of the main tokenless workspace on purpose — see
 the per-workspace `README.md` files for build/run instructions and methodology.
 
+In addition to the two benchmark layers, [`standard-payload/`](standard-payload)
+holds the deterministic user-facing payloads behind the user-guide page
+"Compression rates and applicable scenarios" — see its own `README.md` for the
+check script and stability policy.
+
 Each layer also keeps its results in its own `reports/` directory
 (`l1-compressor/reports/`, `l2-module/reports/`) so the two layers' numbers
 never mix. Both directories are gitignored: benchmark reports are

@@ -1,0 +1,232 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "search_codebase",
+      "description": "Search the entire codebase for symbols, definitions and free-text matches. Use this tool first whenever you need to locate where a function, class or configuration key is defined or referenced. The search index covers all committed files and is refreshed at the start of every session.\n\nResults are ranked by relevance and include the file path, line range and a short snippet for every match. Prefer a narrow `query` over a broad one: queries with more than three words rarely improve recall and make the result set harder to read.\n\n```python\n# Example: find every caller of the retry helper\nsearch_codebase(query=\"with_retry\", file_pattern=\"*.py\")\n```\n\nDo not use this tool for files that were created after the session started; they are not indexed yet. Read such files directly with `read_file` instead.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "The search expression. Supports plain text, symbol names and simple regular expressions. Keep it short and specific; the engine returns at most 50 matches ranked by relevance."
+          },
+          "file_pattern": {
+            "type": "string",
+            "description": "Optional glob that restricts the search to matching paths, for example `src/**/*.rs` or `*.test.ts`. When omitted every indexed file is searched."
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Maximum number of matches to return, between 1 and 50. Defaults to 20.",
+            "minimum": 1,
+            "maximum": 50
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "examples": [
+          {
+            "query": "parse_config",
+            "file_pattern": "src/**/*.rs"
+          },
+          {
+            "query": "TODO(.*timeout)",
+            "max_results": 10
+          }
+        ]
+      },
+      "title": "Codebase Search Tool"
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "description": "Read the content of a single file from the workspace. The tool returns the file as text together with its size and last modification time. Binary files are rejected with an explicit error instead of being returned.\n\nFor large files prefer a line range over reading the whole file; responses above the context budget are truncated and annotated. When you only need to know whether a symbol exists, use `search_codebase` first and read exactly the matching range afterwards.\n\n```\nread_file(path=\"src/server/router.rs\", start_line=120, end_line=180)\n```",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative path of the file to read. Symbolic links are resolved."
+          },
+          "start_line": {
+            "type": "integer",
+            "description": "First line to read, 1-based. Optional; defaults to the first line."
+          },
+          "end_line": {
+            "type": "integer",
+            "description": "Last line to read, inclusive. Optional; defaults to the last line."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "title": "File Reader"
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_shell_command",
+      "description": "Run a shell command inside the workspace sandbox and return its combined standard output and standard error. The command runs with a configurable timeout and is killed when the timeout is exceeded.\n\nUse this tool for builds, tests, linters and version-control commands. Commands that require network access must be declared in the session manifest, otherwise they fail with a permission error.\n\n```bash\n# Example: run the unit tests for one crate\ncargo test -p tokenless-stats\n```\n\nNever run destructive commands (force push, recursive delete of shared directories) through this tool without an explicit user confirmation.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The shell command line to execute. It is passed to `bash -c` unchanged."
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "description": "Kill the command after this many seconds. Defaults to 120, maximum 1800.",
+            "default": 120
+          },
+          "working_directory": {
+            "type": "string",
+            "description": "Optional workspace-relative directory the command starts in."
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "examples": [
+          {
+            "command": "cargo fmt --check",
+            "timeout_seconds": 60
+          }
+        ]
+      },
+      "title": "Shell Command Runner"
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_directory",
+      "description": "List the entries of a directory in the workspace. Each entry includes its name, type (file or directory), size in bytes and last modification time. Hidden entries are included only when requested.\n\nThe result is sorted alphabetically. Use `recursive` with care: deep trees produce very large responses and are truncated beyond 5000 entries.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative path of the directory to list."
+          },
+          "recursive": {
+            "type": "boolean",
+            "description": "When true, list the whole subtree instead of a single level.",
+            "default": false
+          },
+          "include_hidden": {
+            "type": "boolean",
+            "description": "When true, include entries whose name starts with a dot.",
+            "default": false
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "title": "Directory Lister"
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_merge_request",
+      "description": "Create a merge request from the current branch to a target branch. The tool pushes the branch if it has not been pushed yet, fills in the title and description, and returns the merge request number and URL.\n\nThe description supports Markdown. Keep the title under 80 characters and start it with a conventional-commit type such as `feat:` or `fix:` so the release tooling can classify the change automatically.\n\n```\ncreate_merge_request(\n    title=\"fix(stats): record dry-run predictions\",\n    description=\"Dry-run records were dropped from the summary.\",\n    target_branch=\"main\",\n    labels=[\"tokenless\", \"bug\"],\n)\n```",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "One-line summary of the change, under 80 characters.",
+            "maxLength": 80
+          },
+          "description": {
+            "type": "string",
+            "description": "Markdown body explaining motivation, approach and testing."
+          },
+          "target_branch": {
+            "type": "string",
+            "description": "Branch the change should merge into. Defaults to `main`.",
+            "default": "main"
+          },
+          "labels": {
+            "type": "array",
+            "description": "Optional labels to attach. Unknown labels are created on demand.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "reviewers": {
+            "type": "array",
+            "description": "Optional list of reviewer usernames.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "draft": {
+            "type": "boolean",
+            "description": "Create the merge request as a draft that cannot be merged.",
+            "default": false
+          }
+        },
+        "required": [
+          "title",
+          "description"
+        ]
+      },
+      "title": "Merge Request Creator"
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "query_database",
+      "description": "Run a read-only SQL query against the analytics replica and return the rows as JSON. Write statements are rejected before execution. Queries that return more than 1000 rows are truncated and flagged so downstream consumers can detect the limit.\n\nPrefer explicit column lists over `SELECT *` and always include a `LIMIT` clause; the replica enforces a 30 second statement timeout.\n\n```sql\nSELECT day, active_users, p95_latency_ms\nFROM service_health_daily\nWHERE day >= current_date - interval '7 days'\nORDER BY day DESC;\n```",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "sql": {
+            "type": "string",
+            "description": "The read-only SQL statement to execute on the analytics replica."
+          },
+          "database": {
+            "type": "string",
+            "description": "Logical database name. One of `analytics`, `billing_readonly`, `events`.",
+            "enum": [
+              "analytics",
+              "billing_readonly",
+              "events"
+            ]
+          },
+          "parameters": {
+            "type": "object",
+            "description": "Optional named parameters bound into the statement, which avoids quoting issues and injection risk.",
+            "additionalProperties": {
+              "type": [
+                "string",
+                "number",
+                "boolean"
+              ]
+            }
+          }
+        },
+        "required": [
+          "sql",
+          "database"
+        ],
+        "examples": [
+          {
+            "sql": "SELECT 1",
+            "database": "analytics"
+          }
+        ]
+      },
+      "title": "Analytics Database Query"
+    }
+  }
+]

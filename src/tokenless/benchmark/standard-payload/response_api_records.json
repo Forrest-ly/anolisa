@@ -1,0 +1,1302 @@
+{
+  "status": "success",
+  "request_id": "req-20260801-000123",
+  "took_ms": 187,
+  "page": 1,
+  "page_size": 48,
+  "total": 1234,
+  "debug": {
+    "cache_hit": false,
+    "shards_scanned": 16,
+    "query_plan": "index_scan on instances_by_region",
+    "internal_notes": "planner fallback disabled"
+  },
+  "trace": [
+    {
+      "span_id": "span-1000",
+      "name": "auth.check",
+      "duration_ms": 4,
+      "attributes": {
+        "shard": 0,
+        "attempt": 1
+      }
+    },
+    {
+      "span_id": "span-1001",
+      "name": "quota.check",
+      "duration_ms": 7,
+      "attributes": {
+        "shard": 1,
+        "attempt": 1
+      }
+    },
+    {
+      "span_id": "span-1002",
+      "name": "planner.plan",
+      "duration_ms": 10,
+      "attributes": {
+        "shard": 2,
+        "attempt": 1
+      }
+    },
+    {
+      "span_id": "span-1003",
+      "name": "index.open",
+      "duration_ms": 13,
+      "attributes": {
+        "shard": 3,
+        "attempt": 1
+      }
+    },
+    {
+      "span_id": "span-1004",
+      "name": "index.scan",
+      "duration_ms": 16,
+      "attributes": {
+        "shard": 4,
+        "attempt": 1
+      }
+    },
+    {
+      "span_id": "span-1005",
+      "name": "index.scan",
+      "duration_ms": 19,
+      "attributes": {
+        "shard": 5,
+        "attempt": 1
+      }
+    },
+    {
+      "span_id": "span-1006",
+      "name": "rows.decode",
+      "duration_ms": 22,
+      "attributes": {
+        "shard": 6,
+        "attempt": 1
+      }
+    },
+    {
+      "span_id": "span-1007",
+      "name": "response.encode",
+      "duration_ms": 25,
+      "attributes": {
+        "shard": 7,
+        "attempt": 1
+      }
+    }
+  ],
+  "logs": [
+    "2026-08-01T00:00:00Z INFO stage=auth ok",
+    "2026-08-01T00:00:01Z INFO stage=quota ok",
+    "2026-08-01T00:00:02Z INFO stage=planner ok",
+    "2026-08-01T00:00:03Z INFO stage=index ok",
+    "2026-08-01T00:00:04Z INFO stage=scan ok",
+    "2026-08-01T00:00:05Z INFO stage=decode ok",
+    "2026-08-01T00:00:06Z INFO stage=encode ok",
+    "2026-08-01T00:00:07Z INFO stage=respond ok",
+    "2026-08-01T00:00:08Z INFO stage=metrics ok",
+    "2026-08-01T00:00:09Z INFO stage=cleanup ok"
+  ],
+  "records": [
+    {
+      "id": "i-20260000",
+      "name": "worker-node-000",
+      "region": "cn-hangzhou",
+      "zone": "cn-hangzhou-a",
+      "status": "active",
+      "cpu_percent": 12.5,
+      "memory_mb": 1024,
+      "disk_mb": 20480,
+      "ip_address": "192.0.2.10",
+      "created_at": "2026-07-01T00:15:00Z",
+      "updated_at": "2026-08-01T00:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1000"
+      },
+      "description": "Batch worker node 000 scheduled by the capacity planner; runs nightly extraction jobs for shard 0.",
+      "last_error": "heartbeat timeout after 3 retries",
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260001",
+      "name": "worker-node-001",
+      "region": "cn-shanghai",
+      "zone": "cn-shanghai-b",
+      "status": "active",
+      "cpu_percent": 19.5,
+      "memory_mb": 1280,
+      "disk_mb": 20992,
+      "ip_address": "192.0.2.11",
+      "created_at": "2026-07-02T01:15:00Z",
+      "updated_at": "2026-08-02T01:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1001"
+      },
+      "description": "Batch worker node 001 scheduled by the capacity planner; runs nightly extraction jobs for shard 1.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260002",
+      "name": "worker-node-002",
+      "region": "us-west-1",
+      "zone": "us-west-1-c",
+      "status": "active",
+      "cpu_percent": 26.5,
+      "memory_mb": 1536,
+      "disk_mb": 21504,
+      "ip_address": "192.0.2.12",
+      "created_at": "2026-07-03T02:15:00Z",
+      "updated_at": "2026-08-03T02:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1002"
+      },
+      "description": "Batch worker node 002 scheduled by the capacity planner; runs nightly extraction jobs for shard 2.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260003",
+      "name": "worker-node-003",
+      "region": "eu-central-1",
+      "zone": "eu-central-1-a",
+      "status": "pending",
+      "cpu_percent": 33.5,
+      "memory_mb": 1792,
+      "disk_mb": 22016,
+      "ip_address": "192.0.2.13",
+      "created_at": "2026-07-04T03:15:00Z",
+      "updated_at": "2026-08-04T03:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1003"
+      },
+      "description": "Batch worker node 003 scheduled by the capacity planner; runs nightly extraction jobs for shard 3.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260004",
+      "name": "worker-node-004",
+      "region": "cn-hangzhou",
+      "zone": "cn-hangzhou-b",
+      "status": "stopped",
+      "cpu_percent": 40.5,
+      "memory_mb": 2048,
+      "disk_mb": 22528,
+      "ip_address": "192.0.2.14",
+      "created_at": "2026-07-05T04:15:00Z",
+      "updated_at": "2026-08-05T04:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1004"
+      },
+      "description": "Batch worker node 004 scheduled by the capacity planner; runs nightly extraction jobs for shard 4.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260005",
+      "name": "worker-node-005",
+      "region": "cn-shanghai",
+      "zone": "cn-shanghai-c",
+      "status": "active",
+      "cpu_percent": 47.5,
+      "memory_mb": 2304,
+      "disk_mb": 23040,
+      "ip_address": "192.0.2.15",
+      "created_at": "2026-07-06T05:15:00Z",
+      "updated_at": "2026-08-06T05:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1005"
+      },
+      "description": "Batch worker node 005 scheduled by the capacity planner; runs nightly extraction jobs for shard 5.",
+      "last_error": "heartbeat timeout after 3 retries",
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260006",
+      "name": "worker-node-006",
+      "region": "us-west-1",
+      "zone": "us-west-1-a",
+      "status": "active",
+      "cpu_percent": 54.5,
+      "memory_mb": 2560,
+      "disk_mb": 23552,
+      "ip_address": "192.0.2.16",
+      "created_at": "2026-07-07T06:15:00Z",
+      "updated_at": "2026-08-07T06:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1006"
+      },
+      "description": "Batch worker node 006 scheduled by the capacity planner; runs nightly extraction jobs for shard 6.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260007",
+      "name": "worker-node-007",
+      "region": "eu-central-1",
+      "zone": "eu-central-1-b",
+      "status": "active",
+      "cpu_percent": 61.5,
+      "memory_mb": 2816,
+      "disk_mb": 24064,
+      "ip_address": "192.0.2.17",
+      "created_at": "2026-07-08T07:15:00Z",
+      "updated_at": "2026-08-08T07:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1000"
+      },
+      "description": "Batch worker node 007 scheduled by the capacity planner; runs nightly extraction jobs for shard 7.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260008",
+      "name": "worker-node-008",
+      "region": "cn-hangzhou",
+      "zone": "cn-hangzhou-c",
+      "status": "pending",
+      "cpu_percent": 68.5,
+      "memory_mb": 3072,
+      "disk_mb": 24576,
+      "ip_address": "192.0.2.18",
+      "created_at": "2026-07-09T08:15:00Z",
+      "updated_at": "2026-08-09T08:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1001"
+      },
+      "description": "Batch worker node 008 scheduled by the capacity planner; runs nightly extraction jobs for shard 8.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260009",
+      "name": "worker-node-009",
+      "region": "cn-shanghai",
+      "zone": "cn-shanghai-a",
+      "status": "stopped",
+      "cpu_percent": 75.5,
+      "memory_mb": 3328,
+      "disk_mb": 25088,
+      "ip_address": "192.0.2.19",
+      "created_at": "2026-07-10T09:15:00Z",
+      "updated_at": "2026-08-10T09:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1002"
+      },
+      "description": "Batch worker node 009 scheduled by the capacity planner; runs nightly extraction jobs for shard 9.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260010",
+      "name": "worker-node-010",
+      "region": "us-west-1",
+      "zone": "us-west-1-b",
+      "status": "active",
+      "cpu_percent": 82.5,
+      "memory_mb": 3584,
+      "disk_mb": 25600,
+      "ip_address": "192.0.2.20",
+      "created_at": "2026-07-11T10:15:00Z",
+      "updated_at": "2026-08-11T10:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1003"
+      },
+      "description": "Batch worker node 010 scheduled by the capacity planner; runs nightly extraction jobs for shard 10.",
+      "last_error": "heartbeat timeout after 3 retries",
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260011",
+      "name": "worker-node-011",
+      "region": "eu-central-1",
+      "zone": "eu-central-1-c",
+      "status": "active",
+      "cpu_percent": 89.5,
+      "memory_mb": 3840,
+      "disk_mb": 26112,
+      "ip_address": "192.0.2.21",
+      "created_at": "2026-07-12T11:15:00Z",
+      "updated_at": "2026-08-12T11:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1004"
+      },
+      "description": "Batch worker node 011 scheduled by the capacity planner; runs nightly extraction jobs for shard 11.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260012",
+      "name": "worker-node-012",
+      "region": "cn-hangzhou",
+      "zone": "cn-hangzhou-a",
+      "status": "active",
+      "cpu_percent": 16.5,
+      "memory_mb": 4096,
+      "disk_mb": 26624,
+      "ip_address": "192.0.2.22",
+      "created_at": "2026-07-13T12:15:00Z",
+      "updated_at": "2026-08-13T12:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1005"
+      },
+      "description": "Batch worker node 012 scheduled by the capacity planner; runs nightly extraction jobs for shard 12.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260013",
+      "name": "worker-node-013",
+      "region": "cn-shanghai",
+      "zone": "cn-shanghai-b",
+      "status": "pending",
+      "cpu_percent": 23.5,
+      "memory_mb": 4352,
+      "disk_mb": 27136,
+      "ip_address": "192.0.2.23",
+      "created_at": "2026-07-14T13:15:00Z",
+      "updated_at": "2026-08-14T13:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1006"
+      },
+      "description": "Batch worker node 013 scheduled by the capacity planner; runs nightly extraction jobs for shard 13.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260014",
+      "name": "worker-node-014",
+      "region": "us-west-1",
+      "zone": "us-west-1-c",
+      "status": "stopped",
+      "cpu_percent": 30.5,
+      "memory_mb": 4608,
+      "disk_mb": 27648,
+      "ip_address": "192.0.2.24",
+      "created_at": "2026-07-15T14:15:00Z",
+      "updated_at": "2026-08-01T14:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1000"
+      },
+      "description": "Batch worker node 014 scheduled by the capacity planner; runs nightly extraction jobs for shard 14.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260015",
+      "name": "worker-node-015",
+      "region": "eu-central-1",
+      "zone": "eu-central-1-a",
+      "status": "active",
+      "cpu_percent": 37.5,
+      "memory_mb": 4864,
+      "disk_mb": 28160,
+      "ip_address": "192.0.2.25",
+      "created_at": "2026-07-16T15:15:00Z",
+      "updated_at": "2026-08-02T15:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1001"
+      },
+      "description": "Batch worker node 015 scheduled by the capacity planner; runs nightly extraction jobs for shard 15.",
+      "last_error": "heartbeat timeout after 3 retries",
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260016",
+      "name": "worker-node-016",
+      "region": "cn-hangzhou",
+      "zone": "cn-hangzhou-b",
+      "status": "active",
+      "cpu_percent": 44.5,
+      "memory_mb": 5120,
+      "disk_mb": 28672,
+      "ip_address": "192.0.2.26",
+      "created_at": "2026-07-17T16:15:00Z",
+      "updated_at": "2026-08-03T16:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1002"
+      },
+      "description": "Batch worker node 016 scheduled by the capacity planner; runs nightly extraction jobs for shard 0.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260017",
+      "name": "worker-node-017",
+      "region": "cn-shanghai",
+      "zone": "cn-shanghai-c",
+      "status": "active",
+      "cpu_percent": 51.5,
+      "memory_mb": 5376,
+      "disk_mb": 29184,
+      "ip_address": "192.0.2.27",
+      "created_at": "2026-07-18T17:15:00Z",
+      "updated_at": "2026-08-04T17:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1003"
+      },
+      "description": "Batch worker node 017 scheduled by the capacity planner; runs nightly extraction jobs for shard 1.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260018",
+      "name": "worker-node-018",
+      "region": "us-west-1",
+      "zone": "us-west-1-a",
+      "status": "pending",
+      "cpu_percent": 58.5,
+      "memory_mb": 5632,
+      "disk_mb": 29696,
+      "ip_address": "192.0.2.28",
+      "created_at": "2026-07-19T18:15:00Z",
+      "updated_at": "2026-08-05T18:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1004"
+      },
+      "description": "Batch worker node 018 scheduled by the capacity planner; runs nightly extraction jobs for shard 2.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260019",
+      "name": "worker-node-019",
+      "region": "eu-central-1",
+      "zone": "eu-central-1-b",
+      "status": "stopped",
+      "cpu_percent": 65.5,
+      "memory_mb": 5888,
+      "disk_mb": 30208,
+      "ip_address": "192.0.2.29",
+      "created_at": "2026-07-20T19:15:00Z",
+      "updated_at": "2026-08-06T19:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1005"
+      },
+      "description": "Batch worker node 019 scheduled by the capacity planner; runs nightly extraction jobs for shard 3.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260020",
+      "name": "worker-node-020",
+      "region": "cn-hangzhou",
+      "zone": "cn-hangzhou-c",
+      "status": "active",
+      "cpu_percent": 72.5,
+      "memory_mb": 6144,
+      "disk_mb": 30720,
+      "ip_address": "192.0.2.30",
+      "created_at": "2026-07-21T20:15:00Z",
+      "updated_at": "2026-08-07T20:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1006"
+      },
+      "description": "Batch worker node 020 scheduled by the capacity planner; runs nightly extraction jobs for shard 4.",
+      "last_error": "heartbeat timeout after 3 retries",
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260021",
+      "name": "worker-node-021",
+      "region": "cn-shanghai",
+      "zone": "cn-shanghai-a",
+      "status": "active",
+      "cpu_percent": 79.5,
+      "memory_mb": 6400,
+      "disk_mb": 31232,
+      "ip_address": "192.0.2.31",
+      "created_at": "2026-07-22T21:15:00Z",
+      "updated_at": "2026-08-08T21:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1000"
+      },
+      "description": "Batch worker node 021 scheduled by the capacity planner; runs nightly extraction jobs for shard 5.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260022",
+      "name": "worker-node-022",
+      "region": "us-west-1",
+      "zone": "us-west-1-b",
+      "status": "active",
+      "cpu_percent": 86.5,
+      "memory_mb": 6656,
+      "disk_mb": 31744,
+      "ip_address": "192.0.2.32",
+      "created_at": "2026-07-23T22:15:00Z",
+      "updated_at": "2026-08-09T22:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1001"
+      },
+      "description": "Batch worker node 022 scheduled by the capacity planner; runs nightly extraction jobs for shard 6.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260023",
+      "name": "worker-node-023",
+      "region": "eu-central-1",
+      "zone": "eu-central-1-c",
+      "status": "pending",
+      "cpu_percent": 13.5,
+      "memory_mb": 6912,
+      "disk_mb": 32256,
+      "ip_address": "192.0.2.33",
+      "created_at": "2026-07-24T23:15:00Z",
+      "updated_at": "2026-08-10T23:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1002"
+      },
+      "description": "Batch worker node 023 scheduled by the capacity planner; runs nightly extraction jobs for shard 7.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260024",
+      "name": "worker-node-024",
+      "region": "cn-hangzhou",
+      "zone": "cn-hangzhou-a",
+      "status": "stopped",
+      "cpu_percent": 20.5,
+      "memory_mb": 7168,
+      "disk_mb": 32768,
+      "ip_address": "192.0.2.34",
+      "created_at": "2026-07-25T00:15:00Z",
+      "updated_at": "2026-08-11T00:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1003"
+      },
+      "description": "Batch worker node 024 scheduled by the capacity planner; runs nightly extraction jobs for shard 8.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260025",
+      "name": "worker-node-025",
+      "region": "cn-shanghai",
+      "zone": "cn-shanghai-b",
+      "status": "active",
+      "cpu_percent": 27.5,
+      "memory_mb": 7424,
+      "disk_mb": 33280,
+      "ip_address": "192.0.2.35",
+      "created_at": "2026-07-26T01:15:00Z",
+      "updated_at": "2026-08-12T01:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1004"
+      },
+      "description": "Batch worker node 025 scheduled by the capacity planner; runs nightly extraction jobs for shard 9.",
+      "last_error": "heartbeat timeout after 3 retries",
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260026",
+      "name": "worker-node-026",
+      "region": "us-west-1",
+      "zone": "us-west-1-c",
+      "status": "active",
+      "cpu_percent": 34.5,
+      "memory_mb": 7680,
+      "disk_mb": 33792,
+      "ip_address": "192.0.2.36",
+      "created_at": "2026-07-27T02:15:00Z",
+      "updated_at": "2026-08-13T02:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1005"
+      },
+      "description": "Batch worker node 026 scheduled by the capacity planner; runs nightly extraction jobs for shard 10.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260027",
+      "name": "worker-node-027",
+      "region": "eu-central-1",
+      "zone": "eu-central-1-a",
+      "status": "active",
+      "cpu_percent": 41.5,
+      "memory_mb": 7936,
+      "disk_mb": 34304,
+      "ip_address": "192.0.2.37",
+      "created_at": "2026-07-28T03:15:00Z",
+      "updated_at": "2026-08-14T03:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1006"
+      },
+      "description": "Batch worker node 027 scheduled by the capacity planner; runs nightly extraction jobs for shard 11.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260028",
+      "name": "worker-node-028",
+      "region": "cn-hangzhou",
+      "zone": "cn-hangzhou-b",
+      "status": "pending",
+      "cpu_percent": 48.5,
+      "memory_mb": 8192,
+      "disk_mb": 34816,
+      "ip_address": "192.0.2.38",
+      "created_at": "2026-07-01T04:15:00Z",
+      "updated_at": "2026-08-01T04:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1000"
+      },
+      "description": "Batch worker node 028 scheduled by the capacity planner; runs nightly extraction jobs for shard 12.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260029",
+      "name": "worker-node-029",
+      "region": "cn-shanghai",
+      "zone": "cn-shanghai-c",
+      "status": "stopped",
+      "cpu_percent": 55.5,
+      "memory_mb": 8448,
+      "disk_mb": 35328,
+      "ip_address": "192.0.2.39",
+      "created_at": "2026-07-02T05:15:00Z",
+      "updated_at": "2026-08-02T05:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1001"
+      },
+      "description": "Batch worker node 029 scheduled by the capacity planner; runs nightly extraction jobs for shard 13.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260030",
+      "name": "worker-node-030",
+      "region": "us-west-1",
+      "zone": "us-west-1-a",
+      "status": "active",
+      "cpu_percent": 62.5,
+      "memory_mb": 8704,
+      "disk_mb": 35840,
+      "ip_address": "192.0.2.40",
+      "created_at": "2026-07-03T06:15:00Z",
+      "updated_at": "2026-08-03T06:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1002"
+      },
+      "description": "Batch worker node 030 scheduled by the capacity planner; runs nightly extraction jobs for shard 14.",
+      "last_error": "heartbeat timeout after 3 retries",
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260031",
+      "name": "worker-node-031",
+      "region": "eu-central-1",
+      "zone": "eu-central-1-b",
+      "status": "active",
+      "cpu_percent": 69.5,
+      "memory_mb": 8960,
+      "disk_mb": 36352,
+      "ip_address": "192.0.2.41",
+      "created_at": "2026-07-04T07:15:00Z",
+      "updated_at": "2026-08-04T07:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1003"
+      },
+      "description": "Batch worker node 031 scheduled by the capacity planner; runs nightly extraction jobs for shard 15.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260032",
+      "name": "worker-node-032",
+      "region": "cn-hangzhou",
+      "zone": "cn-hangzhou-c",
+      "status": "active",
+      "cpu_percent": 76.5,
+      "memory_mb": 9216,
+      "disk_mb": 36864,
+      "ip_address": "192.0.2.42",
+      "created_at": "2026-07-05T08:15:00Z",
+      "updated_at": "2026-08-05T08:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1004"
+      },
+      "description": "Batch worker node 032 scheduled by the capacity planner; runs nightly extraction jobs for shard 0.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260033",
+      "name": "worker-node-033",
+      "region": "cn-shanghai",
+      "zone": "cn-shanghai-a",
+      "status": "pending",
+      "cpu_percent": 83.5,
+      "memory_mb": 9472,
+      "disk_mb": 37376,
+      "ip_address": "192.0.2.43",
+      "created_at": "2026-07-06T09:15:00Z",
+      "updated_at": "2026-08-06T09:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1005"
+      },
+      "description": "Batch worker node 033 scheduled by the capacity planner; runs nightly extraction jobs for shard 1.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260034",
+      "name": "worker-node-034",
+      "region": "us-west-1",
+      "zone": "us-west-1-b",
+      "status": "stopped",
+      "cpu_percent": 90.5,
+      "memory_mb": 9728,
+      "disk_mb": 37888,
+      "ip_address": "192.0.2.44",
+      "created_at": "2026-07-07T10:15:00Z",
+      "updated_at": "2026-08-07T10:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1006"
+      },
+      "description": "Batch worker node 034 scheduled by the capacity planner; runs nightly extraction jobs for shard 2.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260035",
+      "name": "worker-node-035",
+      "region": "eu-central-1",
+      "zone": "eu-central-1-c",
+      "status": "active",
+      "cpu_percent": 17.5,
+      "memory_mb": 9984,
+      "disk_mb": 38400,
+      "ip_address": "192.0.2.45",
+      "created_at": "2026-07-08T11:15:00Z",
+      "updated_at": "2026-08-08T11:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1000"
+      },
+      "description": "Batch worker node 035 scheduled by the capacity planner; runs nightly extraction jobs for shard 3.",
+      "last_error": "heartbeat timeout after 3 retries",
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260036",
+      "name": "worker-node-036",
+      "region": "cn-hangzhou",
+      "zone": "cn-hangzhou-a",
+      "status": "active",
+      "cpu_percent": 24.5,
+      "memory_mb": 10240,
+      "disk_mb": 38912,
+      "ip_address": "192.0.2.46",
+      "created_at": "2026-07-09T12:15:00Z",
+      "updated_at": "2026-08-09T12:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1001"
+      },
+      "description": "Batch worker node 036 scheduled by the capacity planner; runs nightly extraction jobs for shard 4.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260037",
+      "name": "worker-node-037",
+      "region": "cn-shanghai",
+      "zone": "cn-shanghai-b",
+      "status": "active",
+      "cpu_percent": 31.5,
+      "memory_mb": 10496,
+      "disk_mb": 39424,
+      "ip_address": "192.0.2.47",
+      "created_at": "2026-07-10T13:15:00Z",
+      "updated_at": "2026-08-10T13:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1002"
+      },
+      "description": "Batch worker node 037 scheduled by the capacity planner; runs nightly extraction jobs for shard 5.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260038",
+      "name": "worker-node-038",
+      "region": "us-west-1",
+      "zone": "us-west-1-c",
+      "status": "pending",
+      "cpu_percent": 38.5,
+      "memory_mb": 10752,
+      "disk_mb": 39936,
+      "ip_address": "192.0.2.48",
+      "created_at": "2026-07-11T14:15:00Z",
+      "updated_at": "2026-08-11T14:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1003"
+      },
+      "description": "Batch worker node 038 scheduled by the capacity planner; runs nightly extraction jobs for shard 6.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260039",
+      "name": "worker-node-039",
+      "region": "eu-central-1",
+      "zone": "eu-central-1-a",
+      "status": "stopped",
+      "cpu_percent": 45.5,
+      "memory_mb": 11008,
+      "disk_mb": 40448,
+      "ip_address": "192.0.2.49",
+      "created_at": "2026-07-12T15:15:00Z",
+      "updated_at": "2026-08-12T15:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1004"
+      },
+      "description": "Batch worker node 039 scheduled by the capacity planner; runs nightly extraction jobs for shard 7.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260040",
+      "name": "worker-node-040",
+      "region": "cn-hangzhou",
+      "zone": "cn-hangzhou-b",
+      "status": "active",
+      "cpu_percent": 52.5,
+      "memory_mb": 11264,
+      "disk_mb": 40960,
+      "ip_address": "192.0.2.50",
+      "created_at": "2026-07-13T16:15:00Z",
+      "updated_at": "2026-08-13T16:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1005"
+      },
+      "description": "Batch worker node 040 scheduled by the capacity planner; runs nightly extraction jobs for shard 8.",
+      "last_error": "heartbeat timeout after 3 retries",
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260041",
+      "name": "worker-node-041",
+      "region": "cn-shanghai",
+      "zone": "cn-shanghai-c",
+      "status": "active",
+      "cpu_percent": 59.5,
+      "memory_mb": 11520,
+      "disk_mb": 41472,
+      "ip_address": "192.0.2.51",
+      "created_at": "2026-07-14T17:15:00Z",
+      "updated_at": "2026-08-14T17:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1006"
+      },
+      "description": "Batch worker node 041 scheduled by the capacity planner; runs nightly extraction jobs for shard 9.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260042",
+      "name": "worker-node-042",
+      "region": "us-west-1",
+      "zone": "us-west-1-a",
+      "status": "active",
+      "cpu_percent": 66.5,
+      "memory_mb": 11776,
+      "disk_mb": 41984,
+      "ip_address": "192.0.2.52",
+      "created_at": "2026-07-15T18:15:00Z",
+      "updated_at": "2026-08-01T18:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1000"
+      },
+      "description": "Batch worker node 042 scheduled by the capacity planner; runs nightly extraction jobs for shard 10.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260043",
+      "name": "worker-node-043",
+      "region": "eu-central-1",
+      "zone": "eu-central-1-b",
+      "status": "pending",
+      "cpu_percent": 73.5,
+      "memory_mb": 12032,
+      "disk_mb": 42496,
+      "ip_address": "192.0.2.53",
+      "created_at": "2026-07-16T19:15:00Z",
+      "updated_at": "2026-08-02T19:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1001"
+      },
+      "description": "Batch worker node 043 scheduled by the capacity planner; runs nightly extraction jobs for shard 11.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260044",
+      "name": "worker-node-044",
+      "region": "cn-hangzhou",
+      "zone": "cn-hangzhou-c",
+      "status": "stopped",
+      "cpu_percent": 80.5,
+      "memory_mb": 12288,
+      "disk_mb": 43008,
+      "ip_address": "192.0.2.54",
+      "created_at": "2026-07-17T20:15:00Z",
+      "updated_at": "2026-08-03T20:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1002"
+      },
+      "description": "Batch worker node 044 scheduled by the capacity planner; runs nightly extraction jobs for shard 12.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260045",
+      "name": "worker-node-045",
+      "region": "cn-shanghai",
+      "zone": "cn-shanghai-a",
+      "status": "active",
+      "cpu_percent": 87.5,
+      "memory_mb": 12544,
+      "disk_mb": 43520,
+      "ip_address": "192.0.2.55",
+      "created_at": "2026-07-18T21:15:00Z",
+      "updated_at": "2026-08-04T21:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:highmem"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1003"
+      },
+      "description": "Batch worker node 045 scheduled by the capacity planner; runs nightly extraction jobs for shard 13.",
+      "last_error": "heartbeat timeout after 3 retries",
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260046",
+      "name": "worker-node-046",
+      "region": "us-west-1",
+      "zone": "us-west-1-b",
+      "status": "active",
+      "cpu_percent": 14.5,
+      "memory_mb": 12800,
+      "disk_mb": 44032,
+      "ip_address": "192.0.2.56",
+      "created_at": "2026-07-19T22:15:00Z",
+      "updated_at": "2026-08-05T22:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1004"
+      },
+      "description": "Batch worker node 046 scheduled by the capacity planner; runs nightly extraction jobs for shard 14.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    },
+    {
+      "id": "i-20260047",
+      "name": "worker-node-047",
+      "region": "eu-central-1",
+      "zone": "eu-central-1-c",
+      "status": "active",
+      "cpu_percent": 21.5,
+      "memory_mb": 13056,
+      "disk_mb": 44544,
+      "ip_address": "192.0.2.57",
+      "created_at": "2026-07-20T23:15:00Z",
+      "updated_at": "2026-08-06T23:45:00Z",
+      "tags": [
+        "pool:batch",
+        "tier:standard"
+      ],
+      "labels": {
+        "team": "data-platform",
+        "cost-center": "cc-1005"
+      },
+      "description": "Batch worker node 047 scheduled by the capacity planner; runs nightly extraction jobs for shard 15.",
+      "last_error": null,
+      "metadata": {},
+      "health_checks": []
+    }
+  ]
+}

@@ -166,6 +166,7 @@ Stash 并不能让所有压缩都可逆。被移除的 `debug`/`trace` 字段、
 | 接入 Agent 产品或集成 AgentScope | [Agent 与框架集成](framework-integration.md) |
 | 手动压缩、取回或运行 MCP | [CLI 参考](cli-reference.md) |
 | 查看节省或内容变化、做双跑对比 | [效果度量](measuring-savings.md) |
+| 了解压缩率适用场景或用标准负载验证 | [压缩率与适用场景](compression-scenarios.md) |
 | 修改配置或了解本地数据 | [配置与数据隐私](configuration-and-privacy.md) |
 | 解决无统计、Adapter 或 Stash 问题 | [故障排查](troubleshooting.md) |
 | 升级或卸载 | [故障排查 · 升级与卸载](troubleshooting.md#升级与卸载) |
