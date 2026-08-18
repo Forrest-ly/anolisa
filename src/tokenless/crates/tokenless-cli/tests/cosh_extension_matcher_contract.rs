@@ -8,53 +8,63 @@
 //! exact string comparison, which an anchored alternation never satisfies, so
 //! the rewrite hook never fires and rtk rewriting is skipped.
 //!
-//! The Python twin of this contract (`tests/test_cosh_extension_matcher.py`)
-//! pins the matcher against Python's `re`, which accepts syntax the Rust
-//! `regex` crate rejects (e.g. lookahead). Only this side of the contract
-//! exercises the engine that actually compiles the matcher; both sides must
-//! stay in sync with the manifest.
+//! The Python twin of this contract (`test_cosh_extension_matcher.py` in the
+//! tokenless test suite) pins the matcher against Python's `re`, which accepts
+//! syntax the Rust `regex` crate rejects (e.g. lookahead). Only this side of
+//! the contract exercises the engine that actually compiles the matcher; both
+//! sides draw their tool-name corpus from the shared
+//! `tests/data/cosh_matcher_corpus.json`.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde_json::Value;
 
-/// Tool names cosh-ng fires PreToolUse with. Must stay in sync with
-/// `MATCHING_TOOLS` in `tests/test_cosh_extension_matcher.py`.
-const MATCHING_TOOLS: &[&str] = &[
-    "shell",
-    "run_shell_command",
-    "Bash",
-    "Shell",
-    "terminal",
-    "exec",
-    "process",
-];
+// Embedded at compile time: if the shared corpus moves, the build fails
+// loudly instead of the test silently weakening.
+const MATCHER_CORPUS: &str = include_str!("../../../tests/data/cosh_matcher_corpus.json");
 
-/// cosh-ng tools (and common foreign shapes) that must never be rewritten:
-/// only shell-execution tools may reach rtk. Must stay in sync with
-/// `NON_MATCHING_TOOLS` in `tests/test_cosh_extension_matcher.py`.
-const NON_MATCHING_TOOLS: &[&str] = &[
-    "read_file",
-    "write_file",
-    "edit",
-    "grep",
-    "todo",
-    "glob",
-    "web_search",
-    "shell_prompt", // anchored: prefix overlap must not match
-    "my_shell",     // anchored: suffix overlap must not match
-    "",
-];
+// Resolved against the tokenless root rather than this crate's nesting depth,
+// so relocating the crate inside the workspace cannot break the contract.
+const MANIFEST_RELATIVE: &str = "adapters/tokenless/common/cosh-extension.json";
 
 fn manifest_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../adapters/tokenless/common/cosh-extension.json")
+    let mut dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        let candidate = dir.join(MANIFEST_RELATIVE);
+        if candidate.is_file() {
+            return candidate;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => panic!(
+                "cosh-extension.json not found at {MANIFEST_RELATIVE} \
+                 in any ancestor of {}",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+        }
+    }
 }
 
-/// Return the matcher of the PreToolUse rtk rewrite hook group, mirroring
-/// the lookup in `CoshExtensionMatcherTest._rewrite_matcher`.
+fn corpus_tools(key: &str) -> Vec<String> {
+    let corpus: Value =
+        serde_json::from_str(MATCHER_CORPUS).expect("shared matcher corpus must be valid JSON");
+    corpus
+        .get(key)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("shared matcher corpus must contain a {key:?} array"))
+        .iter()
+        .map(|entry| {
+            entry.as_str().map(str::to_string).unwrap_or_else(|| {
+                panic!("entries of {key:?} in the shared corpus must be strings")
+            })
+        })
+        .collect()
+}
+
+// Mirrors the lookup in the Python suite's `_rewrite_matcher`, so both sides
+// of the contract select the same hook group from the manifest.
 fn rewrite_matcher() -> String {
     let path = manifest_path();
     let raw = fs::read_to_string(&path).unwrap_or_else(|err| {
@@ -130,9 +140,9 @@ fn matcher_hits_cosh_shell_tool_name() {
 #[test]
 fn matcher_hits_all_shell_family_names() {
     let re = Regex::new(&rewrite_matcher()).expect("matcher must compile");
-    for name in MATCHING_TOOLS {
+    for name in corpus_tools("matching_tools") {
         assert!(
-            re.is_match(name),
+            re.is_match(&name),
             "matcher must match shell-family tool name {name:?}"
         );
     }
@@ -141,9 +151,9 @@ fn matcher_hits_all_shell_family_names() {
 #[test]
 fn matcher_rejects_non_shell_tools() {
     let re = Regex::new(&rewrite_matcher()).expect("matcher must compile");
-    for name in NON_MATCHING_TOOLS {
+    for name in corpus_tools("non_matching_tools") {
         assert!(
-            !re.is_match(name),
+            !re.is_match(&name),
             "matcher must not match non-shell tool name {name:?}"
         );
     }

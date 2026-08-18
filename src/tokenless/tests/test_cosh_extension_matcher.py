@@ -20,9 +20,10 @@ alternation here never triggers.
 
 These tests pin the matcher against Python's ``re``. The Rust ``regex``
 crate side of the contract — the engine cosh-ng actually compiles the
-matcher with — is pinned by
-``crates/tokenless-cli/tests/cosh_extension_matcher_contract.rs``; the
-two suites share one tool-name corpus and must stay in sync.
+matcher with — is pinned by the ``cosh_extension_matcher_contract`` test
+in the tokenless-cli crate. Both suites draw their tool-name corpus from
+the shared ``tests/data/cosh_matcher_corpus.json``, so the two sides
+cannot drift apart.
 """
 
 import json
@@ -38,33 +39,26 @@ MANIFEST = (
     / "cosh-extension.json"
 )
 
+CORPUS = Path(__file__).resolve().parent / "data" / "cosh_matcher_corpus.json"
+
+
+def _load_corpus() -> dict:
+    with open(CORPUS, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+_CORPUS = _load_corpus()
+
 # Tool names cosh-ng fires PreToolUse with. ``shell`` is the cosh-ng
 # internal name; ``run_shell_command`` is the copilot-shell standard name
 # kept so both naming conventions keep reaching the rewrite hook.
-MATCHING_TOOLS = [
-    "shell",
-    "run_shell_command",
-    "Bash",
-    "Shell",
-    "terminal",
-    "exec",
-    "process",
-]
+MATCHING_TOOLS = _CORPUS["matching_tools"]
 
 # cosh-ng tools (and common foreign shapes) that must never be rewritten:
-# only shell-execution tools may reach rtk.
-NON_MATCHING_TOOLS = [
-    "read_file",
-    "write_file",
-    "edit",
-    "grep",
-    "todo",
-    "glob",
-    "web_search",
-    "shell_prompt",   # anchored: prefix overlap must not match
-    "my_shell",       # anchored: suffix overlap must not match
-    "",
-]
+# only shell-execution tools may reach rtk. ``shell_prompt`` / ``my_shell``
+# probe anchoring (prefix/suffix overlap must not match); ``""`` probes the
+# empty-matcher guard.
+NON_MATCHING_TOOLS = _CORPUS["non_matching_tools"]
 
 
 class CoshExtensionMatcherTest(unittest.TestCase):
@@ -99,9 +93,8 @@ class CoshExtensionMatcherTest(unittest.TestCase):
     def test_matcher_compiles_as_regex(self):
         # The pattern must be valid Python ``re`` syntax. Rust ``regex``
         # crate validity — what cosh-ng actually compiles with Regex::new
-        # — is enforced by the Rust-side contract test in
-        # crates/tokenless-cli/tests/cosh_extension_matcher_contract.rs,
-        # since ``re`` accepts syntax (e.g. lookahead) Rust's regex
+        # — is enforced by the Rust-side ``cosh_extension_matcher_contract``
+        # test, since ``re`` accepts syntax (e.g. lookahead) Rust's regex
         # rejects and a compile failure silently disables the hook.
         re.compile(self._rewrite_matcher())
 
