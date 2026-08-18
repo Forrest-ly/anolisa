@@ -17,6 +17,12 @@ matcher is compiled as a regex and applied as an *unanchored* search
 (Rust ``Regex::is_match`` ≈ ``re.search``); a matcher that fails to
 compile would fall back to exact string equality, which the anchored
 alternation here never triggers.
+
+These tests pin the matcher against Python's ``re``. The Rust ``regex``
+crate side of the contract — the engine cosh-ng actually compiles the
+matcher with — is pinned by
+``crates/tokenless-cli/tests/cosh_extension_matcher_contract.rs``; the
+two suites share one tool-name corpus and must stay in sync.
 """
 
 import json
@@ -91,8 +97,12 @@ class CoshExtensionMatcherTest(unittest.TestCase):
         self.assertTrue(matcher)
 
     def test_matcher_compiles_as_regex(self):
-        # The pattern must be valid regex syntax in both Python's ``re``
-        # and Rust's ``regex`` crate (cosh compiles it with Regex::new).
+        # The pattern must be valid Python ``re`` syntax. Rust ``regex``
+        # crate validity — what cosh-ng actually compiles with Regex::new
+        # — is enforced by the Rust-side contract test in
+        # crates/tokenless-cli/tests/cosh_extension_matcher_contract.rs,
+        # since ``re`` accepts syntax (e.g. lookahead) Rust's regex
+        # rejects and a compile failure silently disables the hook.
         re.compile(self._rewrite_matcher())
 
     def test_matcher_hits_cosh_shell_tool_name(self):
