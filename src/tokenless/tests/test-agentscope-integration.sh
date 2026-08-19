@@ -50,18 +50,18 @@ run_smoke() {
     local venv="$TEST_ROOT/$venv_name"
 
     uv venv --python python3 "$venv" >/dev/null
-    local extra_requirements=()
     local smoke_script="$ROOT/tests/agentscope_integration_smoke.py"
     if [[ "$agentscope_requirement" == agentscope==1.* \
         || "$agentscope_requirement" == 'agentscope>=1.0.11,<1.1' ]]; then
-        # AgentScope 1.x imports tqdm at package import time without
-        # declaring it; it used to arrive transitively through openai,
-        # which dropped the tqdm dependency in openai 3.3.0.
-        extra_requirements+=(tqdm)
         smoke_script="$ROOT/tests/agentscope_v1_integration_smoke.py"
     fi
+    # Install only the pinned AgentScope requirement plus the two wheels.
+    # AgentScope 1.x imports tqdm at package import time without declaring it
+    # (openai 3.3.0 stopped providing it transitively), so the 1.x envs
+    # intentionally rely on the integration wheel's own tqdm dependency —
+    # this exercises exactly the clean end-user install path.
     uv pip install --python "$venv/bin/python" \
-        "$agentscope_requirement" "${extra_requirements[@]}" \
+        "$agentscope_requirement" \
         "${RUNTIME_WHEELS[0]}" "${INTEGRATION_WHEELS[0]}" >/dev/null
     "$venv/bin/python" "$smoke_script"
     "$venv/bin/python" - <<'PY'
@@ -101,6 +101,9 @@ assert any(
     and "<2" in requirement
     for requirement in requirements
 )
+# AgentScope 1.x needs tqdm at import time but does not declare it, so the
+# wheel must carry the dependency for the whole declared support range.
+assert any(requirement.startswith("tqdm") for requirement in requirements)
 assert package.metadata.get_all("License-File") == ["LICENSE"]
 license_paths = [
     path for path in package.files or ()
