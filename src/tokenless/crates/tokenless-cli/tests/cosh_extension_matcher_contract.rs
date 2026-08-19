@@ -118,6 +118,9 @@ fn matcher_compiles_with_rust_regex_crate() {
 }
 
 #[test]
+// The invalid literal is the point of this test, so opt out of the lint
+// that flags invalid regex literals.
+#[allow(clippy::invalid_regex)]
 fn rust_regex_rejects_python_only_syntax() {
     // Sanity check for the contract itself: lookahead is valid Python `re`
     // syntax but unsupported by the Rust `regex` crate, proving that only
