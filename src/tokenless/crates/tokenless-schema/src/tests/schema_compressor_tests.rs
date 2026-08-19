@@ -1033,3 +1033,79 @@ fn test_clear_stash_session_keeps_emitted_markers() {
         "emitted keep-marker payload must survive rollback after clear_stash_session"
     );
 }
+
+#[test]
+fn test_gemini_wrapper_multi_declaration_order_and_titles() {
+    // Multi-declaration wrappers keep declaration names and order, and
+    // declaration-level titles are dropped like in the OpenAI wrapper.
+    let compressor = SchemaCompressor::new();
+    let tool = json!({
+        "functionDeclarations": [
+            {
+                "name": "shell",
+                "description": "Run a shell command in the workspace. ".repeat(20),
+                "title": "Shell",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command line to execute. ".repeat(12)
+                        }
+                    },
+                    "required": ["command"]
+                }
+            },
+            {
+                "name": "read_file",
+                "description": "Read a file. ".repeat(25),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}}
+                }
+            }
+        ]
+    });
+
+    let result = compressor.compress(&tool);
+
+    let decls = result["functionDeclarations"].as_array().unwrap();
+    assert_eq!(decls.len(), 2);
+    assert_eq!(decls[0]["name"], "shell");
+    assert_eq!(decls[1]["name"], "read_file");
+    // Declaration titles dropped.
+    assert!(decls[0].get("title").is_none());
+    // Protected schema fields preserved.
+    assert_eq!(decls[0]["parameters"]["required"][0], "command");
+    // The rewrite actually shrank the declaration set.
+    assert!(
+        serde_json::to_string(&result).unwrap().len()
+            < serde_json::to_string(&tool).unwrap().len()
+    );
+}
+
+#[test]
+fn test_gemini_malformed_function_declarations_untouched() {
+    // A non-array functionDeclarations value is not a valid wrapper and
+    // must pass through unchanged.
+    let compressor = SchemaCompressor::new();
+    let malformed = json!({"functionDeclarations": {"name": "not-an-array"}});
+    assert_eq!(compressor.compress(&malformed), malformed);
+}
+
+#[test]
+fn test_gemini_wrapper_no_savings_returns_original() {
+    let compressor = SchemaCompressor::new();
+    let tool = json!({
+        "functionDeclarations": [
+            {
+                "name": "shell",
+                "description": "Run a shell command.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        ]
+    });
+
+    // Nothing to compress: the original value is returned unchanged.
+    assert_eq!(compressor.compress(&tool), tool);
+}
