@@ -136,13 +136,16 @@ By default it removes exact, case-sensitive blacklisted keys, `null`, and empty 
 |--------|---------|-------------|
 | `-f, --file <path>` | stdin | Input file |
 | `--truncate-strings-at <n>` | `4096` | String truncation threshold |
-| `--truncate-arrays-at <n>` | `32` | Maximum retained array items |
+| `--truncate-arrays-at <n>` | `32` | Array length that triggers truncation; the first `n` items are kept |
+| `--array-tail-preserve <n>` | `8` | Items preserved from the tail of truncated arrays; `0` disables tail preservation |
 | `--max-depth <n>` | `8` | Maximum nesting depth |
 | `--agent-id <id>` | `cli` | Agent identifier in statistics |
 | `--session-id <id>` | — | Session identifier in statistics |
 | `--tool-use-id <id>` | — | Tool-call identifier in statistics |
 | `--no-stash` | off | Disable reversible Stash |
 | `--stash-db <path>` | `~/.tokenless/stash.db` | Override the Stash database; an invalid path is rejected as an override and the CLI falls back to the environment or default path |
+
+Array truncation keeps a head window of `--truncate-arrays-at` items and a tail window of `--array-tail-preserve` items, with a truncation marker in between. Middle items are dropped only when the array is longer than both windows combined, so under the defaults a command can retain `n + 8` items plus the marker; when the two windows cover the whole array, every item is retained without a marker. Set `--array-tail-preserve 0` for head-only truncation.
 
 Override thresholds:
 

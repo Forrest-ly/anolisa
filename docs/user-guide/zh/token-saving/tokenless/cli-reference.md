@@ -131,13 +131,16 @@ tokenless compress-response -f response.json
 |------|--------|------|
 | `-f, --file <path>` | stdin | 输入文件 |
 | `--truncate-strings-at <n>` | `4096` | 字符串截断阈值 |
-| `--truncate-arrays-at <n>` | `32` | 数组元素保留上限 |
+| `--truncate-arrays-at <n>` | `32` | 触发数组截断的长度阈值；保留前 `n` 个元素 |
+| `--array-tail-preserve <n>` | `8` | 截断数组时从尾部保留的元素数；`0` 禁用尾部保留 |
 | `--max-depth <n>` | `8` | 最大嵌套深度 |
 | `--agent-id <id>` | `cli` | 统计中的 Agent 标识 |
 | `--session-id <id>` | — | 统计中的 Session 标识 |
 | `--tool-use-id <id>` | — | 统计中的工具调用标识 |
 | `--no-stash` | 关闭 | 禁用可逆 Stash |
 | `--stash-db <path>` | `~/.tokenless/stash.db` | 覆盖 Stash 数据库；无效路径会被拒绝为覆盖值，CLI 随后回退到环境变量或默认路径 |
+
+数组截断会保留 `--truncate-arrays-at` 个头部元素和 `--array-tail-preserve` 个尾部元素，并在两者之间插入截断标记。只有当数组长度超过首尾窗口之和时才会丢弃中间元素：默认配置下单条命令可保留 `n + 8` 个元素（外加截断标记）；当两个窗口覆盖整个数组时，所有元素都会保留且不插入标记。设置 `--array-tail-preserve 0` 可恢复纯头部截断。
 
 覆盖阈值：
 

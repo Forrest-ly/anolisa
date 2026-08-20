@@ -80,7 +80,8 @@ enum Commands {
         /// Max string length before truncation
         #[arg(long)]
         truncate_strings_at: Option<usize>,
-        /// Max array length before truncation
+        /// Array length that triggers truncation; the first n items are
+        /// kept plus a tail window (see --array-tail-preserve)
         #[arg(long)]
         truncate_arrays_at: Option<usize>,
         /// Items preserved from the tail of truncated arrays (default: 8)
