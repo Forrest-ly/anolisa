@@ -900,3 +900,33 @@ fn test_array_tail_preserve_stash_covers_middle_only() {
     // Marker references the stash (reversible for the dropped middle).
     assert!(r[3].as_str().unwrap().contains("tokenless:"));
 }
+
+#[test]
+fn test_array_tail_preserve_usize_max_does_not_overflow() {
+    // Regression: the CLI accepts `array_tail_preserve` as an unconstrained
+    // usize (e.g. usize::MAX). The head+tail budget must saturate instead of
+    // overflowing, keeping every index inside the array. A saturated budget
+    // means head+tail covers the array, so all items are preserved.
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(1)
+        .with_array_tail_preserve(usize::MAX);
+    let result = compressor.compress(&json!([1, 2, 3]));
+    let r = result.as_array().unwrap();
+    assert_eq!(r.len(), 3, "all items preserved, no marker");
+    assert_eq!(r[0].as_i64().unwrap(), 1);
+    assert_eq!(r[2].as_i64().unwrap(), 3);
+}
+
+#[test]
+fn test_array_tail_preserve_budget_wrapping_by_one_keeps_all() {
+    // head + tail wraps exactly one past usize::MAX; the array still fits
+    // inside the logical budget, so nothing may be dropped or panic.
+    let compressor = ResponseCompressor::new()
+        .with_truncate_arrays_at(2)
+        .with_array_tail_preserve(usize::MAX - 1);
+    let result = compressor.compress(&json!(["a", "b", "c", "d", "e"]));
+    let r = result.as_array().unwrap();
+    assert_eq!(r.len(), 5, "head+tail covers the array, no marker");
+    assert_eq!(r[0].as_str().unwrap(), "a");
+    assert_eq!(r[4].as_str().unwrap(), "e");
+}

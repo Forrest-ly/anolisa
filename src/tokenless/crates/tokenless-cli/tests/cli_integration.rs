@@ -611,6 +611,40 @@ fn compress_response_from_file() {
 }
 
 #[test]
+fn compress_response_array_tail_preserve_max_does_not_abort() {
+    // Regression: `--array-tail-preserve` is an unconstrained usize. Even
+    // usize::MAX must not overflow the head+tail budget (panic in debug,
+    // abort in release); the saturated budget keeps the whole array.
+    let huge = usize::MAX.to_string();
+    let output = tokenless_bin()
+        .args([
+            "compress-response",
+            "--truncate-arrays-at",
+            "1",
+            "--array-tail-preserve",
+            huge.as_str(),
+            "--no-stash",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(b"[1,2,3]\n")?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "CLI aborted on large --array-tail-preserve: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result, serde_json::json!([1, 2, 3]));
+}
+
+#[test]
 fn compress_response_no_stash() {
     let response = r#"{"data":"value","debug":"remove"}"#;
     let output = tokenless_bin()

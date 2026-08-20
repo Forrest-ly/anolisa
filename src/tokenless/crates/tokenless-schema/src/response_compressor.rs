@@ -125,7 +125,9 @@ impl ResponseCompressor {
     }
 
     /// Set how many items from the tail of a truncated array are preserved.
-    /// Zero disables tail preservation (pure head-only truncation).
+    /// Zero disables tail preservation (pure head-only truncation). Values
+    /// large enough to cover the array together with the head limit keep
+    /// every item: truncation only drops items beyond the combined budget.
     pub fn with_array_tail_preserve(mut self, n: usize) -> Self {
         self.array_tail_preserve = n;
         self
@@ -400,8 +402,13 @@ impl ResponseCompressor {
         let mut result = Vec::new();
         let head_limit = self.truncate_arrays_at;
         // Truncation drops middle items only when the array exceeds both
-        // the head limit AND the combined head+tail budget.
-        let truncate = arr.len() > head_limit && arr.len() > head_limit + self.array_tail_preserve;
+        // the head limit AND the combined head+tail budget. The budget uses
+        // saturating arithmetic: `array_tail_preserve` reaches the public
+        // API/CLI as an unconstrained `usize`, and a saturated budget just
+        // means head+tail covers the whole array, so no item is dropped and
+        // every index derived below stays within `arr`.
+        let head_tail_budget = head_limit.saturating_add(self.array_tail_preserve);
+        let truncate = arr.len() > head_limit && arr.len() > head_tail_budget;
         // Tail preserves items from the end: the configured count when
         // truncation drops middle items, or the overflow beyond head_limit
         // when head+tail covers the array (no items lost).
