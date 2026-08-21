@@ -164,7 +164,7 @@ debug, trace, traces, stack, stacktrace, logs, logging
 
 Field matching and truncation change the response representation seen by the model. Save representative samples and compare the result before processing critical payloads.
 
-Stash applies only to truncation of strings, array tails, and deep subtrees. Blacklisted fields, `null`, and empty values are removed without a retrieval marker.
+Stash applies only to truncation of strings, the dropped middle segment of truncated arrays, and deep subtrees. Tail items are kept inline, not stashed. Blacklisted fields, `null`, and empty values are removed without a retrieval marker.
 
 Most adapters override these standalone defaults. Their shared shell profile uses `65536`, `128`, and `8`; the other-structured-tool profile uses `1048576`, `65536`, and `32`. Content-retrieval tools are skipped. See [Framework integration · Adapter processing rules](framework-integration.md#adapter-processing-rules).
 

@@ -296,8 +296,12 @@ tokenless compress-response -f response.json
 curl -s https://api.example.com/data | tokenless compress-response
 ```
 
-By default `compress-response` stashes dropped array items so they can be
-retrieved later (see [Reversible compression](docs/stash-reversible-compression.md)).
+Long arrays are truncated to a head+tail window: the first
+`--truncate-arrays-at` items (default 32) plus the last
+`--array-tail-preserve` items (default 8), with a truncation marker in
+between; pass `--array-tail-preserve 0` for head-only truncation. By default
+`compress-response` stashes the dropped middle segment so it can be retrieved
+later (see [Reversible compression](docs/stash-reversible-compression.md)).
 Pass `--no-stash` for lossy truncation, or `--stash-db <path>` to override the
 stash database (default `~/.tokenless/stash.db`).
 
