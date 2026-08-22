@@ -663,6 +663,73 @@ fn compress_response_no_stash() {
 }
 
 #[test]
+fn no_stash_response_to_toon_roundtrip_is_decodable() {
+    // Regression: `--no-stash` is a supported mode, and its plain truncation
+    // marker used to lack a TOON quoting trigger, so the pipeline
+    // compress-response --no-stash -> compress-toon -> decompress-toon exited
+    // 2 at the mid-array marker while both compression commands reported
+    // success. The marker now carries the `, not stashed` clause, which
+    // forces TOON quoting, so the whole pipeline must round-trip and the
+    // paired decoder must accept the TOON output.
+    let bad: Vec<serde_json::Value> = (0..60)
+        .map(|i| serde_json::json!({ "id": i, "value": "x" }))
+        .collect();
+    let good: Vec<serde_json::Value> = (0..5)
+        .map(|i| serde_json::json!({ "identifier": i, "repeated_field_alpha": "alpha-value" }))
+        .collect();
+    let payload = serde_json::json!({
+        "bad": bad,
+        "good": good,
+        "tool": "search",
+        "status": "ok",
+    });
+
+    let run_stage = |args: &[&str], input: &[u8]| -> Vec<u8> {
+        let output = tokenless_bin()
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child.stdin.take().unwrap().write_all(input)?;
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+
+    let compressed = run_stage(
+        &["compress-response", "--no-stash"],
+        payload.to_string().as_bytes(),
+    );
+    let toon = run_stage(&["compress-toon"], &compressed);
+    // The TOON candidate must actually be TOON (not a JSON fallback) for the
+    // pipeline under test.
+    let toon_text = String::from_utf8_lossy(&toon);
+    assert!(
+        toon_text.contains("more items truncated, not stashed"),
+        "plain marker present in the TOON output"
+    );
+    let decompressed = run_stage(&["decompress-toon"], &toon);
+    let decoded: serde_json::Value = serde_json::from_slice(&decompressed).unwrap();
+    assert_eq!(decoded["tool"], "search", "root key survives the pipeline");
+    assert_eq!(decoded["status"], "ok", "root key survives the pipeline");
+    assert_eq!(
+        decoded["bad"].as_array().map(Vec::len),
+        Some(41),
+        "32 head + marker + 8 tail preserved"
+    );
+    assert_eq!(decoded["good"].as_array().map(Vec::len), Some(5));
+}
+
+#[test]
 fn stats_list_empty() {
     let output = tokenless_bin().args(["stats", "list"]).output().unwrap();
     // May succeed or fail depending on db state; should not panic

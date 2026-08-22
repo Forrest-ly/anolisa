@@ -19,23 +19,16 @@
 //! their semantic fields while noise is stripped.
 //!
 //! Decode outcomes are pinned, never swallowed: the pipeline helper returns
-//! the raw `Result` of the TOON decode, and each test asserts the outcome it
-//! expects for its compressor configuration. The canonical fixture exercises
-//! three shapes, each pinned here:
-//!
-//! - default config (truncation marker BETWEEN head and tail items): TOON
-//!   decode fails entirely — pinned by
-//!   `response_pipeline_default_tail_preserve_decode_failure_is_pinned`;
-//! - default config with a stash store: the quoted stash marker round-trips
-//!   intact — pinned by `response_pipeline_stash_marker_roundtrips_intact`;
-//! - head-only config (marker appended after the last kept item): decode
-//!   succeeds but loses root-level keys after the array and truncates the
-//!   unquoted marker text — pinned by
-//!   `response_toon_roundtrip_known_limitation`. The retention assertions
-//!   below use this shape so they inspect real decoded output.
-//!
-//! A pipeline change that moves any of these behaviors fails loudly instead
-//! of passing silently on a fallback value.
+//! the raw `Result` of a STRICT TOON decode — the exact mode the paired
+//! `tokenless decompress-toon` command uses — and every test asserts decode
+//! success for its configuration. All truncation-marker shapes round-trip:
+//! the plain marker carries a trailing `, not stashed` clause and the stash
+//! marker carries the retrieval key, both of which force the TOON encoder to
+//! quote the string, so the marker survives the round-trip intact whether it
+//! sits between the head and tail items (default config), after the last
+//! kept item (head-only config), or in a stash-protected array. A regression
+//! that makes any supported shape undecodable fails loudly here instead of
+//! shipping output the paired decoder rejects.
 
 use std::sync::Arc;
 
@@ -52,20 +45,18 @@ fn response_compressed(value: &Value) -> Value {
 /// Run a response value through compress → TOON encode → TOON decode and
 /// return the raw decode outcome.
 ///
-/// Uses non-strict decode because the compressor's truncation marker (a
-/// string inside an object array) produces a mixed-type array whose TOON
-/// text is ambiguous under strict validation. The outcome is returned to the
-/// caller instead of being swallowed: each test pins whether decode must
-/// succeed or fail for its configuration, so a regression in the combined
-/// pipeline surfaces as a test failure in both directions.
+/// Decodes in strict mode because that is what the paired decoder
+/// (`tokenless decompress-toon`) does: output this pipeline accepts must be
+/// acceptable to it. The outcome is returned to the caller instead of being
+/// swallowed — every test pins decode success for a supported configuration,
+/// so a regression that produces undecodable TOON fails loudly.
 fn response_pipeline(
     value: &Value,
     compressor: ResponseCompressor,
 ) -> Result<Value, toon_format::ToonError> {
     let compressed = compressor.compress(value);
     let encoded = toon_format::encode_default(&compressed).expect("TOON encode");
-    let opts = toon_format::DecodeOptions::default().with_strict(false);
-    toon_format::decode::<Value>(&encoded, &opts)
+    toon_format::decode_default::<Value>(&encoded)
 }
 
 /// Run a schema value through compress → TOON encode → TOON decode.
@@ -77,11 +68,14 @@ fn schema_pipeline(value: &Value) -> Value {
 
 #[test]
 fn response_pipeline_preserves_tool_and_status() {
-    // Tool and status are top-level scalar keys that the TOON decoder does
-    // not recover when they follow the large `results` list — with the
-    // default configuration decode fails entirely, and even the head-only
-    // shape that decodes loses them (both pinned below). Verify them on the
-    // compressed value: the compression stage is what must preserve them.
+    // Tool and status are top-level scalar keys appearing after the large
+    // `results` list. With the TOON-safe truncation marker the strict
+    // round-trip recovers them, so assert on real decoded output.
+    let decoded = response_pipeline(&response_canonical(), ResponseCompressor::new())
+        .expect("default no-stash pipeline must round-trip through strict TOON decode");
+    assert_eq!(decoded["tool"], "search_code");
+    assert_eq!(decoded["status"], "ok");
+    // The compression stage must preserve them too.
     let compressed = response_compressed(&response_canonical());
     assert_eq!(compressed["tool"], "search_code");
     assert_eq!(compressed["status"], "ok");
@@ -89,44 +83,39 @@ fn response_pipeline_preserves_tool_and_status() {
 
 #[test]
 fn response_pipeline_preserves_result_item_fields() {
-    // Head-only truncation (array_tail_preserve = 0) appends the marker
-    // after the last kept item; that shape round-trips through non-strict
-    // TOON decode, so the assertions below inspect real decoded output.
-    let decoded = response_pipeline(
-        &response_canonical(),
-        ResponseCompressor::new().with_array_tail_preserve(0),
-    )
-    .expect("head-only truncation must round-trip through TOON decode");
+    // Default configuration: the plain marker sits BETWEEN the head and tail
+    // items of `results`. The marker's `, not stashed` clause forces the TOON
+    // encoder to quote it, so the strict round-trip keeps it intact.
+    let decoded = response_pipeline(&response_canonical(), ResponseCompressor::new())
+        .expect("default no-stash pipeline must round-trip through strict TOON decode");
     let results = decoded["results"]
         .as_array()
         .expect("results array exists after pipeline");
-    // The canonical response has 60 items; head-only truncation keeps
-    // 32 head + 1 trailing marker = 33 items.
-    assert_eq!(results.len(), 33, "32 head items + trailing marker");
+    // The canonical response has 60 items; the compressor keeps 32 head +
+    // 1 marker + 8 tail = 41 items.
+    assert_eq!(results.len(), 41, "32 head + marker + 8 tail");
     let first = &results[0];
     assert!(first["id"].is_number(), "id preserved");
     assert!(first["name"].is_string(), "name preserved");
     assert!(first["path"].is_string(), "path preserved");
     assert!(first["status"].is_string(), "status preserved");
     assert!(first["score"].is_number(), "score preserved");
-    // The marker position survives; its text is truncated by the round-trip
-    // (pinned in response_toon_roundtrip_known_limitation).
+    // The marker survives the round-trip intact, including the clause that
+    // makes it TOON-safe. If this assertion ever fails, the marker text lost
+    // its quoting trigger and the combined pipeline is broken again.
+    let marker = results[32]
+        .as_str()
+        .expect("plain marker sits between head and tail");
     assert!(
-        results
-            .last()
-            .and_then(Value::as_str)
-            .is_some_and(|s| s.starts_with("<...")),
-        "truncation marker survives as the last item"
+        marker.contains("more items truncated, not stashed"),
+        "plain marker round-trips intact: {marker}"
     );
 }
 
 #[test]
 fn response_pipeline_drops_noise_fields() {
-    let decoded = response_pipeline(
-        &response_canonical(),
-        ResponseCompressor::new().with_array_tail_preserve(0),
-    )
-    .expect("head-only truncation must round-trip through TOON decode");
+    let decoded = response_pipeline(&response_canonical(), ResponseCompressor::new())
+        .expect("default no-stash pipeline must round-trip through strict TOON decode");
     let obj = decoded.as_object().expect("decoded response is an object");
     // Top-level noise fields dropped by the compressor.
     for k in ["debug", "trace", "logs"] {
@@ -149,17 +138,29 @@ fn response_pipeline_drops_noise_fields() {
 }
 
 #[test]
-fn response_pipeline_default_tail_preserve_decode_failure_is_pinned() {
-    // With the default configuration the truncation marker sits BETWEEN the
-    // head and tail items of `results`. The TOON encoder emits the plain
-    // marker unquoted and the decoder rejects the scalar row in the middle
-    // of the object list, so non-strict decode fails deterministically on
-    // the canonical fixture. Pin the failure: if a future TOON or compressor
-    // change makes this shape decode, this test fails so the pipeline
-    // expectations are revisited deliberately — a silent fallback to the
-    // compressed value used to hide exactly this kind of shift.
-    let outcome = response_pipeline(&response_canonical(), ResponseCompressor::new());
-    outcome.expect_err("pinned known limitation: mid-array marker breaks TOON decode");
+fn response_pipeline_head_only_marker_roundtrips() {
+    // Head-only truncation (array_tail_preserve = 0) appends the plain
+    // marker after the last kept item; the quoted marker round-trips and
+    // the root-level keys after the array are recovered as well.
+    let decoded = response_pipeline(
+        &response_canonical(),
+        ResponseCompressor::new().with_array_tail_preserve(0),
+    )
+    .expect("head-only truncation must round-trip through strict TOON decode");
+    let results = decoded["results"]
+        .as_array()
+        .expect("results array exists after pipeline");
+    // 32 head + 1 trailing marker = 33 items.
+    assert_eq!(results.len(), 33, "32 head items + trailing marker");
+    assert!(
+        results
+            .last()
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("more items truncated, not stashed")),
+        "trailing marker survives the round-trip intact"
+    );
+    assert_eq!(decoded["tool"], "search_code", "root keys recovered");
+    assert_eq!(decoded["status"], "ok", "root keys recovered");
 }
 
 #[test]
@@ -174,7 +175,7 @@ fn response_pipeline_stash_marker_roundtrips_intact() {
         &response_canonical(),
         ResponseCompressor::new().with_stash_store(store.clone()),
     )
-    .expect("stash-marker shape must round-trip through TOON decode");
+    .expect("stash-marker shape must round-trip through strict TOON decode");
     let results = decoded["results"]
         .as_array()
         .expect("results array exists after pipeline");
@@ -190,53 +191,6 @@ fn response_pipeline_stash_marker_roundtrips_intact() {
     assert_eq!(store.len(), 1, "one stash entry for the dropped middle");
     assert_eq!(decoded["tool"], "search_code", "root keys recovered");
     assert_eq!(decoded["status"], "ok", "root keys recovered");
-}
-
-#[test]
-fn response_toon_roundtrip_known_limitation() {
-    // Pins, with assertions on real decoded output, two known TOON
-    // limitations of the head-only truncation shape:
-    //
-    // 1. root-level scalar keys (`tool`, `status`) appearing AFTER the large
-    //    `results` array in the TOON text are not recovered by the decoder;
-    // 2. the plain truncation marker is emitted unquoted by the TOON encoder
-    //    and its text does not fully survive the round-trip — only the
-    //    `<...` prefix is decoded, so retrieval cannot rely on a TOON
-    //    round-trip keeping the plain marker intact (the quoted stash marker
-    //    shape is unaffected; see
-    //    response_pipeline_stash_marker_roundtrips_intact).
-    let compressed = response_compressed(&response_canonical());
-    assert_eq!(
-        compressed["tool"], "search_code",
-        "compressor preserves tool"
-    );
-    assert_eq!(compressed["status"], "ok", "compressor preserves status");
-    let decoded = response_pipeline(
-        &response_canonical(),
-        ResponseCompressor::new().with_array_tail_preserve(0),
-    )
-    .expect("head-only truncation must round-trip through TOON decode");
-    assert!(
-        decoded["results"].is_array(),
-        "the array preceding the scalar keys round-trips"
-    );
-    let tool_missing = decoded.get("tool").is_none() || decoded["tool"].is_null();
-    let status_missing = decoded.get("status").is_none() || decoded["status"].is_null();
-    assert!(
-        tool_missing && status_missing,
-        "pinned known limitation: root keys after the large array are lost; \
-         if this fails, TOON recovered them and these tests need an update"
-    );
-    let marker = decoded["results"]
-        .as_array()
-        .and_then(|r| r.last().cloned());
-    assert_eq!(
-        marker.as_ref().and_then(Value::as_str),
-        Some("<..."),
-        "pinned known limitation: unquoted marker text is truncated by the \
-         TOON round-trip; if this fails, the encoder quoting changed and \
-         these tests need an update"
-    );
 }
 
 #[test]

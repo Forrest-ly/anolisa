@@ -296,7 +296,7 @@ fn test_array_truncation_without_stash_is_lossy() {
     assert_eq!(arr_result[1], json!(2));
     assert_eq!(arr_result[2], json!(3));
     let marker = arr_result[3].as_str().unwrap();
-    assert!(marker.contains("more items truncated"));
+    assert!(marker.contains("more items truncated, not stashed"));
     assert!(marker.contains("7")); // 10 - 3 dropped
     assert!(!marker.contains("tokenless:"));
 }
@@ -555,7 +555,7 @@ fn test_array_truncation_with_failing_stash_falls_back_to_lossy() {
     let result = compressor.compress(&json!(arr));
     let marker = result.as_array().unwrap().last().unwrap();
     let s = marker.as_str().unwrap();
-    assert!(s.contains("more items truncated"));
+    assert!(s.contains("more items truncated, not stashed"));
     assert!(!s.contains("tokenless:"));
     // The failed write is surfaced via the error counter so a persistent
     // backend failure isn't invisible.

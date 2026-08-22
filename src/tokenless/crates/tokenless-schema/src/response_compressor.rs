@@ -441,7 +441,7 @@ impl ResponseCompressor {
                     remaining,
                     marker_for(&key)
                 ),
-                None => format!("<... {} more items truncated>", remaining),
+                None => format!("<... {} more items truncated, not stashed>", remaining),
             };
             result.push(Value::String(marker));
         } else if truncate && self.stash_store.is_some() {
