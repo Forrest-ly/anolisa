@@ -164,8 +164,11 @@ payload" rather than an injection.
 - **Compress path**: if the stash cannot be opened (invalid data directory,
   directory cannot be created, db open fails) or `stash()` errors, compression
   proceeds without stash and the marker degrades to the plain
-  `<... N more items truncated>` form. Compression never fails because of the
-  stash.
+  `<... N more items truncated, not stashed>` form. The trailing `, not
+  stashed` clause also keeps the plain marker TOON-safe: it forces the TOON
+  encoder to quote the string, so `compress-toon`/`decompress-toon`
+  round-trip it intact (the stash marker is quoted for the same reason).
+  Compression never fails because of the stash.
 - **Retrieve path**: retrieve is user-initiated, so failures surface as
   errors (exit 1) rather than being swallowed.
 

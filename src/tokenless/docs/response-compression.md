@@ -9,7 +9,7 @@ Response 压缩由核心 Rust 库 `ResponseCompressor`（`crates/tokenless-schem
 | # | 规则 | 判断条件 | 处理方式 | 默认阈值 |
 |---|------|---------|---------|---------|
 | R1 | **字符串截断** | 字符串字节长度 > 4096 | 在 UTF-8 安全边界截断，追加 `… (truncated)` | 4096 字节 |
-| R2 | **数组截断** | 数组元素 > 32 | 保留前 32 个 + 末尾 8 个（`array_tail_preserve`），head 与 tail 之间插入 `<... N more items truncated>`；head+tail 覆盖全部元素时不截断 | 32 + 8 个 |
+| R2 | **数组截断** | 数组元素 > 32 | 保留前 32 个 + 末尾 8 个（`array_tail_preserve`），head 与 tail 之间插入 `<... N more items truncated, not stashed>`；head+tail 覆盖全部元素时不截断 | 32 + 8 个 |
 | R3 | **字段删除** | key 匹配黑名单 | 整个字段移除（不递归进入） | 7 个字段 |
 | R4 | **null 移除** | 值为 `null` | 从对象/数组中删除 | 启用 |
 | R5 | **空值移除** | 值为 `""` / `[]` / `{}` | 从对象/数组中删除 | 启用 |
@@ -192,7 +192,7 @@ curl -s https://api.example.com/data | tokenless compress-response
 
 输出：
 ```json
-[1, 2, 3, "<... 7 more items truncated>"]
+[1, 2, 3, "<... 7 more items truncated, not stashed>"]
 ```
 
 默认阈值 32 个元素。默认同时保留末尾 8 个元素（`array_tail_preserve = 8`）：
@@ -272,7 +272,7 @@ curl -s https://api.example.com/data | tokenless compress-response
 [
   {"id": 1},
   {"id": 2},
-  "<... 2 more items truncated>"
+  "<... 2 more items truncated, not stashed>"
 ]
 ```
 
