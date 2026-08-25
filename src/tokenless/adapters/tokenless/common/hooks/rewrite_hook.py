@@ -36,6 +36,7 @@ from hook_utils import (
 
 _PRE_TOOL_TIMEOUT = 8
 _AGENT_ID = resolve_agent_id()
+_WORKBUDDY_AGENT_ID = "workbuddy"
 
 
 def main() -> None:
@@ -59,6 +60,29 @@ def main() -> None:
         skip()
     command = tool_input.get("command", "")
     if not isinstance(command, str) or not command:
+        skip()
+
+    # WorkBuddy/CodeBuddy hosts apply ``modifiedInput`` only together with
+    # ``permissionDecision: "allow"`` (the official PreToolUse contract and
+    # its troubleshooting Q5: with any other decision the tool keeps the
+    # original parameters). Protocol v2 routes the rtk run through the
+    # Tokenless Core, which deliberately reports Allow and Ask/Default
+    # rewrites alike — the hook never learns whether rtk's permission rules
+    # attested the command. Emitting "allow" unconditionally would therefore
+    # bypass the host permission gate for unattested commands, so WorkBuddy
+    # passes the original command through and keeps the host's normal
+    # permission flow; users who accept the bypass opt in with
+    # TOKENLESS_WORKBUDDY_AUTO_ALLOW=1 (documented in the user guide).
+    if (
+        _AGENT_ID == _WORKBUDDY_AGENT_ID
+        and os.environ.get("TOKENLESS_WORKBUDDY_AUTO_ALLOW") != "1"
+    ):
+        warn(
+            "WorkBuddy rewrite requires permissionDecision allow, which "
+            "would bypass the host permission gate for a command Protocol "
+            "v2 cannot attest; passing the original command through "
+            "(TOKENLESS_WORKBUDDY_AUTO_ALLOW=1 opts into the bypass)."
+        )
         skip()
 
     session_id = input_data.get("session_id", "")
@@ -93,17 +117,30 @@ def main() -> None:
         warn(f"failed to persist PreTool optimization state: {error}")
         skip()
 
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "tool_input": {"command": rewritten},
-                    "updatedInput": updated_input,
-                },
-            }
+    # Emit the formats for runtime compatibility:
+    # - ``tool_input``: Cosh-NG partial patch (merges with original params)
+    # - ``updatedInput``: copilot-shell / Claude Code full replacement
+    # - ``modifiedInput``: WorkBuddy/CodeBuddy partial field override
+    hook_output = {
+        "hookEventName": "PreToolUse",
+        "tool_input": {"command": rewritten},
+        "updatedInput": updated_input,
+    }
+    if _AGENT_ID == _WORKBUDDY_AGENT_ID:
+        # WorkBuddy/CodeBuddy hosts apply ``modifiedInput`` only together
+        # with ``permissionDecision: "allow"`` (official PreToolUse
+        # contract), so "allow" is mandatory once a rewrite is emitted.
+        # Reaching this point means the user opted into the bypass with
+        # TOKENLESS_WORKBUDDY_AUTO_ALLOW=1 (see the gate above); Protocol v2
+        # never reports rtk's verdict, so the reason records the opt-in.
+        hook_output["modifiedInput"] = {"command": rewritten}
+        hook_output["permissionDecisionReason"] = (
+            "Tokenless: rtk rewrite auto-allowed via "
+            "TOKENLESS_WORKBUDDY_AUTO_ALLOW (host confirmation bypassed)"
         )
-    )
+        hook_output["permissionDecision"] = "allow"
+
+    print(json.dumps({"hookSpecificOutput": hook_output}))
 
 
 if __name__ == "__main__":
