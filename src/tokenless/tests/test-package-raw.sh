@@ -24,7 +24,8 @@ mkdir -p \
     "$ADAPTERS/codex/.codex-plugin" \
     "$ADAPTERS/agentscope/build/lib/tokenless_agentscope" \
     "$ADAPTERS/agentscope/src/anolisa_tokenless_agentscope.egg-info" \
-    "$ADAPTERS/qwencode/hooks"
+    "$ADAPTERS/qwencode/hooks" \
+    "$ADAPTERS/workbuddy/hooks"
 
 cat > "$SOURCE/Cargo.toml" <<EOF
 [workspace]
@@ -77,6 +78,7 @@ chmod 0755 \
     "$ADAPTERS/common/hooks/run-hook.sh"
 ln -s ../../common/hooks/run-hook.sh "$ADAPTERS/claude-code/hooks/run-hook.sh"
 ln -s ../../common/hooks/run-hook.sh "$ADAPTERS/qwencode/hooks/run-hook.sh"
+ln -s ../../common/hooks/run-hook.sh "$ADAPTERS/workbuddy/hooks/run-hook.sh"
 
 make_binaries() {
     local os="$1"

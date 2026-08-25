@@ -123,6 +123,7 @@ anolisa adapter scan
 | DeepSeek Harness (dsh) | `anolisa adapter enable tokenless dsh --profile <profile>` |
 | OpenCode | `anolisa adapter enable tokenless opencode` |
 | Qwen Code | `anolisa adapter enable tokenless qwencode` |
+| WorkBuddy | Lifecycle script (see below) |
 
 Restart the Agent CLI or IDE after setting it up. OpenClaw also requires
 `openclaw gateway restart`; if its security check rejects the plugin, follow
@@ -141,7 +142,9 @@ Every later enable or re-enable replaces the entire recorded profile set.
 Include every profile that should retain Tokenless each time.
 
 OpenCode is available through the same adapter command. The bundled lifecycle script remains an
-alternative for npm installations that have no ANOLISA component record.
+alternative for npm installations that have no ANOLISA component record. WorkBuddy is not
+registered with `anolisa adapter enable` in this release; use the bundled lifecycle script
+described in the [WorkBuddy integration instructions](framework-integration.md#workbuddy).
 
 ## Optional: test compression without an Agent
 
