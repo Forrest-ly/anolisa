@@ -249,6 +249,54 @@ jobs:
           echo "SPEC_BASENAME=$(basename "$SPEC_FILE")" >> $GITHUB_ENV
           echo "EXTRACT_DIR=${EXTRACT_DIR}" >> $GITHUB_ENV
 
+      - name: Verify tokenless component contract
+        if: inputs.component == 'tokenless'
+        run: |
+          # Component contract guard for the nightly RPM path: this workflow
+          # processes the archived spec and calls rpmbuild directly, so it
+          # never runs the build_tokenless guard in scripts/rpm-build.sh.
+          # Mirror that assertion here: derive the component name from
+          # .anolisa/component.toml.in, verify it matches the RPM package
+          # name, and require an exact "Provides: anolisa-component(<name>)"
+          # line in the processed spec, so spec drift fails the build
+          # instead of publishing an RPM that silently lacks the capability
+          # used by `anolisa install tokenless` (GH-2836).
+          COMPONENT_IN=$(find "$EXTRACT_DIR" -path '*/.anolisa/component.toml.in' | head -1)
+          if [ -z "$COMPONENT_IN" ]; then
+            echo "ERROR: component contract template (.anolisa/component.toml.in) not found in source archive"
+            exit 1
+          fi
+
+          COMPONENT_NAME=$(awk '
+            $0 == "[component]" { in_component = 1; next }
+            in_component && /^\[/ { exit }
+            in_component && /^name = / {
+              value = $0
+              sub(/^name = "/, "", value)
+              sub(/"$/, "", value)
+              print value
+              exit
+            }
+          ' "$COMPONENT_IN")
+          if [ -z "$COMPONENT_NAME" ]; then
+            echo "ERROR: could not parse component name from $COMPONENT_IN"
+            exit 1
+          fi
+
+          SPEC_NAME=$(grep -E '^Name:' "$HOME/rpmbuild/SPECS/$SPEC_BASENAME" | awk '{print $2}' | tr -d ' \t')
+          if [ "$COMPONENT_NAME" != "$SPEC_NAME" ]; then
+            echo "ERROR: tokenless identity mismatch: RPM name '$SPEC_NAME', component name '$COMPONENT_NAME'"
+            exit 1
+          fi
+
+          if ! grep -Fqx "Provides:       anolisa-component($COMPONENT_NAME)" "$HOME/rpmbuild/SPECS/$SPEC_BASENAME"; then
+            echo "ERROR: tokenless spec must provide anolisa-component($COMPONENT_NAME)"
+            exit 1
+          fi
+
+          echo "TOKENLESS_COMPONENT_NAME=$COMPONENT_NAME" >> "$GITHUB_ENV"
+          echo "tokenless component contract OK: $SPEC_NAME provides anolisa-component($COMPONENT_NAME)"
+
       - name: Build RPM
         run: |
           rpmbuild -bb --nodeps \
@@ -271,6 +319,21 @@ jobs:
           if [ "${{ inputs.component }}" = "agentsight" ]; then
             while IFS= read -r rpm_path; do
               "$AGENTSIGHT_VERIFY_RPM" "$rpm_path"
+            done < <(find /tmp/rpm-output/ -maxdepth 1 -type f -name "*.rpm" -print)
+          fi
+
+          if [ "${{ inputs.component }}" = "tokenless" ]; then
+            # Verify the built artifact actually publishes the component
+            # capability; this catches cases where rpmbuild silently drops a
+            # malformed Provides line that passed the spec text guard.
+            while IFS= read -r rpm_path; do
+              echo "Verifying tokenless RPM capabilities: $rpm_path"
+              if ! rpm -qp --provides "$rpm_path" | grep -Eq "^anolisa-component\(${TOKENLESS_COMPONENT_NAME}\)([[:space:]]|$)"; then
+                echo "ERROR: $rpm_path does not provide anolisa-component(${TOKENLESS_COMPONENT_NAME})"
+                echo "Actual provides:"
+                rpm -qp --provides "$rpm_path"
+                exit 1
+              fi
             done < <(find /tmp/rpm-output/ -maxdepth 1 -type f -name "*.rpm" -print)
           fi
 
