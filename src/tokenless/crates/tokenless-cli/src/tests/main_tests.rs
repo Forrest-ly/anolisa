@@ -1627,7 +1627,8 @@ fn run_command_compress_toon_tiny_input() {
         session_id: None,
         tool_use_id: None,
     });
-    // A tiny JSON string compresses successfully.
+    // A tiny JSON string is below the TOON minimum-length threshold and
+    // passes through unchanged; the command still succeeds.
     assert!(result.is_ok());
 }
 
@@ -1644,7 +1645,8 @@ fn run_command_compress_toon_empty_obj() {
         session_id: None,
         tool_use_id: None,
     });
-    // An empty JSON object compresses successfully.
+    // An empty JSON object is below the TOON minimum-length threshold and
+    // passes through unchanged; the command still succeeds.
     assert!(result.is_ok());
 }
 

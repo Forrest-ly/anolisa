@@ -10,8 +10,8 @@ use std::process;
 use std::sync::Arc;
 use tokenless_ccr::{SqliteStore, StashStore};
 use tokenless_runtime::{
-    CompressOptions, CompressResult, Disposition, MAX_INPUT_BYTES, compress_response_with_store,
-    compress_toon, retrieve_from_store,
+    CompressOptions, CompressResult, Disposition, MAX_INPUT_BYTES, MIN_TOON_CHARS,
+    compress_response_with_store, compress_toon, retrieve_from_store,
 };
 use tokenless_schema::SchemaCompressor;
 use tokenless_stats::{
@@ -116,6 +116,10 @@ enum Commands {
     #[command(subcommand)]
     Stats(StatsCommands),
     /// Encode JSON to TOON format
+    ///
+    /// Payloads shorter than 500 characters pass through unchanged: TOON
+    /// saves near-nothing on small JSON, so the CLI applies the same
+    /// minimum-length threshold as the agent hooks.
     CompressToon {
         #[arg(short, long)]
         file: Option<String>,
@@ -904,6 +908,11 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                 eprintln!(
                     "tokenless: TOON encoding did not reduce size ({} -> {} est. tokens), outputting original JSON",
                     result.before_tokens, result.after_tokens
+                );
+            }
+            if result.disposition == Disposition::Passthrough {
+                eprintln!(
+                    "tokenless: payload shorter than {MIN_TOON_CHARS} chars, skipping TOON encoding (same minimum-length threshold as the agent hooks), outputting original JSON"
                 );
             }
 

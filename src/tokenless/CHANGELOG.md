@@ -9,6 +9,10 @@ Releases from 0.7.2 onward follow
 
 ## [Unreleased]
 
+### Changed
+
+- `tokenless compress-toon` and the runtime/SDK `compress_toon` path now apply the same 500-character minimum-length threshold as the agent hooks: shorter payloads pass through unchanged, so the CLI no longer TOON-encodes small JSON that the hooks would skip ([#2838](https://github.com/alibaba/anolisa/issues/2838)).
+
 ## [0.7.13] - 2026-08-25
 
 ### Added

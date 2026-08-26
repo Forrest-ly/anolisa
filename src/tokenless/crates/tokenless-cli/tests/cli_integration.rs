@@ -1097,10 +1097,13 @@ fn compress_toon_dry_run_predicted_tokens_match_recorded_stats_for_cjk() {
         Some(fixture) => fixture,
         None => return,
     };
+    // Repeated far enough past the 500-char TOON minimum-length threshold
+    // to reach the encoding path.
     let input = serde_json::to_string(&serde_json::json!({
-        "msg": "你好世界你好世界"
+        "msg": "你好世界你好世界".repeat(80)
     }))
     .unwrap();
+    assert!(input.chars().count() >= 500);
     assert_ne!(
         estimate_tokens(&input),
         estimate_tokens_from_bytes(input.len()),
@@ -1145,14 +1148,20 @@ fn compress_toon_ascii_emits_toon_when_character_estimator_saves() {
         Some(fixture) => fixture,
         None => return,
     };
-    let input = r#"{"content":"some content","debug":"remove"}"#;
+    // Repetitive objects above the 500-char TOON minimum-length threshold;
+    // TOON's single key header beats JSON's per-object key repetition.
+    let items: Vec<serde_json::Value> = (0..30)
+        .map(|index| serde_json::json!({"content": "some content", "debug": "remove", "index": index}))
+        .collect();
+    let input = serde_json::to_string(&serde_json::json!({ "items": items })).unwrap();
+    assert!(input.chars().count() >= 500);
     assert_eq!(
-        estimate_tokens(input),
+        estimate_tokens(&input),
         estimate_tokens_from_bytes(input.len()),
         "ascii fixture should keep the two estimators in agreement"
     );
 
-    let output = run_compress_toon(&fixture, input, "1", "ascii-toon-active");
+    let output = run_compress_toon(&fixture, &input, "1", "ascii-toon-active");
     assert!(
         output.status.success(),
         "compress-toon failed: {}",
@@ -1162,8 +1171,8 @@ fn compress_toon_ascii_emits_toon_when_character_estimator_saves() {
     let emitted = stdout.trim_end();
     assert_ne!(emitted, input, "active TOON with savings must replace JSON");
     assert!(
-        emitted.contains("content:") || emitted.starts_with("content:"),
-        "expected TOON object encoding, got {emitted:?}"
+        emitted.contains("{content,debug,index}"),
+        "expected TOON table encoding with a single key header, got {emitted:?}"
     );
 
     let recorder = StatsRecorder::new(fixture.data_dir.join("stats.db")).unwrap();
@@ -1171,7 +1180,7 @@ fn compress_toon_ascii_emits_toon_when_character_estimator_saves() {
         .records_by_session("ascii-toon-active", None)
         .unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].before_tokens, estimate_tokens(input));
+    assert_eq!(records[0].before_tokens, estimate_tokens(&input));
     assert_eq!(records[0].after_tokens, estimate_tokens(emitted));
     assert!(records[0].after_tokens < records[0].before_tokens);
 }
@@ -1182,10 +1191,13 @@ fn compress_toon_cjk_active_emits_toon_and_records_character_tokens() {
         Some(fixture) => fixture,
         None => return,
     };
+    // Repeated far enough past the 500-char TOON minimum-length threshold
+    // to reach the encoding path.
     let input = serde_json::to_string(&serde_json::json!({
-        "msg": "你好世界你好世界"
+        "msg": "你好世界你好世界".repeat(80)
     }))
     .unwrap();
+    assert!(input.chars().count() >= 500);
     let output = run_compress_toon(&fixture, &input, "1", "cjk-toon-active");
     assert!(
         output.status.success(),
@@ -1207,6 +1219,50 @@ fn compress_toon_cjk_active_emits_toon_and_records_character_tokens() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].before_tokens, estimate_tokens(&input));
     assert_eq!(records[0].after_tokens, estimate_tokens(emitted));
+}
+
+/// Payloads below the 500-char minimum-length threshold pass through
+/// unchanged with a stderr note and record no stats row, matching the
+/// hook-layer behavior.
+#[test]
+fn compress_toon_short_payload_passes_through_without_stats() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let input = r#"{"content":"some content","debug":"remove"}"#;
+    assert!(input.chars().count() < 500);
+
+    let output = run_compress_toon(&fixture, input, "1", "toon-short-skip");
+    assert!(
+        output.status.success(),
+        "compress-toon short-payload skip failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim_end(),
+        input,
+        "short payloads must pass through unchanged"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("500") && stderr.contains("skipping TOON encoding"),
+        "stderr must explain the minimum-length skip, got {stderr:?}"
+    );
+
+    // No stats row may be recorded for a skipped payload; the stats
+    // database may even be absent entirely when nothing was written.
+    let stats_db = fixture.data_dir.join("stats.db");
+    if stats_db.exists() {
+        let recorder = StatsRecorder::new(stats_db).unwrap();
+        let records = recorder
+            .records_by_session("toon-short-skip", None)
+            .unwrap();
+        assert!(
+            records.is_empty(),
+            "skipped payloads must not record stats rows"
+        );
+    }
 }
 
 /// Parse failures keep the documented compress-command exit code 2 now

@@ -9,6 +9,10 @@ Tokenless 的所有重要变更都会记录在此文件中。
 
 ## [未发布]
 
+### 变更
+
+- `tokenless compress-toon` 及运行时/SDK 的 `compress_toon` 路径现在与 agent hook 使用相同的 500 字符最小长度阈值：短于该阈值的负载原样透传，CLI 不再对 hook 会跳过的小型 JSON 进行 TOON 编码（[#2838](https://github.com/alibaba/anolisa/issues/2838)）。
+
 ## [0.7.13] - 2026-08-25
 
 ### 新增

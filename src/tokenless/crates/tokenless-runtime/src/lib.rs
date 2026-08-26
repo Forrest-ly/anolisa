@@ -33,6 +33,17 @@ pub use tokenless_protocol::Disposition;
 /// Maximum accepted response size, matching the standalone CLI input limit.
 pub const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Minimum payload length (in Unicode chars, not bytes) for TOON encoding.
+///
+/// TOON on small JSON saves only a few characters (observed ~0.3% below
+/// ~500 chars) while the per-event encode cost stays the same, so payloads
+/// under this threshold pass through untouched. The hook layer enforces the
+/// same threshold before spawning the CLI (`_MIN_TOON_CHARS` in
+/// `compress_toon_hook.py` / `compress_response_hook.py`); keeping the gate
+/// here too makes the CLI and SDK entry points behave identically no matter
+/// which path is invoked (GH issue: CLI/hook parity).
+pub const MIN_TOON_CHARS: usize = 500;
+
 /// Runtime construction options for state and observability.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -503,6 +514,23 @@ pub fn compress_toon(
 ) -> Result<CompressResult, RuntimeError> {
     validate_input_size(input)?;
     let value: serde_json::Value = serde_json::from_str(input)?;
+    // Minimum-length gate shared with the hook layer: TOON savings on small
+    // JSON are near-zero, so short payloads pass through untouched. Chars,
+    // not bytes, match the hook `_MIN_TOON_CHARS` semantics.
+    if input.chars().count() < MIN_TOON_CHARS {
+        let tokens = estimate_tokens(input);
+        return Ok(CompressResult {
+            output: input.to_string(),
+            compressed_output: String::new(),
+            disposition: Disposition::Passthrough,
+            before_tokens: tokens,
+            after_tokens: tokens,
+            stash_writes: None,
+            stash_errors: None,
+            unrecoverable_truncations: None,
+            stash_size: None,
+        });
+    }
     let compressed_output = toon_format::encode_default(&value)
         .map_err(|error| RuntimeError::ToonEncode(error.to_string()))?
         .trim_end()
@@ -1280,8 +1308,46 @@ mod tests {
 
         let tiny = "null";
         let result = compress_toon(tiny, true).unwrap();
-        assert_eq!(result.disposition, Disposition::NoSavings);
+        assert_eq!(result.disposition, Disposition::Passthrough);
         assert_eq!(result.output, tiny);
+    }
+
+    #[test]
+    fn toon_below_min_chars_passes_through_with_savings_available() {
+        // Repetitive small JSON that TOON *would* shrink, but the payload is
+        // under MIN_TOON_CHARS, so the runtime must skip encoding entirely.
+        let input = serde_json::to_string(&serde_json::json!({
+            "items": (0..5)
+                .map(|index| serde_json::json!({"name": "same", "value": index}))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap();
+        assert!(input.chars().count() < MIN_TOON_CHARS);
+        let result = compress_toon(&input, true).unwrap();
+        assert_eq!(result.disposition, Disposition::Passthrough);
+        assert_eq!(result.output, input);
+        assert_eq!(result.compressed_output, "");
+        assert_eq!(result.before_tokens, result.after_tokens);
+    }
+
+    #[test]
+    fn toon_at_or_above_min_chars_still_encodes_when_smaller() {
+        // At and above the threshold the gate no longer applies: a repetitive
+        // payload that TOON shrinks must be encoded like any larger input.
+        let input = serde_json::to_string(&serde_json::json!({
+            "items": (0..100)
+                .map(|index| serde_json::json!({"name": "same", "value": index}))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap();
+        assert!(input.chars().count() >= MIN_TOON_CHARS);
+        let result = compress_toon(&input, true).unwrap();
+        assert!(
+            result.applied(),
+            "expected TOON encoding above threshold, got {:?}",
+            result.disposition
+        );
+        assert!(result.after_tokens < result.before_tokens);
     }
 
     #[test]

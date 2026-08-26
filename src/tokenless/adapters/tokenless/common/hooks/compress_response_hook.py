@@ -85,6 +85,8 @@ _MIN_RESPONSE_CHARS = 200
 # saves only a few characters (observed ~0.3% below ~500 chars) while the
 # per-event encode cost stays the same, so payloads under this threshold
 # keep the response-compressed form and skip the TOON pass entirely.
+# Keep in sync with tokenless-runtime's MIN_TOON_CHARS, which enforces the
+# same threshold inside `tokenless compress-toon` itself.
 _MIN_TOON_CHARS = 500
 
 # Claude Code added hookSpecificOutput.updatedToolOutput (normal-path tool

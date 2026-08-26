@@ -43,6 +43,8 @@ _AGENT_ID = resolve_agent_id()
 # Minimum payload size for TOON encoding. TOON on small JSON saves only a
 # few characters (observed ~0.3% below ~500 chars) while the per-event
 # encode cost stays the same, so smaller responses pass through untouched.
+# Keep in sync with tokenless-runtime's MIN_TOON_CHARS, which enforces the
+# same threshold inside `tokenless compress-toon` itself.
 _MIN_TOON_CHARS = 500
 
 
