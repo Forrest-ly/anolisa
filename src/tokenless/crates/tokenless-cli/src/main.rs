@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokenless_ccr::{SqliteStore, StashStore};
 use tokenless_protocol::CompressionRequest;
 use tokenless_runtime::{
-    CompressOptions, CompressResult, Disposition, EntryOptions, MAX_INPUT_BYTES,
+    CompressOptions, CompressResult, Disposition, EntryOptions, MAX_INPUT_BYTES, MIN_TOON_CHARS,
     compress_response_with_store, compress_toon, compress_with_store, retrieve_from_store,
 };
 use tokenless_schema::SchemaCompressor;
@@ -130,7 +130,14 @@ enum Commands {
     /// View and export statistics
     #[command(subcommand)]
     Stats(StatsCommands),
-    /// Encode JSON to TOON format
+    /// Encode JSON to TOON format. Payloads shorter than the minimum
+    /// length (500 characters by default, matching the adapter hooks) pass
+    /// through unchanged because TOON savings on small JSON are near-zero.
+    /// Passthrough and no-savings runs write the original payload to stdout
+    /// byte-for-byte (no trailing newline is added or stripped) and exit 0;
+    /// the stderr note is informational only, so automation should detect
+    /// encoding by comparing stdout with the input payload, not by parsing
+    /// stderr. Encoded runs emit the TOON text without a trailing newline.
     CompressToon {
         #[arg(short, long)]
         file: Option<String>,
@@ -143,6 +150,11 @@ enum Commands {
         /// Tool use ID
         #[arg(long)]
         tool_use_id: Option<String>,
+        /// Minimum payload length (in characters) for TOON encoding.
+        /// Shorter payloads pass through unchanged; set to 0 to encode any
+        /// payload that yields token savings.
+        #[arg(long, value_name = "CHARS", default_value_t = MIN_TOON_CHARS)]
+        min_toon_chars: usize,
     },
     /// Decode TOON format back to JSON
     DecompressToon {
@@ -956,37 +968,61 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             agent_id,
             session_id,
             tool_use_id,
+            min_toon_chars,
         } => {
             let input = read_input(&file).map_err(|e| (e, 2))?;
             let config = TokenlessConfig::load();
             let compression_on = config.is_compression_enabled();
             // Share runtime scoring so CLI dry-run predictions match
             // `stats summary` and the Python/SDK compress_toon path. The
-            // previous bytes/4 heuristic under-counted CJK.
-            let result = compress_toon(&input, compression_on).map_err(|error| {
-                // JSON parse, oversized input, and TOON encode keep the
-                // documented compress-command exit code 2.
-                let code = if matches!(
-                    error,
-                    tokenless_runtime::RuntimeError::InvalidJson(_)
-                        | tokenless_runtime::RuntimeError::InputTooLarge { .. }
-                        | tokenless_runtime::RuntimeError::ToonEncode(_)
-                ) {
-                    2
-                } else {
-                    1
-                };
-                (error.to_string(), code)
-            })?;
-            if result.disposition == Disposition::NoSavings {
-                eprintln!(
-                    "tokenless: TOON encoding did not reduce size ({} -> {} est. tokens), outputting original JSON",
-                    result.before_tokens, result.after_tokens
-                );
+            // previous bytes/4 heuristic under-counted CJK. The shared
+            // minimum-length gate keeps the CLI aligned with the adapter
+            // hooks, which skip payloads under the same threshold.
+            let result =
+                compress_toon(&input, compression_on, min_toon_chars).map_err(|error| {
+                    // JSON parse, oversized input, and TOON encode keep the
+                    // documented compress-command exit code 2.
+                    let code = if matches!(
+                        error,
+                        tokenless_runtime::RuntimeError::InvalidJson(_)
+                            | tokenless_runtime::RuntimeError::InputTooLarge { .. }
+                            | tokenless_runtime::RuntimeError::ToonEncode(_)
+                    ) {
+                        2
+                    } else {
+                        1
+                    };
+                    (error.to_string(), code)
+                })?;
+            match result.disposition {
+                Disposition::Passthrough => {
+                    eprintln!(
+                        "tokenless: payload under the {min_toon_chars}-character TOON minimum ({} chars), skipping encoding and outputting original JSON",
+                        input.chars().count()
+                    );
+                }
+                Disposition::NoSavings => {
+                    eprintln!(
+                        "tokenless: TOON encoding did not reduce size ({} -> {} est. tokens), outputting original JSON",
+                        result.before_tokens, result.after_tokens
+                    );
+                }
+                _ => {}
             }
 
             let mode = resolve_mode(compression_on, result.before_tokens, result.after_tokens);
-            println!("{}", result.output);
+            // Byte-exact stdout: the documented detection contract compares
+            // stdout with the input payload, so passthrough and no-savings
+            // runs must reproduce the input verbatim. `println!` would append
+            // a LF (added for inputs without one, doubled for inputs with
+            // one) and break that comparison.
+            {
+                let mut stdout = io::stdout().lock();
+                stdout
+                    .write_all(result.output.as_bytes())
+                    .and_then(|()| stdout.flush())
+                    .map_err(|e| (format!("Failed to write output: {e}"), 1))?;
+            }
 
             // Recorded `after` = the predicted TOON result (or original when
             // TOON did not reduce size), so dry-run captures the prediction.

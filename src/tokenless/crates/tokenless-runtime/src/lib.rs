@@ -36,6 +36,16 @@ pub use tokenless_protocol::Disposition;
 /// Maximum accepted response size, matching the standalone CLI input limit.
 pub const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Minimum payload length (in characters) before TOON encoding runs.
+///
+/// TOON on small JSON saves only a few characters (observed ~0.3% below
+/// ~500 chars) while the per-event encode cost stays the same, so smaller
+/// payloads pass through untouched. Keeping the threshold here lets the
+/// `compress-toon` CLI and the [`TokenlessRuntime::compress_toon`] SDK
+/// path behave exactly like the adapter hook layer, which skips payloads
+/// under the same threshold before invoking the CLI.
+pub const MIN_TOON_CHARS: usize = 500;
+
 /// Runtime construction options for state and observability.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -314,6 +324,9 @@ impl TokenlessRuntime {
 
     /// Encode one JSON value as TOON when doing so reduces estimated tokens.
     ///
+    /// Payloads shorter than [`MIN_TOON_CHARS`] characters pass through
+    /// unchanged, matching the adapter hook layer.
+    ///
     /// # Errors
     ///
     /// Returns [`RuntimeError`] for oversized or invalid JSON input, or when
@@ -323,7 +336,7 @@ impl TokenlessRuntime {
         input: &str,
         attribution: &Attribution,
     ) -> Result<CompressResult, RuntimeError> {
-        let result = compress_toon(input, self.config.compression_enabled)?;
+        let result = compress_toon(input, self.config.compression_enabled, MIN_TOON_CHARS)?;
         self.record_stats(OperationType::CompressToon, input, &result, attribution);
         Ok(result)
     }
@@ -546,23 +559,52 @@ fn finish_schema_compression(
     }
 }
 
-/// Encode JSON as TOON and apply the shared no-savings and dry-run policy.
+/// Encode JSON as TOON and apply the shared minimum-length gate,
+/// no-savings, and dry-run policies.
+///
+/// Payloads with fewer than `min_toon_chars` characters pass through
+/// unchanged as [`Disposition::Passthrough`] because TOON savings on small
+/// JSON are near-zero (see [`MIN_TOON_CHARS`], the shared default used by
+/// the CLI and the adapter hooks). Pass `0` to encode any payload that
+/// yields token savings, restoring the pre-gate behavior. The input is
+/// still validated as JSON, so short invalid payloads fail instead of
+/// passing through.
 ///
 /// # Errors
 ///
-/// Returns [`RuntimeError`] for oversized or invalid JSON input, or when the
-/// TOON encoder rejects the value.
+/// Returns [`RuntimeError`] for oversized or invalid JSON input, and for
+/// TOON encode failures on payloads that clear the minimum-length gate.
 pub fn compress_toon(
     input: &str,
     compression_enabled: bool,
+    min_toon_chars: usize,
 ) -> Result<CompressResult, RuntimeError> {
     validate_input_size(input)?;
+    let before_tokens = estimate_tokens(input);
+    // Parse before the minimum-length gate: invalid JSON must fail with
+    // `RuntimeError::InvalidJson` (CLI exit code 2) regardless of payload
+    // size. The gate only skips TOON encoding; it never exempts input from
+    // JSON validation.
     let value: serde_json::Value = serde_json::from_str(input)?;
+    // Character count, not byte length: the adapter hooks measure the same
+    // threshold in Unicode code points, so CJK payloads gate identically.
+    if input.chars().count() < min_toon_chars {
+        return Ok(CompressResult {
+            output: input.to_string(),
+            compressed_output: input.to_string(),
+            disposition: Disposition::Passthrough,
+            before_tokens,
+            after_tokens: before_tokens,
+            stash_writes: None,
+            stash_errors: None,
+            unrecoverable_truncations: None,
+            stash_size: None,
+        });
+    }
     let compressed_output = toon_format::encode_default(&value)
         .map_err(|error| RuntimeError::ToonEncode(error.to_string()))?
         .trim_end()
         .to_string();
-    let before_tokens = estimate_tokens(input);
     let after_tokens = estimate_tokens(&compressed_output);
     let disposition = if compressed_output.is_empty() || after_tokens >= before_tokens {
         Disposition::NoSavings
@@ -1373,14 +1415,66 @@ mod tests {
                 .collect::<Vec<_>>()
         }))
         .unwrap();
-        let result = compress_toon(&input, true).unwrap();
+        let result = compress_toon(&input, true, MIN_TOON_CHARS).unwrap();
         assert!(result.applied());
         assert!(result.after_tokens < result.before_tokens);
 
+        // A tiny payload never reaches the encoder now: the shared
+        // minimum-length gate passes it through untouched.
         let tiny = "null";
-        let result = compress_toon(tiny, true).unwrap();
+        let result = compress_toon(tiny, true, MIN_TOON_CHARS).unwrap();
+        assert_eq!(result.disposition, Disposition::Passthrough);
+        assert_eq!(result.output, tiny);
+
+        // The same tiny payload encodes when the gate is disabled.
+        let result = compress_toon(tiny, true, 0).unwrap();
         assert_eq!(result.disposition, Disposition::NoSavings);
         assert_eq!(result.output, tiny);
+    }
+
+    #[test]
+    fn toon_skips_short_payloads_with_savings() {
+        // Uniform rows compress well under TOON, so without the gate this
+        // payload would be Applied; the minimum-length check must win.
+        let input = serde_json::to_string(&serde_json::json!({
+            "items": (0..10)
+                .map(|index| serde_json::json!({"name": "same", "value": index}))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap();
+        assert!(input.chars().count() < MIN_TOON_CHARS);
+        let gated = compress_toon(&input, true, MIN_TOON_CHARS).unwrap();
+        assert_eq!(gated.disposition, Disposition::Passthrough);
+        assert_eq!(gated.output, input);
+        assert_eq!(gated.before_tokens, gated.after_tokens);
+
+        let forced = compress_toon(&input, true, 0).unwrap();
+        assert!(forced.applied());
+        assert!(forced.after_tokens < forced.before_tokens);
+    }
+
+    #[test]
+    fn toon_min_chars_boundary_is_inclusive() {
+        // Build {"pad":"aaa..."} with exactly MIN_TOON_CHARS characters.
+        let overhead = r#"{"pad":""}"#.chars().count();
+        let padded = format!(r#"{{"pad":"{}"}}"#, "a".repeat(MIN_TOON_CHARS - overhead));
+        assert_eq!(padded.chars().count(), MIN_TOON_CHARS);
+        // At exactly the threshold the gate must not fire; the savings
+        // comparison alone decides the disposition.
+        let result = compress_toon(&padded, true, MIN_TOON_CHARS).unwrap();
+        assert_ne!(result.disposition, Disposition::Passthrough);
+    }
+
+    #[test]
+    fn toon_gate_does_not_skip_json_validation() {
+        // Short invalid input must fail with InvalidJson even under the
+        // default gate: the gate skips TOON encoding, not JSON validation.
+        let error = compress_toon("not json", true, MIN_TOON_CHARS).unwrap_err();
+        assert!(matches!(error, RuntimeError::InvalidJson(_)));
+
+        // The same contract holds with the gate disabled.
+        let error = compress_toon("not json", true, 0).unwrap_err();
+        assert!(matches!(error, RuntimeError::InvalidJson(_)));
     }
 
     #[test]

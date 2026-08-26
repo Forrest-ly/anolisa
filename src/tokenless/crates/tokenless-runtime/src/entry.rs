@@ -21,18 +21,17 @@ use tokenless_schema::SchemaCompressor;
 use tokenless_stats::{OperationType, estimate_tokens};
 
 use crate::{
-    CompressOptions, MAX_INPUT_BYTES, ResponsePipelineRun, finish_schema_compression,
-    run_response_pipeline, taxonomy,
+    CompressOptions, MAX_INPUT_BYTES, MIN_TOON_CHARS, ResponsePipelineRun,
+    finish_schema_compression, run_response_pipeline, taxonomy,
 };
 
 /// Minimum content size (Unicode scalar values, matching the Python hooks'
 /// `len()`) for post-tool compression to be attempted at all.
 const MIN_RESPONSE_CHARS: usize = 200;
 
-/// Minimum candidate size for the TOON encoding pass. TOON on small JSON
-/// saves only a few characters while the per-event encode cost stays the
-/// same (observed ~0.3% below ~500 chars).
-const MIN_TOON_CHARS: usize = 500;
+// TOON selection gate: minimum candidate size for the TOON encoding pass,
+// shared with the standalone compress-toon CLI/runtime path via
+// [`crate::MIN_TOON_CHARS`].
 
 /// Per-call behavior toggles resolved by the frontend from its config.
 #[derive(Debug, Clone)]
