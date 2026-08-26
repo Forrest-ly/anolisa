@@ -9,9 +9,10 @@
 //! adapter needs to build its host-specific envelope.
 //!
 //! The roadmap section numbers cited throughout this crate (§4.1, §4.5,
-//! §5.1, §5.6, …) refer to the tokenless evolution roadmap, which has not
-//! landed in this repository yet. Until it does, the JSON examples and
-//! contract tests in this crate are the authoritative wire contract.
+//! §5.1, §5.6, …) refer to the tokenless evolution roadmap at
+//! `docs/roadmap/evolution-roadmap.md`. The JSON examples and contract
+//! tests in this crate are the drift guard between that document and the
+//! wire types.
 //!
 //! # Compatibility rules
 //!

@@ -16,7 +16,7 @@
 //! existing JSON response cleanup ([`RESPONSE_CLEANUP`]), whose executable
 //! implementation lives with the Runtime that owns its stash and per-call
 //! configuration. The roadmap section numbers refer to the tokenless
-//! evolution roadmap, which has not landed in this repository yet.
+//! evolution roadmap at `docs/roadmap/evolution-roadmap.md`.
 
 mod content;
 mod pipeline;
