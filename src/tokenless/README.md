@@ -321,13 +321,30 @@ tokenless retrieve "<... 160 items truncated, retrieve with <<tokenless:c30ccf5e
 
 ### compress-toon / decompress-toon
 
-Encode JSON to TOON format (or decode back to JSON):
+Encode JSON to TOON format (or decode back to JSON). Payloads shorter than
+500 characters pass through unchanged, because TOON saves near-nothing on
+small JSON:
 
 ```bash
-# Encode JSON to TOON
+# Encode JSON to TOON (payloads of at least 500 characters)
+tokenless compress-toon <<'EOF'
+{"users":[{"id":1,"name":"Alice","role":"admin","city":"Paris"},{"id":2,"name":"Bob","role":"editor","city":"Lyon"},{"id":3,"name":"Carol","role":"viewer","city":"Nice"},{"id":4,"name":"Dan","role":"editor","city":"Lille"},{"id":5,"name":"Erin","role":"viewer","city":"Metz"},{"id":6,"name":"Frank","role":"admin","city":"Lens"},{"id":7,"name":"Grace","role":"editor","city":"Caen"},{"id":8,"name":"Heidi","role":"viewer","city":"Rennes"},{"id":9,"name":"Ivan","role":"viewer","city":"Brest"},{"id":10,"name":"Judy","role":"editor","city":"Toulouse"}]}
+EOF
+# users[10]{id,name,role,city}:
+#   1,Alice,admin,Paris
+#   2,Bob,editor,Lyon
+#   3,Carol,viewer,Nice
+#   4,Dan,editor,Lille
+#   5,Erin,viewer,Metz
+#   6,Frank,admin,Lens
+#   7,Grace,editor,Caen
+#   8,Heidi,viewer,Rennes
+#   9,Ivan,viewer,Brest
+#   10,Judy,editor,Toulouse
+
+# Payloads under 500 characters pass through unchanged
 echo '{"name":"Alice","age":30}' | tokenless compress-toon
-# name: Alice
-# age: 30
+# {"name":"Alice","age":30}
 
 # Decode TOON back to JSON
 echo 'name: Alice\nage: 30' | tokenless decompress-toon

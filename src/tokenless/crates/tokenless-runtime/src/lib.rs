@@ -37,11 +37,14 @@ pub const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// TOON on small JSON saves only a few characters (observed ~0.3% below
 /// ~500 chars) while the per-event encode cost stays the same, so payloads
-/// under this threshold pass through untouched. The hook layer enforces the
-/// same threshold before spawning the CLI (`_MIN_TOON_CHARS` in
-/// `compress_toon_hook.py` / `compress_response_hook.py`); keeping the gate
-/// here too makes the CLI and SDK entry points behave identically no matter
-/// which path is invoked (GH issue: CLI/hook parity).
+/// under this threshold pass through untouched. This single constant
+/// constrains every TOON entry point — the `tokenless compress-toon` CLI
+/// subcommand, the SDK `compress_toon` path, and the Python binding — which
+/// keeps them all consistent with the user-guide contract that payloads
+/// shorter than 500 characters pass through unchanged. The hook layer
+/// enforces the same threshold before spawning the CLI (`_MIN_TOON_CHARS`
+/// in `compress_toon_hook.py` / `compress_response_hook.py`) as a pre-spawn
+/// fast-path, so CLI and hook behavior stay identical.
 pub const MIN_TOON_CHARS: usize = 500;
 
 /// Runtime construction options for state and observability.
@@ -519,9 +522,12 @@ pub fn compress_toon(
     // not bytes, match the hook `_MIN_TOON_CHARS` semantics.
     if input.chars().count() < MIN_TOON_CHARS {
         let tokens = estimate_tokens(input);
+        // No candidate ran: per the `CompressResult` contract,
+        // `compressed_output` carries the original input and `after_tokens`
+        // estimates it, matching the response-compression passthrough path.
         return Ok(CompressResult {
             output: input.to_string(),
-            compressed_output: String::new(),
+            compressed_output: input.to_string(),
             disposition: Disposition::Passthrough,
             before_tokens: tokens,
             after_tokens: tokens,
@@ -1326,7 +1332,7 @@ mod tests {
         let result = compress_toon(&input, true).unwrap();
         assert_eq!(result.disposition, Disposition::Passthrough);
         assert_eq!(result.output, input);
-        assert_eq!(result.compressed_output, "");
+        assert_eq!(result.compressed_output, input);
         assert_eq!(result.before_tokens, result.after_tokens);
     }
 

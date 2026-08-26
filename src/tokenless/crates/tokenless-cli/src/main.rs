@@ -912,7 +912,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             }
             if result.disposition == Disposition::Passthrough {
                 eprintln!(
-                    "tokenless: payload shorter than {MIN_TOON_CHARS} chars, skipping TOON encoding (same minimum-length threshold as the agent hooks), outputting original JSON"
+                    "tokenless: payload shorter than {MIN_TOON_CHARS} chars: skipping TOON encoding, outputting original JSON"
                 );
             }
 

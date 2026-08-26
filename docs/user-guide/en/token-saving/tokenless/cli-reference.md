@@ -170,10 +170,12 @@ Most adapters override these standalone defaults. Their shared shell profile use
 
 ## `compress-toon` and `decompress-toon`
 
-JSON to TOON:
+JSON to TOON (payloads of at least 500 characters):
 
 ```bash
-echo '{"name":"Alice","age":30}' | tokenless compress-toon
+tokenless compress-toon <<'EOF'
+{"users":[{"id":1,"name":"Alice","role":"admin","city":"Paris"},{"id":2,"name":"Bob","role":"editor","city":"Lyon"},{"id":3,"name":"Carol","role":"viewer","city":"Nice"},{"id":4,"name":"Dan","role":"editor","city":"Lille"},{"id":5,"name":"Erin","role":"viewer","city":"Metz"},{"id":6,"name":"Frank","role":"admin","city":"Lens"},{"id":7,"name":"Grace","role":"editor","city":"Caen"},{"id":8,"name":"Heidi","role":"viewer","city":"Rennes"},{"id":9,"name":"Ivan","role":"viewer","city":"Brest"},{"id":10,"name":"Judy","role":"editor","city":"Toulouse"}]}
+EOF
 ```
 
 TOON to JSON:
@@ -182,15 +184,13 @@ TOON to JSON:
 printf 'name: Alice\nage: 30\n' | tokenless decompress-toon
 ```
 
-Round-trip verification:
+Round-trip verification (`users.json` holds a JSON document of at least 500 characters):
 
 ```bash
-echo '{"name":"test","value":42}' \
-  | tokenless compress-toon \
-  | tokenless decompress-toon
+tokenless compress-toon --file users.json | tokenless decompress-toon
 ```
 
-`compress-toon` supports `--agent-id`, `--session-id`, and `--tool-use-id`. When encoding provides no savings, it returns the original JSON and does not record that operation.
+`compress-toon` supports `--agent-id`, `--session-id`, and `--tool-use-id`. Payloads shorter than 500 characters pass through unchanged — they are not TOON-encoded and record no statistics row, matching the minimum-length threshold the agent hooks apply. When encoding provides no savings, it returns the original JSON and does not record that operation.
 
 ## `retrieve`
 
