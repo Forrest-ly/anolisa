@@ -463,6 +463,38 @@ build_tokenless() {
 
     local pkg_name
     pkg_name=$(parse_spec_name "$spec_in")
+
+    # Component contract guard (mirrors build_cosh_ng): the RPM must publish
+    # the anolisa-component(<name>) capability so `anolisa install tokenless`
+    # can resolve the package via Provides when the component index is
+    # unavailable. Fail the build on spec drift instead of shipping a package
+    # that silently lacks the capability (GH-2836).
+    local component_in="${TOKEN_DIR}/.anolisa/component.toml.in"
+    if [ ! -f "$component_in" ]; then
+        err "Component contract template not found: $component_in"
+        return 1
+    fi
+    local component_name
+    component_name=$(awk '
+        $0 == "[component]" { in_component = 1; next }
+        in_component && /^\[/ { exit }
+        in_component && /^name = / {
+            value = $0
+            sub(/^name = "/, "", value)
+            sub(/"$/, "", value)
+            print value
+            exit
+        }
+    ' "$component_in")
+    if [ "$component_name" != "$pkg_name" ]; then
+        err "tokenless identity mismatch: RPM name '${pkg_name}', component name '${component_name}'"
+        return 1
+    fi
+    if ! grep -Fqx "Provides:       anolisa-component(${component_name})" "$spec_in"; then
+        err "tokenless spec must provide anolisa-component(${component_name})"
+        return 1
+    fi
+
     local tarball_name="${pkg_name}-${version}.tar.gz"
 
     # Step 1: Process spec template
