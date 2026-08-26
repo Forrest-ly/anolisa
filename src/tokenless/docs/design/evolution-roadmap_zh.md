@@ -5,7 +5,8 @@
 Tokenless 统一压缩管线演进的规范参考。各 crate 中引用的章节编号
 （`§4.1`–`§6`）、设计原则与里程碑标记（`M1`、`M4`）均指向本文档。
 本文档汇总了已落地代码与已合并实现 PR 中所编码的演进路线，状态以
-Tokenless 0.7.13 为准。
+Tokenless 0.7.14 为准，含该版本发布后合入的 PostTool 管线重构
+（PR #2974）。
 
 ## 目标
 
@@ -23,20 +24,20 @@ Tokenless 0.7.13 为准。
 不做复述。
 
 - **原则 2 —— 按内容路由，按接缝约束。** 一个压缩器只有在支持检测出的
-  内容类型、运行于请求的接缝、且适配器声明了其所需的全部能力时才是
-  候选者。重塑响应形态的压缩器永远不会到达无法替换模型可见输出的宿主；
-  可恢复有损压缩器永远不会到达没有检索工具的宿主。
-- **原则 3 —— 分阶段升级。** 阶梯依次为无损、可恢复有损、有界截断。
-  仅在配置的尺寸策略未满足时才升级，每个有损阶段至多运行一个压缩器；
-  专项有损决策一经做出即为最终决策。
+  内容类型、运行于请求的接缝、且适配器声明了其所需的全部能力时才运行。
+  所有能力默认为 `false`，未声明任何能力的适配器得到的是 passthrough
+  而非无法输出的候选者：无法替换模型可见输出的宿主不会运行重塑响应形态
+  的压缩器；只有在宿主发布了检索工具时才挂载 Stash，可恢复有损标记因此
+  不会成为死链。已发布的 JSON 域压缩器（§5.3）运行于 `post_tool` 并以
+  `replace_output` 为门槛：它在没有检索工具的宿主上仍会运行，并按实际
+  发生的情况声明可逆性——无法入 Stash 的截断报告为 `unrecoverable`；
+  请求要求可逆性时，裁决拒绝该候选者（原则 5）。
 - **原则 5 —— 显式可逆性声明。** 每个应用的变换都报告其恢复状态——
   `lossless`、`retrievable` 或 `unrecoverable`；require-reversible 模式
   直接拒绝不可恢复的候选者。
 - **原则 6 —— 失败开放，诊断有界。** 压缩器失败绝不使请求失败；首个
   失败被保留为以 `DIAGNOSTIC_MAX_BYTES`（4 KiB）为界的诊断，`output`
   始终恰好携带适配器应输出的内容。
-- **原则 7 —— 静态注册。** 注册表是编译期组装的 `const` 切片；动态插件
-  与配置驱动加载不在范围内。条目与其实现者一同入库，绝不做投机性注册。
 
 ## 架构（§4）
 
@@ -53,25 +54,29 @@ Tokenless 0.7.13 为准。
 - `from_json` 先校验版本再解析形态，未来版本会报告
   `UnsupportedVersion` 而非误导性的形态错误。
 
-### §4.2 内容检测与注册表路由
+### §4.2 内容检测与域分派
 
-`tokenless-pipeline` 承载内容分类（`json_records`、`search_results`、
-`build_log`、`stack_trace`、`diff`、`html`、`tabular`、`source_code`、
-`plain_text`、`unknown`）、确定性的有界成本检测器，以及带原则 2 路由
-过滤的编译期注册表。
+Runtime 的 `post_tool` 模块承载内容分类（`json_records`、
+`search_results`、`build_log`、`stack_trace`、`diff`、`html`、
+`tabular`、`source_code`、`plain_text`、`unknown`）与确定性的有界成本
+检测器。第一阶段只把 JSON 域分派给压缩器；其余检测出的域在其压缩器被
+刻意接入之前原样通过。
 
-检测是内容的纯函数，至多检查 64 KiB / 200 行，绝不完整解析任何格式；
-昂贵解析留在被选中的压缩器内部。检查从最具特征的形态到最一般的形态
-依次进行，且检测天生保守：HTML 仅识别以其自身起始的完整文档，源代码
-需要 shebang 或多个声明关键字行，类二进制输入归为 `unknown`（里程碑
-M4 策略：歧义片段不做分类）。
+检测是内容的纯函数，绝不完整解析任何格式；昂贵解析留在被选中的
+压缩器内部。检查量以首部 64 KiB 前缀为界，仅 JSON 括号嗅探额外检查
+至多 64 KiB 的末尾窗口；按行的检查以 200 行为上限。检查从最具特征的
+形态到最一般的形态依次进行，且检测天生保守：HTML 仅识别以其自身起始
+的完整文档，源代码需要 shebang 或多个声明关键字行，类二进制输入归为
+`unknown`（里程碑 M4 策略：歧义片段不做分类）。
 
-### §4.3 分阶段执行与端到端裁决
+### §4.3 PostTool 执行与端到端裁决
 
-`tokenless_pipeline::run` 让请求经过检测、路由与升级阶梯，然后对原始
-内容与最终候选者做一次性比较。未移除归一化 token、违反必需可逆性、
-或超出整体超时预算的候选者被整体拒绝；其新建的 Stash 写入按
-`(key, generation)` 回滚，并原样输出原始内容。
+Runtime 的 `PostToolPipeline` 让 post-tool 请求经过有界检测、域分派与
+一次性最终裁决，对原始内容与候选者做一次性比较。未移除归一化 token、
+违反必需可逆性、或超出超时预算的候选者被整体拒绝；其试写的 Stash 写入
+按 `(key, generation)` 回滚，并原样输出原始内容。请求还携带适配器观察
+到的内容来源（`ContentOrigin`）：来源决定截断阈值——命令输出与
+API/文件内容的阈值相差一个数量级以上——文件内容则原样通过。
 
 ### §4.5 适配器边界
 
@@ -100,20 +105,19 @@ Protocol v1 的所有 token 计数使用字符类启发式 `heuristic-v1`
 
 ### §5.2 路由契约
 
-未知或歧义内容路由到 passthrough。检测只把记录形态的 JSON
-（`{...}` / `[...]`）路由给 JSON 清理；标量根原样通过。误分类在设计
-上退化为失败开放的 passthrough 路径。
+未知或歧义内容路由到 passthrough，尚无实现的接缝同样如此。检测只把
+记录形态的 JSON（`{...}` / `[...]`）路由给 JSON 压缩器；标量根原样
+通过，检测出但尚无压缩器接入的域在其压缩器落地前原样通过。误分类在
+设计上退化为失败开放的 passthrough 路径。
 
-### §5.3 Response 清理接入管线
+### §5.3 Response 清理接入 PostTool 管线
 
-既有的 JSON response 清理注册为 `RESPONSE_CLEANUP`（内容
-`json_records`、接缝 `post_tool`、阶段为可恢复有损、成本 moderate、
-要求 `replace_output`），CLI `compress-response` 命令、
-`TokenlessRuntime::compress_response` 与 Python 绑定背后的共享路径
-改经 `tokenless_pipeline::run`。一个整体超时预算（进程内 10 秒）守护
-检测与所有阶段；超时时返回原始内容并回滚 Stash 写入。可逆性按实际
-发生的情况声明：无截断 → 无损，全部截断已入 Stash → 可恢复，其余 →
-不可恢复。
+既有的 JSON response 清理由 JSON 域压缩器（`tokenless-compressors` 中的
+`JsonCompressor`）实现，CLI `compress-response` 命令、
+`TokenlessRuntime::compress_response` 与 Python 绑定背后的共享路径改经
+Runtime 自有的 `PostToolPipeline`。一个超时预算（进程内 10 秒）守护整次
+运行；超时时返回原始内容并回滚 Stash 写入。可逆性按实际发生的情况声明：
+无截断 → 无损，全部截断已入 Stash → 可恢复，其余 → 不可恢复。
 
 ### §5.4 单一外部 hook 入口
 
@@ -129,9 +133,9 @@ Protocol v1 的所有 token 计数使用字符类启发式 `heuristic-v1`
   replacement / no-savings / timeout / malformed）；
 - 新路由行为由运行时配置开关控制，默认关闭，随接线变更一并引入。
 
-状态：评审中（PR #2844），首先迁移公共 Python hook
-（`compress_response_hook.py`、`compress_schema_hook.py`）；codex /
-hermes / openclaw / dsh / SDK 适配器在迁移前保持现有路径。
+状态：已随 0.7.14 发布（PR #2844）。公共 Python hook
+（`compress_response_hook.py`、`compress_schema_hook.py`）已迁移到统一
+入口；codex / hermes / openclaw / dsh / SDK 适配器在迁移前保持现有路径。
 
 ### §5.5 统计迁移
 
@@ -149,9 +153,10 @@ CLI、Runtime 与语言绑定共享同一套 disposition 名称与线格式字�
 
 ## §6 压缩器包
 
-新的内容专项压缩器通过为注册表条目实现 `Compressor` trait 加入管线。
-规划方向包括面向 schema 接缝的 `SchemaCompressor`。按原则 7，条目与其
-实现者一同入库，绝不做投机性注册。
+内容域压缩器以无状态引擎的形式位于 `tokenless-compressors`，返回完整
+结果；内容路由、最终裁决与 Stash 提交/回滚由 Runtime 拥有。第一阶段只把
+`JsonCompressor` 接入 PostTool 管线。新的域压缩器通过把其引擎刻意接入
+Runtime 而加入，绝不做投机性接入——在此之前，未接入的域原样通过。
 
 ## 里程碑标记
 
@@ -166,12 +171,12 @@ CLI、Runtime 与语言绑定共享同一套 disposition 名称与线格式字�
 | 章节 | 交付物 | 状态 | 参考 |
 |---------|-------------|--------|-----------|
 | §4.1 | `tokenless-protocol` v1 类型与线格式契约 | 已随 0.7.13 发布 | PR #2783 |
-| §4.2 | 内容分类、检测器、静态注册表 | 已随 0.7.13 发布 | PR #2788 |
-| §4.3 | 分阶段执行与端到端裁决 | 已随 0.7.13 发布 | PR #2799 |
-| §5.3 | Response 清理改经管线路由 | 已随 0.7.13 发布 | PR #2816 |
-| §5.4 | 统一外部 hook 入口、契约夹具、运行时开关 | 评审中 | PR #2844 |
+| §4.2 | 内容分类、检测器、域分派 | 已随 0.7.13 发布，0.7.14 后重构 | PR #2788、PR #2974 |
+| §4.3 | Runtime 自有的 PostTool 执行与端到端裁决 | 已随 0.7.13 发布，0.7.14 后重构 | PR #2799、PR #2974 |
+| §5.3 | Response 清理接入 PostTool 管线 | 已随 0.7.13 发布，0.7.14 后重构 | PR #2816、PR #2974 |
+| §5.4 | 统一外部 hook 入口、契约夹具、运行时开关 | 已随 0.7.14 发布 | PR #2844 |
 | §5.5 | 统计归因迁移 | 规划中 | 紧随 §5.4 |
-| §6 | 新压缩器包（含 schema 接缝） | 规划中 | — |
+| §6 | 域压缩器包（JSON 优先） | 0.7.14 后合入 | PR #2974 |
 
 遗留的 `compress-response` / `compress-schema` / `compress-toon`
 子命令与 pre-pipeline Python helper 保留到所有使用方迁移到统一入口

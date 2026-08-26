@@ -1,7 +1,7 @@
 // Contract tests for protocol v1. The two *_roadmap_example tests pin the
 // §4.1 JSON examples from the evolution roadmap
-// (`docs/roadmap/evolution-roadmap.md`); they are the drift guard between
-// that document and the wire types.
+// (`src/tokenless/docs/design/evolution-roadmap.md`); they are the
+// drift guard between that document and the wire types.
 
 #[test]
 fn request_roadmap_example_parses() {

@@ -10,7 +10,8 @@
 //!
 //! The roadmap section numbers cited throughout this crate (§4.1, §4.5,
 //! §5.1, §5.6, …) refer to the tokenless evolution roadmap at
-//! `docs/roadmap/evolution-roadmap.md`. The JSON examples and contract
+//! `src/tokenless/docs/design/evolution-roadmap.md` (Chinese:
+//! `evolution-roadmap_zh.md` alongside). The JSON examples and contract
 //! tests in this crate are the authoritative wire contract.
 //!
 //! # Compatibility rules
@@ -34,9 +35,11 @@
 //!
 //! Token counts use the counter named by each response's `tokenizer_id`.
 //! Normal processing uses [`TOKENIZER_ID`], the character-class heuristic
-//! `heuristic-v1`. Inputs rejected before a text scan use
-//! [`BYTE_ESTIMATOR_ID`]. Counts are normalized tokens for arbitration and
-//! attribution, not billing estimates.
+//! `heuristic-v1` — the measured §5.1 decision, not a provider tokenizer
+//! (see the note in `src/tokenless/docs/design/evolution-roadmap.md`).
+//! Inputs rejected before a text scan use [`BYTE_ESTIMATOR_ID`]. Counts
+//! are normalized tokens for arbitration and attribution, not billing
+//! estimates.
 
 use serde::{Deserialize, Serialize};
 

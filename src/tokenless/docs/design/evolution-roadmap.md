@@ -6,7 +6,9 @@ Canonical reference for the evolution of the Tokenless unified compression
 pipeline. The section numbers cited across the crates (`§4.1`–`§6`), the
 design principles, and the milestone markers (`M1`, `M4`) refer to this
 document. It consolidates the roadmap as encoded in the shipped crates and
-the merged implementation PRs; status is current as of Tokenless 0.7.13.
+the merged implementation PRs; status is current as of Tokenless 0.7.14,
+including the post-tool pipeline restructure merged after that release
+(PR #2974).
 
 ## Goal
 
@@ -27,16 +29,19 @@ content unchanged.
 The principles are numbered as the shipped code cites them; numbers without
 a shipped citation are intentionally not restated here.
 
-- **Principle 2 — Route by content, constrain by seam.** A compressor is a
-  candidate only when it supports the detected content type, runs at the
-  request's seam, and every capability it requires is declared by the
-  adapter. Response-shaping compressors never reach hosts that cannot
-  replace model-visible output; retrievable-lossy compressors never reach
-  hosts without a retrieve tool.
-- **Principle 3 — Staged escalation.** The ladder is lossless, then
-  retrievable-lossy, then bounded truncation. Escalation happens only while
-  the configured size policy is unmet, at most one compressor per lossy
-  stage; a specialized lossy decision is final.
+- **Principle 2 — Route by content, constrain by seam.** A compressor runs
+  only when it supports the detected content type, runs at the request's
+  seam, and the adapter declares every capability it needs. Every
+  capability defaults to `false`, so an adapter that declares nothing gets
+  passthrough rather than an unemittable candidate: a host that cannot
+  replace model-visible output never runs a response-shaping compressor,
+  and the stash attaches only where the host publishes a retrieve tool, so
+  retrievable-lossy markers are never dead ends. The shipped JSON domain
+  compressor (§5.3) runs at `post_tool` and gates on `replace_output`: it
+  still runs on hosts without a retrieve tool and claims its reversibility
+  from what actually happened — truncations that could not be stashed are
+  reported as `unrecoverable`, and arbitration rejects the candidate
+  whenever the request requires reversibility (principle 5).
 - **Principle 5 — Explicit reversibility claims.** Every applied
   transformation reports its recovery state — `lossless`, `retrievable`, or
   `unrecoverable` — and required-reversible mode rejects unrecoverable
@@ -45,10 +50,6 @@ a shipped citation are intentionally not restated here.
   never fails the request; the first failure is kept as a diagnostic bounded
   to `DIAGNOSTIC_MAX_BYTES` (4 KiB), and `output` always carries exactly
   what the adapter must emit.
-- **Principle 7 — Static registration.** The registry is a `const` slice
-  assembled at compile time; dynamic plugins and configuration-driven
-  loading are out of scope. Entries land together with the compressor that
-  implements them, never speculatively.
 
 ## Architecture (§4)
 
@@ -66,30 +67,37 @@ Compatibility rules:
 - `from_json` validates the version before the shape, so a future version
   reports `UnsupportedVersion` instead of a misleading shape error.
 
-### §4.2 Content detection and registry routing
+### §4.2 Content detection and domain dispatch
 
-`tokenless-pipeline` carries the content taxonomy (`json_records`,
-`search_results`, `build_log`, `stack_trace`, `diff`, `html`, `tabular`,
-`source_code`, `plain_text`, `unknown`), the deterministic bounded-cost
-detector, and the compile-time registry with the principle-2 routing
-filter.
+The Runtime's `post_tool` module carries the content taxonomy
+(`json_records`, `search_results`, `build_log`, `stack_trace`, `diff`,
+`html`, `tabular`, `source_code`, `plain_text`, `unknown`) and the
+deterministic bounded-cost detector. Phase one dispatches only the JSON
+domain to a compressor; every other detected domain passes through
+unchanged until its compressor is deliberately wired.
 
-Detection is a pure function of the content, inspecting at most 64 KiB /
-200 lines and never fully parsing any format; expensive parsing stays
-inside the selected compressor. Checks run from the most distinctive shape
-to the most general, and detection is conservative by design: HTML is only
-a document that starts as one, source code needs a shebang or several
+Detection is a pure function of the content and never fully parses any
+format; expensive parsing stays inside the selected compressor. The
+inspection bound is the leading 64 KiB prefix plus, for the JSON bracket
+sniff alone, at most a trailing 64 KiB window; line-based checks stop
+after 200 lines. Checks run from the most distinctive shape to the most
+general, and detection is conservative by design: HTML is only a document
+that starts as one, source code needs a shebang or several
 declaration-keyword lines, and binary-like input is `unknown` (milestone
 M4 policy: ambiguous fragments are not classified).
 
-### §4.3 Staged execution and end-to-end arbitration
+### §4.3 PostTool execution and end-to-end arbitration
 
-`tokenless_pipeline::run` takes a request through detection, routing, and
-the escalation ladder, then compares the original and the final candidate
-once. A candidate that does not remove normalized tokens, violates required
-reversibility, or exceeds the overall timeout budget is rejected as a
-whole; its newly created Stash writes are rolled back by `(key,
-generation)` and the original content is emitted unchanged.
+The Runtime's `PostToolPipeline` takes a post-tool request through bounded
+detection, domain dispatch, and one final arbitration that compares the
+original and the candidate once. A candidate that does not remove
+normalized tokens, violates required reversibility, or exceeds the timeout
+budget is rejected as a whole; its tentative Stash writes are rolled back
+by `(key, generation)` and the original content is emitted unchanged. The
+request also carries the content origin observed by the adapter
+(`ContentOrigin`): the origin selects the truncation thresholds — command
+output and API/file content differ by more than an order of magnitude —
+and file content passes through untouched.
 
 ### §4.5 Adapter boundary
 
@@ -122,22 +130,24 @@ be merged into one series without an explicit per-counter breakdown.
 
 ### §5.2 Routing contract
 
-Unknown or ambiguous content routes to passthrough. Detection routes only
-record-shaped JSON (`{...}` / `[...]`) to the JSON cleanup; scalar roots
-pass through unchanged. Misclassification degrades to the fail-open
+Unknown or ambiguous content routes to passthrough, as does any seam
+without an implementation yet. Detection routes only record-shaped JSON
+(`{...}` / `[...]`) to the JSON compressor; scalar roots pass through
+unchanged, and detected domains without a wired compressor pass through
+until their compressor lands. Misclassification degrades to the fail-open
 passthrough path by design.
 
-### §5.3 Response cleanup behind the pipeline
+### §5.3 Response cleanup behind the PostTool pipeline
 
-The pre-existing JSON response cleanup is registered as `RESPONSE_CLEANUP`
-(content `json_records`, seam `post_tool`, stage retrievable-lossy, cost
-moderate, requires `replace_output`) and the shared path behind the CLI
-`compress-response` command, `TokenlessRuntime::compress_response`, and the
-Python binding routes through `tokenless_pipeline::run`. One overall
-timeout budget (10 s in-process) guards detection and all stages; on expiry
-the original is returned and Stash writes are rolled back. Reversibility is
-claimed from what actually happened: no truncation → lossless, all
-truncations stashed → retrievable, otherwise → unrecoverable.
+The pre-existing JSON response cleanup is implemented by the JSON domain
+compressor (`JsonCompressor` in `tokenless-compressors`), and the shared
+path behind the CLI `compress-response` command,
+`TokenlessRuntime::compress_response`, and the Python binding routes
+through the Runtime-owned `PostToolPipeline`. One timeout budget (10 s
+in-process) guards the run; on expiry the original is returned and Stash
+writes are rolled back. Reversibility is claimed from what actually
+happened: no truncation → lossless, all truncations stashed →
+retrievable, otherwise → unrecoverable.
 
 ### §5.4 Single external-hook entry point
 
@@ -156,10 +166,10 @@ selection, and final size acceptance — move into one shared seam router:
 - new routing behavior is gated by a runtime configuration toggle, default
   off, introduced with the wiring change.
 
-Status: in review (PR #2844), migrating the common Python hooks
-(`compress_response_hook.py`, `compress_schema_hook.py`) first; codex /
-hermes / openclaw / dsh / SDK adapters keep their current paths until
-migrated.
+Status: shipped in 0.7.14 (PR #2844). The common Python hooks
+(`compress_response_hook.py`, `compress_schema_hook.py`) are migrated to
+the unified entry; codex / hermes / openclaw / dsh / SDK adapters keep
+their current paths until migrated.
 
 ### §5.5 Statistics migration
 
@@ -179,10 +189,12 @@ behavior classes for every migrated agent.
 
 ## §6 Compressor pack
 
-New content-specific compressors join the pipeline by implementing the
-`Compressor` trait against a registry entry. Planned directions include a
-`SchemaCompressor` for the schema seam. Per principle 7, entries land
-together with the compressor that implements them, never speculatively.
+Content-domain compressors live in `tokenless-compressors` as stateless
+engines that return complete outcomes; the Runtime owns content routing,
+final arbitration, and Stash commit or rollback. Phase one wires only
+`JsonCompressor` into the PostTool pipeline. A new domain compressor joins
+by wiring its engine into the Runtime deliberately, never speculatively —
+unwired domains pass through unchanged until then.
 
 ## Milestone markers
 
@@ -197,12 +209,12 @@ together with the compressor that implements them, never speculatively.
 | Section | Deliverable | Status | Reference |
 |---------|-------------|--------|-----------|
 | §4.1 | `tokenless-protocol` v1 types and wire contract | Shipped in 0.7.13 | PR #2783 |
-| §4.2 | Content taxonomy, detector, static registry | Shipped in 0.7.13 | PR #2788 |
-| §4.3 | Staged execution and end-to-end arbitration | Shipped in 0.7.13 | PR #2799 |
-| §5.3 | Response cleanup routed through the pipeline | Shipped in 0.7.13 | PR #2816 |
-| §5.4 | Unified external-hook entry, contract fixtures, runtime toggle | In review | PR #2844 |
+| §4.2 | Content taxonomy, detector, domain dispatch | Shipped in 0.7.13, restructured post-0.7.14 | PR #2788, PR #2974 |
+| §4.3 | Runtime-owned PostTool execution and arbitration | Shipped in 0.7.13, restructured post-0.7.14 | PR #2799, PR #2974 |
+| §5.3 | Response cleanup behind the PostTool pipeline | Shipped in 0.7.13, restructured post-0.7.14 | PR #2816, PR #2974 |
+| §5.4 | Unified external-hook entry, contract fixtures, runtime toggle | Shipped in 0.7.14 | PR #2844 |
 | §5.5 | Statistics attribution migration | Planned | follows §5.4 |
-| §6 | New compressor pack (incl. schema seam) | Planned | — |
+| §6 | Domain compressor pack (JSON first) | Merged post-0.7.14 | PR #2974 |
 
 Legacy `compress-response` / `compress-schema` / `compress-toon`
 subcommands and the pre-pipeline Python helpers stay until every consumer
