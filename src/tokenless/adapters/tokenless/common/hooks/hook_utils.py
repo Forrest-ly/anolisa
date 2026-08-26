@@ -135,7 +135,7 @@ _FALLBACK_SKIP_TOOLS = [
 _FALLBACK_SHELL_TOOLS = [
     "Bash", "bash", "Shell", "shell", "exec", "terminal",
     "run_shell_command", "run_in_terminal", "get_terminal_output",
-    "execute_command", "process",
+    "execute_command", "RunCommand", "process",
 ]
 
 
