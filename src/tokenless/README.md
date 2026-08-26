@@ -223,10 +223,23 @@ methods and bundles the matching RTK executable; TOON is linked into the native
 runtime. It does not require the Tokenless CLI or system helper binaries.
 Prebuilt wheels (`anolisa-tokenless` and the pure-Python
 `anolisa-tokenless-agentscope` integration) are attached to every `tokenless/v*`
-[GitHub Release](https://github.com/alibaba/anolisa/releases) and can be
-installed directly with `pip install <wheel asset URL>`. The packages are built
-and tested in this repository but are not yet published to PyPI; the source
-build below remains available for other platforms. See the
+[GitHub Release](https://github.com/alibaba/anolisa/releases). The AgentScope
+wheel pins the same-version `anolisa-tokenless`, which pip cannot resolve from
+PyPI, so pass both release asset URLs from the same release to one `pip
+install` command:
+
+```bash
+pip install \
+  "https://github.com/alibaba/anolisa/releases/download/tokenless%2Fv<VERSION>/anolisa_tokenless-<VERSION>-cp311-abi3-<PLATFORM>.whl" \
+  "https://github.com/alibaba/anolisa/releases/download/tokenless%2Fv<VERSION>/anolisa_tokenless_agentscope-<VERSION>-py3-none-any.whl"
+```
+
+Replace `<VERSION>` with the release version (for example `0.7.13`) and copy
+the native wheel's file name, including its platform tag, from the release
+asset list. Installing only the AgentScope wheel fails because its exact
+`anolisa-tokenless` dependency is not available from any package index. The
+packages are built and tested in this repository but are not yet published to
+PyPI; the source build above remains available for other platforms. See the
 [runtime design](docs/design/runtime-library.md)
 and the [user manual](../../docs/user-guide/en/token-saving/tokenless/user-manual.md#build-the-python-runtime-from-source).
 
@@ -643,7 +656,17 @@ AgentScope 1.0.11 through 1.0.x and AgentScope 2.0.x applications install two sa
 wheels explicitly.
 The framework integration uses the `anolisa-tokenless` runtime directly and
 does not start a CLI subprocess. Neither Python package is currently published
-to a package index. Build and install both wheels from a source checkout:
+to a package index, so install both wheels from the same `tokenless/v*` GitHub
+Release in one command, replacing `<VERSION>` and `<PLATFORM>` as in the
+[release-asset example above](#build-the-python-runtime):
+
+```bash
+pip install \
+  "https://github.com/alibaba/anolisa/releases/download/tokenless%2Fv<VERSION>/anolisa_tokenless-<VERSION>-cp311-abi3-<PLATFORM>.whl" \
+  "https://github.com/alibaba/anolisa/releases/download/tokenless%2Fv<VERSION>/anolisa_tokenless_agentscope-<VERSION>-py3-none-any.whl"
+```
+
+To build both wheels from a source checkout instead:
 
 ```bash
 make python-wheel agentscope-wheel

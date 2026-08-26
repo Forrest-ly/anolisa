@@ -899,7 +899,8 @@ jobs:
           RUSTUP_TOOLCHAIN: '1.91.0'
         run: |
           make -C src/tokenless \
-            test-python-runtime test-agentscope-integration
+            test-python-runtime test-agentscope-integration \
+            test-wheel-release-gate
 
       - uses: actions/setup-node@v4
         with:

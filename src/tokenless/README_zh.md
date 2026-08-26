@@ -193,9 +193,21 @@ Wheel 的对应平台使用。它开放四个 Tokenless 生命周期接口并内
 TOON 已链接进原生 Runtime，不依赖 Tokenless CLI 或系统 helper。每个
 `tokenless/v*` [GitHub Release](https://github.com/alibaba/anolisa/releases)
 都会附带预构建 Wheel（`anolisa-tokenless` 与纯 Python 的
-`anolisa-tokenless-agentscope` 集成包），可直接通过 `pip install <wheel 资产 URL>`
-安装。仓库会构建并测试该包，但目前尚未发布到 PyPI；其他平台仍可使用下文的源码构建。
-具体见 [Runtime 设计](docs/design/runtime-library_zh.md) 和
+`anolisa-tokenless-agentscope` 集成包）。AgentScope Wheel 固定依赖相同版本的
+`anolisa-tokenless`，而 pip 无法从 PyPI 解析该依赖，因此必须在同一条
+`pip install` 命令中同时传入同一版本的两个 Release 资产 URL：
+
+```bash
+pip install \
+  "https://github.com/alibaba/anolisa/releases/download/tokenless%2Fv<VERSION>/anolisa_tokenless-<VERSION>-cp311-abi3-<PLATFORM>.whl" \
+  "https://github.com/alibaba/anolisa/releases/download/tokenless%2Fv<VERSION>/anolisa_tokenless_agentscope-<VERSION>-py3-none-any.whl"
+```
+
+将 `<VERSION>` 替换为发布版本（例如 `0.7.13`），原生 Wheel 的文件名（含平台标签）
+以 Release 资产列表为准。只安装 AgentScope Wheel 会失败，因为它精确依赖的
+`anolisa-tokenless` 不在任何包索引上。仓库会构建并测试该包，但目前尚未发布到
+PyPI；其他平台仍可使用上文的源码构建。具体见
+[Runtime 设计](docs/design/runtime-library_zh.md) 和
 [用户手册](../../docs/user-guide/zh/token-saving/tokenless/user-manual.md#从源码构建-python-runtime)。
 
 同一个 Wheel 还提供不依赖 CLI 的只读 typed Stats 查询。可以让 `TokenlessStats` 指向
@@ -255,7 +267,17 @@ Tokenless 的全部 profile。每个名称必须与 `dsh --profile <profile>` �
 
 AgentScope 1.0.11 至 1.0.x 及 AgentScope 2.0.x 应用需要显式安装两个相同版本的 Python
 Wheel。框架集成直接调用 `anolisa-tokenless` Runtime，不会启动 CLI 子进程。两个 Python
-包当前都尚未发布到包索引。当前应从源码 checkout 构建并同时安装两个 Wheel：
+包当前都尚未发布到包索引，因此应在同一条命令中安装同一个 `tokenless/v*` GitHub
+Release 附带的两个 Wheel，`<VERSION>` 与 `<PLATFORM>` 的替换方式参见
+[上文的 Release 资产示例](#构建-python-runtime)：
+
+```bash
+pip install \
+  "https://github.com/alibaba/anolisa/releases/download/tokenless%2Fv<VERSION>/anolisa_tokenless-<VERSION>-cp311-abi3-<PLATFORM>.whl" \
+  "https://github.com/alibaba/anolisa/releases/download/tokenless%2Fv<VERSION>/anolisa_tokenless_agentscope-<VERSION>-py3-none-any.whl"
+```
+
+如需从源码 checkout 构建两个 Wheel：
 
 ```bash
 make python-wheel agentscope-wheel

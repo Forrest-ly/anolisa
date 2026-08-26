@@ -51,7 +51,7 @@ PYPROJECT_BUILD ?= uvx --from 'build>=1,<2' pyproject-build
 .PHONY: build build-tokenless build-openclaw-plugin build-dsh-plugin \
         stamp-adapter-templates stamp-python-packages generate-component-contract \
         install uninstall test lint clean package-raw stage-raw \
-        test-raw-package test-npm-package test-toon-cleanup \
+        test-raw-package test-npm-package test-toon-cleanup test-wheel-release-gate \
         install-binaries install-helpers install-adapter-resources install-cosh-extension \
         adapter-install adapter-uninstall adapter-scan \
         cosh-extension-install cosh-extension-uninstall \
@@ -337,6 +337,9 @@ test-raw-package:
 test-npm-package:
 	@bash tests/test-package-npm-prebuilt.sh
 
+test-wheel-release-gate:
+	@bash tests/test-wheel-release-gate.sh
+
 test-toon-cleanup:
 	@bash tests/test-toon-cleanup.sh
 
@@ -595,6 +598,7 @@ help:
 	@echo "  python-wheel      Build the native anolisa-tokenless wheel"
 	@echo "  agentscope-wheel  Build the AgentScope integration wheel"
 	@echo "  test-agentscope-integration  Test the integration with supported AgentScope versions"
+	@echo "  test-wheel-release-gate  Test the release wheel inventory/version gate"
 	@echo "  adapter-scan      List registered adapter capabilities"
 	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+qoder+claude-code+codex+opencode+qwencode)"
 	@echo "  adapter-uninstall Unregister all adapters"

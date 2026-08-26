@@ -9,10 +9,6 @@ Tokenless 的所有重要变更都会记录在此文件中。
 
 ## [未发布]
 
-### 新增
-
-- `tokenless/v*` 版本发布现在会构建并附带预构建的 Python Wheel（基于 stable ABI、适用于 CPython 3.11+ 的 `anolisa-tokenless` SDK，以及纯 Python 的 `anolisa-tokenless-agentscope` 集成包），无需本地 Rust 工具链即可直接从 GitHub Release 资产安装 SDK；这两个包仍未发布到 PyPI，源码构建方式继续保留（[#2837](https://github.com/alibaba/anolisa/issues/2837)）。
-
 ## [0.7.13] - 2026-08-25
 
 ### 新增

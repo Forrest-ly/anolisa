@@ -209,6 +209,16 @@ jobs:
         run: |
           make -C src/tokenless python-wheel agentscope-wheel test-python-runtime
 
+      - name: Verify wheel inventory
+        env:
+          TOKENLESS_RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ls -l src/tokenless/target/wheels
+          python3 src/tokenless/packaging/python/verify-wheels.py \
+            --directory src/tokenless/target/wheels \
+            --version "$TOKENLESS_RELEASE_VERSION"
+
       - name: Upload Python wheels (preview)
         uses: actions/upload-artifact@v4
         with:
