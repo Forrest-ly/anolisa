@@ -173,18 +173,96 @@ jobs:
           retention-days: 28
 
   # =========================================================================
+  # Tokenless Python wheels (CPython 3.11 stable ABI)
+  #
+  # The anolisa-tokenless SDK and its AgentScope integration are otherwise
+  # only buildable from source (Rust toolchain + Maturin). Build the wheels
+  # here and attach them to the GitHub Release so the SDK has an installable
+  # distribution channel, mirroring the cosh-ng prebuilt pattern above.
+  # =========================================================================
+  build_tokenless_python_wheels:
+    name: Build tokenless Python wheels
+    needs: package
+    if: needs.package.outputs.component == 'tokenless'
+    permissions:
+      contents: read
+    runs-on: anolisa-k8s-general-ci-x64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.91.0'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/tokenless
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: astral-sh/setup-uv@v6
+
+      - uses: extractions/setup-just@v2
+
+      # Mirrors the "Build and test Tokenless Python packages" step of the
+      # ordinary CI job: `test-python-runtime` installs the freshly built
+      # wheel into an isolated venv and runs its unit tests before anything
+      # is published. The AgentScope integration matrix stays in PR CI.
+      - name: Build and test Tokenless Python wheels
+        run: |
+          make -C src/tokenless python-wheel agentscope-wheel test-python-runtime
+
+      - name: Verify wheel inventory
+        run: |
+          set -euo pipefail
+          cd src/tokenless/target/wheels
+          ls -l
+          mapfile -t RUNTIME_WHEELS < <(find . -maxdepth 1 -type f \
+              -name 'anolisa_tokenless-*.whl' ! -name '*agentscope*' -printf '%f\n')
+          mapfile -t AGENTSCOPE_WHEELS < <(find . -maxdepth 1 -type f \
+              -name 'anolisa_tokenless_agentscope-*.whl' -printf '%f\n')
+          if [ "${#RUNTIME_WHEELS[@]}" -ne 1 ] || [ "${#AGENTSCOPE_WHEELS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one anolisa-tokenless wheel and one AgentScope wheel"
+            exit 1
+          fi
+          case "${RUNTIME_WHEELS[0]}" in
+            *-cp311-abi3-*.whl) ;;
+            *)
+              echo "::error::Native wheel is not tagged for the CPython 3.11 stable ABI: ${RUNTIME_WHEELS[0]}"
+              exit 1
+              ;;
+          esac
+
+      - name: Upload Python wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenless-python-wheels-${{ needs.package.outputs.version }}
+          path: src/tokenless/target/wheels/*.whl
+          if-no-files-found: error
+          retention-days: 28
+
+  # =========================================================================
   # Step 2: Publish (requires manual approval via GitHub Environment)
   #
   # If reviewer rejects, no Release is created.
   # =========================================================================
   publish:
     name: Publish ${{ needs.package.outputs.tag }}
-    needs: [package, build_prebuilt]
+    needs: [package, build_prebuilt, build_tokenless_python_wheels]
     if: >-
       always() &&
       needs.package.result == 'success' &&
       (needs.package.outputs.prebuilt-enabled != 'true' ||
-       needs.build_prebuilt.result == 'success')
+       needs.build_prebuilt.result == 'success') &&
+      (needs.package.outputs.component != 'tokenless' ||
+       needs.build_tokenless_python_wheels.result == 'success')
     permissions:
       contents: write
       actions: read
@@ -245,6 +323,13 @@ jobs:
             --version "$VERSION" \
             --layout actions
 
+      - name: Download tokenless Python wheels
+        if: needs.package.outputs.component == 'tokenless'
+        uses: actions/download-artifact@v4
+        with:
+          name: tokenless-python-wheels-${{ needs.package.outputs.version }}
+          path: /tmp/tokenless-python-wheels
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
@@ -288,6 +373,14 @@ jobs:
               ASSETS+=("$asset")
             done < <(
               find /tmp/prebuilt -mindepth 2 -maxdepth 2 -type f -print |
+                LC_ALL=C sort
+            )
+          fi
+          if [ "$COMPONENT" = "tokenless" ]; then
+            while IFS= read -r asset; do
+              ASSETS+=("$asset")
+            done < <(
+              find /tmp/tokenless-python-wheels -maxdepth 1 -type f -name '*.whl' -print |
                 LC_ALL=C sort
             )
           fi

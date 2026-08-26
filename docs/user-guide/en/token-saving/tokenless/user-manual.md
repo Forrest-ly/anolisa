@@ -38,7 +38,10 @@ compile the Python member and require the same environment, while default
 workspace Cargo commands exclude it.
 
 The wheel uses the CPython 3.11 stable ABI, so it supports CPython 3.11 and later on the operating
-system and CPU architecture where it was built. The package is not yet published to PyPI.
+system and CPU architecture where it was built. Prebuilt wheels for the release platform are
+attached to every `tokenless/v*` [GitHub Release](https://github.com/alibaba/anolisa/releases)
+and can be installed directly with `pip install <wheel asset URL>`. The package is not yet
+published to PyPI; the source build above remains available for other platforms.
 
 The first API accepts JSON text and exposes response compression and Stash retrieval:
 

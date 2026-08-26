@@ -37,7 +37,10 @@ python3 -m venv /tmp/tokenless-python
 workspace 命令则不包含它。
 
 Wheel 使用 CPython 3.11 stable ABI，因此支持构建平台上的 CPython 3.11 及更高
-版本，但仍受操作系统和 CPU 架构限制。该包目前尚未发布到 PyPI。
+版本，但仍受操作系统和 CPU 架构限制。发布平台的预构建 Wheel 会附带在每个
+`tokenless/v*` [GitHub Release](https://github.com/alibaba/anolisa/releases) 中，
+可直接通过 `pip install <wheel 资产 URL>` 安装。该包目前尚未发布到 PyPI；
+其他平台仍可使用上文的源码构建。
 
 首版 API 接收 JSON 文本，开放响应压缩和 Stash 取回：
 

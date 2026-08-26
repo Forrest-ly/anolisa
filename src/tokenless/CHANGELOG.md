@@ -9,6 +9,10 @@ Releases from 0.7.2 onward follow
 
 ## [Unreleased]
 
+### Added
+
+- Tagged `tokenless/v*` releases now build and attach prebuilt Python wheels (the `anolisa-tokenless` SDK for CPython 3.11+ via the stable ABI, plus the pure-Python `anolisa-tokenless-agentscope` integration), so the SDK can be installed directly from GitHub Release assets without a local Rust toolchain; the packages remain unpublished to PyPI and source builds stay available ([#2837](https://github.com/alibaba/anolisa/issues/2837)).
+
 ## [0.7.13] - 2026-08-25
 
 ### Added

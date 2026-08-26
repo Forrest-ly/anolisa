@@ -220,9 +220,14 @@ plain workspace-default Cargo commands exclude the Python extension.
 The `anolisa_tokenless` module supports CPython 3.11 and later on the platform
 where its native wheel was built. It exposes the four Tokenless lifecycle
 methods and bundles the matching RTK executable; TOON is linked into the native
-runtime. It does not require the Tokenless CLI or system helper binaries. The
-package is built and tested in this repository but is not yet published to
-PyPI. See the [runtime design](docs/design/runtime-library.md)
+runtime. It does not require the Tokenless CLI or system helper binaries.
+Prebuilt wheels (`anolisa-tokenless` and the pure-Python
+`anolisa-tokenless-agentscope` integration) are attached to every `tokenless/v*`
+[GitHub Release](https://github.com/alibaba/anolisa/releases) and can be
+installed directly with `pip install <wheel asset URL>`. The packages are built
+and tested in this repository but are not yet published to PyPI; the source
+build below remains available for other platforms. See the
+[runtime design](docs/design/runtime-library.md)
 and the [user manual](../../docs/user-guide/en/token-saving/tokenless/user-manual.md#build-the-python-runtime-from-source).
 
 The same wheel provides typed, read-only statistics queries without requiring

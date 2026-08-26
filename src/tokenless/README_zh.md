@@ -190,9 +190,12 @@ Maturin。请先安装 [`uv`](https://docs.astral.sh/uv/)，或者在 `PATH` 中
 
 `anolisa_tokenless` 模块支持 CPython 3.11 及更高版本，但只能在构建该原生
 Wheel 的对应平台使用。它开放四个 Tokenless 生命周期接口并内置对应平台的 RTK；
-TOON 已链接进原生 Runtime，不依赖 Tokenless CLI 或系统 helper。仓库会构建并测试该包，
-但目前尚未发布到
-PyPI。具体见 [Runtime 设计](docs/design/runtime-library_zh.md) 和
+TOON 已链接进原生 Runtime，不依赖 Tokenless CLI 或系统 helper。每个
+`tokenless/v*` [GitHub Release](https://github.com/alibaba/anolisa/releases)
+都会附带预构建 Wheel（`anolisa-tokenless` 与纯 Python 的
+`anolisa-tokenless-agentscope` 集成包），可直接通过 `pip install <wheel 资产 URL>`
+安装。仓库会构建并测试该包，但目前尚未发布到 PyPI；其他平台仍可使用下文的源码构建。
+具体见 [Runtime 设计](docs/design/runtime-library_zh.md) 和
 [用户手册](../../docs/user-guide/zh/token-saving/tokenless/user-manual.md#从源码构建-python-runtime)。
 
 同一个 Wheel 还提供不依赖 CLI 的只读 typed Stats 查询。可以让 `TokenlessStats` 指向
