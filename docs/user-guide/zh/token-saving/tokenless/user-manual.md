@@ -96,7 +96,11 @@ Adapter 不会压缩每一次工具结果。以响应压缩为例，只有以下
 1. 压缩未被停用。`compression_enabled=false` 或 `TOKENLESS_COMPRESSION_ENABLED=0` 时进入 dry-run，仍计算统计但返回原文（见上一节）。
 2. 工具不属于内容读取类。Read/Glob/Grep/LSP/NotebookRead 及别名会跳过响应压缩，保留完整内容。
 3. 响应长度达到最小阈值。共享响应 Hook、OpenClaw 和 Hermes 跳过短于 200 字符的响应。长度按字符数而非字节数计算。
-4. 内容是合法 JSON。按阈值截断的响应压缩只处理 JSON 对象和数组。在共享响应 Hook 路径上，到达时不是 JSON 的纯文本会交给内容感知的文本压缩（终端输出清理、构建/日志空隙移除），见[Adapter 处理规则](framework-integration.md#adapter-处理规则)；OpenClaw 和 Hermes 只压缩 JSON，但这两个框架本身会把 Shell 输出包装成 JSON（如 `{"stdout": ...}`），因此这类输出仍会被压缩。共享响应 Hook、OpenClaw 和 Hermes 还会跳过带 YAML frontmatter、形似 Skill 的文本。
+4. 内容是合法 JSON。按阈值截断的响应压缩只处理 JSON 对象和数组。
+   - **4a. 共享响应 Hook 路径**：到达时不是 JSON 的纯文本会交给内容感知的文本压缩（终端输出清理、构建/日志空隙移除），见[Adapter 处理规则](framework-integration.md#adapter-处理规则)。
+   - **4b. OpenClaw 和 Hermes**：这两条路径只压缩 JSON，但这两个框架本身会把 Shell 输出包装成 JSON（如 `{"stdout": ...}`），因此这类输出仍会被压缩。
+
+   共享响应 Hook、OpenClaw 和 Hermes 还会跳过带 YAML frontmatter、形似 Skill 的文本。
 5. 压缩结果严格小于原文。响应压缩和 TOON 编码都没有让内容变小时，保留原文。
 
 通过上述检查后，截断强度由工具类别决定。分类和阈值定义在 Adapter 目录下的 `tool_categories.json`（各 Adapter 共享的单一事实来源）；文件缺失或无效时使用内置的安全回退值：

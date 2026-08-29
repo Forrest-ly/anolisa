@@ -99,7 +99,11 @@ Adapters do not compress every tool result. For response compression, compressed
 1. Compression is not switched off. With `compression_enabled=false` or `TOKENLESS_COMPRESSION_ENABLED=0` the run becomes a dry-run: statistics are still calculated, but the original text is returned (see the previous section).
 2. The tool is not a content-retrieval tool. Read/Glob/Grep/LSP/NotebookRead and their aliases skip response compression so their content stays intact.
 3. The response reaches the minimum length. The shared response hook, OpenClaw, and Hermes skip responses shorter than 200 characters. Length is counted in characters, not bytes.
-4. The content is valid JSON. Threshold-based response compression works on JSON objects and arrays. On the shared response hook path, output that arrives as plain text (not JSON) is routed to the content-aware text compressors (terminal cleanup, build/log gap removal) described in [Adapter processing rules](framework-integration.md#adapter-processing-rules); OpenClaw and Hermes only compress JSON, but their frameworks already wrap shell output in JSON (for example `{"stdout": ...}`), so that output is still compressed. The shared response hook, OpenClaw, and Hermes additionally skip skill-like text with YAML frontmatter.
+4. The content is valid JSON. Threshold-based response compression works on JSON objects and arrays.
+   - **4a. Shared response hook path:** output that arrives as plain text (not JSON) is routed to the content-aware text compressors (terminal cleanup, build/log gap removal) described in [Adapter processing rules](framework-integration.md#adapter-processing-rules).
+   - **4b. OpenClaw and Hermes:** these paths only compress JSON, but their frameworks already wrap shell output in JSON (for example `{"stdout": ...}`), so that output is still compressed.
+
+   The shared response hook, OpenClaw, and Hermes additionally skip skill-like text with YAML frontmatter.
 5. The compressed result is strictly smaller. When neither response compression nor TOON encoding makes the content smaller, the original text is kept.
 
 After these checks, truncation strength depends on the tool category. Categories and thresholds are defined in `tool_categories.json` inside the adapter directory (the single source of truth shared by all adapters); built-in safe fallbacks are used when the file is missing or invalid:
