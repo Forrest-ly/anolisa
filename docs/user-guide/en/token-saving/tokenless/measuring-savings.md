@@ -224,8 +224,10 @@ The Tokenless compression rate depends on how much removable material a payload 
 | Function-calling schema (long descriptions), schema compression alone | ~47% | description truncation; `title`/`examples` and code blocks removed |
 | Mixed workload (response + schema): response compression only | ~62% | responses dominate the savings |
 | Mixed workload: schema + response stacked | ~65% | both payload types reduced |
-| Mixed workload: full stack (schema + response + TOON, deployed gating) | ~65% | the deployed `compress-toon` size guard keeps the original input when TOON does not reduce estimated tokens; on this fixture TOON inflates after response/schema compression, so the deployed rate equals the stacked rate above. The benchmark's ungated `full_stack` config measures ~63% but is not what the deployed path emits |
+| Mixed workload: full stack (schema + response + TOON, deployed gating) | ~65% | deployed gating applies; the rate equals the row above (see the note below the table) |
 | TOON encoding only | ~16% | only tabular, regular JSON benefits clearly |
+
+> Full stack (deployed gating): the deployed `compress-toon` size guard keeps the original input when TOON does not reduce estimated tokens; on this fixture TOON inflates after response/schema compression, so the deployed rate equals the stacked row above. The benchmark's ungated `full_stack` config measures ~63% but is not what the deployed path emits.
 
 By scenario:
 
