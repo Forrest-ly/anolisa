@@ -151,6 +151,8 @@ smaller result. When a later waterfall listener replaces the canonical
 `value`, Tokenless classifies that replacement and does not carry attribution
 from the superseded result.
 
+For the full trigger conditions (compression switch, minimum response length, JSON validation, strictly-smaller guard) and threshold semantics, see [User manual · Compression trigger conditions and thresholds](user-manual.md#compression-trigger-conditions-and-thresholds).
+
 ## Manage adapters with anolisa (recommended)
 
 These commands require an ANOLISA component record. If Tokenless was installed

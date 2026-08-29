@@ -135,6 +135,8 @@ DSH 使用 `isError` 标记的原始失败可以为任何工具追加依赖、�
 压缩没有得到更短结果时仍会生效。后续 waterfall listener 替换 canonical `value`
 后，Tokenless 会按替换值重新分类，不会沿用已经被替换结果的旧归因。
 
+完整触发条件（压缩开关、最小响应长度、JSON 校验、严格变小保护）与阈值含义见[用户手册 · 压缩的触发条件与阈值](user-manual.md#压缩的触发条件与阈值)。
+
 ## 通过 anolisa 管理（推荐）
 
 这些命令需要 ANOLISA 组件记录。如果 Tokenless 是通过 YUM 直接安装的，
