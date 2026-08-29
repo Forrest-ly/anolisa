@@ -43,6 +43,11 @@ exit 1
 );
 chmodSync(fakeRtk, 0o755);
 
+// Since the rtk-prefix anchoring fix, the plugin rewrites the bare `rtk`
+// prefix to the resolved binary path so the rewritten command stays
+// executable even when the tool shell's PATH lacks rtk.  Here rtk resolves
+// to the fake binary staged on PATH above.
+
 process.env.HOME = sandbox;
 process.env.PATH = `${fakeBinDir}:${originalPath || ""}`;
 
@@ -98,7 +103,7 @@ test("persists RTK context after a successful rewrite", () => {
     toolCallId: "tool-456",
   });
 
-  assert.equal(result.params.command, "rtk optimized git status");
+  assert.equal(result.params.command, `${fakeRtk} optimized git status`);
   assert.deepEqual(result.params.env, {
     TOKENLESS_AGENT_ID: "openclaw",
     TOKENLESS_SESSION_ID: "session-123",
@@ -132,7 +137,7 @@ test("keeps rewritten exec context isolated across sessions", () => {
     toolCallId: "tool-b",
   });
 
-  assert.equal(first.params.command, "rtk optimized first command");
+  assert.equal(first.params.command, `${fakeRtk} optimized first command`);
   assert.deepEqual(first.params.env, {
     EXISTING_VALUE: "preserved",
     TOKENLESS_AGENT_ID: "openclaw",
@@ -164,7 +169,7 @@ test("truncates existing context without reusing IDs from the previous call", ()
   });
   const result = invokeRewrite("second command");
 
-  assert.equal(result.params.command, "rtk optimized second command");
+  assert.equal(result.params.command, `${fakeRtk} optimized second command`);
   assert.equal(readFileSync(contextFile, "utf8"), "openclaw\n\n\n");
 });
 
@@ -186,7 +191,7 @@ test("refuses a symlink without blocking the rewritten command", () => {
     console.warn = originalWarn;
   }
 
-  assert.equal(result.params.command, "rtk optimized git status");
+  assert.equal(result.params.command, `${fakeRtk} optimized git status`);
   assert.equal(readFileSync(victimFile, "utf8"), "sentinel");
   assert.equal(lstatSync(contextFile).isSymbolicLink(), true);
   assert.equal(warnings.some((warning) => warning.includes("cannot persist rewrite context")), true);
@@ -210,7 +215,7 @@ test("refuses a symlinked context directory without blocking the rewrite", () =>
     console.warn = originalWarn;
   }
 
-  assert.equal(result.params.command, "rtk optimized git status");
+  assert.equal(result.params.command, `${fakeRtk} optimized git status`);
   assert.equal(existsSync(redirectedContextFile), false);
   assert.equal(lstatSync(contextDir).isSymbolicLink(), true);
   assert.equal(warnings.some((warning) => warning.includes("cannot persist rewrite context")), true);

@@ -269,6 +269,13 @@ test-hook-parity:
 	cargo build -p tokenless-cli
 	python3 tests/test_hook_parity.py
 
+# OpenClaw anchor helper tests need Node >= 18 (node --test) and the compiled
+# plugin; CI runs them in a dedicated step after actions/setup-node, not here,
+# because test-integration executes before setup-node on system Node (v12).
+test-openclaw-anchor: build-openclaw-plugin
+	@echo "==> Testing OpenClaw anchor helpers (Node)..."
+	node --test tests/test_openclaw_anchor.mjs
+
 test-adapters: build-openclaw-plugin build-dsh-plugin
 	@echo "==> Testing openclaw RTK context propagation..."
 	node --test tests/test-openclaw-rtk-context.mjs

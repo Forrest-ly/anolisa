@@ -32,6 +32,9 @@ import {
   writeFileSync,
 } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
+import {
+  anchorRtkPrefix,
+} from "./anchor-helpers.js";
 
 // ---- Session ID mapping --------------------------------------------------------
 // OpenClaw's tool_result_persist ctx provides sessionKey ("agent:main:main")
@@ -259,7 +262,7 @@ function tryRtkRewrite(command: string, context: TokenlessCallContext): string |
     //       user confirmation; in non-interactive hook context, treat as valid
     //       rewrite since the intent is token optimization, not permission gating)
     if ((result.status === 0 || result.status === 3) && rewritten && rewritten !== command) {
-      return rewritten;
+      return anchorRtkPrefix(rewritten, rtkPath);
     }
     return null;
   } catch {
