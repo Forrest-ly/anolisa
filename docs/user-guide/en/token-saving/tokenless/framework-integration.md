@@ -16,7 +16,7 @@ product adapters. The Python SDK and its AgentScope-specific child document live
 | Qoder | `qoder` | Hard-disabled | Emits rewritten shell input | Replaces output through `updatedToolOutput` | Pipeline-selected for replaceable text | — |
 | Claude Code | `claude-code` | Hard-disabled | Replaces Bash input | Replaces output on 2.1.121 or later; otherwise passes through | Pipeline-selected for replaceable text | — |
 | Codex | `codex` | Hard-disabled | Replaces supported shell input | Keeps the original; adds context only for classified environment failures | — | — |
-| Trae | `trae` | Hard-disabled | Replaces RunCommand input | Emits `additionalContext` | Attempted after response compression | — |
+| Trae | `trae` | Hard-disabled | Replaces RunCommand input | Keeps the original; adds context only for classified environment failures | — | — |
 | DeepSeek Harness | `dsh` | — | — | Replaces an accepted single-text JSON result when the replacement is smaller | — | — |
 | OpenCode | `opencode` | Hard-disabled | Replaces Bash input | Replaces tool output | Pipeline-selected for replaceable text | ✅ |
 | Qwen Code | `qwencode` | Hard-disabled | Emits rewritten shell input | Passes through because the host has no replacement field | — | — |
@@ -346,7 +346,7 @@ bash ~/.local/share/anolisa/adapters/tokenless/trae/scripts/install.sh
 bash ~/.local/share/anolisa/adapters/tokenless/trae/scripts/uninstall.sh
 ```
 
-User-configured hooks are preserved; the uninstall script removes only the Tokenless-owned entries. Trae standardizes the terminal tool name to `RunCommand`, so the rewrite hook matches that name. Response compression is delivered through `additionalContext` because Trae's PostToolUse does not support tool-output replacement. Restart Trae after installing or removing.
+User-configured hooks are preserved; the uninstall script removes only the Tokenless-owned entries. Trae standardizes the terminal tool name to `RunCommand`, so the rewrite hook matches that name. Because Trae's PostToolUse does not support tool-output replacement, the response hook keeps the original output: it only adds `additionalContext` for classified environment failures and never appends a compressed copy, which would grow the model-visible payload. Restart Trae after installing or removing.
 
 ## AgentScope framework integration
 

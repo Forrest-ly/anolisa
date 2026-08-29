@@ -7,8 +7,9 @@ JSON to stdout.
 
 Hook point: **PreToolUse** — matcher: shell-family tool names
 (``Bash``, ``run_shell_command``, ``terminal``, ``Shell``, ``shell``,
-``exec``, ``process``).  The lowercase ``shell`` alternative covers
-cosh-ng, whose built-in shell tool is named ``shell`` on the wire.
+``exec``, ``process``, ``RunCommand``).  The lowercase ``shell``
+alternative covers cosh-ng, whose built-in shell tool is named ``shell``
+on the wire; ``RunCommand`` is Trae's normalized terminal tool name.
 
 The agent ID is read from the TOKENLESS_AGENT_ID environment variable
 (set by the install action script).  Fallback paths follow the ANOLISA

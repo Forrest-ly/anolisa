@@ -840,6 +840,55 @@ class TestNonReplacementAdapters(unittest.TestCase):
         self.assertIn("[tokenless:env]", hso.get("additionalContext", ""))
         self.assertNotIn("updatedToolOutput", hso)
 
+    def test_trae_passes_through_without_spawning(self):
+        """Trae's PostToolUse cannot replace tool output: the hook must
+        pass through (no compressed copy in additionalContext — that would
+        duplicate the still-visible original) and must not spawn the
+        compressor. Regression guard for the manifest/README capability
+        claims."""
+        large_payload = _make_large_json_payload()
+
+        result = _run_hook(
+            {
+                "tool_name": "RunCommand",
+                "tool_response": large_payload,
+                "session_id": "s",
+                "tool_use_id": "t",
+            },
+            agent_id="trae",
+            mock_tokenless_path=self.mock_bin,
+            isolated_home=self.isolated_home,
+        )
+
+        self.assertNotIn("_subprocess_error", result,
+                         f"Hook subprocess failed: {result}")
+        self.assertEqual(result, {},
+                         "Trae must remain passthrough: no replacement field")
+        self.assertEqual(_spawn_log_lines(self.mock_bin), [],
+                         "Trae responses must not spawn tokenless")
+
+    def test_trae_still_receives_env_attribution(self):
+        """Environment attribution is additive and stays for Trae: it is
+        the only PostToolUse content the hook may inject there."""
+        result = _run_hook(
+            {
+                "tool_name": "RunCommand",
+                "tool_response": {"stdout": "", "stderr": "bash: rg: command not found",
+                                  "exit_code": 127},
+                "session_id": "s",
+                "tool_use_id": "t",
+            },
+            agent_id="trae",
+            mock_tokenless_path=self.mock_bin,
+            isolated_home=self.isolated_home,
+        )
+
+        self.assertNotIn("_subprocess_error", result,
+                         f"Hook subprocess failed: {result}")
+        hso = result.get("hookSpecificOutput", {})
+        self.assertIn("[tokenless:env]", hso.get("additionalContext", ""))
+        self.assertNotIn("updatedToolOutput", hso)
+
 
 @unittest.skipIf(_needs_py39, "hook_utils requires Python 3.9+")
 class TestSingleSubprocess(unittest.TestCase):

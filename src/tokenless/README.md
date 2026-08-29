@@ -45,6 +45,7 @@ retrieval, and attribution.
 | Codex plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Environment diagnostics ✅, Response compression — protocol-blocked |
 | OpenCode plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Schema compression ✅, Response compression ✅, TOON ✅ |
 | Qwen Code extension | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response/Schema replacement unavailable in current host |
+| Trae adapter | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Environment diagnostics ✅, Response compression — protocol-blocked |
 | DeepSeek Harness plugin | — | Response compression ✅, Environment-error attribution ✅ |
 | AgentScope framework integration | — | Schema ✅, RTK ✅, Response ✅, TOON ✅, Retrieval ✅ |
 | Zero runtime deps | — | Pure Rust, single static binary |
@@ -643,7 +644,14 @@ install wrote.
 |---|---|---|---|
 | Tool Ready | `PreToolUse` (all tools) | Registered silent pass-through; no check, repair, context, or block | ⛔ Hard-disabled |
 | Command rewriting | `PreToolUse` (`RunCommand`) | Rewrites shell input via `hookSpecificOutput.updatedInput` | ✅ Active |
-| Response + TOON compression | `PostToolUse` | Emits the compressed payload via `additionalContext` (Trae cannot replace tool output) | ✅ Active |
+| Environment diagnostics | `PostToolUse` | Adds actionable context only for classified environment failures | ✅ Active |
+| Response + TOON compression | `PostToolUse` | Passthrough (host lacks output replacement): an additive compressed copy would grow the model-visible payload | ⛔ Passthrough |
+
+> **Trae protocol constraint**: `PostToolUse` cannot replace or suppress the
+> original tool output. Tokenless therefore does not append compressed content,
+> which would make the model-visible payload larger. Environment-error
+> attribution is still injected because it is genuinely additive. First-pass
+> savings for `RunCommand` come from RTK rewriting the command before execution.
 
 Install or remove the hooks (no-op when no Trae edition home exists):
 

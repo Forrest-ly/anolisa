@@ -60,9 +60,16 @@ class ResponseHookContract(unittest.TestCase):
     maxDiff = None
 
     # Replacement hosts and how an applied output lands in their envelope.
-    # qwencode is additionalContext-only: no replacement capability, so every
-    # class must be passthrough with zero spawns.
     REPLACEMENT_AGENTS = ["claude-code", "qoder-cli", "opencode", "cosh-ng"]
+
+    # additionalContext-only hosts: no replacement capability, so every
+    # behavior class must be passthrough with zero spawns. Kept separate from
+    # corpus.RESPONSE_AGENTS because that matrix is keyed to the pre-unified-
+    # entry golden baselines, which do not exist for newer adapters (trae).
+    ADDITIVE_AGENTS = {
+        "qwencode": corpus.RESPONSE_AGENTS["qwencode"],
+        "trae": {"TOKENLESS_AGENT_ID": "trae"},
+    }
 
     def setUp(self):
         self.fixture = load_fixture("post_tool", "api_records")
@@ -107,12 +114,18 @@ class ResponseHookContract(unittest.TestCase):
                     self.assertEqual(result.envelope, {})
                     self.assertEqual(result.spawns, ["compress"])
 
-    def test_additive_host_is_passthrough_without_spawning(self):
-        for behavior in ["applied"] + FAIL_OPEN_BEHAVIORS:
-            with self.subTest(behavior=behavior):
-                result = self.run_case("qwencode", behavior)
-                self.assertEqual(result.envelope, {})
-                self.assertEqual(result.spawns, [])
+    def test_additive_hosts_pass_through_without_spawning(self):
+        for agent, agent_env in self.ADDITIVE_AGENTS.items():
+            for behavior in ["applied"] + FAIL_OPEN_BEHAVIORS:
+                with self.subTest(agent=agent, behavior=behavior):
+                    result = contract_runner.run_case(
+                        corpus.RESPONSE_HOOK,
+                        self.fixture,
+                        agent_env,
+                        behavior,
+                    )
+                    self.assertEqual(result.envelope, {})
+                    self.assertEqual(result.spawns, [])
 
     def test_missing_binary_passes_through(self):
         for agent in self.REPLACEMENT_AGENTS:
@@ -122,12 +135,14 @@ class ResponseHookContract(unittest.TestCase):
                 self.assertEqual(result.spawns, [])
 
     def test_malformed_hook_stdin_passes_through(self):
-        for agent in self.REPLACEMENT_AGENTS + ["qwencode"]:
+        agents = {a: corpus.RESPONSE_AGENTS[a] for a in self.REPLACEMENT_AGENTS}
+        agents.update(self.ADDITIVE_AGENTS)
+        for agent, agent_env in agents.items():
             with self.subTest(agent=agent):
                 result = contract_runner.run_case(
                     corpus.RESPONSE_HOOK,
                     "this is not JSON {{",
-                    corpus.RESPONSE_AGENTS[agent],
+                    agent_env,
                     "applied",
                 )
                 self.assertEqual(result.envelope, {})
