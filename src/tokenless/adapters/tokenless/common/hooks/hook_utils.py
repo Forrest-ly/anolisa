@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 
 # -- Binary fallback paths ----------------------------------------------------
 #
@@ -196,7 +198,7 @@ SHELL_TOOLS: set[str] = set(_tool_categories.get("layer_2_shell", {}).get("tools
 # is missing or the file failed to load.
 
 # Layer 2 thresholds: moderate truncation for shell/exec output.
-# Restores old ResponseCompressor defaults for shell commands (git log, ls,
+# Restores the old JSON compression defaults for shell commands (git log, ls,
 # cat, etc.) where truncation is acceptable.
 # 64K strings: 95% of real shell output (git diff ~63K, git log ~34K) preserved.
 # 128 arrays: 95% of result sets (test results, audit reports) preserved.
@@ -210,12 +212,6 @@ _layer3_thr = _tool_categories.get("layer_3_api", {}).get("thresholds", {})
 _TRUNCATE_STRINGS_AT = _layer3_thr.get("truncate_strings_at", 1_048_576)
 _TRUNCATE_ARRAYS_AT = _layer3_thr.get("truncate_arrays_at", 65_536)
 _MAX_DEPTH = _layer3_thr.get("max_depth", 32)
-
-# Backward-compatible alias — direct reference (not a copy) so consumers see
-# the same set as SKIP_TOOLS. Used by compress_toon_hook.py for the standalone
-# TOON-only path where "content retrieval" is the more descriptive name.
-CONTENT_RETRIEVAL_TOOLS = SKIP_TOOLS
-
 
 def get_thresholds(tool_name: str) -> tuple[int, int, int]:
     """Return (truncate_strings_at, truncate_arrays_at, max_depth) for a tool.
@@ -729,10 +725,15 @@ def _anchor_rtk_prefix(rewritten: str, rtk_bin: str) -> str:
         return rewritten
     parts.append(rewritten[pos:])
     return "".join(parts)
+
+
 # -- Context file for rewrite session tracking --
 
 _CONTEXT_DIR = os.path.join(os.path.expanduser("~"), ".tokenless")
 _CONTEXT_FILE = os.path.join(_CONTEXT_DIR, ".rewrite-context")
+_OPTIMIZATION_STATE_DIR = os.path.join(_CONTEXT_DIR, "hook-state")
+_OPTIMIZATION_STATE_TTL_SECONDS = 24 * 60 * 60
+_OPTIMIZATION_STATE_MAX_FILES = 1024
 
 # -- Binary resolution (cached) -----------------------------------------------
 
@@ -861,6 +862,83 @@ def write_context(agent_id: str, session_id: str, tool_use_id: str) -> None:
     secure_write_text(_CONTEXT_FILE, f"{agent_id}\n{session_id}\n{tool_use_id}\n")
 
 
+def _optimization_state_path(
+    agent_id: str, session_id: str, tool_use_id: str
+) -> str:
+    identity = "\0".join((agent_id, session_id, tool_use_id)).encode()
+    digest = hashlib.sha256(identity).hexdigest()
+    return os.path.join(_OPTIMIZATION_STATE_DIR, digest)
+
+
+def _prune_optimization_states() -> None:
+    """Bound abandoned per-call state when a host omits PostToolUse."""
+    try:
+        entries = os.scandir(_OPTIMIZATION_STATE_DIR)
+    except FileNotFoundError:
+        return
+
+    cutoff = time.time() - _OPTIMIZATION_STATE_TTL_SECONDS
+    live = []
+    with entries:
+        for entry in entries:
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                modified = entry.stat(follow_symlinks=False).st_mtime
+                if ".consuming." in entry.name and modified > cutoff:
+                    continue
+                if modified <= cutoff:
+                    os.unlink(entry.path)
+                else:
+                    live.append((modified, entry.path))
+            except FileNotFoundError:
+                continue
+
+    excess = len(live) - _OPTIMIZATION_STATE_MAX_FILES + 1
+    if excess > 0:
+        for _, path in sorted(live)[:excess]:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+def mark_rtk_optimized(agent_id: str, session_id: str, tool_use_id: str) -> None:
+    """Persist RTK ownership for one tool call before applying its rewrite."""
+    _prune_optimization_states()
+    secure_write_text(
+        _optimization_state_path(agent_id, session_id, tool_use_id), "rtk\n"
+    )
+
+
+def consume_output_optimization(
+    agent_id: str, session_id: str, tool_use_id: str
+) -> str:
+    """Consume one tool call's optimization state for its final result."""
+    if not tool_use_id:
+        return "none"
+    path = _optimization_state_path(agent_id, session_id, tool_use_id)
+    consuming_path = f"{path}.consuming.{os.getpid()}"
+    try:
+        os.rename(path, consuming_path)
+    except FileNotFoundError:
+        return "none"
+
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(consuming_path, flags)
+        with os.fdopen(fd) as state_file:
+            state = state_file.read()
+    finally:
+        try:
+            os.unlink(consuming_path)
+        except FileNotFoundError:
+            pass
+    return "rtk" if state == "rtk\n" else "none"
+
+
 def forward_stderr(proc: subprocess.CompletedProcess) -> None:
     """Forward subprocess stderr on failure (non-zero exit) via warn()."""
     if proc.returncode != 0 and proc.stderr:
@@ -883,45 +961,109 @@ def run(args: list[str], input_data: str, timeout: int = 3) -> subprocess.Comple
         return None
 
 
-def build_compression_request(
-    content: str,
+def _attribution(
     agent_id: str,
-    seam: str,
     session_id: str = "",
     tool_use_id: str = "",
-    tool_name: str = "",
-    replace_output: bool = False,
-    publish_retrieve_tool: bool = False,
-    replace_with_text: bool = False,
 ) -> dict:
-    """Build a protocol-v1 CompressionRequest for ``tokenless compress``.
+    """Build the shared Protocol v2 attribution object."""
+    value = {"agent_id": agent_id}
+    if session_id:
+        value["session_id"] = session_id
+    if tool_use_id:
+        value["tool_use_id"] = tool_use_id
+    return value
 
-    The adapter only copies the model-visible value and declares what its
-    host can do with the result (roadmap §4.5); all compression decisions
-    live behind the entry point.
-    """
-    request = {
-        "protocol_version": 1,
-        "content": content,
-        "agent_id": agent_id,
-        "seam": seam,
-        "capabilities": {
-            "replace_output": replace_output,
-            "publish_retrieve_tool": publish_retrieve_tool,
-            "replace_with_text": replace_with_text,
+
+def build_before_model_request(
+    tools: list,
+    visible_context: object,
+    agent_id: str,
+    session_id: str = "",
+    tool_use_id: str = "",
+) -> dict:
+    """Build a Protocol v2 BeforeModel transport request."""
+    return {
+        "protocol_version": 2,
+        "operation": "before_model",
+        "attribution": _attribution(agent_id, session_id, tool_use_id),
+        "input": {
+            "tools": tools,
+            "visible_context": visible_context,
+            "retrieve_tool_name": "tokenless_retrieve",
+            "capabilities": {
+                "replace_tools": True,
+                # Common Hooks have no trusted agent-facing Retrieve entry.
+                "publish_retrieve_tool": False,
+            },
         },
     }
-    if session_id:
-        request["session_id"] = session_id
-    if tool_use_id:
-        request["tool_use_id"] = tool_use_id
-    if tool_name:
-        request["tool_name"] = tool_name
-    return request
+
+
+def build_pre_tool_request(
+    arguments: dict,
+    agent_id: str,
+    tool_name: str,
+    command_field: str,
+    session_id: str = "",
+    tool_use_id: str = "",
+) -> dict:
+    """Build a Protocol v2 PreTool transport request."""
+    return {
+        "protocol_version": 2,
+        "operation": "pre_tool",
+        "attribution": _attribution(agent_id, session_id, tool_use_id),
+        "input": {
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "command_field": command_field,
+            "capabilities": {
+                "replace_arguments": True,
+                "block_and_suggest": False,
+            },
+        },
+    }
+
+
+def build_post_tool_request(
+    content: str,
+    agent_id: str,
+    tool_name: str,
+    status: str,
+    content_origin: str,
+    output_optimization: str,
+    session_id: str = "",
+    tool_use_id: str = "",
+    replace_output: bool = False,
+    replace_with_text: bool = False,
+) -> dict:
+    """Build a Protocol v2 PostTool transport request.
+
+    Common Hooks intentionally declare no trusted Retrieve capability, so
+    Core may apply lossless cleanup but rejects lossy candidates.
+    """
+    return {
+        "protocol_version": 2,
+        "operation": "post_tool",
+        "attribution": _attribution(agent_id, session_id, tool_use_id),
+        "input": {
+            "result_kind": "tool",
+            "tool_name": tool_name,
+            "content": content,
+            "status": status,
+            "content_origin": content_origin,
+            "output_optimization": output_optimization,
+            "capabilities": {
+                "replace_output": replace_output,
+                "publish_retrieve_tool": False,
+                "replace_with_text": replace_with_text,
+            },
+        },
+    }
 
 
 def run_compress(
-    tokenless_bin: str, request: dict, timeout: int
+    tokenless_bin: str, request: dict, timeout: int, expected_operation: str
 ) -> dict | None:
     """Run ``tokenless compress`` on one request; None on any failure.
 
@@ -942,12 +1084,19 @@ def run_compress(
     if not isinstance(response, dict):
         warn("tokenless compress returned malformed output")
         return None
-    if response.get("protocol_version") != 1:
+    if response.get("protocol_version") != 2:
         # Version-skewed binary: never trust a response whose contract
         # this adapter does not speak.
         warn("tokenless compress returned an unsupported protocol version")
         return None
-    return response
+    if response.get("operation") != expected_operation:
+        warn("tokenless compress returned a mismatched operation")
+        return None
+    result = response.get("result")
+    if not isinstance(result, dict):
+        warn("tokenless compress returned a malformed operation result")
+        return None
+    return result
 
 
 def detect_cosh_ng_runtime() -> tuple | None:

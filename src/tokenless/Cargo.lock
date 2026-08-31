@@ -861,17 +861,11 @@ dependencies = [
 name = "tokenless-compressors"
 version = "0.7.14"
 dependencies = [
- "tokenless-ccr",
-]
-
-[[package]]
-name = "tokenless-pipeline"
-version = "0.7.14"
-dependencies = [
+ "serde_json",
  "thiserror 2.0.18",
  "tokenless-ccr",
  "tokenless-protocol",
- "tokenless-stats",
+ "toon-format",
 ]
 
 [[package]]
@@ -888,7 +882,9 @@ name = "tokenless-python"
 version = "0.7.14"
 dependencies = [
  "pyo3",
+ "serde",
  "serde_json",
+ "tokenless-protocol",
  "tokenless-runtime",
  "tokenless-stats",
 ]
@@ -904,7 +900,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenless-ccr",
  "tokenless-compressors",
- "tokenless-pipeline",
  "tokenless-protocol",
  "tokenless-schema",
  "tokenless-stats",
@@ -934,6 +929,7 @@ dependencies = [
  "similar",
  "tempfile",
  "thiserror 2.0.18",
+ "tokenless-protocol",
 ]
 
 [[package]]

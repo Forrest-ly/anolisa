@@ -1,158 +1,109 @@
 #!/usr/bin/env python3
-"""Tokenless command rewriting hook via rtk.
+"""Tokenless command rewriting hook via Protocol v2 PreTool.
 
-Reads a PreToolUse JSON from stdin, extracts the shell command,
-invokes ``rtk rewrite`` via subprocess, and writes a HookOutput
-JSON to stdout.
+Reads a PreToolUse JSON from stdin, forwards shell arguments to
+``tokenless compress``, and translates the Core result into the host's
+HookOutput envelope.
 
 Hook point: **PreToolUse** — matcher: shell-family tool names
 (``Bash``, ``run_shell_command``, ``terminal``, ``Shell``, ``shell``,
-``exec``, ``process``).  The lowercase ``shell`` alternative covers
-cosh-ng, whose built-in shell tool is named ``shell`` on the wire.
+``exec``, ``process``).
 
-The agent ID is read from the TOKENLESS_AGENT_ID environment variable
-(set by the install action script).  Fallback paths follow the ANOLISA
-FHS spec: /usr/libexec/anolisa/tokenless/rtk.
+The agent ID is resolved from the host runtime, ``--agent-id`` argument, or
+TOKENLESS_AGENT_ID environment variable. Fallback paths follow the ANOLISA
+FHS spec: /usr/bin/tokenless.
 """
 
 import json
 import os
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from hook_utils import (
-    _RTK_FALLBACK,
-    _RTK_LOCAL_LIB,
-    _RTK_LOCAL_SHARE,
     _TOKENLESS_FALLBACK,
     _TOKENLESS_LOCAL_LIB,
     _TOKENLESS_LOCAL_SHARE,
-    _anchor_rtk_prefix,
-    forward_stderr,
-    parse_version,
+    build_pre_tool_request,
+    mark_rtk_optimized,
     resolve_agent_id,
     resolve_binary,
     resolve_tool_call_id,
+    run_compress,
     skip,
     warn,
-    write_context,
 )
 
-# -- constants ---------------------------------------------------------------
-
-_MIN_RTK_VERSION = (0, 35, 0)
+_PRE_TOOL_TIMEOUT = 8
 _AGENT_ID = resolve_agent_id()
 
 
-# -- main --------------------------------------------------------------------
-
-
 def main() -> None:
-    # 1. Resolve rtk binary
-    rtk_bin = resolve_binary(
-        "rtk", _RTK_FALLBACK, _RTK_LOCAL_SHARE, _RTK_LOCAL_LIB
-    )
-    if not rtk_bin:
-        warn("rtk is not installed or not in PATH. Hook disabled.")
-        skip()
-
-    # 2. Version guard
-    try:
-        result = subprocess.run(
-            [rtk_bin, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        ver = parse_version(result.stdout)
-        if ver and ver < _MIN_RTK_VERSION:
-            warn(f"rtk {result.stdout.strip()} is too old (need >= 0.35.0).")
-            skip()
-    except Exception as e:
-        warn(f"rtk version check failed: {e}")
-
-    # 3. Check tokenless binary (for stats)
-    if not resolve_binary(
+    tokenless_bin = resolve_binary(
         "tokenless",
         _TOKENLESS_FALLBACK,
         _TOKENLESS_LOCAL_SHARE,
         _TOKENLESS_LOCAL_LIB,
-    ):
+    )
+    if not tokenless_bin:
         warn("tokenless is not installed. Hook disabled.")
         skip()
 
-    # 4. Read stdin JSON
     try:
         input_data = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError, ValueError):
         skip()
 
-    # 5. Extract command
     tool_input = input_data.get("tool_input", {})
-    cmd = tool_input.get("command", "")
-    if not cmd:
+    if not isinstance(tool_input, dict):
+        skip()
+    command = tool_input.get("command", "")
+    if not isinstance(command, str) or not command:
         skip()
 
-    # 6. Rewrite via rtk
-    env = os.environ.copy()
-    env["TOKENLESS_AGENT_ID"] = _AGENT_ID
     session_id = input_data.get("session_id", "")
     tool_use_id = resolve_tool_call_id(_AGENT_ID, input_data)
-    if session_id:
-        env["TOKENLESS_SESSION_ID"] = session_id
-    if tool_use_id:
-        env["TOKENLESS_TOOL_USE_ID"] = tool_use_id
+    if not tool_use_id:
+        skip()
 
-    write_context(_AGENT_ID, session_id, tool_use_id)
+    request = build_pre_tool_request(
+        tool_input,
+        _AGENT_ID,
+        input_data.get("tool_name", ""),
+        "command",
+        session_id=session_id,
+        tool_use_id=tool_use_id,
+    )
+    response = run_compress(tokenless_bin, request, _PRE_TOOL_TIMEOUT, "pre_tool")
+    if response is None or response.get("action") != "replace_arguments":
+        skip()
+    if response.get("output_optimization") != "rtk":
+        skip()
+
+    updated_input = response.get("arguments")
+    if not isinstance(updated_input, dict):
+        skip()
+    rewritten = updated_input.get("command")
+    if not isinstance(rewritten, str) or not rewritten or rewritten == command:
+        skip()
 
     try:
-        proc = subprocess.run(
-            [rtk_bin, "rewrite", cmd],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            env=env,
+        mark_rtk_optimized(_AGENT_ID, session_id, tool_use_id)
+    except OSError as error:
+        warn(f"failed to persist PreTool optimization state: {error}")
+        skip()
+
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "tool_input": {"command": rewritten},
+                    "updatedInput": updated_input,
+                },
+            }
         )
-    except Exception as e:
-        warn(f"rtk rewrite subprocess failed: {e}")
-        skip()
-
-    # Exit code protocol (from rtk rewrite_cmd.rs):
-    #   0 = rewrite available, Allow verdict (auto-allow by permission rule)
-    #   1 = no RTK equivalent (passthrough)
-    #   2 = deny rule matched (let hook handle)
-    #   3 = Ask/Default verdict (rewrite available but permission model requires
-    #       user confirmation; in non-interactive hook context, treat as valid
-    #       rewrite since the intent is token optimization, not permission gating)
-    if proc.returncode not in (0, 1, 2, 3):
-        forward_stderr(proc)
-        warn(f"rtk rewrite exited with unexpected code {proc.returncode}")
-        skip()
-    if proc.returncode in (1, 2):
-        skip()
-    rewritten = proc.stdout.strip()
-    if not rewritten or rewritten == cmd:
-        skip()
-
-    rewritten = _anchor_rtk_prefix(rewritten, rtk_bin)
-
-    # 7. Build response
-    # Emit both formats for runtime compatibility:
-    # - ``tool_input``: Cosh-NG partial patch (merges with original params)
-    # - ``updatedInput``: copilot-shell full replacement (legacy)
-    updated_input = dict(tool_input)
-    updated_input["command"] = rewritten
-
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "tool_input": {"command": rewritten},
-            "updatedInput": updated_input,
-        },
-    }
-    print(json.dumps(output))
+    )
 
 
 if __name__ == "__main__":

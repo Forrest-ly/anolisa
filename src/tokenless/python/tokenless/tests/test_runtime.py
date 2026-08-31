@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import sqlite3
@@ -14,16 +13,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from anolisa_tokenless import (
-    RetrievalError,
     StatsDiffSort,
     StatsMode,
     StatsNotFoundError,
     StatsOperation,
-    TokenlessConfig,
     TokenlessError,
     TokenlessRuntime,
     TokenlessStats,
-    ToolResponseCompressor,
     __version__,
 )
 
@@ -97,82 +93,6 @@ class TokenlessRuntimeTests(unittest.TestCase):
         recovered = self.runtime.retrieve(marker.group(1).upper())
         self.assertEqual(recovered, payload)
 
-    def test_framework_core_compresses_and_authorizes_visible_marker(self) -> None:
-        payload = "RECOVERY_SENTINEL=FRAMEWORK\n" + ("世界" * 3_000)
-        original = json.dumps({"payload": payload}, ensure_ascii=False)
-        compressor = ToolResponseCompressor(
-            TokenlessConfig(
-                mode="aggressive",
-                data_dir=Path(self.temporary_directory.name, "framework"),
-                min_chars=0,
-            ),
-        )
-        compressed = asyncio.run(
-            compressor.compress_text(
-                original,
-                tool_name="api_call",
-                agent_id="framework-test",
-                session_id="session",
-                tool_use_id="tool",
-            ),
-        )
-        self.assertIsNotNone(compressed)
-        assert compressed is not None
-        marker = re.search(r"<<tokenless:([0-9a-f]{24})>>", compressed)
-        self.assertIsNotNone(marker)
-        assert marker is not None
-
-        with self.assertRaisesRegex(RetrievalError, "not present"):
-            asyncio.run(compressor.retrieve(marker.group(1), "no visible marker"))
-        recovered = asyncio.run(
-            compressor.retrieve(marker.group(1).upper(), compressed)
-        )
-        self.assertEqual(recovered, payload)
-
-    def test_framework_core_treats_oversized_integer_as_text(self) -> None:
-        compressor = ToolResponseCompressor(
-            TokenlessConfig(
-                data_dir=Path(self.temporary_directory.name, "oversized-integer"),
-                min_chars=0,
-            ),
-        )
-        compressed = asyncio.run(
-            compressor.compress_text(
-                "9" * 4_301,
-                tool_name="api_call",
-                agent_id="framework-test",
-                session_id="session",
-                tool_use_id="tool",
-            ),
-        )
-        self.assertIsNone(compressed)
-
-    def test_framework_core_treats_deep_json_as_text(self) -> None:
-        compressor = ToolResponseCompressor(
-            TokenlessConfig(
-                data_dir=Path(self.temporary_directory.name, "deep-json"),
-                min_chars=0,
-            ),
-        )
-        compressed = asyncio.run(
-            compressor.compress_text(
-                "[" * 10_000 + "]" * 10_000,
-                tool_name="api_call",
-                agent_id="framework-test",
-                session_id="session",
-                tool_use_id="tool",
-            ),
-        )
-        self.assertIsNone(compressed)
-
-    def test_framework_config_enforces_common_policy(self) -> None:
-        compressor = ToolResponseCompressor(TokenlessConfig(mode="balanced"))
-        self.assertTrue(compressor.is_excluded("Read"))
-        self.assertFalse(compressor.is_excluded("api_call"))
-        self.assertEqual(compressor.thresholds_for("Bash"), (65_536, 128, 8))
-        with self.assertRaisesRegex(ValueError, "absolute path"):
-            TokenlessConfig(data_dir="relative")
-
     def test_stats_query_empty_database_and_invalid_path(self) -> None:
         data_dir = Path(self.temporary_directory.name, "empty-stats")
         stats = TokenlessStats(data_dir)
@@ -213,6 +133,12 @@ class TokenlessRuntimeTests(unittest.TestCase):
             tool_use_id="tool-active",
         )
         self.assertTrue(active_result.applied)
+        with sqlite3.connect(Path(data_dir, "stats.db")) as connection:
+            connection.execute(
+                "UPDATE stats SET applied_operations = ?, recoverability = ? "
+                "WHERE session_id = ?",
+                ('["json_cleanup","toon"]', "lossless", "tokenless-session"),
+            )
 
         stats = TokenlessStats(data_dir)
         status = stats.status
@@ -240,6 +166,8 @@ class TokenlessRuntimeTests(unittest.TestCase):
         self.assertEqual(len(records), 2)
         self.assertEqual(records[0].session_id, "tokenless-session")
         self.assertEqual(records[0].mode, StatsMode.ACTIVE)
+        self.assertEqual(records[0].applied_operations, ("json_cleanup", "toon"))
+        self.assertEqual(records[0].recoverability, "lossless")
         self.assertIsNone(records[0].before_text)
         self.assertIsNone(records[0].after_text)
         self.assertEqual(len(stats.list(limit=1)), 1)
@@ -347,14 +275,14 @@ class TokenlessRuntimeTests(unittest.TestCase):
                 truncate_arrays_at=2,
                 agent_id="python-test",
             )
-            self.assertEqual(result.disposition, "reversibility_unavailable")
+            self.assertEqual(result.disposition, "recoverability_unavailable")
             self.assertEqual(result.output, original)
 
     def test_short_string_limit_is_reversible_fail_open(self) -> None:
         original = json.dumps({"tail": "x" * 400})
         result = self.runtime.compress_response(original, truncate_strings_at=10)
 
-        self.assertEqual(result.disposition, "reversibility_unavailable")
+        self.assertEqual(result.disposition, "recoverability_unavailable")
         self.assertEqual(result.output, original)
         self.assertEqual(result.stash_errors, 0)
         self.assertEqual(result.unrecoverable_truncations, 1)
@@ -369,7 +297,7 @@ class TokenlessRuntimeTests(unittest.TestCase):
 
             original = json.dumps({"tail": "x" * 400})
             result = runtime.compress_response(original, truncate_strings_at=80)
-            self.assertEqual(result.disposition, "reversibility_unavailable")
+            self.assertEqual(result.disposition, "recoverability_unavailable")
             self.assertEqual(result.output, original)
             self.assertEqual(result.stash_errors, 1)
             self.assertEqual(result.unrecoverable_truncations, 1)
@@ -384,7 +312,7 @@ class TokenlessRuntimeTests(unittest.TestCase):
 
             original = json.dumps({"nested": {"payload": "x" * 400}})
             result = runtime.compress_response(original, max_depth=0)
-            self.assertEqual(result.disposition, "reversibility_unavailable")
+            self.assertEqual(result.disposition, "recoverability_unavailable")
             self.assertEqual(result.output, original)
             self.assertEqual(result.stash_errors, 1)
             self.assertEqual(result.unrecoverable_truncations, 1)

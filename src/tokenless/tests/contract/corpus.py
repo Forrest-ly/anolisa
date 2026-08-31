@@ -21,6 +21,7 @@ GOLDENS_DIR = os.path.join(CONTRACT_DIR, "goldens")
 
 RESPONSE_HOOK = os.path.join(HOOKS_DIR, "compress_response_hook.py")
 SCHEMA_HOOK = os.path.join(HOOKS_DIR, "compress_schema_hook.py")
+PRE_TOOL_HOOK = os.path.join(HOOKS_DIR, "rewrite_hook.py")
 
 DEBUG_TOKENLESS_BIN = os.path.join(REPO_ROOT, "target", "debug", "tokenless")
 
@@ -50,24 +51,6 @@ SCHEMA_AGENTS = {
 FIXTURE_AGENTS = {
     ("post_tool", "cosh_wrapper"): ["cosh-ng"],
 }
-
-# The one sanctioned envelope change of the unified entry (roadmap line on
-# additive hosts): additionalContext-only hosts no longer receive compressed
-# copies beside the still-visible original — they pass through. Environment
-# attribution (genuinely additive) is unaffected. Keys are
-# (kind, fixture, agent) -> the expected new envelope.
-PARITY_ALLOWLIST = {
-    ("post_tool", name, "qwencode"): {}
-    for name in [
-        "api_records",
-        "bash_array_truncation",
-        "bash_empty_fields",
-        "double_encoded",
-        "string_json",
-        "string_json_large",
-    ]
-}
-
 
 def agents_for(kind: str, name: str, agents: dict) -> dict:
     """The agent matrix for one fixture, honoring FIXTURE_AGENTS."""

@@ -2,15 +2,14 @@
 """Tokenless response compression hook for Cosh-NG, Claude Code, Qoder, and OpenCode.
 
 Reads a PostToolUse JSON from stdin, forwards the model-visible tool
-response to the unified ``tokenless compress`` entry point (protocol v1,
-roadmap §5.4), and translates the CompressionResponse into the host's
+response to the unified ``tokenless compress`` Protocol v2 PostTool operation
+and translates the result into the host's
 envelope. JSON detection, tool threshold selection, TOON selection, and
 final acceptance all live behind the entry point; this hook only parses the
 host object, declares capabilities, and builds envelopes (§4.5).
 
-One Tokenless subprocess per invocation (§5.6). Environment-error
-attribution stays hook-side: it is genuinely additive diagnostics, not a
-compression decision.
+One Tokenless subprocess per invocation. Environment-error attribution is
+owned by the Rust PostTool service.
 
 Hook point: **PostToolUse**
 
@@ -37,10 +36,10 @@ Output contract per agent:
     replacement remain passthrough (roadmap §7). Environment attribution is
     still injected: it is additive by design.
 
-The agent ID is read from the TOKENLESS_AGENT_ID environment variable
-(set by the install action script).  When running under Cosh-NG, the
-agent ID is overridden to ``cosh-ng`` for correct stats attribution.
-Fallback paths follow the ANOLISA FHS spec: /usr/bin/tokenless.
+The agent ID is resolved from the host runtime, ``--agent-id`` argument, or
+TOKENLESS_AGENT_ID environment variable. When running under Cosh-NG, runtime
+detection overrides the declared ID for correct stats attribution. Fallback
+paths follow the ANOLISA FHS spec: /usr/bin/tokenless.
 """
 
 from __future__ import annotations
@@ -58,8 +57,8 @@ from hook_utils import (
     _TOKENLESS_LOCAL_SHARE,
     SHELL_TOOLS,
     SKIP_TOOLS,
-    build_compression_request,
-    classify_env_error,
+    build_post_tool_request,
+    consume_output_optimization,
     detect_cosh_ng_runtime,
     is_skill_file,
     parse_version,
@@ -74,12 +73,6 @@ from hook_utils import (
 )
 
 # -- constants ---------------------------------------------------------------
-
-# Spawn-avoidance mirror of the entry point's 200-char gate. The authority
-# lives in Rust; skipping here only saves the subprocess for content the
-# entry would pass through anyway (normalization never grows the char
-# count, so raw < 200 implies normalized < 200).
-_MIN_RESPONSE_CHARS = 200
 
 # Shell tool envelopes carry the log in one dominant text field. Unwrapping
 # is worth a rebuilt envelope only when that field is large enough for the
@@ -220,27 +213,36 @@ def main() -> None:
     cosh_ng_version = detect_cosh_ng_runtime()
     cosh_ng_detected = cosh_ng_version is not None
 
-    # If Cosh-NG is detected but unsupported version, fail open
+    # 2. Resolve agent ID based on runtime
+    agent_id = resolve_agent_id()
+
+    # 3. Read stdin JSON and consume any matching PreTool state.
+    try:
+        input_data = json.load(sys.stdin)
+    except (json.JSONDecodeError, EOFError, ValueError):
+        warn("failed to read PostToolUse payload. Passing through unchanged.")
+        skip()
+
+    session_id = input_data.get("session_id", "")
+    tool_use_id = resolve_tool_call_id(agent_id, input_data)
+    try:
+        output_optimization = consume_output_optimization(
+            agent_id, session_id, tool_use_id
+        )
+    except OSError as error:
+        warn(f"failed to consume PreTool optimization state: {error}")
+        output_optimization = "none"
+
     if cosh_ng_detected and cosh_ng_version == (0, 0, 0):
         warn("Unsupported Cosh-NG version. Response compression disabled (fail open).")
         skip()
 
-    # 2. Resolve agent ID based on runtime
-    agent_id = resolve_agent_id()
-
-    # 3. Resolve binaries
+    # 4. Resolve the single Core entry point after consuming per-call state.
     tokenless_bin = resolve_binary(
         "tokenless", _TOKENLESS_FALLBACK, _TOKENLESS_LOCAL_SHARE, _TOKENLESS_LOCAL_LIB
     )
     if not tokenless_bin:
         warn("tokenless is not installed. Response compression hook disabled.")
-        skip()
-
-    # 4. Read stdin JSON
-    try:
-        input_data = json.load(sys.stdin)
-    except (json.JSONDecodeError, EOFError, ValueError):
-        warn("failed to read PostToolUse payload. Passing through unchanged.")
         skip()
 
     tool_name = input_data.get("tool_name", "unknown")
@@ -285,30 +287,7 @@ def main() -> None:
     else:
         skip()
 
-    # 8. Extract caller context
-    session_id = input_data.get("session_id", "")
-    tool_use_id = resolve_tool_call_id(agent_id, input_data)
-
-    # 9. Environment attribution analysis — additive diagnostics, computed
-    # hook-side. Only structured payloads are classified (with the same
-    # string-unwrap the entry point applies): plain text never reached
-    # attribution in the two-subprocess hook and still does not.
-    if isinstance(model_visible_before, dict):
-        attr_subject = model_visible_before
-    else:
-        parsed = try_parse_json(content)
-        if isinstance(parsed, str):
-            parsed = try_parse_json(parsed)
-        attr_subject = parsed if isinstance(parsed, (dict, list)) else None
-    env_attribution = ""
-    attr_category, attr_fix_hint = classify_env_error(attr_subject)
-    if attr_category:
-        env_attribution = (
-            f"[tokenless:env] {tool_name} failed: "
-            f"{attr_category} ({attr_fix_hint}). Skip retry."
-        )
-
-    # 10. Capability declaration (§4.5): what can this host actually do?
+    # 8. Capability declaration: what can this host actually do?
     if cosh_ng_detected:
         can_replace = True
         replace_with_text = True  # updatedToolResponse accepts any text
@@ -334,32 +313,77 @@ def main() -> None:
         can_replace = False
         replace_with_text = True
 
-    # 11. Prefilters. Two of them only save the exec; SKIP_TOOLS does more
-    # than that now. The entry point no longer keeps a tool list of its own
-    # (roadmap §6.3), so until this hook declares a content origin per tool
-    # (item 10) this check is the only thing keeping content retrieval — the
-    # hottest PostToolUse traffic — away from the compressor. It is
-    # load-bearing, not an optimization: do not drop it as one.
-    if not can_replace:
-        _emit_attribution_or_skip(env_attribution)
+    # 9. Map host facts into the required lifecycle fields.
     if tool_name in SKIP_TOOLS:
-        _emit_attribution_or_skip(env_attribution)
-    if len(content) < _MIN_RESPONSE_CHARS:
-        _emit_attribution_or_skip(env_attribution)
+        content_origin = "file_content"
+    elif tool_name in SHELL_TOOLS:
+        content_origin = "command_output"
+    else:
+        content_origin = "api_response"
+    raw_status = str(input_data.get("status", "")).lower()
+    shell_process_result = (
+        model_visible_before if isinstance(model_visible_before, dict) else None
+    )
+    shell_process_error = (
+        tool_name in SHELL_TOOLS
+        and shell_process_result is not None
+        and (
+            shell_process_result.get("error") is not None
+            or (
+                shell_process_result.get("exit_code") is not None
+                and shell_process_result.get("exit_code") != 0
+            )
+            or (
+                shell_process_result.get("exitCode") is not None
+                and shell_process_result.get("exitCode") != 0
+            )
+        )
+    )
+    if raw_status in {"interrupted", "denied"}:
+        status = raw_status
+    elif input_data.get("is_error") is True or (
+        isinstance(tool_response_raw, dict)
+        and tool_response_raw.get("isError") is True
+    ):
+        status = "error"
+    elif shell_process_error:
+        status = "error"
+    else:
+        status = "success"
 
-    # 12. The one Tokenless subprocess: the unified entry point decides.
-    request = build_compression_request(
+    # Shell envelopes often carry a large stdout alongside the actual failure
+    # in a short stderr. Error results are never replaced, so send the error
+    # stream to Core for diagnosis while the host keeps the original envelope.
+    if status == "error" and tool_name in SHELL_TOOLS and isinstance(
+        model_visible_before, dict
+    ):
+        error_parts = []
+        for field in ("stderr", "error"):
+            value = model_visible_before.get(field)
+            if isinstance(value, str) and value.strip():
+                error_parts.append(value)
+        if error_parts:
+            content = "\n".join(error_parts)
+
+    # 10. The one Tokenless subprocess: Core owns all PostTool policy.
+    request = build_post_tool_request(
         content,
         agent_id,
-        "post_tool",
+        tool_name,
+        status,
+        content_origin,
+        output_optimization,
         session_id=session_id,
         tool_use_id=tool_use_id,
-        tool_name=tool_name,
-        replace_output=True,
-        publish_retrieve_tool=True,
+        replace_output=can_replace,
         replace_with_text=replace_with_text,
     )
-    response = run_compress(tokenless_bin, request, _COMPRESS_TIMEOUT)
+    response = run_compress(
+        tokenless_bin, request, _COMPRESS_TIMEOUT, "post_tool"
+    )
+    env_attribution = (
+        response.get("additional_context", "") if response is not None else ""
+    )
     if response is None or response.get("disposition") != "applied":
         _emit_attribution_or_skip(env_attribution)
 
@@ -368,7 +392,7 @@ def main() -> None:
         warn("tokenless compress returned no output. Passing through unchanged.")
         _emit_attribution_or_skip(env_attribution)
 
-    # 13. Envelope construction — dispatch by agent runtime. An unwrapped
+    # 11. Envelope construction — dispatch by agent runtime. An unwrapped
     # shell field is re-injected into a same-shaped envelope: the compressed
     # text replaces exactly the field that was sent, every other field stays
     # byte-identical.

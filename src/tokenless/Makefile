@@ -249,7 +249,6 @@ test-claude-code-detect:
 test-integration:
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_compress_response_hook.py
-	python3 tests/test_compress_toon_hook.py
 	python3 tests/test_codex_response_diagnostics.py
 	python3 tests/test_hermes_toon_threshold.py
 	python3 tests/test_compress_schema_hook.py
@@ -261,9 +260,8 @@ test-integration:
 	python3 tests/test_cosh_extension_matcher.py
 	python3 tests/test_resolve_agent_id.py
 
-# Golden parity for the unified-entry hooks (roadmap §5.6): replays the
-# tests/contract corpus through the current hooks against the real debug
-# binary and diffs against goldens captured from the pre-PR-6 hooks.
+# Protocol v2 Common Hook parity: replay the contract corpus through the
+# current hooks and real debug binary, then compare with the v2 goldens.
 test-hook-parity:
 	@echo "==> Testing hook golden parity (real binary)..."
 	cargo build -p tokenless-cli
