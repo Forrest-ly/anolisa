@@ -1,4 +1,4 @@
-//! Content taxonomy and deterministic detection (roadmap §4.2).
+//! Bounded content detection for PostTool domain dispatch.
 //!
 //! Detection is a pure function of the content with bounded work: only the
 //! first [`MAX_SCAN_BYTES`] bytes / [`MAX_SCAN_LINES`] lines are inspected
@@ -7,8 +7,8 @@
 //! selected compressor, not in a detector that runs on every input. When no
 //! cheap signal is decisive the detector prefers the more general class, and
 //! ultimately [`ContentType::PlainText`] or [`ContentType::Unknown`]; the
-//! pipeline routes those to passthrough until a conservative fallback
-//! compressor exists.
+//! Runtime routes unsupported domains to passthrough until their compressor
+//! is deliberately connected.
 
 mod build_log;
 mod diff;
@@ -19,52 +19,7 @@ mod source_code;
 mod stack_trace;
 mod tabular;
 
-/// The first content taxonomy (roadmap §4.2).
-///
-/// Wire values (see [`ContentType::wire_str`]) are the stable strings the
-/// protocol's `content_type` response field carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ContentType {
-    /// JSON documents, typically arrays of records or nested objects.
-    JsonRecords,
-    /// grep/ripgrep-style `path:line[:col]:text` match listings.
-    SearchResults,
-    /// Compiler, package-manager, or test-runner terminal output.
-    BuildLog,
-    /// A stack trace or panic report, starting as one.
-    StackTrace,
-    /// Unified diff / patch output.
-    Diff,
-    /// A complete HTML document. Ambiguous fragments are not classified.
-    Html,
-    /// Delimiter-consistent tables (CSV, TSV, Markdown tables).
-    Tabular,
-    /// Program source code. Detected only on strong signals.
-    SourceCode,
-    /// Readable text with no more specific classification.
-    PlainText,
-    /// Empty, binary-like, or otherwise unclassifiable content.
-    Unknown,
-}
-
-impl ContentType {
-    /// The stable wire value used by the protocol's `content_type` field.
-    #[must_use]
-    pub fn wire_str(self) -> &'static str {
-        match self {
-            Self::JsonRecords => "json_records",
-            Self::SearchResults => "search_results",
-            Self::BuildLog => "build_log",
-            Self::StackTrace => "stack_trace",
-            Self::Diff => "diff",
-            Self::Html => "html",
-            Self::Tabular => "tabular",
-            Self::SourceCode => "source_code",
-            Self::PlainText => "plain_text",
-            Self::Unknown => "unknown",
-        }
-    }
-}
+use tokenless_protocol::ContentType;
 
 /// Detection inspects at most this many leading bytes.
 pub const MAX_SCAN_BYTES: usize = 64 * 1024;
@@ -96,7 +51,7 @@ pub fn detect(content: &str) -> ContentType {
     // compressor is the authority — it parses, and non-record JSON passes
     // through there.
     if json::is_json_like(content) {
-        return ContentType::JsonRecords;
+        return ContentType::Json;
     }
     if html::is_html_document(scan) {
         return ContentType::Html;
