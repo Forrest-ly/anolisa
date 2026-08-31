@@ -20,6 +20,11 @@ the unified-entry architecture (roadmap §5.4):
 - PreToolUse: the rewritten command is emitted both as the ``tool_input``
   partial patch Cosh-NG merges and the legacy ``updatedInput`` full
   replacement, unchanged when running under Cosh-NG env markers.
+- Cross-host regression: the string-envelope error classification in
+  compress_response_hook.py is deliberately not Cosh-NG gated — it restores
+  the v1 hook-side classification for every host — so copilot-shell string
+  envelopes keep their error attribution, and envelope-shaped output of a
+  successful command is not misclassified as an error.
 
 Uses subprocesses with mock ``tokenless`` / ``rtk`` binaries, following the
 pattern of test_compress_response_hook.py and test_rewrite_hook.py.
@@ -487,6 +492,81 @@ class TestCoshNGCompressResponseIntegration(unittest.TestCase):
             env_overrides={"COSH_NG_VERSION": "0.6.0"},
         )
         self.assertEqual(out, {})
+
+
+class TestCopilotShellEnvelopeClassification(unittest.TestCase):
+    """Cross-host regression for string-envelope error classification.
+
+    Protocol v2 moved environment diagnosis into Core, gated on the
+    hook-supplied status, so compress_response_hook.py parses string shell
+    envelopes (``try_parse_json``, double-unwrap) without a Cosh-NG gate —
+    restoring the host-agnostic classification the v1 hook ran hook-side.
+    copilot-shell delivers shell output as a plain string envelope, so it
+    must keep working through the same parse, and envelope-shaped text
+    without error markers must not be misclassified.
+    """
+
+    def setUp(self) -> None:
+        self._saved_env = os.environ.copy()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.mock_tokenless = _create_mock_tokenless(self.home)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+        os.environ.clear()
+        os.environ.update(self._saved_env)
+
+    def _run_hook(self, stdin_data: dict, env_overrides: dict | None = None) -> dict:
+        env = os.environ.copy()
+        env.pop("COSH_NG_VERSION", None)
+        env.pop("COSH_RUNTIME", None)
+        env["HOME"] = str(self.home)
+        env["PATH"] = str(self.mock_tokenless.parent) + ":" + env.get("PATH", "")
+        env["TOKENLESS_AGENT_ID"] = "copilot-shell"
+        if env_overrides:
+            env.update(env_overrides)
+        proc = subprocess.run(
+            [sys.executable, str(COMPRESS_HOOK)],
+            input=json.dumps(stdin_data),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        stdout = proc.stdout.strip()
+        if not stdout or stdout == "{}":
+            return {}
+        return json.loads(stdout)
+
+    def test_copilot_shell_string_envelope_error_keeps_attribution(self):
+        """A failing copilot-shell string envelope is classified as error."""
+        stdin_data = {
+            "tool_name": "Bash",
+            "tool_response": json.dumps(
+                {"stderr": "command not found: foobar", "exit_code": 127}
+            ),
+        }
+        out = self._run_hook(stdin_data)
+        specific = out.get("hookSpecificOutput", {})
+        self.assertNotIn("updatedToolOutput", specific)
+        self.assertIn("additionalContext", specific)
+        self.assertIn("ENV_DEPENDENCY_MISSING", specific["additionalContext"])
+
+    def test_copilot_shell_envelope_shaped_success_not_misclassified(self):
+        """Envelope-shaped output of a successful command stays success."""
+        stdin_data = {
+            "tool_name": "Bash",
+            "tool_response": json.dumps(
+                {
+                    "exit_code": 0,
+                    "stdout": "s" * 300,
+                    "stderr": "warning: skipped 2 entries",
+                }
+            ),
+        }
+        self.assertEqual(self._run_hook(stdin_data), {})
 
 
 class TestCoshNGRewriteIntegration(unittest.TestCase):
