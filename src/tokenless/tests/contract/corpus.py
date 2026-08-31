@@ -51,24 +51,6 @@ FIXTURE_AGENTS = {
     ("post_tool", "cosh_wrapper"): ["cosh-ng"],
 }
 
-# The one sanctioned envelope change of the unified entry (roadmap line on
-# additive hosts): additionalContext-only hosts no longer receive compressed
-# copies beside the still-visible original — they pass through. Environment
-# attribution (genuinely additive) is unaffected. Keys are
-# (kind, fixture, agent) -> the expected new envelope.
-PARITY_ALLOWLIST = {
-    ("post_tool", name, "qwencode"): {}
-    for name in [
-        "api_records",
-        "bash_array_truncation",
-        "bash_empty_fields",
-        "double_encoded",
-        "string_json",
-        "string_json_large",
-    ]
-}
-
-
 def agents_for(kind: str, name: str, agents: dict) -> dict:
     """The agent matrix for one fixture, honoring FIXTURE_AGENTS."""
     allowed = FIXTURE_AGENTS.get((kind, name))
