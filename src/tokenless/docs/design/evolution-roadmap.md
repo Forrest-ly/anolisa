@@ -7,18 +7,21 @@ pipeline. The section numbers cited across the crates (`§4.1`–`§6`), the
 design principles, and the milestone markers (`M1`, `M4`) refer to this
 document. It consolidates the roadmap as encoded in the shipped crates and
 the merged implementation PRs; status is current as of Tokenless 0.7.14,
-including the post-tool pipeline restructure merged after that release
-(PR #2974).
+including the post-tool pipeline restructure (PR #2974) and the protocol
+v2 lifecycle (PR #2978) merged after that release.
 
 ## Goal
 
 One shared Rust compression pipeline serving the CLI hooks, the in-process
 Runtime, and the framework adapters. A single versioned compatibility
-boundary — protocol v1 — replaces adapter-specific payloads: an adapter
-copies only the model-visible value into a `CompressionRequest` and gets
-back the final content plus the decision facts it needs to build its
-host-specific envelope. UI or business objects that must remain unmodified
-never enter the protocol.
+boundary replaces adapter-specific payloads: protocol v2 carries four typed
+lifecycle operations — BeforeModel, PreTool, PostTool, and Retrieve — in
+attributed envelopes, so an adapter builds only the operation-specific
+request and gets back the typed result facts it needs to build its
+host-specific envelope. Protocol v1's generic `CompressionRequest` /
+`CompressionResponse` pair (shipped in 0.7.13) is superseded and no longer
+parsed. UI or business objects that must remain unmodified never enter the
+protocol.
 
 Compression stays an optional optimization throughout: no pipeline failure
 may fail the request, and every non-applied outcome emits the original
@@ -38,14 +41,15 @@ a shipped citation are intentionally not restated here.
   and the stash attaches only where the host publishes a retrieve tool, so
   retrievable-lossy markers are never dead ends. The shipped JSON domain
   compressor (§5.3) runs at `post_tool` and gates on `replace_output`: it
-  still runs on hosts without a retrieve tool and claims its reversibility
+  still runs on hosts without a retrieve tool and claims its recoverability
   from what actually happened — truncations that could not be stashed are
-  reported as `unrecoverable`, and arbitration rejects the candidate
-  whenever the request requires reversibility (principle 5).
-- **Principle 5 — Explicit reversibility claims.** Every applied
+  reported as `unrecoverable`, and a lossy candidate is rejected outright
+  whenever no trusted Retrieve path exists (principle 5).
+- **Principle 5 — Explicit recoverability claims.** Every applied
   transformation reports its recovery state — `lossless`, `retrievable`, or
-  `unrecoverable` — and required-reversible mode rejects unrecoverable
-  candidates outright.
+  `unrecoverable` — and a lossy candidate is rejected
+  (`recoverability_unavailable`) whenever the host publishes no trusted
+  retrieve tool.
 - **Principle 6 — Fail-open, bounded diagnostics.** A failing compressor
   never fails the request; the first failure is kept as a diagnostic bounded
   to `DIAGNOSTIC_MAX_BYTES` (4 KiB), and `output` always carries exactly
@@ -53,24 +57,34 @@ a shipped citation are intentionally not restated here.
 
 ## Architecture (§4)
 
-### §4.1 Protocol v1 boundary
+### §4.1 Protocol boundary
 
-`tokenless-protocol` defines the compatibility boundary:
-`CompressionRequest` / `CompressionResponse` with `protocol_version`, the
-`Seam`, `Capabilities`, `Disposition`, and `Reversibility` types.
-Compatibility rules:
+`tokenless-protocol` defines the compatibility boundary. Protocol v1
+(shipped in 0.7.13, PR #2783) carried a generic
+`CompressionRequest` / `CompressionResponse` pair with `protocol_version`,
+the `Seam`, `Capabilities`, `Disposition`, and `Reversibility` types.
+Protocol v2 (PR #2978) supersedes it with four typed lifecycle operations —
+`before_model` (model-bound tool declarations), `pre_tool` (tool arguments
+before execution), `post_tool` (one completed tool result), and `retrieve`
+(one visible stash marker) — carried by `RequestEnvelope` /
+`ResponseEnvelope` together with the request `Attribution`. Compatibility
+rules:
 
-- Readers ignore unknown fields within a supported major version, so
-  optional fields may be added without a version bump.
-- An incompatible shape requires a new `protocol_version`, never a parallel
-  adapter-specific payload.
-- `from_json` validates the version before the shape, so a future version
-  reports `UnsupportedVersion` instead of a misleading shape error.
+- Payloads parse strictly: unknown fields are rejected rather than ignored,
+  so every wire change is deliberate.
+- `RequestEnvelope::from_json` / `ResponseEnvelope::from_json` validate the
+  version before the shape, so an unsupported version reports
+  `UnsupportedVersion` instead of a misleading shape error.
+- A response must carry the operation its request selected
+  (`OperationMismatch` otherwise); an incompatible shape requires a new
+  `protocol_version`, never a parallel adapter-specific payload.
+- In-process callers use the operation-specific payload types directly; the
+  envelopes exist only for CLI and other cross-process transports.
 
 ### §4.2 Content detection and domain dispatch
 
-The Runtime's `post_tool` module carries the content taxonomy
-(`json_records`, `search_results`, `build_log`, `stack_trace`, `diff`,
+The Runtime's `post_tool` module carries the protocol `ContentType`
+taxonomy (`json`, `search_results`, `build_log`, `stack_trace`, `diff`,
 `html`, `tabular`, `source_code`, `plain_text`, `unknown`) and the
 deterministic bounded-cost detector. Phase one dispatches only the JSON
 domain to a compressor; every other detected domain passes through
@@ -101,28 +115,32 @@ and file content passes through untouched.
 
 ### §4.5 Adapter boundary
 
-Adapters own their private host contracts. Only the model-visible value is
-copied into the request; the response carries the final content plus the
-decision facts (`disposition`, token counts, `compressor_chain`,
-`stash_keys`, bounded `diagnostic`) the adapter needs to build its host
-envelope. Adapters need no local fallback logic: `output` is always
-emittable.
+Adapters own their private host contracts. Each lifecycle request carries
+only the operation-specific facts, and the response carries the typed
+result (`disposition`, detected `content_type`, `applied_operations`,
+`recoverability`, `before_tokens`/`after_tokens` with `tokenizer_id`,
+`stash_keys`, and bounded tool-error context) the adapter needs to build
+its host envelope. Adapters need no local fallback logic: `output` is
+always emittable.
 
 ### §4.6 Seams
 
-Four interception points in the agent loop: `before_model` (e.g. schema
-publication), `pre_tool` (e.g. command rewrite), `post_tool` (the primary
-compression seam), and `proxy` (a frontend observing model traffic). Only
-Stash keys of committed, applied results appear in a response; rolled-back
-candidates never leak keys.
+The agent loop exposes four lifecycle seams, each one protocol operation:
+`before_model` (model-bound tool declarations, e.g. schema compression),
+`pre_tool` (tool arguments before execution, e.g. RTK command rewrite),
+`post_tool` (the primary compression seam), and `retrieve` (restoring one
+visible stash marker, authorized against the markers visible at retrieval
+time). Only Stash keys of committed, applied results appear in a response;
+rolled-back candidates never leak keys.
 
 ## Decisions and contracts (§5)
 
 ### §5.1 Token counter decision
 
-All token counts in protocol v1 use the character-class heuristic
-`heuristic-v1` (CJK ≈ 1 token per char, other ≈ 1 token per 4 chars),
-implemented once in `tokenless-stats` — not a provider tokenizer. Counts
+All token counts use the character-class heuristic `heuristic-v1` (CJK ≈ 1
+token per char, other ≈ 1 token per 4 chars), implemented once in
+`tokenless-protocol` and re-exported by `tokenless-stats` — not a provider
+tokenizer. Counts
 are normalized tokens for arbitration and attribution, not billing
 estimates. Any change to the estimator's character classes or ratios
 requires a new counter ID, and rows produced under different IDs must never
@@ -141,13 +159,13 @@ passthrough path by design.
 
 The pre-existing JSON response cleanup is implemented by the JSON domain
 compressor (`JsonCompressor` in `tokenless-compressors`), and the shared
-path behind the CLI `compress-response` command,
-`TokenlessRuntime::compress_response`, and the Python binding routes
-through the Runtime-owned `PostToolPipeline`. One timeout budget (10 s
-in-process) guards the run; on expiry the original is returned and Stash
-writes are rolled back. Reversibility is claimed from what actually
-happened: no truncation → lossless, all truncations stashed →
-retrievable, otherwise → unrecoverable.
+path behind the `post_tool` lifecycle operation, the CLI
+`compress-response` command, `TokenlessRuntime::compress_response`, and
+the Python binding routes through the Runtime-owned `PostToolPipeline`.
+One timeout budget (10 s in-process) guards the run; on expiry the
+original is returned and Stash writes are rolled back. Recoverability is
+claimed from what actually happened: no truncation → lossless, all
+truncations stashed → retrievable, otherwise → unrecoverable.
 
 ### §5.4 Single external-hook entry point
 
@@ -155,9 +173,9 @@ The four decisions previously duplicated across the common Python hooks and
 the CLI subcommands — JSON detection, tool threshold selection, TOON
 selection, and final size acceptance — move into one shared seam router:
 
-- a protocol-v1 `tokenless compress` subcommand (stdin
-  `CompressionRequest` → stdout `CompressionResponse`) and an in-process
-  `TokenlessRuntime::compress`, both routed through the same entry point;
+- a `tokenless compress` subcommand carrying protocol envelopes (stdin
+  `RequestEnvelope` → stdout `ResponseEnvelope`) and the in-process Runtime
+  lifecycle methods, both routed through the same entry point;
 - external hooks become envelope-only adapters that build one request,
   spawn at most one `tokenless` subprocess, and translate the response into
   their host's envelope;
@@ -168,15 +186,19 @@ selection, and final size acceptance — move into one shared seam router:
 
 Status: shipped in 0.7.14 (PR #2844). The common Python hooks
 (`compress_response_hook.py`, `compress_schema_hook.py`) are migrated to
-the unified entry; codex / hermes / openclaw / dsh / SDK adapters keep
-their current paths until migrated.
+the unified entry and now send protocol v2 envelopes (PR #2978); codex /
+hermes / openclaw / dsh / SDK adapters keep their current direct-API paths
+until migrated.
 
 ### §5.5 Statistics migration
 
-Attribution columns land in the statistics schema, and the legacy dry-run
-measurement channel (`CompressResult.compressed_output`, which records the
-predicted candidate text) is replaced by measured numbers and removed.
-Attribution reaches statistics with the request instead of separately.
+Attribution columns (`agent_id`, `session_id`, `tool_use_id`) and retrieve
+events landed in the statistics schema (PR #2885); protocol v2 derives the
+stats rows from operation results in the core, and attribution reaches
+statistics with the request envelope instead of separately (PR #2978). The
+legacy dry-run measurement channel (`CompressResult.compressed_output`,
+which records the predicted candidate text) persists for the adapters still
+on the direct API and is removed once they migrate.
 
 ### §5.6 Shared vocabulary and parity
 
@@ -208,12 +230,12 @@ unwired domains pass through unchanged until then.
 
 | Section | Deliverable | Status | Reference |
 |---------|-------------|--------|-----------|
-| §4.1 | `tokenless-protocol` v1 types and wire contract | Shipped in 0.7.13 | PR #2783 |
+| §4.1 | Protocol boundary: v1 compression envelope, superseded by the v2 lifecycle operations | v1 shipped in 0.7.13; v2 merged post-0.7.14 | PR #2783, PR #2978 |
 | §4.2 | Content taxonomy, detector, domain dispatch | Shipped in 0.7.13, restructured post-0.7.14 | PR #2788, PR #2974 |
 | §4.3 | Runtime-owned PostTool execution and arbitration | Shipped in 0.7.13, restructured post-0.7.14 | PR #2799, PR #2974 |
 | §5.3 | Response cleanup behind the PostTool pipeline | Shipped in 0.7.13, restructured post-0.7.14 | PR #2816, PR #2974 |
 | §5.4 | Unified external-hook entry, contract fixtures, runtime toggle | Shipped in 0.7.14 | PR #2844 |
-| §5.5 | Statistics attribution migration | Planned | follows §5.4 |
+| §5.5 | Statistics attribution migration | Attribution columns and retrieve events shipped; legacy dry-run channel pending adapter migration | PR #2885, PR #2978 |
 | §6 | Domain compressor pack (JSON first) | Merged post-0.7.14 | PR #2974 |
 
 Legacy `compress-response` / `compress-schema` / `compress-toon`
