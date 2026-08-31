@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """Tests for Cosh-NG compatibility of the tokenless hooks.
 
 Covers the Cosh-NG hook contract (issue #1615 acceptance criteria) against
@@ -26,6 +24,8 @@ the unified-entry architecture (roadmap §5.4):
 Uses subprocesses with mock ``tokenless`` / ``rtk`` binaries, following the
 pattern of test_compress_response_hook.py and test_rewrite_hook.py.
 """
+
+from __future__ import annotations
 
 import importlib.util
 import json
@@ -55,6 +55,7 @@ _spec.loader.exec_module(hook_utils)
 
 COMPRESS_HOOK = _HOOKS_DIR / "compress_response_hook.py"
 REWRITE_HOOK = _HOOKS_DIR / "rewrite_hook.py"
+
 
 def _write_exec(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,6 +187,7 @@ class CoshNGEnvTestCase(unittest.TestCase):
         self._saved_env = os.environ.copy()
         os.environ.pop("COSH_NG_VERSION", None)
         os.environ.pop("COSH_RUNTIME", None)
+        os.environ.pop("TOKENLESS_AGENT_ID", None)
 
     def tearDown(self) -> None:
         os.environ.clear()
@@ -491,6 +493,8 @@ class TestCoshNGRewriteIntegration(unittest.TestCase):
 
     def _run_hook(self, stdin_data: dict, env_overrides: dict | None = None) -> dict:
         env = os.environ.copy()
+        env.pop("COSH_NG_VERSION", None)
+        env.pop("COSH_RUNTIME", None)
         env["HOME"] = str(self.home)
         env["PATH"] = str(self.mock_rtk.parent) + ":" + env.get("PATH", "")
         env["TOKENLESS_AGENT_ID"] = "copilot-shell"
