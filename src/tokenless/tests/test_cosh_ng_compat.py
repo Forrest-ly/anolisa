@@ -64,17 +64,21 @@ def _write_exec(path: Path, content: str) -> None:
 
 
 def _make_large_llm_content(char_target: int = 500) -> str:
-    """Return a JSON object string larger than _MIN_RESPONSE_CHARS (200)."""
+    """Return a JSON object string above the mock's 200-char compress gate."""
     return json.dumps({"stdout": "x" * char_target, "exit_code": 0})
 
 
 def _create_mock_tokenless(tmpdir: Path, behavior: str = "compress") -> Path:
-    """Create a mock `tokenless` speaking the protocol-v1 `compress` entry.
+    """Create a mock `tokenless` speaking the Protocol v2 PostTool operation.
 
-    The unified entry point (roadmap §5.4) receives a CompressionRequest
-    JSON on stdin — ``protocol_version`` + ``capabilities`` + ``content`` —
-    and answers with a CompressionResponse JSON carrying ``disposition``
-    and ``output``.
+    Protocol v2 lifecycle (roadmap §5.4): the hook sends one request —
+    ``protocol_version`` 2, ``operation`` "post_tool", ``attribution`` and
+    an ``input`` object carrying ``content`` / ``status`` /
+    ``content_origin`` / ``capabilities`` — and reads the replacement from
+    ``result.output`` plus optional ``result.additional_context`` in the
+    response.  Core owns the policy the v1 entry point ran itself: error
+    results are diagnosed (never compressed) and sub-threshold content
+    passes through unchanged.
 
     Behaviors:
       - "compress": truncate strings longer than 20 chars to their first 20
@@ -87,6 +91,57 @@ def _create_mock_tokenless(tmpdir: Path, behavior: str = "compress") -> Path:
     """
     mock_script = tmpdir / "tokenless"
 
+    prologue = textwrap.dedent("""\
+        #!/usr/bin/env python3
+        import json, sys
+        if len(sys.argv) < 2 or sys.argv[1] != "compress":
+            sys.exit(2)
+        request = json.loads(sys.stdin.read())
+        operation_input = request.get("input", {})
+        if (request.get("protocol_version") != 2
+                or request.get("operation") != "post_tool"
+                or "capabilities" not in operation_input):
+            sys.exit(2)
+        content = operation_input["content"]
+
+        def respond(output, disposition, additional_context=None):
+            result = {
+                "output": output,
+                "disposition": disposition,
+                "content_type": "json",
+                "applied_operations": ["json_cleanup"] if disposition == "applied" else [],
+                "recoverability": "lossless",
+                "before_tokens": 100,
+                "after_tokens": 50 if disposition == "applied" else 100,
+                "stash_keys": [],
+                "tokenizer_id": "heuristic-v1",
+            }
+            if additional_context:
+                result["additional_context"] = additional_context
+            print(json.dumps({
+                "protocol_version": 2,
+                "operation": "post_tool",
+                "attribution": request["attribution"],
+                "result": result,
+            }))
+
+        if operation_input.get("status") == "error":
+            context = None
+            if "command not found" in content.lower():
+                context = (
+                    "[tokenless:env] %s failed: ENV_DEPENDENCY_MISSING "
+                    "(Install the missing dependency or ask the user for "
+                    "guidance.)." % operation_input.get("tool_name", "tool")
+                )
+            respond(content, "tool_error", context)
+            sys.exit(0)
+        if (not operation_input["capabilities"]["replace_output"]
+                or operation_input.get("content_origin") == "file_content"
+                or len(content) < 200):
+            respond(content, "passthrough")
+            sys.exit(0)
+    """)
+
     if behavior == "passthrough":
         script = textwrap.dedent("""\
             #!/usr/bin/env python3
@@ -94,50 +149,9 @@ def _create_mock_tokenless(tmpdir: Path, behavior: str = "compress") -> Path:
             print(sys.stdin.read())
         """)
     elif behavior == "no-savings":
-        script = textwrap.dedent("""\
-            #!/usr/bin/env python3
-            import json, sys
-            if len(sys.argv) < 2 or sys.argv[1] != "compress":
-                sys.exit(2)
-            request = json.loads(sys.stdin.read())
-            if request.get("protocol_version") != 1 or "capabilities" not in request:
-                sys.exit(2)
-            print(json.dumps({
-                "protocol_version": 1,
-                "output": request["content"],
-                "disposition": "no_savings",
-                "compressor_chain": [],
-                "reversibility": "lossless",
-                "before_tokens": 100,
-                "after_tokens": 100,
-                "stash_keys": [],
-                "tokenizer_id": "heuristic-v1",
-            }))
-        """)
+        script = prologue + 'respond(content, "no_savings")\n'
     elif behavior == "compress":
-        script = textwrap.dedent("""\
-            #!/usr/bin/env python3
-            import json, sys
-            if len(sys.argv) < 2 or sys.argv[1] != "compress":
-                sys.exit(2)
-            request = json.loads(sys.stdin.read())
-            if request.get("protocol_version") != 1 or "capabilities" not in request:
-                sys.exit(2)
-            content = request["content"]
-
-            def respond(output, disposition):
-                print(json.dumps({
-                    "protocol_version": 1,
-                    "output": output,
-                    "disposition": disposition,
-                    "compressor_chain": ["response-cleanup"],
-                    "reversibility": "lossless",
-                    "before_tokens": 100,
-                    "after_tokens": 50,
-                    "stash_keys": [],
-                    "tokenizer_id": "heuristic-v1",
-                }))
-
+        script = prologue + textwrap.dedent("""\
             try:
                 data = json.loads(content)
                 if isinstance(data, str):
