@@ -60,12 +60,15 @@ class ResponseHookContract(unittest.TestCase):
     maxDiff = None
 
     # Replacement hosts and how an applied output lands in their envelope.
+    # qwencode is additionalContext-only: Core sees that it cannot replace
+    # output and returns passthrough, but the hook still makes its one v2 call.
     REPLACEMENT_AGENTS = ["claude-code", "qoder-cli", "opencode", "cosh-ng"]
 
-    # additionalContext-only hosts: no replacement capability, so every
-    # behavior class must be passthrough with zero spawns. Kept separate from
-    # corpus.RESPONSE_AGENTS because that matrix is keyed to the pre-unified-
-    # entry golden baselines, which do not exist for newer adapters (trae).
+    # additionalContext-only hosts: no replacement capability, so Core
+    # returns passthrough for every behavior class, but the hook still makes
+    # its one v2 call. Kept separate from corpus.RESPONSE_AGENTS because that
+    # matrix is keyed to the golden baselines, which do not exist for newer
+    # adapters (trae).
     ADDITIVE_AGENTS = {
         "qwencode": corpus.RESPONSE_AGENTS["qwencode"],
         "trae": {"TOKENLESS_AGENT_ID": "trae"},
@@ -114,7 +117,7 @@ class ResponseHookContract(unittest.TestCase):
                     self.assertEqual(result.envelope, {})
                     self.assertEqual(result.spawns, ["compress"])
 
-    def test_additive_hosts_pass_through_without_spawning(self):
+    def test_additive_hosts_declare_passthrough_capability(self):
         for agent, agent_env in self.ADDITIVE_AGENTS.items():
             for behavior in ["applied"] + FAIL_OPEN_BEHAVIORS:
                 with self.subTest(agent=agent, behavior=behavior):
@@ -125,7 +128,7 @@ class ResponseHookContract(unittest.TestCase):
                         behavior,
                     )
                     self.assertEqual(result.envelope, {})
-                    self.assertEqual(result.spawns, [])
+                    self.assertEqual(result.spawns, ["compress"])
 
     def test_missing_binary_passes_through(self):
         for agent in self.REPLACEMENT_AGENTS:
