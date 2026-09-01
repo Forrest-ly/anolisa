@@ -87,7 +87,13 @@ def main() -> None:
 
     session_id = input_data.get("session_id", "")
     tool_use_id = resolve_tool_call_id(_AGENT_ID, input_data)
-    if not tool_use_id:
+    # The official WorkBuddy/CodeBuddy HookInput (CLI, IDE and Enterprise
+    # references alike) carries no tool-call identifier — only session_id,
+    # transcript_path, cwd, permission_mode, hook_event_name and the event
+    # fields — so the workbuddy rewrite path must not require one. Every
+    # other host keeps the ID requirement for its PreTool->PostTool
+    # optimization linkage.
+    if not tool_use_id and _AGENT_ID != _WORKBUDDY_AGENT_ID:
         skip()
 
     request = build_pre_tool_request(
@@ -111,11 +117,15 @@ def main() -> None:
     if not isinstance(rewritten, str) or not rewritten or rewritten == command:
         skip()
 
-    try:
-        mark_rtk_optimized(_AGENT_ID, session_id, tool_use_id)
-    except OSError as error:
-        warn(f"failed to persist PreTool optimization state: {error}")
-        skip()
+    # The PreTool->PostTool state is keyed by the call ID; PostTool can
+    # never consume an ID-less entry (consume returns "none" for an empty
+    # ID), so hosts without a call-ID field skip the mark entirely.
+    if tool_use_id:
+        try:
+            mark_rtk_optimized(_AGENT_ID, session_id, tool_use_id)
+        except OSError as error:
+            warn(f"failed to persist PreTool optimization state: {error}")
+            skip()
 
     # Emit the formats for runtime compatibility:
     # - ``tool_input``: Cosh-NG partial patch (merges with original params)

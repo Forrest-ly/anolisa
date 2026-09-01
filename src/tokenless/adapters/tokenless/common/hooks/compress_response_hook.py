@@ -46,27 +46,26 @@ Output contract per agent:
       sets it before spawning ``cbc`` for its sidecar / prewarm pool, and
       the hook inherits the bundle environment. The marker only exists
       from CLI 2.136.0 on, so its absence proves nothing by itself.
-    - hosted argv shapes: a CLI-binary ancestor carrying ``--serve`` /
-      ``--prewarm`` / ``--prewarm-force`` / ``--teammate-mode`` is a
-      spawned headless sidecar — these modes exist in artifacts that
-      predate the launcher marker.
-      ``CODEBUDDY_SESSION_KIND`` is deliberately NOT a hosted signal:
-      the official Daemon Mode reference documents it as the worker type,
-      and the standalone CLI declares it for its own background sessions
-      (``bg`` for ``codebuddy --bg``), so the kind alone cannot separate
-      hosted workers from standalone sessions. Daemon and teammate
-      workers remain excluded from compression by their hosted argv
-      flags instead: ``daemon start`` forks the daemon child with
-      ``--serve`` prepended (the Daemon Mode reference documents the
-      daemon as the ``--serve`` resident service), and team sidecars
-      carry ``--teammate-mode``.
+    - daemon session kind: the Daemon Mode reference documents
+      ``CODEBUDDY_SESSION_KIND`` as the worker type
+      (interactive / bg / daemon); the resident daemon worker declares
+      ``daemon`` and is excluded from compression. Every other value is
+      standalone evidence for the CLI's own sessions.
+    - hosted argv shapes: a CLI-binary ancestor carrying ``--prewarm`` /
+      ``--prewarm-force`` / ``--teammate-mode`` is a spawned headless
+      sidecar — these modes exist in artifacts that predate the launcher
+      marker. ``--serve`` is deliberately NOT a hosted signal: the Web
+      UI reference documents users starting ``codebuddy --serve``
+      directly, and the resident daemon that ``daemon start`` forks with
+      ``--serve`` prepended is separated by the daemon session kind.
     - standalone CLI: a CLI-binary ancestor free of every hosted signal
       above. The controlling terminal is deliberately NOT required — the
       supported headless shapes (``-p`` / ``--print`` for CI/CD and stdin
-      pipelines, ``--acp``, ``--bg``, ...) legitimately run without a
-      TTY, and the CLI Hooks contract still honors ``updatedToolOutput``
-      there. A missing marker alone is never proof of a standalone CLI;
-      the hosted sidecar shapes rule a host out.
+      pipelines, ``--acp``, ``--bg``, and the user-started ``--serve``
+      Web UI) legitimately run without a TTY, and the CLI Hooks contract
+      still honors ``updatedToolOutput`` there. A missing marker alone is
+      never proof of a standalone CLI; the hosted signals rule a host
+      out.
 
     ``CODEBUDDY_PROJECT_DIR`` cannot discriminate either: the IDE Hooks
     reference lists it for IDE hook scripts as well. The classification is
@@ -279,13 +278,28 @@ _CODEBUDDY_CLI_BASENAMES = frozenset({"codebuddy", "codebuddy-code", "cbc"})
 _WORKBUDDY_HEADLESS_LAUNCH_ENV = "CODEBUDDY_FORCE_HEADLESS_BUNDLE"
 
 # Hosted / headless process shapes: flags carried by cbc processes that a
-# host (WorkBuddy desktop sidecar / prewarm pool) or the CLI's own
-# detached backends (teammate / swarm sidecars, serve mode) spawn instead
-# of an interactive terminal session. These modes exist in artifacts that
-# predate the launcher marker, so they are checked on every version.
+# host (WorkBuddy desktop prewarm pool) or the CLI's own detached team
+# backends spawn instead of a user session. These modes exist in
+# artifacts that predate the launcher marker, so they are checked on
+# every version. ``--serve`` is deliberately NOT hosted evidence: the
+# official Web UI reference documents users starting ``codebuddy --serve``
+# directly, and the CLI Hooks contract honors updatedToolOutput in that
+# host. Daemon workers (``daemon start`` forks the resident child with
+# ``--serve`` prepended) are excluded through the documented session-kind
+# environment variable instead (see _workbuddy_cli_host).
 _WORKBUDDY_HOSTED_ARGV_FLAGS = frozenset(
-    {"--serve", "--prewarm", "--prewarm-force", "--teammate-mode"}
+    {"--prewarm", "--prewarm-force", "--teammate-mode"}
 )
+
+# Daemon worker evidence: the Daemon Mode reference documents
+# CODEBUDDY_SESSION_KIND as the worker type (interactive / bg / daemon),
+# and the daemon child inherits it into the hook environment. It is the
+# contract-backed signal that separates the resident daemon (which is not
+# a standalone replacement-capable CLI) from a user-started
+# ``codebuddy --serve`` Web UI session (kind interactive), whose argv
+# shapes are otherwise identical. Matching is case-insensitive; every
+# other value (interactive / bg / unset) stays standalone.
+_WORKBUDDY_DAEMON_SESSION_KIND = "daemon"
 
 # Interpreter basenames that can front a script-style CLI launch; for these
 # the script path is the first argument (shebang exec and `env` re-exec both
@@ -416,27 +430,34 @@ def _workbuddy_cli_host() -> bool:
     """Whether the hook is executed by a standalone CodeBuddy Code CLI.
 
     Multi-signal (see the module-level comment): the host launcher marker
-    is positive hosted evidence; a CLI-binary ancestor carrying a hosted
-    mode flag (``--serve`` / ``--prewarm`` / ...) is a spawned sidecar
-    even in artifacts predating the marker. A CLI-binary ancestor free of
-    every hosted signal is a standalone CLI regardless of whether it owns
-    a controlling terminal: the supported headless shapes (``-p`` /
-    ``--print`` for CI/CD and stdin pipelines, ``--acp``, ``--bg``, ...)
+    is positive hosted evidence; ``CODEBUDDY_SESSION_KIND=daemon`` marks
+    the resident daemon worker; a CLI-binary ancestor carrying a hosted
+    mode flag (``--prewarm`` / ``--prewarm-force`` / ``--teammate-mode``)
+    is a spawned sidecar even in artifacts predating the marker. A
+    CLI-binary ancestor free of every hosted signal is a standalone CLI
+    regardless of whether it owns a controlling terminal: the supported
+    headless shapes (``-p`` / ``--print`` for CI/CD and stdin pipelines,
+    ``--acp``, ``--bg``, and the user-started ``--serve`` Web UI)
     legitimately run without a TTY, and the CLI Hooks contract still
-    honors ``updatedToolOutput`` there. The declared
-    ``CODEBUDDY_SESSION_KIND`` is never treated as hosted evidence by
-    itself: the standalone CLI's own background sessions declare it too
-    (``bg`` overlaps), while daemon and teammate workers stay excluded
-    through their hosted argv flags (``daemon start`` forks the daemon
-    child with ``--serve`` prepended; team sidecars carry
-    ``--teammate-mode``). A missing marker is never treated
-    as proof of a standalone CLI by itself — the hosted sidecar shapes
-    are what rule a host out, and the ancestry walk is best-effort
-    anyway. No version probe is needed once the CLI is detected: hooks
-    exist only in CodeBuddy Code v1.16.0+, and that same contract
-    defines ``updatedToolOutput``.
+    honors ``updatedToolOutput`` there. ``--serve`` is NOT hosted
+    evidence: the Web UI reference documents users launching
+    ``codebuddy --serve`` directly; the resident daemon that
+    ``daemon start`` forks with ``--serve`` prepended is separated by the
+    documented session kind instead. Session kinds other than ``daemon``
+    (``interactive`` / ``bg`` / unset) are never treated as hosted
+    evidence: the standalone CLI declares them for its own sessions. A
+    missing marker is never treated as proof of a standalone CLI by
+    itself — the hosted signals are what rule a host out, and the
+    ancestry walk is best-effort anyway. No version probe is needed once
+    the CLI is detected: hooks exist only in CodeBuddy Code v1.16.0+,
+    and that same contract defines ``updatedToolOutput``.
     """
     if _launched_by_workbuddy_host():
+        return False
+    if (
+        os.environ.get("CODEBUDDY_SESSION_KIND", "").strip().lower()
+        == _WORKBUDDY_DAEMON_SESSION_KIND
+    ):
         return False
     for argv in _ancestor_procs():
         if not _argv_is_codebuddy_cli(argv):
