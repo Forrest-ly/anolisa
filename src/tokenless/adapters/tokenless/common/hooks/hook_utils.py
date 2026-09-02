@@ -1007,6 +1007,8 @@ def build_pre_tool_request(
     command_field: str,
     session_id: str = "",
     tool_use_id: str = "",
+    replace_arguments: bool = True,
+    block_and_suggest: bool = False,
 ) -> dict:
     """Build a Protocol v2 PreTool transport request."""
     return {
@@ -1018,8 +1020,8 @@ def build_pre_tool_request(
             "arguments": arguments,
             "command_field": command_field,
             "capabilities": {
-                "replace_arguments": True,
-                "block_and_suggest": False,
+                "replace_arguments": replace_arguments,
+                "block_and_suggest": block_and_suggest,
             },
         },
     }
