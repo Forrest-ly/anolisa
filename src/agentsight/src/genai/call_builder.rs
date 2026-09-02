@@ -259,10 +259,10 @@ impl GenAIBuilder {
             token_usage,
             error,
             pid: pid_i32,
-            // Process name = the *process* comm (/proc/<pid>/comm), not the SSL
-            // event's per-event thread comm (which may be a library worker-thread
-            // name such as "HTTP client"). Falls back to the event comm only when
-            // /proc is unreadable (process already gone).
+            // Process name = the *process* comm (`<procfs root>/<pid>/comm`), not
+            // the SSL event's per-event thread comm (which may be a library
+            // worker-thread name such as "HTTP client"). Falls back to the event
+            // comm only when the entry is unreadable (process already gone).
             process_name: crate::discovery::scanner::read_comm(http.pid)
                 .unwrap_or_else(|| http.comm.clone()),
             agent_name: Some(agent_name.clone()),
@@ -623,11 +623,19 @@ impl GenAIBuilder {
                                 crate::analyzer::message::AnthropicContentBlock::ToolResult {
                                     tool_use_id,
                                     content,
-                                    ..
+                                    is_error,
                                 } => {
-                                    // Anthropic tool_result: convert to MessagePart::ToolCallResponse
-                                    let response_val =
-                                        content.clone().unwrap_or(serde_json::Value::Null);
+                                    // Anthropic tool_result: convert to MessagePart::ToolCallResponse.
+                                    // `is_error` must ride along inside the wrapper so the ATIF
+                                    // converter can preserve it as a structured failure signal.
+                                    let response_val = match (content.clone(), *is_error) {
+                                        (Some(value), Some(flag)) => {
+                                            serde_json::json!({"content": value, "is_error": flag})
+                                        }
+                                        (Some(value), None) => value,
+                                        (None, Some(flag)) => serde_json::json!({"is_error": flag}),
+                                        (None, None) => serde_json::Value::Null,
+                                    };
                                     parts.push(MessagePart::ToolCallResponse {
                                         id: Some(tool_use_id.clone()),
                                         response: response_val,

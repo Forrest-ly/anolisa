@@ -53,6 +53,78 @@ fn shell_function<'a>(script: &'a str, name: &str) -> &'a str {
 }
 
 #[test]
+fn bash_secret_detector_matches_canonical_jwt_shape() {
+    if Command::new("bash").arg("--version").output().is_err() {
+        return;
+    }
+    let script = include_str!("../../src/shell_host/marker/bash.sh");
+    let function = shell_function(script, "_cosh_command_has_secret");
+    let command = format!("{function}\n_cosh_command_has_secret \"$1\"");
+    for input in [
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature",
+        "inspect eyJabcde.fghijk.lmnopq now",
+    ] {
+        let status = Command::new("bash")
+            .args(["-c", command.as_str(), "cosh-marker-test", input])
+            .status()
+            .expect("run bash JWT detector");
+        assert!(status.success(), "secret not detected: {input}");
+    }
+    for input in [
+        "xeyJabcde.fghijk.lmnopq",
+        "eyJabcd.fghijk.lmnopq",
+        "eyJabcde.fghi.lmnopq",
+    ] {
+        let status = Command::new("bash")
+            .args(["-c", command.as_str(), "cosh-marker-test", input])
+            .status()
+            .expect("run bash JWT control");
+        assert!(!status.success(), "safe control rejected: {input}");
+    }
+}
+
+#[test]
+fn bash_secret_detector_matches_canonical_assignment_shape() {
+    if Command::new("bash").arg("--version").output().is_err() {
+        return;
+    }
+    let script = include_str!("../../src/shell_host/marker/bash.sh");
+    let function = shell_function(script, "_cosh_command_has_secret");
+    let command = format!("{function}\n_cosh_command_has_secret \"$1\"");
+    for input in [
+        "你好 \"token\" = TEST_ONLY_RECOVERY_SECRET",
+        "inspect 'client-secret' : TEST_ONLY_RECOVERY_SECRET",
+        "你好 AWS_SECRET_ACCESS_KEY=TEST_ONLY_RECOVERY_SECRET",
+        "inspect 'aws-secret_access-key' : TEST_ONLY_RECOVERY_SECRET",
+        "你好 AWS_ACCESS_KEY_ID = TEST_ONLY_RECOVERY_SECRET",
+        "你好 OPENAI_API_KEY = TEST_ONLY_RECOVERY_SECRET",
+        "你好 DASHSCOPE_API_KEY = TEST_ONLY_RECOVERY_SECRET",
+        "你好 GITHUB_TOKEN = TEST_ONLY_RECOVERY_SECRET",
+        "你好 ALIBABA_CLOUD_ACCESS_KEY_ID = TEST_ONLY_RECOVERY_SECRET",
+    ] {
+        let status = Command::new("bash")
+            .args(["-c", command.as_str(), "cosh-marker-test", input])
+            .status()
+            .expect("run Bash assignment detector");
+        assert!(status.success(), "secret not detected: {input}");
+    }
+    for input in [
+        "你好 token candidate",
+        "inspect monkey = value",
+        "inspect token =",
+        "你好 AWS_ACCESS_KEY_ID candidate",
+        "你好 AWS_ACCESS_KEY_ID =",
+        "你好 MY_OPENAI_API_KEY = public-name",
+    ] {
+        let status = Command::new("bash")
+            .args(["-c", command.as_str(), "cosh-marker-test", input])
+            .status()
+            .expect("run Bash assignment control");
+        assert!(!status.success(), "safe control rejected: {input}");
+    }
+}
+
+#[test]
 fn shell_host_marker_control_cwd_keeps_json_frame_intact() {
     let control_name = concat!(
         "cwd-中-",
@@ -687,6 +759,47 @@ fn shell_host_bash_sensitive_missing_emits_raw_free_provenance() {
     assert!(routing.command.is_none());
     assert!(!format!("{:?}", output.events).contains("secretvalue"));
     assert!(String::from_utf8_lossy(&output.terminal_output).contains("command not found"));
+}
+
+#[test]
+fn shell_host_bash_success_then_missing_keeps_routing_provenance() {
+    if !bash_supports_command_not_found_handler() {
+        return;
+    }
+
+    let work_dir = std::env::temp_dir().join(format!(
+        "cosh-shell-bash-success-then-missing-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let output = run_scripted_bash(
+        &ShellHostConfig::new("bash-success-then-missing", &work_dir),
+        &[
+            ScriptedInput::user_line("printf '__PREVIOUS_OK__\\n'"),
+            ScriptedInput::user_line("sdsd"),
+        ],
+    )
+    .expect("scripted bash");
+
+    let failed_id = output
+        .events
+        .iter()
+        .find(|event| {
+            event.kind == ShellEventKind::CommandFailed && event.command.as_deref() == Some("sdsd")
+        })
+        .and_then(|event| event.command_id.as_deref())
+        .expect("missing command block");
+    assert!(
+        output.events.iter().any(|event| {
+            event.kind == ShellEventKind::CommandRoutingObserved
+                && event.command_id.as_deref() == Some(failed_id)
+                && event.routing.as_ref().is_some_and(|routing| {
+                    routing.top_level_missing && routing.proven && !routing.sensitive
+                })
+        }),
+        "{:?}",
+        output.events
+    );
 }
 
 /// #2138: natural-language input carrying a secret routes to the agent like

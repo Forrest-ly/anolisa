@@ -250,9 +250,8 @@ test-claude-code-detect:
 test-integration:
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_compress_response_hook.py
-	python3 tests/test_compress_toon_hook.py
 	python3 tests/test_codex_response_diagnostics.py
-	python3 tests/test_hermes_toon_threshold.py
+	python3 tests/test_hermes_lifecycle.py
 	python3 tests/test_compress_schema_hook.py
 	python3 tests/test_hook_contract.py
 	python3 tests/test_hermes_plugin_import.py
@@ -270,10 +269,8 @@ test-hook-parity:
 	python3 tests/test_hook_parity.py
 
 test-adapters: build-openclaw-plugin build-dsh-plugin
-	@echo "==> Testing openclaw RTK context propagation..."
-	node --test tests/test-openclaw-rtk-context.mjs
-	@echo "==> Testing openclaw TOON minimum payload threshold..."
-	node --test tests/test-openclaw-toon-threshold.mjs
+	@echo "==> Testing openclaw Protocol v2 lifecycle..."
+	node --test tests/test-openclaw-lifecycle-v2.mjs
 	@echo "==> Testing native dsh adapter bundle..."
 	bash tests/test-dsh-adapter.sh
 	@echo "==> Testing qoder adapter installer..."

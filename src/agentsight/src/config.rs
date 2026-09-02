@@ -327,6 +327,8 @@ pub struct JsonFeatures {
     pub session_mapping: Option<JsonSessionMappingFeature>,
     /// Local SQLite persistence of GenAI events.
     pub sqlite_storage: Option<JsonSqliteStorageFeature>,
+    /// Periodic Agent process CPU and RSS resource sampling.
+    pub resource_sampling: Option<bool>,
     /// Interruption / DeadLoop detection.
     pub interruption_detection: Option<JsonInterruptionFeature>,
     /// Audit event storage.
@@ -688,6 +690,8 @@ pub struct FeatureFlags {
     pub session_mapping_max_entries: usize,
     /// Local SQLite persistence of GenAI events.
     pub sqlite_storage_enabled: bool,
+    /// Periodic Agent process CPU and RSS resource sampling.
+    pub resource_sampling_enabled: bool,
     /// Optional SQLite batch insert config.
     pub sqlite_batch: Option<BatchConfig>,
     /// Interruption / DeadLoop detection.
@@ -719,6 +723,7 @@ impl Default for FeatureFlags {
             session_mapping_enabled: false,
             session_mapping_max_entries: 10_000,
             sqlite_storage_enabled: false,
+            resource_sampling_enabled: false,
             sqlite_batch: None,
             interruption_detection_enabled: false,
             interruption_retention_days: 30,
@@ -899,6 +904,16 @@ pub struct AgentsightConfig {
     /// Local enforcer socket used by the optional FFI security subscription.
     pub ffi_enforcer_socket: PathBuf,
 
+    // --- Procfs Root ---
+    /// Procfs mount point that pid-keyed lookups resolve through.
+    ///
+    /// Defaults to `/proc`. Point it at a bind-mounted host procfs
+    /// (`/logtail_host/proc`) to observe processes living in other pid
+    /// namespaces without joining them -- a DaemonSet then needs no
+    /// `hostPID: true`. Applied process-wide at startup; see
+    /// [`crate::utils::procfs`] for what does and does not follow it.
+    pub procfs_root: PathBuf,
+
     // --- Config File Path ---
     /// Path to JSON configuration file
     pub config_path: Option<PathBuf>,
@@ -989,6 +1004,9 @@ impl Default for AgentsightConfig {
             ffi_enable_raw_https: false,
             ffi_enable_security_audit: false,
             ffi_enforcer_socket: PathBuf::from("/run/agentsight/enforcer.sock"),
+
+            // Read our own procfs unless a deployment points us elsewhere.
+            procfs_root: PathBuf::from(crate::utils::procfs::DEFAULT_PROC_ROOT),
 
             // Config file path default
             config_path: None,
@@ -1200,6 +1218,7 @@ impl AgentsightConfig {
                     .as_ref()
                     .and_then(|f| f.enabled)
                     .unwrap_or(false),
+                resource_sampling_enabled: features.resource_sampling.unwrap_or(false),
                 sqlite_batch: features.sqlite_storage.as_ref().and_then(|f| {
                     f.batch.as_ref().map(|b| BatchConfig {
                         max_size: b.max_size.unwrap_or(100),
@@ -1979,6 +1998,7 @@ mod tests {
         assert_eq!(flags.tokenizer_cache_size, DEFAULT_TOKENIZER_CACHE_SIZE);
         assert!(!flags.session_mapping_enabled);
         assert!(!flags.sqlite_storage_enabled);
+        assert!(!flags.resource_sampling_enabled);
         assert!(!flags.interruption_detection_enabled);
         assert!(!flags.audit_enabled);
         assert!(!flags.token_consumption_enabled);
@@ -2033,6 +2053,7 @@ mod tests {
                 "tokenizer": { "enabled": true, "cache_size": 8 },
                 "session_mapping": { "enabled": false, "max_entries": 5000 },
                 "sqlite_storage": { "enabled": false },
+                "resource_sampling": true,
                 "interruption_detection": { "enabled": false },
                 "audit": false,
                 "token_consumption": true,
@@ -2046,6 +2067,7 @@ mod tests {
         assert!(!config.features.session_mapping_enabled);
         assert_eq!(config.features.session_mapping_max_entries, 5000);
         assert!(!config.features.sqlite_storage_enabled);
+        assert!(config.features.resource_sampling_enabled);
         assert!(!config.features.interruption_detection_enabled);
         assert!(!config.features.audit_enabled);
         assert!(config.features.token_consumption_enabled);

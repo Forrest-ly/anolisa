@@ -13,9 +13,9 @@ Token-Less combines complementary strategies to minimize LLM token consumption:
 
 Agent adapters are available for:
 
-- **OpenClaw plugin** — covers command rewriting and response/TOON compression in one plugin.
+- **OpenClaw plugin** — delegates PreTool RTK rewriting and PostTool optimization to Protocol v2 Core.
 - **copilot-shell hook** — intercepts Shell commands via a PreToolUse hook and delegates to RTK for command rewriting + output filtering.
-- **Hermes Agent plugin** — response compression, TOON encoding, command rewriting (block + suggest), and registered but hard-disabled Tool Ready via Hermes's native plugin system.
+- **Hermes Agent plugin** — delegates block-and-suggest command rewriting and model-bound result optimization to Core through Hermes's native plugin system.
 - **Qoder CLI plugin** — registered but hard-disabled Tool Ready, command rewriting, and response compression via Qoder's native hook system.
 - **Claude Code plugin** — RTK command rewriting, response/TOON compression, and registered but hard-disabled Tool Ready via Claude Code's official plugin marketplace.
 - **Codex plugin** — RTK command rewriting, environment-failure diagnostics, and registered but hard-disabled Tool Ready via Codex's native hook system.
@@ -37,9 +37,9 @@ retrieval, and attribution.
 | TOON context compression | 17.0% on reference response | Encodes JSON to TOON format for LLMs |
 | Command rewriting | 60–90% | Filters CLI output via RTK (70+ commands supported) |
 | Tool Ready | reduces retry waste | Legacy pre-call check, auto-fix, and blocking; hard-disabled |
-| OpenClaw plugin | — | Command rewriting ✅, Response compression ✅, optional TOON ✅, Schema compression — |
+| OpenClaw plugin | — | Protocol v2 RTK ✅, transcript PostTool ✅, Schema/Retrieve unavailable in the host |
 | copilot-shell hooks | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Protocol v2 PostTool; Common BeforeModel passes schemas through until trusted Retrieve is available |
-| Hermes Agent plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅, TOON ✅, Schema compression ⏳ |
+| Hermes Agent plugin | — | Tool Ready ⛔ hard-disabled, Core-owned command rewriting/response/TOON ✅, lossless-only PostTool, Schema/Retrieve unavailable |
 | Qoder CLI plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅ |
 | Claude Code plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅, TOON ✅ |
 | Codex plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Environment diagnostics ✅, Response compression — protocol-blocked |
@@ -487,49 +487,66 @@ String format `"jq"` is also supported (auto-converts to object).
 
 ## OpenClaw Plugin
 
-The plugin hooks into the OpenClaw agent loop at two stages:
+The plugin translates two OpenClaw events into Protocol v2 lifecycle operations:
 
 | Hook | Event | Action | Status |
 |---|---|---|---|
 | Tool Ready | `before_tool_call` | Registered silent pass-through; no check, repair, context, or block | ⛔ Hard-disabled |
-| Command rewriting | `before_tool_call` | Rewrites `exec` commands to RTK equivalents for filtered output | ✅ Active |
-| Response compression | `tool_result_persist` | Compresses tool results before they enter the context window | ✅ Active |
-| Schema compression | — | Not supported by OpenClaw's hook system | ⏳ → ✅ |
+| PreTool | `before_tool_call` | Sends `exec` arguments to Core and applies the returned RTK rewrite | ✅ Active |
+| PostTool | `tool_result_persist` | Rewrites supported OpenClaw-owned transcript tool results | ✅ Active |
+| BeforeModel / Retrieve | — | OpenClaw exposes neither a reliable schema-transform seam nor trusted Marker visibility | — |
 
-**Response compression details:**
-- Automatically compresses results from all tool types (`web_search`, `web_fetch`, `read_file`, etc.)
-- Skips `exec` tool results when RTK is enabled — RTK already produces optimized output, avoiding double-compression
-- Observed savings: **~78%** on `web_fetch` results, varies by content type
+Core owns RTK execution, JSON detection, cleanup, TOON selection, thresholds, diagnostics, and final
+arbitration. The plugin carries Core's per-call `output_optimization` from PreTool into the matching
+PostTool request, so RTK output is not compressed twice. It declares no trusted Retrieve capability,
+therefore candidates that require recovery pass through unchanged.
 
-Each hook degrades gracefully — if the corresponding binary (`rtk` or `tokenless`) is not installed, that hook is silently skipped.
+`tool_result_persist` is a synchronous OpenClaw transcript seam. It can replace a persisted string,
+a structured value, or a single text block while preserving the surrounding Tool Result envelope;
+media and multi-block results pass through. It does not replace a tool result already consumed by
+the model in the same turn, and it does not cover non-OpenClaw transcript implementations.
+
+Both operations use the single `tokenless compress` entry point and fail open if Tokenless is
+missing or returns an invalid response.
 
 ### Configuration
+
+The adapter requires OpenClaw Plugin API `2026.4.22` or newer; package metadata enforces this
+minimum during installation on hosts that support compatibility checks.
 
 Options in `openclaw.plugin.json`:
 
 | Option | Default | Description |
 |---|---|---|
 | `rtk_enabled` | `true` | Enable RTK command rewriting |
-| `schema_compression_enabled` | `true` | Enable tool schema compression (pending OpenClaw support) |
-| `response_compression_enabled` | `true` | Enable tool response compression via `tool_result_persist` |
-| `verbose` | `true` | Log detailed rewrite/compression info |
+| `post_tool_enabled` | `true` | Enable Protocol v2 PostTool handling of persisted tool results |
+| `tool_ready_enabled` | `true` | Register the currently hard-disabled Tool Ready hook |
+| `verbose` | `false` | Log lifecycle rewrites and applied PostTool results |
+
+The previous response, TOON, skip-tool, and shell-tool configuration keys are removed; Core now
+owns those decisions.
 
 ## Hermes Agent Plugin
 
-The plugin registers hooks at three Hermes events, covering five strategies:
+The plugin registers hooks at three Hermes events while Core owns the lifecycle policy:
 
 | Strategy | Event | Action | Status |
 |---|---|---|---|
 | Tool Ready | `pre_tool_call` | Registered silent pass-through; no check, repair, context, or block | ⛔ Hard-disabled |
-| Command rewriting | `pre_tool_call` | Blocks original command, suggests `rtk`-rewritten version (one extra round-trip) | ✅ Active |
-| Response compression | `transform_tool_result` | Compresses tool results via `tokenless compress-response` | ✅ Active |
-| TOON encoding | `transform_tool_result` | Pipeline step after response compression — encodes JSON to TOON format | ✅ Active |
+| Command rewriting | `pre_tool_call` | Sends the command to Core, then blocks and suggests the returned RTK form | ✅ Active |
+| PostTool optimization | `transform_tool_result` | Sends the final model-bound result to Core and applies only accepted lossless output | ✅ Active |
 | Session tracking | `on_session_start` | Propagates agent/session IDs for stats recording | ✅ Active |
-| Schema compression | — | Not supported by Hermes hook system (no hook exposes tool schemas) | ⏳ Blocked |
+| Schema/Retrieve | — | Hermes exposes neither a schema-transform seam nor trusted Marker visibility | — |
 
-**How command rewriting works in Hermes**: Hermes's `pre_tool_call` hook can only block tool execution (not modify arguments), so the plugin blocks the original shell command and returns a message suggesting the RTK-rewritten version. The agent then re-executes with the optimized command, adding one extra tool-call round-trip. This is safe — `rtk rewrite` only does text substitution and never executes the command.
+**How command rewriting works in Hermes**: to remain compatible with Hermes releases that only
+support blocking, the plugin asks Core for a rewrite, blocks the original shell command, and tells
+the agent to retry with the returned command. The retry adds one tool-call round-trip. The final
+hook recognizes Core's attributed RTK wrapper from the command Hermes actually executed, so RTK
+output bypasses a second compression pass without correlating two different tool-call IDs.
 
-Each hook degrades gracefully — if the corresponding binary is not installed, that hook is silently skipped.
+Hermes cannot publish a trusted Retrieve tool, so Core applies only lossless cleanup or TOON output;
+truncation candidates pass through. If the Tokenless operation is unavailable or fails, the hook
+leaves the host value unchanged.
 
 ### Install
 
@@ -714,13 +731,16 @@ Installation requires an explicit session identifier.
 
 ```python
 from agentscope.agent import ReActAgent
-from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig
+from anolisa_tokenless import ContentOrigin
+from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig, ToolContract
 
 integration = TokenlessAgentScope(
     TokenlessConfig(
-        mode="balanced",
         data_dir="/absolute/path/to/tenant-tokenless-data",
     ),
+    tool_contracts={
+        "application_tool": ToolContract(ContentOrigin.API_RESPONSE),
+    },
 )
 toolkit = integration.create_toolkit()
 toolkit.register_tool_function(application_tool)
@@ -735,14 +755,17 @@ patch versions.
 ```python
 from agentscope.agent import Agent
 from agentscope.tool import Toolkit
-from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig
+from anolisa_tokenless import ContentOrigin
+from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig, ToolContract
 
 integration = TokenlessAgentScope(
     TokenlessConfig(
-        mode="balanced",
         data_dir="/absolute/path/to/tenant-tokenless-data",
         # retrieve_tool_name="tenant_tokenless_retrieve",
     ),
+    tool_contracts={
+        "application_tool": ToolContract(ContentOrigin.API_RESPONSE),
+    },
 )
 toolkit = Toolkit(tools=[*application_tools, *integration.tools])
 
@@ -773,13 +796,15 @@ so that patch release supports direct Agent construction only. The existing
 should use `TokenlessAgentScope` so it does not depend on patch-specific
 Toolkit mutation or automatic Tool collection.
 
-| Mode | Policy |
-|---|---|
-| `conservative` | Compress every non-excluded tool with 1 MiB / 65,536 / depth 32 limits |
-| `balanced` | Skip Read/Glob/Grep; use 65,536 / 128 / depth 8 for Shell and conservative limits elsewhere |
-| `aggressive` | Skip Read/Glob/Grep; use CLI defaults of 4,096 / 32 / depth 8 elsewhere |
+AgentScope supplies explicit contracts for its known shell, file, and API tools.
+Register every custom tool with `ToolContract`: select `COMMAND_OUTPUT`,
+`FILE_CONTENT`, or `API_RESPONSE`, and set `command_field` only for commands
+that may be rewritten by RTK. Unknown custom tools fail during registration or
+at the model boundary rather than guessing from output text. Compression
+thresholds, TOON selection, diagnostics, and retrieval authorization remain in
+Rust Core.
 
-`balanced` is the default. The read-only retrieval Tool is published to the
+The read-only retrieval Tool is published to the
 model only when a marker is visible and accepts only a hash from the exact
 marker set retained for that model call. Pass a different absolute `data_dir`
 to each user or tenant for direct Agents;

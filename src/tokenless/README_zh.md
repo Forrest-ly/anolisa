@@ -74,9 +74,9 @@ tokenless 优化进入 LLM 上下文前、由它实际处理的工具相关内�
 
 ### Agent Adapter
 
-- **OpenClaw 插件** — 命令重写 + 响应压缩 + 可选 TOON；不支持 Schema 压缩
+- **OpenClaw 插件** — 通过 Protocol v2 Core 执行 PreTool RTK 改写和 transcript PostTool 优化；宿主不支持 BeforeModel Schema 与受信 Retrieve
 - **copilot-shell 钩子** — Tool Ready（已硬关闭）+ 命令重写 + Protocol v2 PostTool；Common BeforeModel 在受信 Retrieve 接入前透传 Schema，旧版 Copilot Shell 透传 Pipeline 输出
-- **Hermes Agent 插件** — Tool Ready（已硬关闭）+ 命令重写 + 响应压缩 + TOON
+- **Hermes Agent 插件** — 把阻止后建议式命令重写和模型可见结果优化委托给 Core；无受信 Retrieve，因此 PostTool 仅应用无损结果
 - **Qoder CLI 插件** — Tool Ready（已硬关闭）+ 命令重写 + 通过 `updatedToolOutput` 交付响应 Pipeline
 - **Claude Code 插件** — Tool Ready（已硬关闭）+ 命令重写 + 响应压缩 + TOON
 - **Codex 插件** — Tool Ready（已硬关闭）+ RTK 命令重写 + 环境失败诊断；Codex
@@ -85,6 +85,19 @@ tokenless 优化进入 LLM 上下文前、由它实际处理的工具相关内�
 - **Trae (TraeCode) 适配器** — Tool Ready（已硬关闭）+ `RunCommand` 命令重写 + 环境失败诊断；Trae 协议不支持替换原始输出，因此不追加压缩副本
 - **DeepSeek Harness 插件**。通过 DSH 原生 `tools/post-execute` 接入响应压缩和环境错误归因
 - **Qwen Code Extension** — Tool Ready（已硬关闭）+ 命令重写；当前宿主不支持工具后输出替换，并跳过声明的 Schema 事件
+
+OpenClaw Plugin 只保留宿主事件转换与逐调用状态：`before_tool_call` 把 `exec` 参数交给
+`tokenless compress`，`tool_result_persist` 把 OpenClaw 自己持久化的 Tool Result 交给同一
+Protocol v2 入口。Core 持有 RTK、JSON 检测、清理、TOON、阈值、诊断与最终仲裁；Plugin
+把 PreTool 返回的 `output_optimization` 传到匹配的 PostTool，因此不会二次压缩 RTK 输出。
+OpenClaw 没有受信 Retrieve 能力，需要恢复的候选会原样透传。该 PostTool Hook 只改写持久化
+transcript，不会改变同一轮中模型已经看到的实时结果；Media 与多个 Content Block 也会透传。
+
+该 Adapter 要求 OpenClaw Plugin API `2026.4.22` 或更高版本；支持兼容性检查的宿主会在
+安装阶段根据 Package Metadata 强制执行该下限。OpenClaw 配置只包含
+`rtk_enabled`、`post_tool_enabled`、`tool_ready_enabled` 和 `verbose`；
+默认值依次为 `true`、`true`、`true` 和 `false`。旧的 Response、TOON 与工具分类开关已经
+删除，所有压缩策略由 Core 统一决定。
 
 ### Agent 开发框架集成
 
@@ -317,13 +330,16 @@ MCP 工具都会获得相同的生命周期处理。安装时必须显式提供 
 
 ```python
 from agentscope.agent import ReActAgent
-from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig
+from anolisa_tokenless import ContentOrigin
+from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig, ToolContract
 
 integration = TokenlessAgentScope(
     TokenlessConfig(
-        mode="balanced",
         data_dir="/absolute/path/to/tenant-tokenless-data",
     ),
+    tool_contracts={
+        "application_tool": ToolContract(ContentOrigin.API_RESPONSE),
+    },
 )
 toolkit = integration.create_toolkit()
 toolkit.register_tool_function(application_tool)
@@ -337,14 +353,17 @@ AgentScope 2.x 在构造阶段接收恢复 Tool 和中间件；该方式从 2.0.
 ```python
 from agentscope.agent import Agent
 from agentscope.tool import Toolkit
-from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig
+from anolisa_tokenless import ContentOrigin
+from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig, ToolContract
 
 integration = TokenlessAgentScope(
     TokenlessConfig(
-        mode="balanced",
         data_dir="/absolute/path/to/tenant-tokenless-data",
         # retrieve_tool_name="tenant_tokenless_retrieve",
     ),
+    tool_contracts={
+        "application_tool": ToolContract(ContentOrigin.API_RESPONSE),
+    },
 )
 toolkit = Toolkit(tools=[*application_tools, *integration.tools])
 
@@ -371,17 +390,16 @@ AgentScope 2.0.0 尚未提供 App 级 Agent middleware 和 Tool 注入，因此�
 直接构造 Agent。原有 `TokenlessMiddleware` 2.x API 继续保留兼容；新代码应使用
 `TokenlessAgentScope`，避免依赖特定补丁版本的 Toolkit 动态修改或 Tool 自动收集行为。
 
-| 模式 | 策略 |
-|---|---|
-| `conservative` | 所有未排除工具使用 1 MiB / 65,536 / 深度 32 限制 |
-| `balanced` | 跳过 Read/Glob/Grep；Shell 使用 65,536 / 128 / 深度 8，其他采用 conservative 限制 |
-| `aggressive` | 跳过 Read/Glob/Grep；其他采用 CLI 默认的 4,096 / 32 / 深度 8 |
+AgentScope 为已知的 Shell、文件和 API 工具提供显式契约。每个自定义工具都必须注册
+`ToolContract`：从 `COMMAND_OUTPUT`、`FILE_CONTENT` 或 `API_RESPONSE` 中选择来源，
+并且只为可能由 RTK 改写的命令设置 `command_field`。未知自定义工具会在注册阶段或
+Model 边界快速失败，不会根据输出文本猜测来源。压缩阈值、TOON 选择、诊断和 Retrieve
+授权都保留在 Rust Core。
 
-默认模式为 `balanced`。只有模型当前可见 marker 时才会向模型发布只读恢复 Tool，
-并且它只接受本次模型调用保留的精确 marker 集合中的 hash。直接构造 Agent 时，每个
-用户或租户必须显式传入不同的绝对 `data_dir`；省略 `data_dir` 时，
-`TOKENLESS_DATA_DIR` 只作为进程级回退。除非应用有明确生命周期策略，否则保留默认
-一小时 stash TTL，且不要依赖跨节点恢复。
+只在模型当前可见 Marker 时才会发布只读 Retrieve Tool，并且它只接受本次模型调用保留
+的精确 Marker 集合中的 Hash。直接构造 Agent 时，每个用户或租户必须显式传入不同的
+绝对 `data_dir`；省略 `data_dir` 时，`TOKENLESS_DATA_DIR` 只作为进程级回退。除非应用
+有明确生命周期策略，否则保留默认一小时 Stash TTL，且不要依赖跨节点恢复。
 
 两个 AgentScope Adapter 都启用 Schema 压缩、RTK 命令改写、响应压缩、TOON、恢复、
 环境错误提示和逐调用归属。原生 Wheel 内置 RTK 并直接链接 TOON，不搜索系统可执行文件。

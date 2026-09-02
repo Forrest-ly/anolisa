@@ -46,16 +46,26 @@ compress_value(value, depth)
    ↓
 OpenClaw 触发 tool_result_persist 事件
    ↓
-插件检查：RTK 启用且 toolName === "exec" → 跳过（避免双重压缩）
+Plugin 按 Tool Call ID 消费 PreTool 输出优化状态
    ↓
-tryCompressResponse(event.message)
+转换为 `operation: "post_tool"` 的 Protocol v2 Request
    ↓
-execFileSync("tokenless", ["compress-response"], { input: JSON, timeout: 3s })
+execFileSync("tokenless", ["compress"], { input: Request, timeout: 8s })
    ↓
-返回 { message: compressed } 替换原始结果
+Core 执行状态路由、JSON Pipeline、TOON 与最终仲裁
+   ↓
+Plugin 只重建宿主允许替换的 Tool Result Slot
 ```
 
-**RTK 跳过逻辑**：当 RTK 启用且可用时，`exec` 工具的结果已经过 RTK 优化，不再二次压缩。
+OpenClaw 的 PreTool 同样调用一次 `tokenless compress`，并把 Core 返回的
+`output_optimization: "rtk"` 按 Session 与 Tool Call ID 存入进程内、消费一次的 Ledger。
+匹配的 PostTool Request 携带该状态，Core 负责直接透传 RTK 输出。Ledger 按 24 小时 TTL、
+1024 条上限和 Session 结束事件清理。
+
+OpenClaw 不声明受信 Retrieve，因此需要恢复的 Lossy Candidate 以
+`recoverability_unavailable` 透传。`tool_result_persist` 只同步改写 OpenClaw 自己持久化的
+transcript；它不替换同一轮模型已经收到的实时结果。Plugin 只处理 String、结构化 Slot 或
+单个 Text Block，并保留 Tool Result Envelope；Media 和多个 Block 原样透传。
 
 ### 路径 2：共享 PostTool Hook（Protocol v2）
 
@@ -80,32 +90,36 @@ Hook 校验版本与 Operation，并按宿主 Capability 应用 v2 Result
 **流水线说明**：`PostToolPipeline` 位于 Runtime 内部。第一阶段只接入
 `ContentType::Json -> JsonCompressor`；清理、截断、Structured Slot 恢复、Compact JSON 与
 可选 TOON 都在同一次 JSON 领域调用内完成。其他 ContentType 当前不调用保留的文本引擎。
-Common Hook 不声明受信 Retrieve 能力，因此只接受无损 JSON 候选；需要截断的候选以
+Common Hook、OpenClaw 与 Hermes Plugin 都不声明受信 Retrieve 能力，因此只接受无损 JSON 候选；需要截断的候选以
 `recoverability_unavailable` 透传。实际 Pipeline、Stash 或 RTK 操作错误由 CLI 以退出码 1
-返回，Hook 在进程边界上 fail-open。Common PreTool Hook 仍直接调用 RTK，本阶段尚未把逐调用
-`output_optimization: "rtk"` 状态传给 PostTool。
+返回，Hook 在进程边界上 fail-open。Common PreTool Hook 通过 Protocol v2 调用 Core，由 Core
+执行 RTK；Adapter 按 Tool Call ID 暂存 `output_optimization: "rtk"`，并在对应 PostTool 调用中
+消费该状态，使 RTK 输出绕过二次压缩。缺少稳定 Tool Call ID 时保持原命令不变；宿主未发送
+PostTool 事件时遗留的状态会在后续 PreTool 调用中按 24 小时 TTL 和 1024 个文件上限清理。
 
 **TOON 效果**：对结构化/表格数据可额外节省 30-60%，整体压缩效果 = 响应压缩节省 + TOON 语法消除。例如：原始 JSON 4480 字节，经响应压缩至 625 字节（~86%），再经 TOON 编码进一步缩减。实测表格数据（`[{"id":...}]`）可达到 44% 的 TOON 单独节省。
 
 ### 路径 3：Hermes Agent 插件（`transform_tool_result` hook）
 
 ```
-工具执行完成
+pre_tool_call 将 Shell 参数发送给 Tokenless Core
    ↓
-Hermes 触发 transform_tool_result 事件
+旧版兼容模式：阻止原调用并建议执行 Core 返回的 RTK 命令
    ↓
-检查：是否为内容检索工具（Read/Glob/...）→ 跳过
+Hermes 执行重试命令并触发 transform_tool_result
    ↓
-检查：响应长度 < 200 字符 → 跳过
+Adapter 映射 Status、Content Origin 和 RTK Wrapper 事实
    ↓
-Step 1：tokenless compress-response（零截断语义清理）
+tokenless compress 执行 PostTool 路由与 JSON-only Pipeline
    ↓
-Step 2：tokenless compress-toon（无损 TOON 编码）
+Core 返回 Applied / Tool Error / Passthrough 等 Disposition
    ↓
-两步均采用 fail-open 策略
-   ↓
-返回压缩后的结果字符串
+Adapter 仅替换 Applied 输出或追加错误指引；其他结果原样透传
 ```
+
+Hermes Adapter 不再持有 200 字符门禁、JSON 检测、截断阈值、TOON 选择或最终大小仲裁。
+Hermes 无法发布受信 Retrieve Tool，因此 Core 只会应用无损候选；需要截断恢复能力的候选
+直接透传。为兼容只支持 Block 的 Hermes 版本，Adapter 不要求 `pre_tool_call modify`。
 
 ### 路径 4：Qoder CLI 插件（`PostToolUse` hook）
 
@@ -291,7 +305,7 @@ curl -s https://api.example.com/data | tokenless compress-response
 
 所有集成路径均采用 fail-open 策略：
 
-- **OpenClaw 插件**：`tryCompressResponse` 的 try-catch 返回 null，hook 不返回值 → 原始结果透传
+- **OpenClaw 插件**：Protocol v2 进程失败、非法响应或不能安全重建 Slot 时，Hook 不返回值 → 原始结果透传
 - **copilot-shell hook**：任何失败点（依赖缺失、压缩失败、输出为空）均 `exit 0` 且不输出 stdout → 原始结果透传
 - **CLI**：错误输出到 stderr，调用方可检查退出码决定是否回退
 
@@ -307,7 +321,7 @@ curl -s https://api.example.com/data | tokenless compress-response
 | 环境检查 | `crates/tokenless-cli/src/env_check.rs` |
 | 统计记录器（SQLite WAL） | `crates/tokenless-stats/src/recorder.rs` |
 | 统计记录类型及操作枚举 | `crates/tokenless-stats/src/record.rs` |
-| OpenClaw 插件 | `adapters/tokenless/openclaw/dist/index.js` |
+| OpenClaw 插件 | `adapters/tokenless/openclaw/index.ts` |
 | OpenClaw 插件配置 | `adapters/tokenless/openclaw/openclaw.plugin.json` |
 | copilot-shell hook（响应+TOON 流水线） | `adapters/tokenless/common/hooks/compress_response_hook.py` |
 | Hermes 插件 | `adapters/tokenless/hermes/__init__.py` |
