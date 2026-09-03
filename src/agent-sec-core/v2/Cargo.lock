@@ -178,6 +178,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "asc-policy-adapter-agentsight"
+version = "0.1.0"
+dependencies = [
+ "asc-policy-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "asc-policy-engine"
 version = "0.1.0"
 dependencies = [

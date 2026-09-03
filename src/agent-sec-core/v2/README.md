@@ -3,9 +3,10 @@
 This workspace slice contains the dependency-light contracts, Policy
 Administration Point, first-version PAP daemon protocol, product Policy-template
 compiler, protocol-independent Unix-domain-socket service framework, and runnable
-foreground process bootstrap used by later AgentSecCore V2 work packages. It
-deliberately contains no concrete persistence, Policy runtime, reconciliation
-worker, outbox, or target Adapter.
+foreground process bootstrap, together with the first AgentSight file-deletion
+target Adapter used by later AgentSecCore V2 work packages. It deliberately
+contains no durable persistence, Policy runtime, reconciliation worker, outbox,
+or target Client.
 
 The Rust `agent-sec-cli` exposes all 15 Policy, Scope and Binding CRUD commands through
 an explicit daemon socket. Its Cargo package and source directory remain `asc-cli`;
@@ -22,6 +23,9 @@ The current crates are:
   explicitly unsupported until their lowering and Adapter evidence are defined.
   The implemented template covers path-entry deletion only; rename, move, and
   other namespace mutations are outside its contract.
+- `asc-policy-adapter-agentsight`: deterministic file-deletion and PID-Scope
+  translation into an AgentSight/ActPlane plan, with semantic and encoding checks.
+  Compiler acceptance belongs to the deployed target, not an embedded compiler.
 - `asc-pap`: transport-independent current-record Policy/Scope/Binding CRUD with
   monotonic revisions over explicit compiler and repository ports.
 - `asc-pap-repository-memory`: explicitly temporary process-local Repository
@@ -261,8 +265,8 @@ Binding replacement and its reconcile intent atomically, then let the future
 Reconciler consume one complete `BindingView` whose embedded revision fences
 claim, retry, completion, failure, restart recovery, and cancellation.
 
-Concrete persistence, Policy runtime, reconciliation worker, outbox,
-and target Adapter belong to later work packages and are intentionally absent
+Durable persistence, Policy runtime, reconciliation worker, outbox,
+and target Client belong to later work packages and are intentionally absent
 from this slice. The compiler included here is limited to the one golden-backed
 `prevent_file_deletion` lowering described above.
 
