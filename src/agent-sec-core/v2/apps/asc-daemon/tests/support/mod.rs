@@ -60,7 +60,7 @@ pub async fn run_frozen_pap_crud_scenario(path: &Path, fixture: &Value) {
     assert_ne!(resource_ids[1], resource_ids[2]);
 }
 
-async fn request_json(path: &Path, request_value: &Value) -> Value {
+pub async fn request_json(path: &Path, request_value: &Value) -> Value {
     let mut payload = serde_json::to_vec(request_value).unwrap();
     payload.push(b'\n');
     let mut stream = UnixStream::connect(path).await.unwrap();

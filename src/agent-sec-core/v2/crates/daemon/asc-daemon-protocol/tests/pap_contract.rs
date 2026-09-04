@@ -152,6 +152,12 @@ fn request_and_response_envelopes_are_strict_and_mutually_exclusive() {
     ] {
         assert!(serde_json::from_value::<DaemonRequest>(invalid).is_err());
     }
+    for invalid in [
+        r#"{"method":"policy.templates.list","params":{"limit":1,"limit":2}}"#,
+        r#"{"method":"policy.templates.create","params":{"policyName":"invalid","template":{"kind":"prevent_file_deletion","files":["/a"],"files":["/b"]}}}"#,
+    ] {
+        assert!(serde_json::from_str::<DaemonRequest>(invalid).is_err());
+    }
 
     let responses: Vec<Value> =
         serde_json::from_str(include_str!("fixtures/daemon-responses.json")).unwrap();
@@ -278,6 +284,64 @@ fn complete_crud_scenario_freezes_every_registered_method_and_domain_result() {
             panic!("CRUD fixture steps must freeze successful responses");
         };
         decode_result(&request.method, &response.result);
+    }
+}
+
+#[test]
+fn invalid_request_fixture_covers_every_registered_crud_method() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/pap-invalid-requests.json")).unwrap();
+    assert_eq!(fixture["schemaVersion"], 1);
+    assert_eq!(
+        fixture["generatedValues"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        ["path_4097", "policy_name_257", "resource_id_129"]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        fixture["dynamicValues"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        ["existing_policy_id"].into_iter().collect()
+    );
+
+    let cases = fixture["cases"].as_array().unwrap();
+    let names = cases
+        .iter()
+        .map(|case| case["name"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        names.len(),
+        cases.len(),
+        "error fixture names must be unique"
+    );
+    assert_eq!(
+        cases
+            .iter()
+            .map(|case| case["request"]["method"].as_str().unwrap())
+            .collect::<BTreeSet<_>>(),
+        method::PAP_METHODS.into_iter().collect::<BTreeSet<_>>()
+    );
+
+    for case in cases {
+        assert!(case["request"]["params"].is_object());
+        let code = case["expectedError"]["code"].as_str().unwrap();
+        ErrorCode::new(code).unwrap();
+        let message = case["expectedError"]["message"].as_str().unwrap();
+        assert!(!message.is_empty(), "{} has an empty message", case["name"]);
+        assert!(
+            message.len() <= 256,
+            "{} has an unbounded expected message",
+            case["name"]
+        );
     }
 }
 

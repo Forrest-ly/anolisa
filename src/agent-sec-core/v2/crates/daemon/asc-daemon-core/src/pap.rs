@@ -2,10 +2,52 @@ use asc_foundation_types::{ResourceId, Revision};
 use asc_pap::{Page, PapError, PapRepository, PapService, PolicyCompiler};
 use asc_policy_types::authoring::PolicyTemplate;
 use asc_policy_types::binding::BindingView;
+use asc_policy_types::error::ValidationError;
 use asc_policy_types::policy::PreparedPolicy;
 use asc_policy_types::scope::{PreparedScope, ScopeSelector};
 
 use crate::{Principal, PrincipalRole};
+
+/// Stable authored-input detail that is safe to expose outside the daemon.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct PolicyInputError {
+    message: String,
+}
+
+impl PolicyInputError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Stable resource class used to describe a PAP not-found failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NotFoundResource {
+    /// A Policy identity requested for update does not exist.
+    #[error("policy was not found")]
+    Policy,
+    /// An exact Policy revision requested for read or delete does not exist.
+    #[error("policy revision was not found")]
+    PolicyRevision,
+    /// A Scope identity requested for update does not exist.
+    #[error("scope was not found")]
+    Scope,
+    /// An exact Scope revision requested for read or delete does not exist.
+    #[error("scope revision was not found")]
+    ScopeRevision,
+    /// A Binding identity does not exist.
+    #[error("binding was not found")]
+    Binding,
+    /// A Binding's referenced Policy revision does not exist.
+    #[error("referenced policy revision was not found")]
+    ReferencedPolicyRevision,
+    /// A Binding's referenced Scope revision does not exist.
+    #[error("referenced scope revision was not found")]
+    ReferencedScopeRevision,
+}
 
 /// Stable PAP application failures safe for a daemon adapter to project.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -14,14 +56,17 @@ pub enum PolicyAdministrationError {
     #[error("principal is not authorized to administer policy")]
     Forbidden,
     /// Authored input failed domain validation.
-    #[error("policy input failed domain validation")]
-    InvalidArgument,
+    #[error("{0}")]
+    InvalidArgument(PolicyInputError),
     /// Current revision or lifecycle state conflicts with the request.
     #[error("policy request conflicts with current state")]
     Conflict,
-    /// The requested current resource does not exist.
-    #[error("requested policy resource was not found")]
-    NotFound,
+    /// A changed Binding request cannot interrupt reconciliation work.
+    #[error("binding reconciliation operation is in progress")]
+    OperationInProgress,
+    /// The requested typed resource does not exist.
+    #[error("{0}")]
+    NotFound(NotFoundResource),
     /// No further positive revision can be allocated.
     #[error("revision space is exhausted")]
     ResourceExhausted,
@@ -30,20 +75,58 @@ pub enum PolicyAdministrationError {
     Internal,
 }
 
-impl From<PapError> for PolicyAdministrationError {
-    fn from(error: PapError) -> Self {
-        match error {
-            PapError::InvalidIdentifier(_)
-            | PapError::InvalidPolicyName(_)
-            | PapError::InvalidPolicy(_)
-            | PapError::InvalidScope(_)
-            | PapError::InvalidBinding(_)
-            | PapError::InvalidPagination => Self::InvalidArgument,
-            PapError::Conflict | PapError::OperationInProgress => Self::Conflict,
-            PapError::NotFound => Self::NotFound,
-            PapError::RevisionExhausted => Self::ResourceExhausted,
-            PapError::Serialization | PapError::Persistence => Self::Internal,
+fn project_pap_error(
+    error: PapError,
+    missing_resource: Option<NotFoundResource>,
+) -> PolicyAdministrationError {
+    match error {
+        PapError::InvalidPolicyName(message) => PolicyAdministrationError::InvalidArgument(
+            PolicyInputError::new(format!("invalid policy name: {message}")),
+        ),
+        PapError::InvalidPolicy(error) => {
+            project_validation_error(&error, "template", "invalid policy")
         }
+        PapError::InvalidScope(error) => {
+            project_validation_error(&error, "selector", "invalid scope")
+        }
+        PapError::InvalidPagination => PolicyAdministrationError::InvalidArgument(
+            PolicyInputError::new("invalid pagination: limit must be between 1 and 1000"),
+        ),
+        PapError::Conflict => PolicyAdministrationError::Conflict,
+        PapError::OperationInProgress => PolicyAdministrationError::OperationInProgress,
+        PapError::NotFound => missing_resource.map_or(
+            PolicyAdministrationError::Internal,
+            PolicyAdministrationError::NotFound,
+        ),
+        PapError::ReferencedPolicyRevisionNotFound => {
+            PolicyAdministrationError::NotFound(NotFoundResource::ReferencedPolicyRevision)
+        }
+        PapError::ReferencedScopeRevisionNotFound => {
+            PolicyAdministrationError::NotFound(NotFoundResource::ReferencedScopeRevision)
+        }
+        PapError::RevisionExhausted => PolicyAdministrationError::ResourceExhausted,
+        PapError::InvalidIdentifier(_)
+        | PapError::InvalidBinding(_)
+        | PapError::Serialization
+        | PapError::Persistence => PolicyAdministrationError::Internal,
+    }
+}
+
+fn project_validation_error(
+    error: &ValidationError,
+    authored_root: &str,
+    public_prefix: &str,
+) -> PolicyAdministrationError {
+    let suffix = error.path.strip_prefix(authored_root);
+    let is_authored_path = suffix.is_some_and(|suffix| {
+        suffix.is_empty() || suffix.starts_with('.') || suffix.starts_with('[')
+    });
+    if is_authored_path {
+        PolicyAdministrationError::InvalidArgument(PolicyInputError::new(format!(
+            "{public_prefix}: {error}"
+        )))
+    } else {
+        PolicyAdministrationError::Internal
     }
 }
 
@@ -253,7 +336,8 @@ where
         template: &PolicyTemplate,
     ) -> Result<PreparedPolicy, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::create_policy(self, policy_name, template)?)
+        PapService::create_policy(self, policy_name, template)
+            .map_err(|error| project_pap_error(error, None))
     }
 
     fn update_policy(
@@ -264,12 +348,8 @@ where
         template: &PolicyTemplate,
     ) -> Result<PreparedPolicy, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::update_policy(
-            self,
-            policy_id,
-            policy_name,
-            template,
-        )?)
+        PapService::update_policy(self, policy_id, policy_name, template)
+            .map_err(|error| project_pap_error(error, Some(NotFoundResource::Policy)))
     }
 
     fn get_policy(
@@ -279,7 +359,8 @@ where
         revision: Revision,
     ) -> Result<PreparedPolicy, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::get_policy(self, id, revision)?)
+        PapService::get_policy(self, id, revision)
+            .map_err(|error| project_pap_error(error, Some(NotFoundResource::PolicyRevision)))
     }
 
     fn list_policies(
@@ -289,7 +370,9 @@ where
         offset: u32,
     ) -> Result<ResourcePage<PreparedPolicy>, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::list_policies(self, limit, offset)?.into())
+        PapService::list_policies(self, limit, offset)
+            .map(Into::into)
+            .map_err(|error| project_pap_error(error, None))
     }
 
     fn delete_policy_revision(
@@ -299,7 +382,8 @@ where
         revision: Revision,
     ) -> Result<PreparedPolicy, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::delete_policy_revision(self, id, revision)?)
+        PapService::delete_policy_revision(self, id, revision)
+            .map_err(|error| project_pap_error(error, Some(NotFoundResource::PolicyRevision)))
     }
 
     fn create_scope(
@@ -308,7 +392,7 @@ where
         selector: &ScopeSelector,
     ) -> Result<PreparedScope, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::create_scope(self, selector)?)
+        PapService::create_scope(self, selector).map_err(|error| project_pap_error(error, None))
     }
 
     fn update_scope(
@@ -318,7 +402,8 @@ where
         selector: &ScopeSelector,
     ) -> Result<PreparedScope, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::update_scope(self, scope_id, selector)?)
+        PapService::update_scope(self, scope_id, selector)
+            .map_err(|error| project_pap_error(error, Some(NotFoundResource::Scope)))
     }
 
     fn get_scope(
@@ -328,7 +413,8 @@ where
         revision: Revision,
     ) -> Result<PreparedScope, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::get_scope(self, id, revision)?)
+        PapService::get_scope(self, id, revision)
+            .map_err(|error| project_pap_error(error, Some(NotFoundResource::ScopeRevision)))
     }
 
     fn list_scopes(
@@ -338,7 +424,9 @@ where
         offset: u32,
     ) -> Result<ResourcePage<PreparedScope>, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::list_scopes(self, limit, offset)?.into())
+        PapService::list_scopes(self, limit, offset)
+            .map(Into::into)
+            .map_err(|error| project_pap_error(error, None))
     }
 
     fn delete_scope_revision(
@@ -348,7 +436,8 @@ where
         revision: Revision,
     ) -> Result<PreparedScope, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::delete_scope_revision(self, id, revision)?)
+        PapService::delete_scope_revision(self, id, revision)
+            .map_err(|error| project_pap_error(error, Some(NotFoundResource::ScopeRevision)))
     }
 
     fn create_binding(
@@ -360,13 +449,8 @@ where
         scope_revision: Revision,
     ) -> Result<BindingView, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::create_binding(
-            self,
-            policy_id,
-            policy_revision,
-            scope_id,
-            scope_revision,
-        )?)
+        PapService::create_binding(self, policy_id, policy_revision, scope_id, scope_revision)
+            .map_err(|error| project_pap_error(error, None))
     }
 
     fn update_binding(
@@ -379,14 +463,15 @@ where
         scope_revision: Revision,
     ) -> Result<BindingView, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::update_binding(
+        PapService::update_binding(
             self,
             binding_id,
             policy_id,
             policy_revision,
             scope_id,
             scope_revision,
-        )?)
+        )
+        .map_err(|error| project_pap_error(error, Some(NotFoundResource::Binding)))
     }
 
     fn get_binding(
@@ -395,7 +480,8 @@ where
         id: &ResourceId,
     ) -> Result<BindingView, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::get_binding(self, id)?)
+        PapService::get_binding(self, id)
+            .map_err(|error| project_pap_error(error, Some(NotFoundResource::Binding)))
     }
 
     fn list_bindings(
@@ -405,7 +491,9 @@ where
         offset: u32,
     ) -> Result<ResourcePage<BindingView>, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::list_bindings(self, limit, offset)?.into())
+        PapService::list_bindings(self, limit, offset)
+            .map(Into::into)
+            .map_err(|error| project_pap_error(error, None))
     }
 
     fn delete_binding(
@@ -414,7 +502,8 @@ where
         id: &ResourceId,
     ) -> Result<BindingView, PolicyAdministrationError> {
         require_policy_administrator(principal)?;
-        Ok(PapService::delete_binding(self, id)?)
+        PapService::delete_binding(self, id)
+            .map_err(|error| project_pap_error(error, Some(NotFoundResource::Binding)))
     }
 }
 
@@ -448,16 +537,36 @@ mod tests {
     #[test]
     fn pap_errors_are_projected_once_at_the_application_boundary() {
         assert_eq!(
-            PolicyAdministrationError::from(PapError::OperationInProgress),
-            PolicyAdministrationError::Conflict
+            project_pap_error(PapError::OperationInProgress, None),
+            PolicyAdministrationError::OperationInProgress
         );
         assert_eq!(
-            PolicyAdministrationError::from(PapError::Persistence),
+            project_pap_error(PapError::Persistence, None),
             PolicyAdministrationError::Internal
         );
         assert_eq!(
-            PolicyAdministrationError::from(PapError::InvalidPagination),
-            PolicyAdministrationError::InvalidArgument
+            project_pap_error(PapError::InvalidPagination, None),
+            PolicyAdministrationError::InvalidArgument(PolicyInputError::new(
+                "invalid pagination: limit must be between 1 and 1000"
+            ))
+        );
+        assert_eq!(
+            project_pap_error(PapError::NotFound, Some(NotFoundResource::Policy)),
+            PolicyAdministrationError::NotFound(NotFoundResource::Policy)
+        );
+        assert_eq!(
+            project_pap_error(PapError::ReferencedScopeRevisionNotFound, None),
+            PolicyAdministrationError::NotFound(NotFoundResource::ReferencedScopeRevision)
+        );
+        assert_eq!(
+            project_pap_error(
+                PapError::InvalidPolicy(ValidationError::new(
+                    "canonicalPolicy.policyId",
+                    "compiler output exposed an internal mismatch"
+                )),
+                None
+            ),
+            PolicyAdministrationError::Internal
         );
     }
 }

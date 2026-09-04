@@ -9,4 +9,7 @@ pub use identity::{
     PeerCredentials, Principal, PrincipalPolicy, PrincipalPolicyError, PrincipalRole,
     RootManagedPrincipalPolicy,
 };
-pub use pap::{PolicyAdministration, PolicyAdministrationError, ResourcePage};
+pub use pap::{
+    NotFoundResource, PolicyAdministration, PolicyAdministrationError, PolicyInputError,
+    ResourcePage,
+};

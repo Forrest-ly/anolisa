@@ -10,8 +10,8 @@ use asc_daemon_protocol::{
     UpdateScopeParams, error_code,
 };
 
-const MAX_PARAMETER_ERROR_BYTES: usize = 256;
-const PARAMETER_ERROR_SUFFIX: &str = "...";
+const MAX_PUBLIC_ERROR_BYTES: usize = 256;
+const ERROR_MESSAGE_SUFFIX: &str = "...";
 
 /// PAP-specific protocol adapter with repository/compiler types erased.
 pub(super) struct PapHandler {
@@ -43,7 +43,7 @@ impl PapHandler {
             }
             Err(PapDispatchError::Application(error)) => {
                 let (code, message) = project_application_error(&error);
-                DaemonResponse::error(request_id, code, message)
+                DaemonResponse::error(request_id, code, &message)
             }
             Err(PapDispatchError::Projection) => DaemonResponse::error(
                 request_id,
@@ -183,16 +183,19 @@ fn decode<T: serde::de::DeserializeOwned>(
 }
 
 fn bounded_parameter_error(error: &serde_json::Error) -> String {
-    let message = error.to_string();
-    if message.len() <= MAX_PARAMETER_ERROR_BYTES {
-        return message;
+    bounded_error_message(&error.to_string())
+}
+
+fn bounded_error_message(message: &str) -> String {
+    if message.len() <= MAX_PUBLIC_ERROR_BYTES {
+        return message.to_owned();
     }
 
-    let mut end = MAX_PARAMETER_ERROR_BYTES - PARAMETER_ERROR_SUFFIX.len();
+    let mut end = MAX_PUBLIC_ERROR_BYTES - ERROR_MESSAGE_SUFFIX.len();
     while !message.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{PARAMETER_ERROR_SUFFIX}", &message[..end])
+    format!("{}{ERROR_MESSAGE_SUFFIX}", &message[..end])
 }
 
 fn encode<T: serde::Serialize>(value: T) -> Result<serde_json::Value, PapDispatchError> {
@@ -220,32 +223,18 @@ impl From<PolicyAdministrationError> for PapDispatchError {
     }
 }
 
-fn project_application_error(error: &PolicyAdministrationError) -> (&'static str, &'static str) {
-    match error {
-        PolicyAdministrationError::Forbidden => (
-            error_code::PERMISSION_DENIED,
-            "principal is not authorized to administer policy",
-        ),
-        PolicyAdministrationError::InvalidArgument => (
-            error_code::INVALID_ARGUMENT,
-            "policy input failed domain validation",
-        ),
-        PolicyAdministrationError::Conflict => (
-            error_code::CONFLICT,
-            "policy request conflicts with current state",
-        ),
-        PolicyAdministrationError::NotFound => (
-            error_code::NOT_FOUND,
-            "requested policy resource was not found",
-        ),
-        PolicyAdministrationError::ResourceExhausted => (
-            error_code::RESOURCE_EXHAUSTED,
-            "revision space is exhausted",
-        ),
-        PolicyAdministrationError::Internal => {
-            (error_code::INTERNAL, "policy state could not be processed")
+fn project_application_error(error: &PolicyAdministrationError) -> (&'static str, String) {
+    let code = match error {
+        PolicyAdministrationError::Forbidden => error_code::PERMISSION_DENIED,
+        PolicyAdministrationError::InvalidArgument(_) => error_code::INVALID_ARGUMENT,
+        PolicyAdministrationError::Conflict | PolicyAdministrationError::OperationInProgress => {
+            error_code::CONFLICT
         }
-    }
+        PolicyAdministrationError::NotFound(_) => error_code::NOT_FOUND,
+        PolicyAdministrationError::ResourceExhausted => error_code::RESOURCE_EXHAUSTED,
+        PolicyAdministrationError::Internal => error_code::INTERNAL,
+    };
+    (code, bounded_error_message(&error.to_string()))
 }
 
 #[cfg(test)]
@@ -260,14 +249,14 @@ mod tests {
         };
         assert_eq!(message, "limit must be between 1 and 1000");
 
-        let long_field = "x".repeat(MAX_PARAMETER_ERROR_BYTES * 2);
+        let long_field = "x".repeat(MAX_PUBLIC_ERROR_BYTES * 2);
         let mut params = serde_json::Map::new();
         params.insert(long_field, serde_json::Value::Null);
         let oversized = decode::<ListParams>(serde_json::Value::Object(params));
         let Err(PapDispatchError::BadRequest(message)) = oversized else {
             panic!("an unknown parameter must fail decoding");
         };
-        assert!(message.len() <= MAX_PARAMETER_ERROR_BYTES);
+        assert!(message.len() <= MAX_PUBLIC_ERROR_BYTES);
         assert!(message.ends_with("..."));
     }
 
@@ -277,12 +266,15 @@ mod tests {
             project_application_error(&PolicyAdministrationError::Forbidden),
             (
                 error_code::PERMISSION_DENIED,
-                "principal is not authorized to administer policy"
+                "principal is not authorized to administer policy".to_owned()
             )
         );
         assert_eq!(
             project_application_error(&PolicyAdministrationError::Internal),
-            (error_code::INTERNAL, "policy state could not be processed")
+            (
+                error_code::INTERNAL,
+                "policy state could not be processed".to_owned()
+            )
         );
     }
 }

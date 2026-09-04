@@ -41,3 +41,31 @@ fn rejects_empty_files_and_unimplemented_template_kinds() {
         "template.kind"
     );
 }
+
+#[test]
+fn validation_errors_point_to_authored_file_entries() {
+    let policy_id = PolicyId::new("invalid-paths").unwrap();
+    let revision = Revision::new(1).unwrap();
+
+    for (files, expected_path, expected_message) in [
+        (
+            vec!["/valid".to_owned(), "/invalid/../path".to_owned()],
+            "template.files[1]",
+            "path contains a dot segment",
+        ),
+        (
+            vec!["/duplicate".to_owned(), "/duplicate".to_owned()],
+            "template.files[1]",
+            "duplicate matcher",
+        ),
+    ] {
+        let input = TemplateEnvelope {
+            policy_id: policy_id.clone(),
+            revision,
+            template: PolicyTemplate::PreventFileDeletion { files },
+        };
+        let error = PolicyTemplateCompiler.lower(&input).unwrap_err();
+        assert_eq!(error.path, expected_path);
+        assert_eq!(error.message, expected_message);
+    }
+}

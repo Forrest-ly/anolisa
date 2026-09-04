@@ -497,13 +497,23 @@ encoded-size gate；本 slice 不以提高 transport limit 代替该修复。
 
 PAP error 稳定投影如下：无法构造成 method params 的字段、类型或 bounded value（包括非法
 identifier、revision、pagination 和 authored selector）→ `invalid_request`，同时返回最多 256
-字节的参数解码原因；成功构造 params 后发生的 authoring/compiler validation →
-`invalid_argument`；not found → `not_found`；revision conflict 或 operation in progress →
-`conflict`；revision exhaustion → `resource_exhausted`；serialization/persistence → `internal`。
+字节的参数解码原因；任意层级 JSON object 的 duplicate key 在进入 `serde_json::Value` 前拒绝，
+按 malformed envelope 返回 `invalid_request / request envelope is invalid`。成功构造 params 后
+发生的 authoring/compiler validation → `invalid_argument`，message 为最多 256 字节的稳定
+`invalid policy name: <reason>`、`invalid policy: <authored-path>: <reason>` 或
+`invalid scope: <authored-path>: <reason>`，不得暴露 canonical IR path、输入内容或内部 error
+code。
+
+not found → `not_found`，并按操作对象稳定区分 `policy was not found`、
+`policy revision was not found`、`scope was not found`、`scope revision was not found`、
+`binding was not found`、`referenced policy revision was not found` 和
+`referenced scope revision was not found`。revision conflict 使用
+`conflict / policy request conflicts with current state`，operation in progress 使用
+`conflict / binding reconciliation operation is in progress`；revision exhaustion →
+`resource_exhausted`；serialization/persistence、内部 identifier/Binding 构造失败 → `internal`。
 Malformed envelope 使用 `invalid_request`，未注册 method 使用 `unknown_method`，授权失败使用
-`permission_denied`。只有 protocol 参数解码产生的有界原因可进入 `invalid_request` message；
-application 内部 validation path、repository error、secret 和内部 error code 不进入 wire
-message。
+`permission_denied`。repository error、secret、内部 validation path 和内部 error code 不进入
+wire message；所有 PAP 公开 error message 均不得超过 256 字节。
 
 <a id="daemon-security-action-handler-contract"></a>
 

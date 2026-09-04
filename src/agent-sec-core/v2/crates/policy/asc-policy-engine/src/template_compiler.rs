@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use asc_pap::PolicyCompiler;
 use asc_policy_types::Validate;
 use asc_policy_types::authoring::{PolicyTemplate, TemplateEnvelope};
@@ -33,19 +35,33 @@ impl PolicyCompiler for PolicyTemplateCompiler {
 
         let resource_id = ResourceSetId::new("protected-file-entries")
             .map_err(|message| ValidationError::new("payload.resources[0].id", message))?;
+        let mut unique_matchers = HashSet::with_capacity(files.len());
         let matchers = files
             .iter()
-            .map(|path| FileMatcher {
-                path: if path.contains(['*', '?']) {
-                    PathMatcher::Glob {
-                        pattern: path.clone(),
-                    }
-                } else {
-                    PathMatcher::Exact { path: path.clone() }
-                },
-                resolution: FileResolution::PathEntry,
+            .enumerate()
+            .map(|(index, path)| {
+                let matcher = FileMatcher {
+                    path: if path.contains(['*', '?']) {
+                        PathMatcher::Glob {
+                            pattern: path.clone(),
+                        }
+                    } else {
+                        PathMatcher::Exact { path: path.clone() }
+                    },
+                    resolution: FileResolution::PathEntry,
+                };
+                matcher.validate().map_err(|error| {
+                    ValidationError::new(format!("template.files[{index}]"), error.message)
+                })?;
+                if !unique_matchers.insert(matcher.clone()) {
+                    return Err(ValidationError::new(
+                        format!("template.files[{index}]"),
+                        "duplicate matcher",
+                    ));
+                }
+                Ok(matcher)
             })
-            .collect();
+            .collect::<Result<Vec<_>, ValidationError>>()?;
         let policy = PolicyEnvelope {
             ir_schema_version: IR_SCHEMA_VERSION_V1,
             profile_id: ProfileId::new(PROFILE_V1ALPHA1_DEMO1)
