@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "zero pagination limit",
+      "request": {
+        "method": "policy.templates.list",
+        "params": {
+          "limit": 0,
+          "offset": 0
+        }
+      },
+      "expectedError": {
+        "code": "invalid_request",
+        "message": "limit must be between 1 and 1000"
+      }
+    },
+    {
+      "name": "zero authored PID",
+      "request": {
+        "method": "policy.scopes.create",
+        "params": {
+          "selector": {
+            "kind": "pid",
+            "pid": 0
+          }
+        }
+      },
+      "expectedError": {
+        "code": "invalid_request",
+        "message": "invalid selector at pid: must be positive"
+      }
+    }
+  ]
+}
