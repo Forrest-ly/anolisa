@@ -7,10 +7,10 @@
 //! not clean up arbitrary paths", and forged-receipt rejection.
 //!
 //! The fake CLI is controlled entirely through the same env contract the
-//! real driver uses (`OPENCLAW_BIN`, `OPENCLAW_HOME`, plus a test-only
-//! `FAKE_OPENCLAW_FAIL` knob). Because those are process-global, every test
-//! serializes on [`ENV_LOCK`], starts from a clean env contract, and
-//! restores the prior environment on exit.
+//! real driver uses (`OPENCLAW_BIN`, `OPENCLAW_STATE_DIR`, `OPENCLAW_HOME`,
+//! plus a test-only `FAKE_OPENCLAW_FAIL` knob). Because those are
+//! process-global, every test serializes on [`ENV_LOCK`], starts from a clean
+//! env contract, and restores the prior environment on exit.
 #![cfg(unix)]
 
 use std::ffi::OsString;
@@ -20,14 +20,18 @@ use std::sync::{Mutex, MutexGuard};
 
 use anolisa_core::adapter::AdapterError;
 use anolisa_core::adapter::claim::{
-    ClaimResourceKind, ClaimStatus, ConfigApplyState, DriverPayload,
+    AdapterClaim, ClaimResourceKind, ClaimStatus, ConfigApplyState, DriverPayload,
 };
 use anolisa_core::adapter::driver::{AdapterSummary, ConditionStatus};
 use anolisa_core::adapter::manager::{AdapterManager, EnableOptions, EnableOutcome};
+use anolisa_core::domain::ProviderBinding;
 use anolisa_core::manifest::{NoticeLevel, NoticeWhen};
-use anolisa_core::state::InstallMode as StateInstallMode;
+use anolisa_core::state::{
+    FileOwner, InstallMode as StateInstallMode, ObjectKind, OwnedFile, OwnedFileKind,
+};
 use anolisa_core::state_store::StateStore;
 use anolisa_platform::fs_layout::FsLayout;
+use sha2::{Digest, Sha256};
 
 /// Serializes the process-global env mutation across tests.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -48,6 +52,7 @@ struct World {
 
 impl World {
     fn manager(&self) -> AdapterManager {
+        record_owned_adapter_files(&self.layout, &self.resource_root);
         AdapterManager::new(
             self.layout.clone(),
             Some(self.user_home.clone()),
@@ -85,6 +90,72 @@ impl World {
         self.load_state()
             .find_adapter_claim(COMPONENT, FRAMEWORK)
             .is_some()
+    }
+}
+
+fn record_owned_adapter_files(layout: &FsLayout, root: &Path) {
+    fn collect(root: &Path, files: &mut Vec<OwnedFile>) {
+        for entry in std::fs::read_dir(root).expect("read adapter fixture") {
+            let entry = entry.expect("adapter fixture entry");
+            let path = entry.path();
+            let file_type = entry.file_type().expect("adapter fixture file type");
+            if file_type.is_dir() {
+                collect(&path, files);
+            } else if file_type.is_symlink() {
+                files.push(OwnedFile {
+                    path: path.clone(),
+                    owner: FileOwner::Anolisa,
+                    sha256: None,
+                    kind: OwnedFileKind::Symlink,
+                    referent: Some(std::fs::read_link(path).expect("adapter fixture symlink")),
+                    mode: None,
+                    capabilities: Vec::new(),
+                });
+            } else if file_type.is_file() {
+                files.push(OwnedFile {
+                    path: path.clone(),
+                    owner: FileOwner::Anolisa,
+                    sha256: Some(format!(
+                        "{:x}",
+                        Sha256::digest(std::fs::read(path).expect("adapter fixture bytes"))
+                    )),
+                    kind: OwnedFileKind::File,
+                    referent: None,
+                    mode: None,
+                    capabilities: Vec::new(),
+                });
+            }
+        }
+    }
+
+    if !root.is_dir() {
+        return;
+    }
+    let state_path = layout.state_dir.join("installed.toml");
+    let mut state = load_state_at(&state_path);
+    let installation = state
+        .find_mut(ObjectKind::Component, COMPONENT)
+        .expect("fixture component");
+    let ProviderBinding::Owned { artifact } = &mut installation.binding else {
+        panic!("fixture component must be raw-owned");
+    };
+    let mut files = Vec::new();
+    collect(root, &mut files);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    artifact.files = files;
+    state.save(&state_path).expect("save fixture state");
+}
+
+fn recorded_openclaw_state_dir(claim: &AdapterClaim) -> &Path {
+    let DriverPayload::OpenClaw(payload) = &claim.driver_payload else {
+        panic!("expected OpenClaw receipt");
+    };
+    let resource = claim
+        .resource(&payload.state_dir_resource)
+        .expect("state directory resource");
+    match &resource.kind {
+        ClaimResourceKind::ExternalPath { path } => path,
+        other => panic!("expected external state directory, got {other:?}"),
     }
 }
 
@@ -149,11 +220,29 @@ dest = "{{datadir}}/adapters/{{component}}/openclaw/"
     )
 }
 
+fn configure_plugin_with_skill(world: &World, skill_name: &str) {
+    let block = format!(
+        r#"[[adapters]]
+framework = "openclaw"
+source = "adapters/{COMPONENT}/openclaw"
+dest = "{{datadir}}/adapters/{{component}}/openclaw/"
+
+[adapters.openclaw]
+skills = ["{skill_name}"]
+"#
+    );
+    write_openclaw_manifest(&world.layout, &block);
+    let skill_source = world.resource_root.join("skills").join(skill_name);
+    std::fs::create_dir_all(&skill_source).expect("skill source");
+    std::fs::write(skill_source.join("marker.txt"), b"skill").expect("skill marker");
+}
+
 /// Every environment variable this test binary's fake OpenClaw contract
 /// owns. The guard saves and restores exactly these so no test leaks state
 /// into another. `FAKE_OC_*` are the capability knobs the fake CLI reads.
 const OWNED_ENV: &[&str] = &[
     "OPENCLAW_BIN",
+    "OPENCLAW_STATE_DIR",
     "OPENCLAW_HOME",
     "FAKE_OPENCLAW_FAIL",
     "FAKE_OC_VERSION",
@@ -169,6 +258,8 @@ const OWNED_ENV: &[&str] = &[
     "FAKE_OC_VERSION_PREAMBLE",
     "FAKE_OC_CONFIG_FAIL_KEY",
     "FAKE_OC_CONFIG_FAIL_AFTER_KEY",
+    "HERMES_BIN",
+    "HERMES_HOME",
 ];
 
 struct OpenClawEnvGuard {
@@ -227,6 +318,17 @@ impl OpenClawEnvGuard {
         // SAFETY: this guard holds ENV_LOCK.
         unsafe {
             std::env::set_var(key, value);
+        }
+    }
+
+    fn unset(&self, key: &str) {
+        assert!(
+            OWNED_ENV.contains(&key),
+            "env key {key} must be guard-owned"
+        );
+        // SAFETY: this guard holds ENV_LOCK.
+        unsafe {
+            std::env::remove_var(key);
         }
     }
 }
@@ -393,6 +495,7 @@ case "$action" in
   uninstall)
     reg="$OPENCLAW_STATE_DIR/registry"; mkdir -p "$reg" 2>/dev/null
     if [ "${FAKE_OPENCLAW_FAIL:-}" = "uninstall" ]; then echo "boom-uninstall" >&2; exit 8; fi
+    if [ ! -e "$reg/$arg3" ]; then echo "Plugin not found: $arg3" >&2; exit 1; fi
     rm -f "$reg/$arg3"
     echo "uninstalled $arg3"
     ;;
@@ -442,6 +545,14 @@ installed_at = "2026-06-15T00:00:00Z"
     );
     std::fs::write(&state_path, toml).expect("seed state");
     write_installed_manifest(layout, FRAMEWORK);
+    record_owned_adapter_files(
+        layout,
+        &layout
+            .datadir
+            .join("adapters")
+            .join(COMPONENT)
+            .join(FRAMEWORK),
+    );
 }
 
 fn write_installed_manifest(layout: &FsLayout, framework: &str) {
@@ -486,6 +597,10 @@ fn enable_status_disable_happy_path() {
         EnableOutcome::Enabled(c) => *c,
         EnableOutcome::Planned { .. } => panic!("expected enabled, got plan"),
     };
+    assert!(
+        world.layout.lock_file.is_file(),
+        "apply must retain the existing install-lock boundary"
+    );
     assert_eq!(claim.component, COMPONENT);
     assert_eq!(claim.framework, FRAMEWORK);
     assert_eq!(claim.plugin_id.as_deref(), Some(COMPONENT));
@@ -531,6 +646,645 @@ fn enable_status_disable_happy_path() {
             .is_none(),
         "receipt must be gone after successful disable"
     );
+}
+
+#[test]
+fn enable_rejects_modified_package_owned_source() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+    std::fs::write(
+        world.resource_root.join("openclaw.plugin.json"),
+        br#"{"id":"modified","name":"Modified"}"#,
+    )
+    .expect("modify package-owned manifest after recording its digest");
+
+    let err = manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect_err("modified package-owned bytes must block enable");
+    assert!(matches!(
+        err,
+        AdapterError::InvalidAdapterInput { reason, .. } if reason.contains("content changed")
+    ));
+    assert!(!world.registry_marker_exists());
+    assert!(!world.has_claim());
+}
+
+#[test]
+fn enable_honors_explicit_openclaw_state_dir() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    world.apply_env(&guard, None);
+    let state_dir = world._root.path().join("configured-openclaw-state");
+    guard.set("OPENCLAW_STATE_DIR", &state_dir);
+    let manager = world.manager();
+
+    let outcome = manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("enable in configured state directory");
+    let claim = match outcome {
+        EnableOutcome::Enabled(claim) => claim,
+        EnableOutcome::Planned { .. } => panic!("expected enabled, got plan"),
+    };
+
+    assert!(state_dir.join("registry").join(COMPONENT).exists());
+    assert!(
+        !world.registry_marker_exists(),
+        "OPENCLAW_HOME must not override an explicit OPENCLAW_STATE_DIR"
+    );
+    assert!(claim.resources.iter().any(|resource| matches!(
+        &resource.kind,
+        ClaimResourceKind::ExternalPath { path } if path == &state_dir
+    )));
+
+    let status = manager.status(Some(COMPONENT)).expect("status");
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Healthy);
+}
+
+#[test]
+fn blank_openclaw_state_dir_falls_back_to_openclaw_home() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    world.apply_env(&guard, None);
+    guard.set("OPENCLAW_STATE_DIR", "  \t  ");
+    let manager = world.manager();
+
+    let outcome = manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("enable with a blank state override");
+    let claim = match outcome {
+        EnableOutcome::Enabled(claim) => claim,
+        EnableOutcome::Planned { .. } => panic!("expected enabled, got plan"),
+    };
+
+    assert!(world.registry_marker_exists());
+    assert!(claim.resources.iter().any(|resource| matches!(
+        &resource.kind,
+        ClaimResourceKind::ExternalPath { path } if path == &world.openclaw_home
+    )));
+}
+
+#[test]
+fn skill_bundle_expands_tilde_in_openclaw_state_dir() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    let block = format!(
+        r#"[[adapters]]
+framework = "openclaw"
+adapter_type = "skill_bundle"
+source = "adapters/{COMPONENT}/openclaw"
+dest = "{{datadir}}/adapters/{{component}}/openclaw/"
+
+[adapters.openclaw]
+skills = ["sec-audit"]
+"#
+    );
+    write_openclaw_manifest(&world.layout, &block);
+    let skill_source = world.resource_root.join("skills/sec-audit");
+    std::fs::create_dir_all(&skill_source).expect("skill source");
+    std::fs::write(skill_source.join("marker.txt"), b"skill").expect("skill marker");
+
+    world.apply_env(&guard, None);
+    guard.unset("OPENCLAW_HOME");
+    guard.set("OPENCLAW_STATE_DIR", "~/.openclaw-work");
+    let manager = world.manager();
+
+    let outcome = manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("enable skill bundle with a tilde state directory");
+    let claim = match outcome {
+        EnableOutcome::Enabled(claim) => claim,
+        EnableOutcome::Planned { .. } => panic!("expected enabled, got plan"),
+    };
+    let expected = world.user_home.join(".openclaw-work");
+
+    assert!(expected.join("skills/sec-audit/marker.txt").is_file());
+    assert!(claim.resources.iter().any(|resource| matches!(
+        &resource.kind,
+        ClaimResourceKind::ExternalPath { path } if path == &expected
+    )));
+
+    std::fs::write(expected.join("skills/sec-audit/runtime.log"), b"runtime")
+        .expect("runtime file");
+    let status = manager
+        .status(Some(COMPONENT))
+        .expect("status with runtime file");
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Healthy);
+
+    std::fs::write(expected.join("skills/sec-audit/marker.txt"), b"changed")
+        .expect("mutate materialized skill");
+    let status = manager
+        .status(Some(COMPONENT))
+        .expect("status with changed skill");
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Degraded);
+    assert!(status.entries[0].report.conditions.iter().any(|condition| {
+        condition.kind
+            == anolisa_core::adapter::driver::AdapterConditionKind::MaterializedBundleMatches
+            && condition.status == ConditionStatus::False
+    }));
+}
+
+#[test]
+fn reenable_prunes_removed_managed_skill_files_but_keeps_runtime_extras() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    configure_plugin_with_skill(&world, "sec-audit");
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("enable initial skill revision");
+    let destination = world.openclaw_home.join("skills/sec-audit");
+    let removed = destination.join("marker.txt");
+    let runtime_extra = destination.join("runtime.log");
+    assert!(removed.is_file());
+    std::fs::write(&runtime_extra, b"runtime").expect("runtime-created extra");
+
+    let source = world.resource_root.join("skills/sec-audit");
+    std::fs::remove_file(source.join("marker.txt")).expect("remove old managed source");
+    std::fs::write(source.join("renamed.txt"), b"skill-v2").expect("write renamed source");
+    record_owned_adapter_files(&world.layout, &world.resource_root);
+
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("re-enable updated skill revision");
+
+    assert!(destination.join("renamed.txt").is_file());
+    assert!(
+        !removed.exists(),
+        "a file owned only by the prior receipt must be removed"
+    );
+    assert_eq!(
+        std::fs::read(&runtime_extra).expect("runtime extra must survive"),
+        b"runtime"
+    );
+    let status = manager
+        .status(Some(COMPONENT))
+        .expect("status after re-enable");
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Healthy);
+}
+
+#[test]
+fn reenable_prunes_empty_ancestors_before_directory_to_file_change() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    configure_plugin_with_skill(&world, "sec-audit");
+    let source = world.resource_root.join("skills/sec-audit");
+    std::fs::create_dir_all(source.join("hook.py/sub")).expect("old nested source directory");
+    std::fs::write(source.join("hook.py/sub/managed.txt"), b"v1").expect("old nested managed file");
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("enable initial directory-shaped output");
+
+    std::fs::remove_dir_all(source.join("hook.py")).expect("remove old source directory");
+    std::fs::write(source.join("hook.py"), b"v2").expect("new file-shaped source");
+    record_owned_adapter_files(&world.layout, &world.resource_root);
+
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("empty ancestors are pruned before replacing the directory");
+
+    let destination = world.openclaw_home.join("skills/sec-audit/hook.py");
+    assert_eq!(
+        std::fs::read(destination).expect("new file-shaped output"),
+        b"v2"
+    );
+}
+
+#[test]
+fn hermes_reenable_prunes_removed_managed_skill_files() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    let hermes_root = world
+        .layout
+        .datadir
+        .join("adapters")
+        .join(COMPONENT)
+        .join("hermes");
+    let source = hermes_root.join("skills/sec-audit");
+    std::fs::create_dir_all(&source).expect("Hermes skill source");
+    std::fs::write(source.join("marker.txt"), b"skill-v1").expect("Hermes skill marker");
+    write_openclaw_manifest(
+        &world.layout,
+        &format!(
+            r#"[[adapters]]
+framework = "hermes"
+adapter_type = "skill_bundle"
+source = "adapters/{COMPONENT}/hermes"
+dest = "{{datadir}}/adapters/{{component}}/hermes/"
+
+[adapters.hermes]
+skills = ["sec-audit"]
+"#
+        ),
+    );
+    record_owned_adapter_files(&world.layout, &hermes_root);
+    let hermes_home = world._root.path().join("hermes-home");
+    guard.set("HERMES_BIN", &world.fake_bin);
+    guard.set("HERMES_HOME", &hermes_home);
+    let manager = AdapterManager::new(
+        world.layout.clone(),
+        Some(world.user_home.clone()),
+        "tester".to_string(),
+    );
+
+    manager
+        .enable(COMPONENT, Some("hermes"), false)
+        .expect("enable initial Hermes skill revision");
+    let destination = hermes_home.join("skills/sec-audit");
+    assert!(destination.join("marker.txt").is_file());
+
+    std::fs::remove_file(source.join("marker.txt")).expect("remove old Hermes source");
+    std::fs::write(source.join("renamed.txt"), b"skill-v2").expect("rename Hermes source");
+    record_owned_adapter_files(&world.layout, &hermes_root);
+    manager
+        .enable(COMPONENT, Some("hermes"), false)
+        .expect("re-enable updated Hermes skill revision");
+
+    assert!(destination.join("renamed.txt").is_file());
+    assert!(!destination.join("marker.txt").exists());
+    let status = manager.status(Some(COMPONENT)).expect("Hermes status");
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Healthy);
+}
+
+#[test]
+fn reenable_refuses_directory_to_file_change_when_runtime_content_would_be_lost() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    configure_plugin_with_skill(&world, "sec-audit");
+    let source = world.resource_root.join("skills/sec-audit");
+    std::fs::create_dir_all(source.join("hook.py")).expect("old source directory");
+    std::fs::write(source.join("hook.py/managed.txt"), b"v1").expect("old managed file");
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("enable initial directory-shaped output");
+
+    let destination = world.openclaw_home.join("skills/sec-audit");
+    std::fs::write(destination.join("hook.py/runtime.log"), b"runtime")
+        .expect("runtime content under old directory");
+    std::fs::remove_dir_all(source.join("hook.py")).expect("remove old source directory");
+    std::fs::write(source.join("hook.py"), b"v2").expect("new file-shaped source");
+    record_owned_adapter_files(&world.layout, &world.resource_root);
+
+    let err = manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect_err("runtime content must not be recursively removed");
+    assert!(matches!(
+        err,
+        AdapterError::ReenableCleanupIncomplete { .. }
+    ));
+    assert_eq!(
+        std::fs::read(destination.join("hook.py/runtime.log")).expect("runtime content survives"),
+        b"runtime"
+    );
+    let claim = world
+        .load_state()
+        .find_adapter_claim(COMPONENT, FRAMEWORK)
+        .cloned()
+        .expect("prior receipt remains durable");
+    assert!(
+        claim
+            .materialized_files
+            .iter()
+            .any(|file| file.relative_path == Path::new("hook.py/managed.txt"))
+    );
+}
+
+#[test]
+fn pre_fix_receipt_remains_visible_and_disable_cleans_recorded_state() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("seed a receipt using the pre-fix state directory");
+    assert!(world.registry_marker_exists());
+
+    let configured_state = world._root.path().join("configured-openclaw-state");
+    guard.set("OPENCLAW_STATE_DIR", &configured_state);
+
+    let status = manager.status(Some(COMPONENT)).expect("status old receipt");
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Degraded);
+
+    let disabled = manager
+        .disable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("disable old receipt");
+    assert!(disabled.claim_removed);
+    assert!(!world.registry_marker_exists());
+    assert!(!world.has_claim());
+}
+
+#[test]
+fn reenable_migrates_pre_fix_receipt_to_configured_state_dir() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    configure_plugin_with_skill(&world, "sec-audit");
+
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("seed a receipt using the pre-fix state directory");
+    assert!(world.registry_marker_exists());
+    assert!(
+        world
+            .openclaw_home
+            .join("skills/sec-audit/marker.txt")
+            .is_file()
+    );
+
+    let configured_state = world._root.path().join("configured-openclaw-state");
+    guard.set("OPENCLAW_STATE_DIR", &configured_state);
+    let outcome = manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("re-enable old receipt in configured state directory");
+    let claim = match outcome {
+        EnableOutcome::Enabled(claim) => claim,
+        EnableOutcome::Planned { .. } => panic!("expected enabled, got plan"),
+    };
+
+    assert!(configured_state.join("registry").join(COMPONENT).exists());
+    assert!(
+        configured_state
+            .join("skills/sec-audit/marker.txt")
+            .is_file()
+    );
+    assert!(!world.registry_marker_exists());
+    assert!(
+        !world
+            .openclaw_home
+            .join("skills/sec-audit/marker.txt")
+            .exists()
+    );
+    assert!(claim.resources.iter().any(|resource| matches!(
+        &resource.kind,
+        ClaimResourceKind::ExternalPath { path } if path == &configured_state
+    )));
+    let status = manager
+        .status(Some(COMPONENT))
+        .expect("status migrated receipt");
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Healthy);
+
+    let disabled = manager
+        .disable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("disable migrated receipt");
+    assert!(disabled.claim_removed);
+    assert!(!world.registry_marker_exists());
+    assert!(!configured_state.join("registry").join(COMPONENT).exists());
+    assert!(
+        !configured_state
+            .join("skills/sec-audit/marker.txt")
+            .exists()
+    );
+    assert!(!world.has_claim());
+}
+
+#[test]
+fn migration_cleanup_retry_tolerates_already_missing_plugin() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    configure_plugin_with_skill(&world, "sec-audit");
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("seed old registry and skill");
+
+    let old_skill = world.openclaw_home.join("skills/sec-audit");
+    let mut blocked = std::fs::metadata(&old_skill)
+        .expect("old skill metadata")
+        .permissions();
+    blocked.set_mode(0o000);
+    std::fs::set_permissions(&old_skill, blocked).expect("block old skill cleanup");
+
+    let configured_state = world._root.path().join("configured-openclaw-state");
+    guard.set("OPENCLAW_STATE_DIR", &configured_state);
+    let err = manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect_err("skill cleanup failure must keep the prior receipt");
+    assert!(matches!(
+        err,
+        AdapterError::ReenableCleanupIncomplete { .. }
+    ));
+    assert!(
+        !world.registry_marker_exists(),
+        "the first cleanup already unregistered the old plugin"
+    );
+    assert!(old_skill.exists());
+    let state = world.load_state();
+    let claim = state
+        .find_adapter_claim(COMPONENT, FRAMEWORK)
+        .expect("prior receipt retained for retry");
+    assert_eq!(recorded_openclaw_state_dir(claim), world.openclaw_home);
+
+    let mut retryable = std::fs::metadata(&old_skill)
+        .expect("blocked skill metadata")
+        .permissions();
+    retryable.set_mode(0o755);
+    std::fs::set_permissions(&old_skill, retryable).expect("allow cleanup retry");
+
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("retry treats the missing old plugin as already clean");
+    assert!(!old_skill.exists());
+    assert!(configured_state.join("registry").join(COMPONENT).exists());
+    assert!(
+        configured_state
+            .join("skills/sec-audit/marker.txt")
+            .is_file()
+    );
+}
+
+#[test]
+fn migration_dry_run_previews_cleanup_without_mutation() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    configure_plugin_with_skill(&world, "sec-audit");
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("seed old registry and skill");
+    let state_path = world.layout.state_dir.join("installed.toml");
+    let state_before = std::fs::read(&state_path).expect("state before dry-run");
+
+    let configured_state = world._root.path().join("configured-openclaw-state");
+    guard.set("OPENCLAW_STATE_DIR", &configured_state);
+    guard.set("FAKE_OC_ARGV_LOG", world.argv_log());
+    let outcome = manager
+        .enable(COMPONENT, Some(FRAMEWORK), true)
+        .expect("plan state-directory migration");
+    let plan = match outcome {
+        EnableOutcome::Planned { plan, .. } => plan,
+        EnableOutcome::Enabled(_) => panic!("dry-run must return a plan"),
+    };
+
+    let action_index = |needle: &str| {
+        plan.actions
+            .iter()
+            .position(|action| action.contains(needle))
+            .unwrap_or_else(|| panic!("missing '{needle}' in plan: {:?}", plan.actions))
+    };
+    assert!(
+        action_index("unregister prior openclaw plugin") < action_index("register openclaw plugin")
+    );
+    assert!(action_index("remove prior openclaw skill") < action_index("deliver openclaw skill"));
+
+    assert_eq!(
+        std::fs::read(&state_path).expect("state after dry-run"),
+        state_before
+    );
+    assert!(world.registry_marker_exists());
+    assert!(
+        world
+            .openclaw_home
+            .join("skills/sec-audit/marker.txt")
+            .is_file()
+    );
+    assert!(!configured_state.join("registry").join(COMPONENT).exists());
+    assert!(
+        argv_lines(&world.argv_log())
+            .iter()
+            .all(|line| !line.starts_with("plugins uninstall "))
+    );
+}
+
+#[test]
+fn reenable_dry_run_previews_stale_materialized_file_cleanup() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    configure_plugin_with_skill(&world, "sec-audit");
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("enable initial skill revision");
+
+    let source = world.resource_root.join("skills/sec-audit");
+    std::fs::remove_file(source.join("marker.txt")).expect("remove old managed source");
+    std::fs::write(source.join("renamed.txt"), b"skill-v2").expect("write renamed source");
+    record_owned_adapter_files(&world.layout, &world.resource_root);
+
+    let destination = world.openclaw_home.join("skills/sec-audit");
+    let stale = destination.join("marker.txt");
+    let outcome = manager
+        .enable(COMPONENT, Some(FRAMEWORK), true)
+        .expect("plan stale materialized-file cleanup");
+    let plan = match outcome {
+        EnableOutcome::Planned { plan, .. } => plan,
+        EnableOutcome::Enabled(_) => panic!("dry-run must return a plan"),
+    };
+    let cleanup = format!("remove stale materialized file {}", stale.display());
+    assert!(
+        plan.actions.iter().any(|action| action == &cleanup),
+        "missing '{cleanup}' in plan: {:?}",
+        plan.actions
+    );
+    assert!(stale.is_file(), "dry-run must not remove the stale output");
+    assert!(
+        !destination.join("renamed.txt").exists(),
+        "dry-run must not deliver the replacement output"
+    );
+}
+
+#[test]
+fn reenable_cleanup_failure_keeps_prior_receipt_and_installation() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("seed a receipt using the pre-fix state directory");
+
+    let configured_state = world._root.path().join("configured-openclaw-state");
+    guard.set("OPENCLAW_STATE_DIR", &configured_state);
+    guard.set("FAKE_OPENCLAW_FAIL", "uninstall");
+    let err = manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect_err("failed prior cleanup must block receipt replacement");
+
+    assert!(matches!(
+        err,
+        AdapterError::ReenableCleanupIncomplete { .. }
+    ));
+    assert!(world.registry_marker_exists());
+    assert!(!configured_state.join("registry").join(COMPONENT).exists());
+    let state = world.load_state();
+    let claim = state
+        .find_adapter_claim(COMPONENT, FRAMEWORK)
+        .expect("prior receipt must remain durable");
+    assert_eq!(recorded_openclaw_state_dir(claim), world.openclaw_home);
+    assert_eq!(claim.status, ClaimStatus::Enabled);
+}
+
+#[test]
+fn failed_install_after_state_migration_tracks_only_new_state() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("seed a receipt using the pre-fix state directory");
+
+    let configured_state = world._root.path().join("configured-openclaw-state");
+    guard.set("OPENCLAW_STATE_DIR", &configured_state);
+    guard.set("FAKE_OPENCLAW_FAIL", "install");
+    let err = manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect_err("new-state install must fail");
+    assert!(matches!(err, AdapterError::FrameworkCli { .. }));
+
+    assert!(!world.registry_marker_exists());
+    assert!(!configured_state.join("registry").join(COMPONENT).exists());
+    let state = world.load_state();
+    let claim = state
+        .find_adapter_claim(COMPONENT, FRAMEWORK)
+        .expect("new-state cleanup receipt");
+    assert_eq!(recorded_openclaw_state_dir(claim), configured_state);
+    assert_eq!(claim.status, ClaimStatus::CleanupFailed);
+
+    guard.unset("FAKE_OPENCLAW_FAIL");
+    let disabled = manager
+        .disable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("clean failed new-state install");
+    assert!(disabled.claim_removed);
+    assert!(!world.registry_marker_exists());
+    assert!(!configured_state.join("registry").join(COMPONENT).exists());
+    assert!(!world.has_claim());
+}
+
+#[test]
+fn legacy_home_must_be_restored_when_it_cannot_be_reconstructed() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("seed a receipt using the pre-fix state directory");
+
+    let configured_state = world._root.path().join("configured-openclaw-state");
+    guard.set("OPENCLAW_STATE_DIR", &configured_state);
+    guard.unset("OPENCLAW_HOME");
+    let err = manager
+        .status(Some(COMPONENT))
+        .expect_err("unknown legacy root must not self-authorize from receipt data");
+    assert!(matches!(err, AdapterError::ClaimValidation(_)));
+
+    guard.set("OPENCLAW_HOME", &world.openclaw_home);
+    let status = manager
+        .status(Some(COMPONENT))
+        .expect("restored legacy home validates the old receipt");
+    assert_eq!(status.entries[0].report.summary, AdapterSummary::Degraded);
 }
 
 #[test]
@@ -681,6 +1435,8 @@ fn dry_run_enable_does_not_register_or_persist() {
     let world = stage();
     world.apply_env(&guard, None);
     let manager = world.manager();
+    assert!(!world.layout.lock_file.exists());
+    assert!(!world.layout.central_log.exists());
 
     let outcome = manager
         .enable(COMPONENT, Some(FRAMEWORK), true)
@@ -707,6 +1463,14 @@ fn dry_run_enable_does_not_register_or_persist() {
             .join("registry")
             .join(COMPONENT)
             .exists()
+    );
+    assert!(
+        !world.layout.lock_file.exists(),
+        "dry-run must not create the install lock file"
+    );
+    assert!(
+        !world.layout.central_log.exists(),
+        "dry-run probes must not create operation records"
     );
 }
 
@@ -912,6 +1676,8 @@ fn dry_run_disable_leaves_state_unchanged() {
         .expect("enable");
     let state_path = world.layout.state_dir.join("installed.toml");
     let state_bytes_before = std::fs::read(&state_path).expect("read state file");
+    let log_bytes_before = std::fs::read(&world.layout.central_log).expect("read central log");
+    std::fs::remove_file(&world.layout.lock_file).expect("remove released seed lock file");
     assert!(
         world
             .load_state()
@@ -951,6 +1717,15 @@ fn dry_run_disable_leaves_state_unchanged() {
         state_bytes_before, state_bytes_after,
         "installed.toml must be byte-identical after dry-run disable"
     );
+    assert!(
+        !world.layout.lock_file.exists(),
+        "dry-run disable must not recreate the install lock file"
+    );
+    assert_eq!(
+        std::fs::read(&world.layout.central_log).expect("read central log after dry-run"),
+        log_bytes_before,
+        "dry-run disable must not append operation records"
+    );
     // Double-check: receipt still present and status unchanged.
     let state_after = world.load_state();
     let claim_after = state_after
@@ -974,6 +1749,7 @@ fn dry_run_disable_leaves_state_unchanged() {
         .expect("real disable");
     assert!(!real.dry_run);
     assert!(real.claim_removed, "real disable must remove receipt");
+    assert!(world.layout.lock_file.is_file());
     assert!(
         world
             .load_state()
@@ -1399,6 +2175,7 @@ fn authorized_unsafe_supported_includes_flag_once() {
             false,
             EnableOptions {
                 allow_unsafe_plugin_install: true,
+                profiles: Vec::new(),
             },
         )
         .expect("authorized unsafe enable");
@@ -1438,6 +2215,7 @@ fn authorized_unsafe_unsupported_blocks() {
             false,
             EnableOptions {
                 allow_unsafe_plugin_install: true,
+                profiles: Vec::new(),
             },
         )
         .expect_err("authorized-but-unsupported unsafe must block");
@@ -1469,6 +2247,7 @@ fn authorized_unsafe_deprecated_noop_blocks() {
             false,
             EnableOptions {
                 allow_unsafe_plugin_install: true,
+                profiles: Vec::new(),
             },
         )
         .expect_err("a deprecated no-op cannot satisfy unsafe authorization");
@@ -2129,6 +2908,7 @@ dest = "{{datadir}}/adapters/{{component}}/openclaw/"
             false,
             EnableOptions {
                 allow_unsafe_plugin_install: true,
+                profiles: Vec::new(),
             },
         )
         .expect_err("unsafe authorization must be rejected for skill_bundle");
@@ -2727,6 +3507,7 @@ fn authorized_unsafe_dry_run_shows_flag_without_mutation() {
             true,
             EnableOptions {
                 allow_unsafe_plugin_install: true,
+                profiles: Vec::new(),
             },
         )
         .expect("dry-run enable");
@@ -2768,6 +3549,7 @@ fn central_log_records_authorized_unsafe_install_argv() {
             false,
             EnableOptions {
                 allow_unsafe_plugin_install: true,
+                profiles: Vec::new(),
             },
         )
         .expect("authorized unsafe enable");
@@ -2803,6 +3585,7 @@ dest = "{{datadir}}/adapters/{{component}}/hermes/"
             false,
             EnableOptions {
                 allow_unsafe_plugin_install: true,
+                profiles: Vec::new(),
             },
         )
         .expect_err("unsafe authorization must be rejected for a non-OpenClaw framework");

@@ -41,7 +41,7 @@ anolisa bug
 # 查看特定组件日志
 anolisa logs <component>
 
-# 查看 warning 和 error 记录
+# 查看 warning 和 error 记录（--level 是 --severity 的别名）
 anolisa logs <component> --severity warn
 
 # 显示最后 N 行
@@ -100,7 +100,8 @@ anolisa env
 anolisa --verbose install tokenless
 
 # 替代方式：使用 YUM
-sudo yum install tokenless
+sudo yum install anolisa tokenless
+sudo anolisa --install-mode system adopt tokenless
 ```
 
 ---

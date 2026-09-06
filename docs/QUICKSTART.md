@@ -2,142 +2,81 @@
 
 [中文版](QUICKSTART_zh.md)
 
-ANOLISA is a server-side operating layer for AI Agent workloads. It provides Token optimization, workspace checkpoints, observability, security enforcement, persistent memory, and more — all installable via a unified CLI.
-
----
+ANOLISA is a server-side operating layer for AI Agent workloads. Install the
+CLI once, then enable only the capability that delivers the first result you
+want.
 
 ## Install the CLI
 
 ```bash
 curl -fsSL https://get.agentic-os.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-> Alinux 4 users can also install via `sudo yum install anolisa`.
+If the anolisa CLI is already installed, skip these commands. Alinux 4 users
+can alternatively install the CLI with `sudo yum install anolisa`.
 
-Verify:
+## Choose your first outcome
+
+### Reduce Agent Token usage
+
+Install Tokenless, connect it to Codex, Claude Code, Qoder, OpenClaw, Hermes,
+Qwen Code, or cosh, then verify a before/after Token record.
+
+[Start the three-minute Tokenless Quick Start →](user-guide/en/token-saving/tokenless/QUICKSTART.md)
+
+### Work with an Agent-native terminal
+
+Choose the terminal that matches your environment:
+
+- [Start with cosh-ng](user-guide/en/user-entrypoint/cosh-ng/QUICKSTART.md) — an AI-native terminal
+- [Start with Copilot Shell](user-guide/en/user-entrypoint/copilot-shell/QUICKSTART.md) — an extensible Agent Shell
+
+On Alibaba Cloud Linux 4, use the RPM backend so dnf selects the matching
+system libraries. Only the component action uses `sudo`:
 
 ```bash
-anolisa --version
+curl -fsSL https://get.agentic-os.sh | bash -s -- --component cosh-ng --backend rpm --install-mode system
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
----
+`--cosh-ng` remains available as shorthand for `--component cosh-ng`. On
+macOS arm64, use `--backend raw --install-mode user` instead.
 
-## Explore Your Environment
+### Add observability, security, or runtime controls
+
+| Goal | Start here |
+|------|------------|
+| Observe Agent activity and Token usage | [AgentSight](user-guide/en/agent-observability/agentsight/README.md) |
+| Add security enforcement | [Agent Sec Core](user-guide/en/agent-security/agent-sec-core/QUICKSTART.md) |
+| Create workspace recovery points | [ws-ckpt](user-guide/en/runtime/ws-ckpt.md) |
+| Mount Skills on demand | [SkillFS](user-guide/en/runtime/skillfs.md) |
+| Reuse context across sessions | [Agent Memory](user-guide/en/token-saving/agent-memory.md) |
+
+Each component page starts with its supported platforms and preferred
+installation path. Linux-only components must be installed and run on Linux.
+
+## Explore the installation
+
+Use the CLI to inspect the current machine and installed components:
 
 ```bash
-# Check platform capabilities
 anolisa env
-
-# List available components
 anolisa list
-```
-
----
-
-## Install Components
-
-Install components on demand. The current `agentsight`, `agent-sec-core`,
-`ws-ckpt`, and `skillfs` artifacts require system mode; the other examples
-below support user mode.
-
-```bash
-# Token optimization (via anolisa CLI)
-anolisa install tokenless
-# Or via npm:
-# npm install -g anolisa-tokenless
-
-# Workspace checkpoints (btrfs COW)
-sudo anolisa --install-mode system install ws-ckpt
-
-# Observability (Linux system mode; includes the agentsight-enforcer service)
-sudo anolisa --install-mode system install agentsight
-
-# Security (requires sudo)
-sudo anolisa --install-mode system install agent-sec-core
-
-# Persistent memory (MCP file-based)
-anolisa install agent-memory
-
-# Skill filesystem (FUSE virtual views)
-sudo anolisa --install-mode system install skillfs
-
-# OS skill library
-anolisa install os-skills
-
-# Copilot Shell (AI terminal gateway)
-anolisa install cosh
-```
-
-Check health:
-
-```bash
 anolisa status
 ```
 
----
-
-## Use Components
-
-After installation, each component operates independently:
+Adapters connect an installed component to an Agent framework. Scan the
+available integrations after installing a component:
 
 ```bash
-# Copilot Shell — AI terminal assistant
-cosh
-
-# Token optimization — compress tool schemas and command output
-tokenless compress-schema -f tool.json
-tokenless env-check --all
-
-# Workspace checkpoints — instant create/rollback
-ws-ckpt checkpoint -w ~/project -s v1 -m "initial"
-ws-ckpt rollback -w ~/project -s v1
-
-# Observability — trace Agent Token consumption
-sudo agentsight trace
-agentsight token --period week
-agentsight serve   # Web Dashboard: http://localhost:7396
-
-# Security — system hardening and skill verification
-agent-sec-cli harden --scan --config agentos_baseline
-agent-sec-cli skill-ledger status
+anolisa adapter scan
 ```
 
----
+## Next steps
 
-## Integrate with Agent Frameworks
-
-Bridge installed components to Agent frameworks (cosh / OpenClaw / Hermes):
-
-```bash
-anolisa adapter scan                        # Discover installed frameworks
-anolisa adapter enable tokenless openclaw   # tokenless → OpenClaw
-anolisa adapter enable ws-ckpt hermes       # ws-ckpt → Hermes
-```
-
----
-
-## Next Steps
-
-### Global
-
-- [Full User Guide](user-guide/en/README.md) — browse all component docs by category
-- [Installation Guide](user-guide/en/installation.md) — progressive install from CLI to full stack
-- [Troubleshooting](user-guide/en/troubleshooting.md) — common issues and fixes
-
-### User Entry Points
-
-- [anolisa CLI Reference](user-guide/en/user-entrypoint/anolisa-cli.md)
-- [Copilot Shell](user-guide/en/user-entrypoint/copilot-shell/QUICKSTART.md)
-- [OS Skills](user-guide/en/user-entrypoint/os-skills.md)
-
-### Runtime & Token Saving
-
-- [Workspace Checkpoints](user-guide/en/runtime/ws-ckpt.md)
-- [Skill Filesystem](user-guide/en/runtime/skillfs.md)
-- [Token Optimization](user-guide/en/token-saving/tokenless/QUICKSTART.md)
-- [Agent Memory](user-guide/en/token-saving/agent-memory.md)
-
-### Observability & Security
-
-- [AgentSight](user-guide/en/agent-observability/agentsight.md)
-- [AgentSecCore](user-guide/en/agent-security/agent-sec-core/QUICKSTART.md)
+- [Installation guide](user-guide/en/installation.md) — platform support, system mode, RPM, and all component install commands
+- [Full user guide](user-guide/en/README.md) — configure, operate, and troubleshoot each capability
+- [anolisa CLI reference](user-guide/en/user-entrypoint/anolisa-cli.md) — lifecycle and adapter commands
+- [Troubleshooting](user-guide/en/troubleshooting.md) — common installation and runtime failures
+- [Build from source](BUILDING.md) — developer builds only

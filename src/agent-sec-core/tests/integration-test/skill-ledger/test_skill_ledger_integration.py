@@ -148,6 +148,17 @@ def write_findings_file(parent: Path, name: str, findings: list | dict) -> Path:
     return path
 
 
+def snapshot_file_tree(root: Path) -> dict[str, bytes]:
+    """Return relative paths and contents for every file below *root*."""
+    if not root.is_dir():
+        return {}
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
 def read_latest_manifest(skill_dir: Path) -> dict:
     """Read ``.skill-meta/latest.json`` for assertions."""
     latest = skill_dir / ".skill-meta" / "latest.json"
@@ -781,7 +792,7 @@ def test_check_after_file_remove_drifted(ws):
 
 
 def test_check_tampered_manifest_hash(ws):
-    """Tamper with latest.json without re-hashing → status=tampered, exit 1."""
+    """Tampering wins over simultaneous live-tree drift."""
     skill = make_skill(ws.skills_dir, "check-tamper", {"f.txt": "safe"})
     env = ws.env()
 
@@ -800,12 +811,29 @@ def test_check_tampered_manifest_hash(ws):
     latest = skill / ".skill-meta" / "latest.json"
     data = json.loads(latest.read_text())
     data["scanStatus"] = "deny"  # tamper without re-hashing
+    data["userDecision"] = {
+        "action": "always_allow",
+        "reason": "attacker-controlled",
+    }
     latest.write_text(json.dumps(data))
+    (skill / "f.txt").write_text("changed")
 
     r = run_skill_ledger(["check", str(skill)], env_extra=env)
     assert r.returncode == 1, f"expected exit 1 for tampered, got {r.returncode}"
     out = parse_json_output(r.stdout)
     assert out["status"] == "tampered", f"expected tampered, got {out}"
+    for field in (
+        "versionId",
+        "createdAt",
+        "updatedAt",
+        "fileCount",
+        "manifestHash",
+        "userDecision",
+    ):
+        assert out[field] is None
+    assert "added" not in out
+    assert "removed" not in out
+    assert "modified" not in out
 
 
 def test_check_tampered_writes_security_event(ws):
@@ -867,8 +895,23 @@ def test_scan_recovers_tampered_latest_with_audit_event_and_valid_chain(ws):
 
     latest = skill / ".skill-meta" / "latest.json"
     data = json.loads(latest.read_text())
-    data["scanStatus"] = "deny"
+    trusted_v1 = read_latest_manifest(skill)
+    data["userDecision"] = {
+        "action": "always_allow",
+        "reason": "forged allow",
+    }
+    data["scans"] = [
+        {
+            "scanner": "forged-scanner",
+            "version": "attacker",
+            "status": "pass",
+            "findings": [],
+            "scannedAt": "attacker-time",
+        }
+    ]
+    data["scanStatus"] = "pass"
     latest.write_text(json.dumps(data))
+    (skill / "main.py").write_text("# changed\n")
 
     r2 = run_skill_ledger(
         ["scan", str(skill), "--scanners", "code-scanner"], env_extra=env
@@ -881,7 +924,13 @@ def test_scan_recovers_tampered_latest_with_audit_event_and_valid_chain(ws):
     assert event["fromStatus"] == "tampered"
     assert event["toStatus"] == out["scanStatus"]
     assert event["versionId"] == out["versionId"]
-    assert "auditEvents" not in read_latest_manifest(skill)
+    recovered = read_latest_manifest(skill)
+    assert recovered["versionId"] == "v000002"
+    assert recovered["previousVersionId"] == "v000001"
+    assert recovered["previousManifestSignature"] == trusted_v1["signature"]["value"]
+    assert recovered["userDecision"] is None
+    assert "forged-scanner" not in {scan["scanner"] for scan in recovered["scans"]}
+    assert "auditEvents" not in recovered
 
     audit_result = run_skill_ledger(["audit", str(skill)], env_extra=env)
     assert audit_result.returncode == 0, audit_result.stderr
@@ -901,17 +950,17 @@ def test_scan_recovers_tampered_latest_with_audit_event_and_valid_chain(ws):
     assert scan_event_result["audit_events"][0]["to_status"] == out["scanStatus"]
 
 
-def test_certify_recovers_tampered_latest_with_audit_event(ws):
-    """certify records tampered recovery when imported findings are signed."""
-    skill = make_skill(ws.skills_dir, "certify-tamper-recover", {"main.py": "# ok\n"})
-    event_data = ws.root / "events_certify_tamper_recover"
+def test_certify_recovers_missing_latest_with_audit_event(ws):
+    """certify treats a missing latest with history as tampered recovery."""
+    skill = make_skill(ws.skills_dir, "certify-missing-latest", {"main.py": "# ok\n"})
+    event_data = ws.root / "events_certify_missing_latest"
     event_data.mkdir()
     env = ws.env({"AGENT_SEC_DATA_DIR": str(event_data)})
     reset_security_event_writers()
 
     first_findings = write_findings_file(
         ws.fixtures,
-        "certify-tamper-recover-first.json",
+        "certify-missing-latest-first.json",
         [{"rule": "ok", "level": "pass", "message": "pass"}],
     )
     r1 = run_skill_ledger(
@@ -920,13 +969,20 @@ def test_certify_recovers_tampered_latest_with_audit_event(ws):
     assert r1.returncode == 0, f"initial certify failed: {r1.stderr}"
 
     latest = skill / ".skill-meta" / "latest.json"
-    data = json.loads(latest.read_text())
-    data["scanStatus"] = "deny"
-    latest.write_text(json.dumps(data))
+    trusted_v1 = read_latest_manifest(skill)
+    latest.unlink()
+
+    checked = run_skill_ledger(["check", str(skill)], env_extra=env)
+    assert checked.returncode == 1
+    checked_out = parse_json_output(checked.stdout)
+    assert checked_out["status"] == "tampered"
+    assert (
+        checked_out["reason"] == "latest.json is missing while version artifacts exist"
+    )
 
     second_findings = write_findings_file(
         ws.fixtures,
-        "certify-tamper-recover-second.json",
+        "certify-missing-latest-second.json",
         [{"rule": "ok", "level": "pass", "message": "pass"}],
     )
     r2 = run_skill_ledger(
@@ -937,7 +993,16 @@ def test_certify_recovers_tampered_latest_with_audit_event(ws):
     event = out["auditEvents"][0]
     assert event["type"] == "tampered_recovered"
     assert event["operation"] == "certify"
+    assert event["fromStatus"] == "tampered"
     assert event["toStatus"] == out["scanStatus"]
+    recovered = read_latest_manifest(skill)
+    assert recovered["versionId"] == "v000002"
+    assert recovered["previousVersionId"] == "v000001"
+    assert recovered["previousManifestSignature"] == trusted_v1["signature"]["value"]
+
+    audit_result = run_skill_ledger(["audit", str(skill)], env_extra=env)
+    assert audit_result.returncode == 0, audit_result.stderr
+    assert parse_json_output(audit_result.stdout)["valid"] is True
 
     events = read_security_events(event_data)
     reset_security_event_writers()
@@ -1445,6 +1510,217 @@ def test_scan_all_no_skill_dirs(ws):
     assert (
         "no skill directories" in combined.lower()
     ), f"Expected no-dirs message: {combined}"
+
+
+def test_readonly_system_scan_all_skips_while_read_commands_still_run(
+    ws,
+    monkeypatch,
+):
+    """Batch writes skip read-only system Skills without changing read commands."""
+    case_root = ws.root / "readonly_system_scan"
+    system_root = case_root / "system-skills"
+    system_skill = make_skill(system_root, "weather", {"main.py": "print('ok')\n"})
+    data_root = case_root / "xdg_data"
+    runtime_root = case_root / "runtime"
+    data_root.mkdir(parents=True)
+    runtime_root.mkdir()
+    write_skill_ledger_config(
+        case_root,
+        {
+            "enableDefaultSkillDirs": True,
+            "managedSkillDirs": [],
+        },
+    )
+    env = {
+        "XDG_CONFIG_HOME": str(case_root / "xdg_config"),
+        "XDG_DATA_HOME": str(data_root),
+        "XDG_RUNTIME_DIR": str(runtime_root),
+    }
+    config_path = (
+        case_root / "xdg_config" / "agent-sec" / "skill-ledger" / "config.json"
+    )
+    config_before = config_path.read_text()
+    monkeypatch.setattr(
+        config_module,
+        "DEFAULT_SYSTEM_SKILL_ROOTS",
+        (system_root,),
+    )
+    monkeypatch.setattr(
+        config_module,
+        "DEFAULT_SKILL_DIRS",
+        [f"{system_root}/*"],
+    )
+    monkeypatch.setattr(
+        "agent_sec_cli.skill_ledger.core.certifier.ledger_update_access",
+        lambda _root: (False, "read-only"),
+    )
+
+    scanned = run_skill_ledger(["scan", "--all"], env_extra=env)
+
+    assert scanned.returncode == 0, scanned.stderr
+    scan_out = parse_json_output(scanned.stdout)
+    assert scan_out["keyCreated"] is True
+    assert scan_out["results"] == [
+        {
+            "canonicalSkillDir": str(system_skill),
+            "skillName": "weather",
+            "status": "skipped",
+            "reasonCode": "readonly_system_skill",
+            "persisted": False,
+        }
+    ]
+    assert config_path.read_text() == config_before
+    assert not (system_skill / ".skill-meta").exists()
+
+    explicit_scan = run_skill_ledger(["scan", str(system_skill)], env_extra=env)
+
+    assert explicit_scan.returncode == 1
+    assert "skill-ledger analyze" in (explicit_scan.stdout + explicit_scan.stderr)
+    assert not (system_skill / ".skill-meta").exists()
+
+    analyzed = run_skill_ledger(
+        ["analyze", str(system_skill), "--format", "json"],
+        env_extra=env,
+    )
+    checked = run_skill_ledger(["check", "--all"], env_extra=env)
+    status = run_skill_ledger(["status"], env_extra=env)
+
+    assert analyzed.returncode == 0, analyzed.stderr
+    assert parse_json_output(analyzed.stdout)["status"] in {
+        "pass",
+        "warn",
+        "deny",
+    }
+    assert checked.returncode == 0, checked.stderr
+    assert parse_json_output(checked.stdout)["results"][0]["status"] == "none"
+    assert status.returncode == 0, status.stderr
+    status_out = parse_json_output(status.stdout)
+    assert status_out["skills"]["breakdown"]["none"] == 1
+    assert status_out["skills"]["health"] == "unscanned"
+    assert not (system_skill / ".skill-meta").exists()
+
+
+def test_scan_all_preserves_mixed_skip_success_and_error_exit_codes(
+    ws,
+    monkeypatch,
+):
+    """Skipped system Skills do not mask writable success or real user errors."""
+    case_root = ws.root / "mixed_system_scan"
+    system_root = case_root / "system-skills"
+    system_skill = make_skill(system_root, "system", {"main.py": "print('ok')\n"})
+    user_skill = make_skill(
+        case_root / "user-skills",
+        "user",
+        {"main.py": "print('ok')\n"},
+    )
+    data_root = case_root / "xdg_data"
+    runtime_root = case_root / "runtime"
+    data_root.mkdir(parents=True)
+    runtime_root.mkdir()
+    write_skill_ledger_config(
+        case_root,
+        {
+            "enableDefaultSkillDirs": False,
+            "managedSkillDirs": [str(system_skill), str(user_skill)],
+        },
+    )
+    env = {
+        "XDG_CONFIG_HOME": str(case_root / "xdg_config"),
+        "XDG_DATA_HOME": str(data_root),
+        "XDG_RUNTIME_DIR": str(runtime_root),
+    }
+    monkeypatch.setattr(
+        config_module,
+        "DEFAULT_SYSTEM_SKILL_ROOTS",
+        (system_root,),
+    )
+    monkeypatch.setattr(
+        "agent_sec_cli.skill_ledger.core.certifier.ledger_update_access",
+        lambda _root: (False, "read-only"),
+    )
+
+    successful = run_skill_ledger(["scan", "--all"], env_extra=env)
+
+    assert successful.returncode == 0, successful.stderr
+    successful_out = parse_json_output(successful.stdout)
+    assert [result["status"] for result in successful_out["results"]] == [
+        "skipped",
+        "scanned",
+    ]
+    assert not (system_skill / ".skill-meta").exists()
+    assert (user_skill / ".skill-meta" / "latest.json").is_file()
+
+    shutil.rmtree(user_skill / ".skill-meta")
+    original_compute_file_hashes = compute_file_hashes
+
+    def fail_user_hashing(skill_dir: str | Path) -> dict[str, str]:
+        if Path(skill_dir) == user_skill:
+            raise PermissionError("user ledger input is unreadable")
+        return original_compute_file_hashes(skill_dir)
+
+    monkeypatch.setattr(
+        "agent_sec_cli.skill_ledger.core.certifier.compute_file_hashes",
+        fail_user_hashing,
+    )
+
+    failed = run_skill_ledger(["scan", "--all"], env_extra=env)
+
+    assert failed.returncode == 1
+    failed_out = parse_json_output(failed.stdout)
+    assert [result["status"] for result in failed_out["results"]] == [
+        "skipped",
+        "error",
+    ]
+    assert "user ledger input is unreadable" in failed_out["results"][1]["error"]
+
+
+def test_init_baseline_creates_keys_but_skips_readonly_system_skill(
+    ws,
+    monkeypatch,
+):
+    """init retains key initialization while avoiding system Skill metadata writes."""
+    case_root = ws.root / "readonly_system_init"
+    system_root = case_root / "system-skills"
+    system_skill = make_skill(system_root, "weather", {"main.py": "print('ok')\n"})
+    data_root = case_root / "xdg_data"
+    runtime_root = case_root / "runtime"
+    data_root.mkdir(parents=True)
+    runtime_root.mkdir()
+    write_skill_ledger_config(
+        case_root,
+        {
+            "enableDefaultSkillDirs": True,
+            "managedSkillDirs": [],
+        },
+    )
+    env = {
+        "XDG_CONFIG_HOME": str(case_root / "xdg_config"),
+        "XDG_DATA_HOME": str(data_root),
+        "XDG_RUNTIME_DIR": str(runtime_root),
+    }
+    monkeypatch.setattr(
+        config_module,
+        "DEFAULT_SYSTEM_SKILL_ROOTS",
+        (system_root,),
+    )
+    monkeypatch.setattr(
+        config_module,
+        "DEFAULT_SKILL_DIRS",
+        [f"{system_root}/*"],
+    )
+    monkeypatch.setattr(
+        "agent_sec_cli.skill_ledger.core.certifier.ledger_update_access",
+        lambda _root: (False, "read-only"),
+    )
+
+    initialized = run_skill_ledger(["init"], env_extra=env)
+
+    assert initialized.returncode == 0, initialized.stderr
+    out = parse_json_output(initialized.stdout)
+    assert out["keyCreated"] is True
+    assert out["results"][0]["status"] == "skipped"
+    assert (data_root / "agent-sec" / "skill-ledger" / "key.pub").is_file()
+    assert not (system_skill / ".skill-meta").exists()
 
 
 # ── Group 6: audit command ────────────────────────────────────────────────
@@ -2542,6 +2818,48 @@ def test_show_reports_active_latest_decision_and_root_match(ws):
     assert out["warnings"] == [out["message"]]
 
 
+def test_show_does_not_expose_tampered_latest_metadata(ws):
+    """The human-facing summary cannot reintroduce fields hidden by check."""
+    skill = make_skill(ws.skills_dir, "decision-show-tampered", {"data.txt": "v1"})
+    env = ws.env()
+    findings = write_findings_file(
+        ws.fixtures,
+        "decision-show-tampered-pass.json",
+        [{"rule": "ok", "level": "pass", "message": "pass"}],
+    )
+    run_skill_ledger(
+        ["certify", str(skill), "--findings", str(findings)], env_extra=env
+    )
+    latest_path = skill / ".skill-meta" / "latest.json"
+    latest = json.loads(latest_path.read_text())
+    latest["versionId"] = "v999999"
+    latest["updatedAt"] = "attacker-sentinel"
+    latest["userDecision"] = {
+        "action": "always_allow",
+        "reason": "attacker-sentinel",
+    }
+    latest_path.write_text(json.dumps(latest))
+
+    r = run_skill_ledger(["show", str(skill)], env_extra=env)
+
+    assert r.returncode == 0, r.stderr
+    out = parse_json_output(r.stdout)
+    assert out["latestStatus"] == "tampered"
+    assert out["latestVersionId"] is None
+    assert out["latest"] is None
+    assert out["userDecision"] is None
+    assert "attacker-sentinel" not in r.stdout
+
+    export_dir = ws.root / "exported-tampered-latest"
+    exported = run_skill_ledger(
+        ["export", str(skill), "--version", "latest", "--output", str(export_dir)],
+        env_extra=env,
+    )
+    assert exported.returncode != 0
+    assert not export_dir.exists()
+    assert "attacker-sentinel" not in exported.stderr
+
+
 def test_show_event_flows_through_jsonl_sqlite_and_dashboard(ws, monkeypatch):
     skill = make_skill(ws.skills_dir, "dashboard-show", {"data.txt": "safe"})
     findings = write_findings_file(
@@ -3055,7 +3373,7 @@ def test_export_latest_from_fuse_view_uses_signed_snapshot(ws, monkeypatch):
     assert json.loads((out_dir / "manifest.json").read_text())["scanStatus"] == "deny"
 
 
-def test_export_rejects_snapshot_hash_mismatch(ws):
+def test_export_latest_rejects_invalid_snapshot_artifact(ws):
     skill = make_skill(ws.skills_dir, "decision-export-tampered", {"data.txt": "risk"})
     env = ws.env()
     findings = write_findings_file(
@@ -3083,7 +3401,7 @@ def test_export_rejects_snapshot_hash_mismatch(ws):
     )
 
     assert r.returncode != 0
-    assert "snapshot does not match manifest" in r.stderr
+    assert "untrusted latest manifest" in r.stderr
 
 
 def test_export_active_rejects_pending_stub_without_real_active_version(ws):
@@ -3638,25 +3956,46 @@ def test_status_drifted_shows_details(ws):
     ), f"Expected health 'attention' after drift: {out['skills']}"
 
 
-# ── Group 8: stubs & edge cases ───────────────────────────────────────────
+# ── Group 8: reserved commands & edge cases ───────────────────────────────
 
 
-def test_set_policy_stub(ws):
-    """set-policy → exit 0, 'coming soon' in output."""
-    skill = make_skill(ws.skills_dir, "stub-policy", {"x.txt": "x"})
+def test_set_policy_removed(ws: Workspace) -> None:
+    """The removed set-policy placeholder fails without creating ledger state."""
+    skill = make_skill(ws.skills_dir, "removed-policy", {"x.txt": "x"})
+    metadata_dir = skill / ".skill-meta"
+    assert not metadata_dir.exists()
+
     r = run_skill_ledger(
         ["set-policy", str(skill), "--policy", "allow"],
         env_extra=ws.env(),
     )
-    assert r.returncode == 0, f"exit {r.returncode}: {r.stderr}"
-    assert "coming soon" in r.stdout.lower()
+    assert r.returncode == 2, f"exit {r.returncode}: {r.stderr}"
+    assert r.stdout == ""
+    error = strip_ansi(r.stderr).lower()
+    assert "no such command" in error
+    assert "set-policy" in error
+    assert not metadata_dir.exists()
 
 
-def test_rotate_keys_stub(ws):
-    """rotate-keys → exit 0, 'coming soon' in output."""
+def test_rotate_keys_not_implemented(ws: Workspace) -> None:
+    """rotate-keys fails explicitly without changing the isolated key store."""
+    key_dir = ws.xdg_data / "agent-sec" / "skill-ledger"
+    before = snapshot_file_tree(key_dir)
+    keyring_existed = (key_dir / "keyring").is_dir()
+    assert {"key.enc", "key.pub"}.issubset(before)
+
     r = run_skill_ledger(["rotate-keys"], env_extra=ws.env())
-    assert r.returncode == 0, f"exit {r.returncode}: {r.stderr}"
-    assert "coming soon" in r.stdout.lower()
+    assert r.returncode == 1, f"exit {r.returncode}: {r.stderr}"
+    assert r.stdout == ""
+    assert r.stderr == (
+        "Error: rotate-keys is not implemented; no keys were changed.\n"
+    )
+    assert snapshot_file_tree(key_dir) == before
+    assert (key_dir / "keyring").is_dir() is keyring_existed
+
+    help_result = run_skill_ledger(["rotate-keys", "--help"], env_extra=ws.env())
+    assert help_result.returncode == 0, help_result.stderr
+    assert "not implemented" in strip_ansi(help_result.stdout).lower()
 
 
 def test_list_scanners(ws):

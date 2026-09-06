@@ -16,7 +16,7 @@ SkillFS 是面向 agent skill 的本地 FUSE 文件系统。它解析 `SKILL.md`
 - 通过 `skillfs-views.toml` 选择默认 view 和 secondary views。
 - 在挂载后的 agent 视图中直接显示默认 view 的 skills。
 - 始终暴露虚拟 `skill-discover` skill，让 agent 能发现 secondary views 中的
-  skills 及其 source paths。
+  skills，并打开其中提供的路径。
 - 读取 `SKILL.md` 时执行条件块编译和命令归一化。
 - 将普通文件和子目录透传到底层物理 source 树。
 - 支持 normal mount 和 in-place mount。
@@ -179,7 +179,7 @@ skills = ["apple-notes", "blogwatcher"]
 
 - `/skills` 显示 default view 中的 skills。
 - `skill-discover/SKILL.md` 列出 secondary views 中的 skills 及其
-  `source_path`。
+  可读 `source_path`。
 
 ## `SKILL.md` 格式
 
@@ -357,6 +357,8 @@ crates/
   skillfs-core/   parser, store, views, compiler, env, watcher
   skillfs-fuse/   FUSE 文件系统与 POSIX passthrough 层
   skillfs-cli/    mount / stop / classify / validate / list
+container/        Sidecar 镜像：Dockerfile、entrypoint、preflight、mount probe
+deploy/kubernetes/  Kubernetes Sidecar manifest 与示例 Skill source
 docs/specs/       实现规格
 docs/security/    external decision 与 runtime activation 文档
 docs/testing/     POSIX 验收与 external harness 文档
@@ -372,11 +374,34 @@ scripts/          build.sh、test.sh 与可选 POSIX harness
   - 创建临时 skill source 目录和 `skillfs-views.toml`。
   - 验证 FUSE mount 启动成功。
   - 验证 `/skills` 暴露 default-view skills。
-  - 验证 `skill-discover` 列出 secondary views 和 `source_path`。
+  - 验证 `skill-discover` 提供的路径可读取 secondary skills。
   - 验证 skill 目录中物理文件的 passthrough read。
   - 验证通过 `SIGTERM` 干净卸载。
 - [scripts/posix/run_pjdfstest.sh](scripts/posix/run_pjdfstest.sh)
   - 可选 external POSIX harness；普通 `cargo test` 不依赖它。
+
+## Kubernetes Sidecar
+
+SkillFS 可以通过特权 Sidecar 向非特权工作负载提供 FUSE view。部署需要
+Kubernetes 1.29+、`/dev/fuse`，并允许 Sidecar 使用特权模式。
+
+```bash
+cd src/skillfs
+IMAGE=registry.example.com/anolisa/skillfs-sidecar:$(git rev-parse --short=12 HEAD)
+DOCKERFILE=container/Dockerfile
+# Alibaba Cloud Linux 4 使用 container/Dockerfile.alinux4。
+docker build -f "$DOCKERFILE" -t "$IMAGE" .
+docker run --rm "$IMAGE" skillfs --version
+docker push "$IMAGE"
+kubectl apply -f deploy/kubernetes/00-namespace.yaml
+kubectl apply -f deploy/kubernetes/10-example-configmap.yaml
+sed "s|skillfs-sidecar:dev|$IMAGE|g" deploy/kubernetes/20-pod.yaml |
+  kubectl apply -f -
+```
+
+部署、`skill-discover` 验证、故障排查和清理见
+[Kubernetes Sidecar 用户指南](../../docs/user-guide/zh/runtime/skillfs-kubernetes-sidecar.md)
+（[English](../../docs/user-guide/en/runtime/skillfs-kubernetes-sidecar.md)）。
 
 ## 测试覆盖
 
@@ -442,12 +467,23 @@ SkillFS 不在文件系统核心中执行扫描、签名校验或风险判断。
 - `--notify-socket <PATH>` 将 debounce 后的 skill mutation 通知发给外部 daemon。
   Notify v2 使用 canonical 路径和完整 flat/Hermes `skillId` 标识 Skill；
   live/backing 路径通过独立 resolver 解析。in-place notify mount，以及任何配置了
-  `--ledger-backing-root` 的 notify mount，都要求配置 `--trusted-peer-exe`，
-  确保 daemon 访问 source 前 authenticated resolver 已可用。
+  `--ledger-backing-root` 的 notify mount，都要求配置 authenticated control-peer
+  mode，确保 daemon 访问 source 前 resolver 已可用。
+  `--notify-auth-key-file <PATH>` 可以为实现拟议合同的容器 peer 启用双向 HMAC
+  认证。内部 notify v2 业务 payload 保持不变，request 和 acknowledgement 由
+  session-bound tag 保护。Authenticated notify 还要求 owner 匹配的 socket 位于
+  owner 匹配且不给 group/other 任何权限的目录下，目录推荐使用 `0700`；socket
+  同样不能给 group/other 任何权限。首版 profile 要求 SkillFS 与 sec-core 使用相同
+  effective UID。本次 SkillFS 改动不实现 peer-side sec-core 支持，该工作仍由 #2439
+  跟踪。
 - `--activation-events-log <PATH>` 将 activation protocol events 写成 JSONL。
 - `--activation-reload-mode poll` 在 notify events 后重读 activation state，
   无需 remount 即可更新 resolver。
-- startup reconcile 会在挂载启动后对已知 skills 发送 best-effort 通知。
+- startup reconcile 会通过 notify worker 为已知 skill 入队，并在暂时性投递失败时
+  重试直至 daemon 确认，因此 SkillFS 先于 daemon 启动时仍能自行收敛。不可重试的
+  错误会被报告，认证结果不确定时则使用所有 skill 共享的有界 endpoint 预算，避免
+  重试风暴。重试与可观测性细节见
+  [Reconcile Delivery Durability](docs/security/runtime-activation-implementation-plan.md#reconcile-delivery-durability)。
 - `--ledger-backing-root <PATH>` 为 in-place activation/notify mount 提供
   daemon 可见的 source 视图，因为公开 source path 已经是 FUSE over-mount。
   推荐使用 `/run/user/$UID/skillfs-ledger/...` 或
@@ -459,17 +495,18 @@ SkillFS 不在文件系统核心中执行扫描、签名校验或风险判断。
   process-name spoofing 风险。
 - `--trusted-writer <NAME>` 是已废弃的兼容门禁，基于 Linux TGID `comm`；
   进程名可伪造，不应用作生产可信依据。
-- `--control-socket <PATH>` 配合 `--trusted-peer-exe <PATH>` 启动可信 Unix
-  socket control plane。可信 peer 可通过 `meta.writeActivation`、
-  `meta.setActivationXattr` 等方法写 activation JSON 或 xattr。packaged Skill
-  Ledger worker 通过 `sys.executable` 启动，因此其 executable 是
-  `/usr/bin/python3.11`，不是 `skill-ledger` launcher。
+- `--control-socket <PATH>` 在恰好配置一种 peer mode 时启动可信 Unix socket
+  control plane。`--trusted-peer-exe <PATH>` 保持宿主机 executable 认证；
+  `--trusted-peer-key-file <PATH>` 启用显式容器 HMAC profile，以 session-bound tag
+  保护 control request/response，并要求显式 socket path。可信 peer 可通过
+  `meta.writeActivation`、`meta.setActivationXattr` 等方法写 activation JSON 或
+  xattr。
 - control plane 是 opt-in 且需认证的。endpoint 按优先级解析：CLI
   `--control-socket` > 配置 `[control_socket].path` > 默认的每用户 endpoint
-  `/run/user/<uid>/skillfs/control.sock`。仅配置 trusted peer 而未给显式
-  path 时使用默认 endpoint；仅给显式 path 而未配置 trusted peer 为配置错误；
-  两者都没有则 control plane 保持关闭。默认 endpoint 绝不 fallback 到 `/tmp`
-  或 `/var/tmp`，第二个实例也绝不 unlink 处于活跃状态的 endpoint。
+  `/run/user/<uid>/skillfs/control.sock`。executable peer 未给显式 path 时使用默认
+  endpoint；HMAC mode 始终要求显式 path；仅给显式 path 而未配置 peer mode 为配置
+  错误。默认 endpoint 绝不 fallback 到 `/tmp` 或 `/var/tmp`，第二个实例也绝不
+  unlink 处于活跃状态的 endpoint。
 - `skill.resolveLiveSource` 是只读查询，将调用方给定的 canonical Skill 目录
   映射到物理 live/backing source。返回 `managed=true`（含推导出的
   `skillId`、`relativeSkillDir`、`liveSkillDir` 以及实际 live 目录的
@@ -480,6 +517,8 @@ SkillFS 不在文件系统核心中执行扫描、签名校验或风险判断。
 
 ## 文档
 
+- [Kubernetes Sidecar 部署指南](../../docs/user-guide/zh/runtime/skillfs-kubernetes-sidecar.md) -
+  在 Kubernetes 中构建、部署、验证和清理 SkillFS。
 - [docs/specs/skillfs-spec.md](docs/specs/skillfs-spec.md) - 架构、运行时一致性边界和部署场景。
 - [docs/specs/core-spec.md](docs/specs/core-spec.md) - `skillfs-core` 实现。
 - [docs/specs/fuse-spec.md](docs/specs/fuse-spec.md) - `skillfs-fuse` 实现。

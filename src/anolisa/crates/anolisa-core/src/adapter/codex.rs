@@ -11,6 +11,9 @@
 //! codex plugin add <plugin>@<marketplace>
 //! ```
 //!
+//! After installation, hook-bearing plugins are trusted through Codex's
+//! app-server so they also work in non-interactive `codex exec` sessions.
+//!
 //! `disable` reverses this via `codex plugin remove` /
 //! `codex plugin marketplace remove` and then removes the marketplace
 //! directory (which contains the symlink). All CLI, file, and symlink IO
@@ -18,6 +21,8 @@
 //!
 //! Env contract: `CODEX_BIN` overrides the executable (tests point it at a
 //! fake CLI); `XDG_DATA_HOME` relocates the marketplace base.
+
+mod hook_trust;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -32,7 +37,7 @@ use super::driver::{
     ClaimResourceRef, ConditionStatus, DetectResult, DisableReport, DriverCtx, DriverPlan,
     FrameworkCommand, FrameworkDriver, HostEnv, PreparedEnable, find_binary_in_path,
 };
-use super::util::{bool_status, cli_failure_reason, digest_tree, display_command, now_iso8601};
+use super::util::{bool_status, cli_failure_reason, display_command, now_iso8601};
 
 /// Default timeout for a Codex CLI invocation.
 const CLI_TIMEOUT: Duration = Duration::from_secs(60);
@@ -133,7 +138,6 @@ impl FrameworkDriver for CodexDriver {
         );
         Ok(AdapterBundle {
             resource_root: root.clone(),
-            digest: digest_tree(root),
             plugin_id,
         })
     }
@@ -146,7 +150,7 @@ impl FrameworkDriver for CodexDriver {
         let layout = MarketplaceLayout::resolve(bundle, ctx)?;
         let add_cmd = build_marketplace_add_cmd(&layout.root);
         let plugin_cmd = build_plugin_add_cmd(&layout.plugin_ref());
-        let actions = vec![
+        let mut actions = vec![
             format!(
                 "write codex marketplace manifest {}",
                 layout.manifest().display()
@@ -159,6 +163,12 @@ impl FrameworkDriver for CodexDriver {
             format!("register codex marketplace '{}'", layout.marketplace),
             format!("add codex plugin '{}'", layout.plugin_ref()),
         ];
+        if bundle_declares_hooks(bundle, ctx) {
+            actions.push(format!(
+                "trust hooks declared by codex plugin '{}'",
+                layout.plugin_ref()
+            ));
+        }
         Ok(DriverPlan {
             framework: self.name().to_string(),
             component: ctx.component.clone(),
@@ -223,7 +233,9 @@ impl FrameworkDriver for CodexDriver {
                 adapter_type: ctx.adapter_type.clone(),
                 enabled_at: now_iso8601(),
                 resource_root: bundle.resource_root.clone(),
-                bundle_digest: bundle.digest.clone(),
+                bundle_digest: None,
+                source_revision: None,
+                materialized_files: Vec::new(),
                 driver_schema: DRIVER_SCHEMA_VERSION,
                 status: ClaimStatus::Enabled,
                 notices: Vec::new(),
@@ -281,6 +293,12 @@ impl FrameworkDriver for CodexDriver {
                 reason: cli_failure_reason("plugin add", &output),
             });
         }
+        if bundle_declares_hooks_for_root(
+            &claim.resource_root,
+            ctx.declared_bundle_entry.as_deref(),
+        ) {
+            establish_hook_trust(ctx, &layout)?;
+        }
         Ok(())
     }
 
@@ -299,10 +317,6 @@ impl FrameworkDriver for CodexDriver {
             reason: Some(detect.reason.clone()),
             resource: None,
         });
-        let bundle_condition = bundle_match_condition(claim);
-        let bundle_status = bundle_condition.status;
-        conditions.push(bundle_condition);
-
         // Symlink presence is a reliable filesystem check independent of
         // the CLI.
         let symlink_ok = claim_symlink(claim)
@@ -383,7 +397,6 @@ impl FrameworkDriver for CodexDriver {
             claim.status,
             detect.detected,
             bool_status(symlink_ok),
-            bundle_status,
             mkt_status,
             plugin_status,
         );
@@ -576,6 +589,37 @@ impl MarketplaceLayout {
     }
 }
 
+fn bundle_declares_hooks(bundle: &AdapterBundle, ctx: &DriverCtx) -> bool {
+    bundle_declares_hooks_for_root(&bundle.resource_root, ctx.declared_bundle_entry.as_deref())
+}
+
+fn bundle_declares_hooks_for_root(resource_root: &Path, declared_entry: Option<&str>) -> bool {
+    hook_trust::bundle_declares_hooks(
+        resource_root,
+        &resource_root.join(declared_entry.unwrap_or(CODEX_PLUGIN_MANIFEST)),
+    )
+}
+
+/// Trust only the hooks Codex attributes to the plugin just installed.
+fn establish_hook_trust(ctx: &DriverCtx, layout: &MarketplaceLayout) -> Result<(), AdapterError> {
+    let program = codex_bin();
+    let output = ctx.ops.run_framework_rpc(hook_trust::list_session(
+        program.clone(),
+        CLI_TIMEOUT,
+        &layout.root,
+    ))?;
+    let Some(state) = hook_trust::plugin_trust_state(&program, &output, &layout.plugin_ref())?
+    else {
+        return Ok(());
+    };
+    let output = ctx.ops.run_framework_rpc(hook_trust::write_session(
+        program.clone(),
+        CLI_TIMEOUT,
+        state,
+    ))?;
+    hook_trust::confirm_write(&program, &output)
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -751,41 +795,13 @@ fn claim_symlink(claim: &AdapterClaim) -> Option<(PathBuf, PathBuf)> {
     })
 }
 
-/// Build the `ResourceBundleMatches` condition.
-fn bundle_match_condition(claim: &AdapterClaim) -> AdapterCondition {
-    let kind = AdapterConditionKind::ResourceBundleMatches;
-    match (&claim.bundle_digest, digest_tree(&claim.resource_root)) {
-        (Some(recorded), Some(current)) if recorded == &current => AdapterCondition {
-            kind,
-            status: ConditionStatus::True,
-            reason: None,
-            resource: None,
-        },
-        (Some(_), Some(_)) => AdapterCondition {
-            kind,
-            status: ConditionStatus::False,
-            reason: Some("resource bundle changed since enable".to_string()),
-            resource: None,
-        },
-        _ => AdapterCondition {
-            kind,
-            status: ConditionStatus::Unknown,
-            reason: Some("no digest recorded or resource root unavailable".to_string()),
-            resource: None,
-        },
-    }
-}
-
 /// Roll signals into a summary. Healthy requires the framework detected,
-/// the plugin symlink functional, the resource bundle verified unchanged,
-/// and both marketplace and plugin verified present — a broken symlink or
-/// a drifted/vanished bundle means codex is not actually serving this
-/// plugin, so registration alone must not report Healthy.
+/// the plugin symlink functional, and both marketplace and plugin verified
+/// present. Package-owned source integrity is added by the Manager.
 fn summarize(
     claim_status: ClaimStatus,
     detected: bool,
     symlink: ConditionStatus,
-    bundle: ConditionStatus,
     marketplace: ConditionStatus,
     plugin: ConditionStatus,
 ) -> AdapterSummary {
@@ -795,7 +811,7 @@ fn summarize(
     if !detected {
         return AdapterSummary::Degraded;
     }
-    let signals = [symlink, bundle, marketplace, plugin];
+    let signals = [symlink, marketplace, plugin];
     if signals.contains(&ConditionStatus::False) {
         return AdapterSummary::Degraded;
     }
@@ -884,25 +900,21 @@ mod tests {
     }
 
     #[test]
-    fn summarize_folds_symlink_and_bundle_signals() {
+    fn summarize_folds_framework_signals() {
         use ConditionStatus::{False, True, Unknown};
-        let s = |symlink, bundle, mkt, plugin| {
-            summarize(ClaimStatus::Enabled, true, symlink, bundle, mkt, plugin)
+        let s = |symlink, marketplace, plugin| {
+            summarize(ClaimStatus::Enabled, true, symlink, marketplace, plugin)
         };
-        // Registration alone must not report Healthy: a broken symlink or
-        // a drifted bundle degrades even with both registrations intact.
-        assert_eq!(s(False, Unknown, True, True), AdapterSummary::Degraded);
-        assert_eq!(s(True, False, True, True), AdapterSummary::Degraded);
-        // Undecidable drift is Unknown, not Healthy.
-        assert_eq!(s(True, Unknown, True, True), AdapterSummary::Unknown);
-        assert_eq!(s(True, True, True, True), AdapterSummary::Healthy);
+        assert_eq!(s(False, True, True), AdapterSummary::Degraded);
+        assert_eq!(s(True, Unknown, True), AdapterSummary::Unknown);
+        assert_eq!(s(True, True, True), AdapterSummary::Healthy);
         // CleanupFailed and framework-missing keep their priority.
         assert_eq!(
-            summarize(ClaimStatus::CleanupFailed, true, True, True, True, True),
+            summarize(ClaimStatus::CleanupFailed, true, True, True, True),
             AdapterSummary::CleanupFailed
         );
         assert_eq!(
-            summarize(ClaimStatus::Enabled, false, True, True, True, True),
+            summarize(ClaimStatus::Enabled, false, True, True, True),
             AdapterSummary::Degraded
         );
     }

@@ -8,25 +8,35 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use anolisa_core::domain::{Installation, LifecycleStatus, ManagementRelation, ProviderBinding};
+#[cfg(test)]
+use anolisa_core::NotSupportedServiceManager;
+use anolisa_core::domain::{
+    Installation, InstallationScope, LifecycleStatus, ManagementRelation, ProviderBinding,
+};
 use anolisa_core::facts::{FactsError, JournalEvidence, JournalInventory};
 use anolisa_core::{
-    CheckEnv, CheckOutcome, CheckSpec, CheckStatus, ComponentManifest, DependencyKind,
-    DependencyResolution, DependencyResolver, DependencyStatus, HealthEntry, ObjectKind,
-    ResolverEnv, ServiceManager, ServiceRef, ServiceScope, ServiceState, check_owned_file,
-    run_check, service_for_install_mode, user_service_for_install_mode,
+    CheckEnv, CheckOutcome, CheckSpec, CheckStatus, ComponentManifest, ComponentSnapshot,
+    DependencyKind, DependencyResolution, DependencyResolver, DependencyStatus, HealthEntry,
+    IntegrityStatus, ManifestHealthProvenance, ManifestHealthSnapshot, NativePackageProvenance,
+    NativePackageSnapshot, ProbeEvidence, ResolverEnv, ServiceManager, ServiceRef, ServiceScope,
+    ServiceState, StateRootScope, StateSnapshot, check_owned_file, run_check,
+    service_for_install_mode, user_service_for_install_mode,
 };
 use anolisa_platform::fs_layout::FsLayout;
 use anolisa_platform::pkg_query::PackageQuery;
+use anolisa_platform::privilege;
 use anolisa_platform::rpm_query::RpmPackageQuery;
+use chrono::{SecondsFormat, Utc};
 use clap::Parser;
 use serde::Serialize;
 
 use crate::color::Palette;
 use crate::commands::common;
 use crate::commands::state_view::{ScopedStateRoot, StateScope, StateView, StateVisibility};
+use crate::commands::tier1::component_observation::{
+    self, AggregateSelection, RpmDrift, drift_probe_identity, rpm_drift_from_evidence,
+};
 use crate::commands::tier1::rpm_install;
-use crate::commands::tier1::status::{self, AggregateRecordSelection, ComponentRecord, RpmDrift};
 use crate::context::{CliContext, InstallMode};
 use crate::response::{CliError, render_json_with_status};
 
@@ -102,6 +112,32 @@ struct DoctorComponent {
     dependencies: Vec<DoctorDependency>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     fix_plan: Vec<FixSuggestion>,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+/// Doctor fields shared with the snapshot conformance suite.
+pub(super) struct DoctorConformanceProjection {
+    /// Resolved component identity.
+    pub(super) name: String,
+    /// Aggregate doctor status.
+    pub(super) status: String,
+    /// State root scope projected by doctor.
+    pub(super) scope: String,
+    /// Whether this record wins multi-root precedence.
+    pub(super) active: bool,
+    /// Whether the current invocation may mutate this record.
+    pub(super) mutable_by_current_invocation: bool,
+    /// Higher-precedence scope hiding this record.
+    pub(super) shadowed_by: Option<String>,
+    /// State file that supplied this record.
+    pub(super) state_path: Option<String>,
+    /// Lifecycle status recorded in state.
+    pub(super) state_status: Option<String>,
+    /// Component version projected from state.
+    pub(super) version: Option<String>,
+    /// Finding codes emitted by the production diagnosis path.
+    pub(super) finding_codes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -239,9 +275,11 @@ fn payload_has_issues(payload: &DoctorPayload) -> bool {
 
 fn diagnose(component: Option<&str>, ctx: &CliContext) -> Result<DoctorPayload, CliError> {
     let mut view = StateView::load(ctx, COMMAND, StateVisibility::UserPlusSystem)?;
-    status::migrate_view_states(&mut view);
+    component_observation::normalize_view_states(&mut view);
     let rpm_query = RpmPackageQuery::system();
-    let component = component.map(|name| lookup_component_name_from_view(name, &view, ctx));
+    let component = component
+        .map(|name| lookup_component_name_from_view(name, &view, ctx))
+        .transpose()?;
     let env = anolisa_env::EnvService::detect();
     let resolver_env = resolver_env_from_facts(&env);
     let current_system_service = service_for_install_mode(ctx.install_mode.as_str(), &env);
@@ -256,127 +294,379 @@ fn diagnose(component: Option<&str>, ctx: &CliContext) -> Result<DoctorPayload, 
         dry_run: ctx.dry_run,
     };
 
-    Ok(diagnose_from_view(&view, component.as_deref(), &view_ctx))
+    diagnose_from_view(&view, component.as_deref(), &view_ctx)
 }
 
 fn diagnose_from_view(
     view: &StateView,
     component: Option<&str>,
     view_ctx: &DoctorViewContext<'_>,
-) -> DoctorPayload {
-    // `None` keeps the projection from executing manifest health checks:
-    // doctor runs the same structured checks itself below (honoring
-    // dry-run), and a second executor here would double every probe.
-    let records = status::select_components_from_view(
+) -> Result<DoctorPayload, CliError> {
+    let records = component_observation::select_visible_components(
         view,
         component,
-        AggregateRecordSelection::ActiveOnly,
-        None,
-        None,
-        None,
+        AggregateSelection::ActiveOnly,
     );
     let warnings = view.warnings.clone();
     let mut components = Vec::new();
     let journal_roots = scan_journal_roots(view);
     let mut claimed_journals = BTreeSet::new();
+    let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
 
-    for mut record in records {
-        let root = root_for_record(view, &record);
-        let remediation_scope = root.map_or(view.writable.scope, |root| root.scope);
-        let object =
-            root.and_then(|root| root.state.find(ObjectKind::Component, record.name.as_str()));
-        normalize_rpm_record(&mut record, object);
-        let layout = root
-            .map(|root| &root.layout)
-            .unwrap_or(&view.writable.layout);
-        let (manifest, manifest_warning) = if object.is_some() {
-            resolve_component_manifest(layout, &record.name)
-        } else {
-            (None, None)
-        };
+    for record in records {
+        let root = record.root;
+        let remediation_scope = root.scope;
+        let layout = &root.layout;
+        let (manifest, manifest_warning) = resolve_component_manifest(layout, &record.object.name);
         let probe_ctx = DoctorProbeContext {
             layout,
             resolver_env: view_ctx.resolver_env,
             rpm_query: view_ctx.rpm_query,
-            system_service: view_ctx.system_service_for_root(root),
+            system_service: view_ctx.system_service_for_root(Some(root)),
             user_service: view_ctx.user_service,
             dry_run: view_ctx.dry_run,
         };
-        let mut component = diagnose_component(
+        let snapshot = collect_doctor_snapshot(
             &record,
+            manifest.as_ref(),
+            manifest_warning.as_deref(),
+            &probe_ctx,
+            &checked_at,
+        )?;
+        let mut diagnosed = diagnose_component(
+            &snapshot,
             remediation_scope,
-            object,
             manifest.as_ref(),
             manifest_warning,
             &probe_ctx,
-        );
-        apply_component_journal_guard(&journal_roots, &mut component, &mut claimed_journals);
-        dedupe_fix_plan(&mut component.fix_plan);
-        component.status = component_status(&component);
-        components.push(component);
+            &checked_at,
+        )?;
+        apply_component_journal_guard(&journal_roots, &mut diagnosed, &mut claimed_journals);
+        dedupe_fix_plan(&mut diagnosed.fix_plan);
+        diagnosed.status = component_status(&diagnosed);
+        components.push(diagnosed);
+    }
+
+    if components.is_empty()
+        && let Some(component) = component
+    {
+        let scope = installation_scope_for_root(view.writable.scope);
+        let snapshot = component_observation::absent_snapshot(
+            component,
+            scope,
+            view.writable.state_path.clone(),
+        )
+        .map_err(snapshot_cli_error)?;
+        let probe_ctx = DoctorProbeContext {
+            layout: &view.writable.layout,
+            resolver_env: view_ctx.resolver_env,
+            rpm_query: view_ctx.rpm_query,
+            system_service: view_ctx.system_service_for_root(None),
+            user_service: view_ctx.user_service,
+            dry_run: view_ctx.dry_run,
+        };
+        let mut diagnosed = diagnose_component(
+            &snapshot,
+            view.writable.scope,
+            None,
+            None,
+            &probe_ctx,
+            &checked_at,
+        )?;
+        dedupe_fix_plan(&mut diagnosed.fix_plan);
+        diagnosed.status = component_status(&diagnosed);
+        components.push(diagnosed);
     }
 
     let recovery_roots = collect_root_recovery(&journal_roots, &claimed_journals, component);
     let summary = summarize(&components, &recovery_roots);
-    DoctorPayload {
+    Ok(DoctorPayload {
         summary,
         components,
         recovery_roots,
         warnings,
         dry_run: view_ctx.dry_run,
+    })
+}
+
+fn snapshot_cli_error(error: component_observation::ComponentObservationError) -> CliError {
+    CliError::Runtime {
+        command: COMMAND.to_string(),
+        reason: format!("failed to assemble component status snapshot: {error}"),
     }
 }
 
-fn lookup_component_name_from_view(input: &str, view: &StateView, ctx: &CliContext) -> String {
+fn installation_scope_for_root(scope: StateScope) -> InstallationScope {
+    match scope {
+        StateScope::System => InstallationScope::System,
+        StateScope::User => InstallationScope::User {
+            uid: privilege::effective_uid(),
+        },
+    }
+}
+
+fn collect_doctor_snapshot(
+    record: &crate::commands::state_view::ScopedInstalledObject<'_>,
+    manifest: Option<&ComponentManifest>,
+    manifest_warning: Option<&str>,
+    probe_ctx: &DoctorProbeContext<'_>,
+    observed_at: &str,
+) -> Result<ComponentSnapshot, CliError> {
+    let owned_files = component_observation::owned_files_evidence(record);
+    let native_package =
+        collect_doctor_native_package(record.object, probe_ctx.rpm_query, observed_at);
+    let manifest_health =
+        collect_doctor_manifest_health(record.object, manifest, manifest_warning, probe_ctx);
+    component_observation::snapshot_from_record(
+        record,
+        owned_files,
+        native_package,
+        manifest_health,
+        ProbeEvidence::NotRequested,
+        ProbeEvidence::NotRequested,
+    )
+    .map_err(snapshot_cli_error)
+}
+
+#[cfg(test)]
+/// Collects the production doctor snapshot with command-specific probes disabled.
+pub(super) fn snapshot_for_conformance(
+    record: &crate::commands::state_view::ScopedInstalledObject<'_>,
+    rpm_query: &dyn PackageQuery,
+    observed_at: &str,
+) -> Result<ComponentSnapshot, CliError> {
+    let resolver_env = ResolverEnv::default();
+    let service = NotSupportedServiceManager::new("conformance probe disabled".to_string());
+    let probe_ctx = DoctorProbeContext {
+        layout: &record.root.layout,
+        resolver_env: &resolver_env,
+        rpm_query,
+        system_service: &service,
+        user_service: &service,
+        dry_run: false,
+    };
+    collect_doctor_snapshot(record, None, None, &probe_ctx, observed_at)
+}
+
+#[cfg(test)]
+/// Projects a snapshot through the production doctor diagnosis path.
+pub(super) fn projection_for_conformance(
+    snapshot: &ComponentSnapshot,
+    layout: &FsLayout,
+    rpm_query: &dyn PackageQuery,
+    checked_at: &str,
+) -> Result<DoctorConformanceProjection, CliError> {
+    let resolver_env = ResolverEnv::default();
+    let service = NotSupportedServiceManager::new("conformance probe disabled".to_string());
+    let probe_ctx = DoctorProbeContext {
+        layout,
+        resolver_env: &resolver_env,
+        rpm_query,
+        system_service: &service,
+        user_service: &service,
+        dry_run: false,
+    };
+    let remediation_scope = match snapshot.request().scope() {
+        InstallationScope::System => StateScope::System,
+        InstallationScope::User { .. } => StateScope::User,
+    };
+    let mut component = diagnose_component(
+        snapshot,
+        remediation_scope,
+        None,
+        None,
+        &probe_ctx,
+        checked_at,
+    )?;
+    component.status = component_status(&component);
+    Ok(DoctorConformanceProjection {
+        name: component.name,
+        status: component.status,
+        scope: component.scope,
+        active: component.active,
+        mutable_by_current_invocation: component.mutable_by_current_invocation,
+        shadowed_by: component.shadowed_by,
+        state_path: component.state_path,
+        state_status: component.state_status,
+        version: component.version,
+        finding_codes: component
+            .findings
+            .into_iter()
+            .map(|finding| finding.code)
+            .collect(),
+    })
+}
+
+fn collect_doctor_native_package(
+    installation: &Installation,
+    query: &dyn PackageQuery,
+    observed_at: &str,
+) -> ProbeEvidence<NativePackageSnapshot, NativePackageProvenance> {
+    let ProviderBinding::Delegated { pm, package, .. } = &installation.binding else {
+        return ProbeEvidence::NotRequested;
+    };
+    if !matches!(installation.scope, InstallationScope::System) {
+        return ProbeEvidence::NotRequested;
+    }
+    let Some(package) = package.resolved_name() else {
+        return ProbeEvidence::NotRequested;
+    };
+    component_observation::native_package_evidence(*pm, package, query, observed_at)
+}
+
+fn collect_doctor_manifest_health(
+    installation: &Installation,
+    manifest: Option<&ComponentManifest>,
+    manifest_warning: Option<&str>,
+    probe_ctx: &DoctorProbeContext<'_>,
+) -> ProbeEvidence<ManifestHealthSnapshot, ManifestHealthProvenance> {
+    let provenance = ManifestHealthProvenance {
+        path: common::installed_component_manifest_path(
+            probe_ctx.layout,
+            &installation.name,
+            COMMAND,
+        )
+        .unwrap_or_else(|_| {
+            probe_ctx
+                .layout
+                .state_dir
+                .join("component-manifests")
+                .join(&installation.name)
+                .join("component.toml")
+        }),
+    };
+    let Some(manifest) = manifest else {
+        return match manifest_warning {
+            Some(reason) if !reason.starts_with("component contract unavailable") => {
+                ProbeEvidence::Unavailable {
+                    provenance,
+                    reason: reason.to_string(),
+                }
+            }
+            _ => ProbeEvidence::Absent { provenance },
+        };
+    };
+    if installation.binding.is_delegated() {
+        return ProbeEvidence::Present {
+            provenance,
+            value: ManifestHealthSnapshot {
+                outcome: CheckOutcome {
+                    spec_label: "component.health_check".to_string(),
+                    status: CheckStatus::Skipped,
+                    detail: Some(
+                        "RPM components are verified through rpmdb; raw-layout health probes are skipped"
+                            .to_string(),
+                    ),
+                    children: Vec::new(),
+                },
+            },
+        };
+    }
+    let Some(spec) = manifest.health_spec() else {
+        return ProbeEvidence::Absent { provenance };
+    };
+    let skip_active_service_probe = installation.status == LifecycleStatus::Disabled;
+    let outcome = run_doctor_check(&spec, Some(manifest), probe_ctx, skip_active_service_probe);
+    ProbeEvidence::Present {
+        provenance,
+        value: ManifestHealthSnapshot { outcome },
+    }
+}
+
+fn lookup_component_name_from_view(
+    input: &str,
+    view: &StateView,
+    ctx: &CliContext,
+) -> Result<String, CliError> {
     if view.has_exact_component(input) {
-        return input.to_string();
+        return Ok(input.to_string());
     }
     common::lookup_component_name_in_store(input, &view.writable.state, ctx, COMMAND)
 }
 
-fn root_for_record<'a>(
-    view: &'a StateView,
-    record: &ComponentRecord,
-) -> Option<&'a ScopedStateRoot> {
-    let state_path = record.state_path.as_deref()?;
-    view.visible_roots
-        .iter()
-        .find(|root| root.state_path.display().to_string() == state_path)
-}
-
 fn diagnose_component(
-    record: &ComponentRecord,
+    snapshot: &ComponentSnapshot,
     remediation_scope: StateScope,
-    object: Option<&Installation>,
     manifest: Option<&ComponentManifest>,
     manifest_warning: Option<String>,
     probe_ctx: &DoctorProbeContext<'_>,
-) -> DoctorComponent {
-    let mut out = DoctorComponent {
-        name: record.name.clone(),
-        status: "ok".to_string(),
-        scope: record.scope.clone(),
-        remediation_scope,
-        active: record.active,
-        mutable_by_current_invocation: record.mutable_by_current_invocation,
-        shadowed_by: record.shadowed_by.clone(),
-        state_path: record.state_path.clone(),
-        state_status: Some(
-            object
-                .map(|object| common::installation_status_str(object).to_string())
-                .unwrap_or_else(|| record.status.clone()),
+    checked_at: &str,
+) -> Result<DoctorComponent, CliError> {
+    let (object, state_path) = match snapshot.state() {
+        ProbeEvidence::Absent { .. } => (None, None),
+        ProbeEvidence::Present {
+            provenance,
+            value: StateSnapshot::Active(installation),
+        } => (
+            Some(installation.as_ref()),
+            Some(provenance.path.display().to_string()),
         ),
-        version: record.version.clone(),
+        ProbeEvidence::Present {
+            value: StateSnapshot::Quarantined(_),
+            ..
+        } => {
+            return Err(CliError::Runtime {
+                command: COMMAND.to_string(),
+                reason: format!(
+                    "component snapshot for '{}' contains quarantined state",
+                    snapshot.request().component()
+                ),
+            });
+        }
+        ProbeEvidence::Unavailable { reason, .. } => {
+            return Err(CliError::Runtime {
+                command: COMMAND.to_string(),
+                reason: reason.clone(),
+            });
+        }
+        ProbeEvidence::NotRequested => {
+            return Err(CliError::Runtime {
+                command: COMMAND.to_string(),
+                reason: format!(
+                    "component snapshot for '{}' did not request state",
+                    snapshot.request().component()
+                ),
+            });
+        }
+    };
+    let visibility = snapshot.state_visibility();
+    let state_status = object
+        .map(common::installation_status_str)
+        .unwrap_or("not_installed");
+    let mut out = DoctorComponent {
+        name: snapshot.request().component().to_string(),
+        status: "ok".to_string(),
+        scope: object.map_or_else(
+            || "none".to_string(),
+            |_| {
+                visibility.map_or_else(
+                    || installation_scope_label(snapshot.request().scope()).to_string(),
+                    |metadata| state_root_scope_label(metadata.root_scope).to_string(),
+                )
+            },
+        ),
+        remediation_scope,
+        active: visibility.is_some_and(|metadata| metadata.active),
+        mutable_by_current_invocation: visibility
+            .is_some_and(|metadata| metadata.mutable_by_current_invocation),
+        shadowed_by: visibility
+            .and_then(|metadata| metadata.shadowed_by)
+            .map(state_root_scope_label)
+            .map(str::to_string),
+        state_path,
+        state_status: Some(state_status.to_string()),
+        version: object.and_then(component_observation::record_version),
         findings: Vec::new(),
         health_checks: Vec::new(),
         dependencies: Vec::new(),
         fix_plan: Vec::new(),
     };
 
-    add_state_finding(record, object, &mut out);
-    add_health_entries(record, object, probe_ctx.layout, &mut out);
+    add_state_finding(state_status, &mut out);
+    add_persisted_health(object, probe_ctx.layout, &mut out);
+    add_owned_file_health(snapshot, object, probe_ctx.layout, checked_at, &mut out);
     add_manifest_warning(manifest_warning, object, probe_ctx.layout, &mut out);
-    add_structured_health(manifest, object, probe_ctx, &mut out);
+    add_snapshot_manifest_health(snapshot, object, probe_ctx.layout, &mut out);
     add_service_refs(manifest, object, probe_ctx, &mut out);
     add_runtime_dependencies(
         manifest,
@@ -385,42 +675,32 @@ fn diagnose_component(
         probe_ctx.dry_run,
         &mut out,
     );
-    add_rpm_drift(object, probe_ctx.rpm_query, &mut out);
-    out
+    add_rpm_drift(snapshot, object, &mut out);
+    Ok(out)
 }
 
-fn normalize_rpm_record(record: &mut ComponentRecord, object: Option<&Installation>) {
-    let Some(object) = object else {
-        return;
-    };
-    if !object.binding.is_delegated() {
-        return;
+fn installation_scope_label(scope: InstallationScope) -> &'static str {
+    match scope {
+        InstallationScope::System => "system",
+        InstallationScope::User { .. } => "user",
     }
-    // `status`' legacy manifest probes expand `{bindir}` through the raw
-    // `/usr/local` layout. Delegated packages own their files under distro
-    // paths, so doctor must not treat those raw-layout probe results as
-    // package health.
-    record
-        .health
-        .retain(|entry| !entry.name.starts_with(&format!("{}:", record.name)));
-    record.status = crate::commands::common::installation_status_str(object).to_string();
 }
 
-fn add_state_finding(
-    record: &ComponentRecord,
-    object: Option<&Installation>,
-    out: &mut DoctorComponent,
-) {
-    let status = object
-        .map(common::installation_status_str)
-        .unwrap_or(record.status.as_str());
+fn state_root_scope_label(scope: StateRootScope) -> &'static str {
+    match scope {
+        StateRootScope::User => "user",
+        StateRootScope::System => "system",
+    }
+}
+
+fn add_state_finding(status: &str, out: &mut DoctorComponent) {
     match status {
         "installed" | "adopted" | "observed" | "disabled" => {}
         "not_installed" => {
             out.findings.push(finding(
                 FindingSeverity::Error,
                 "component_not_installed",
-                format!("component '{}' is not installed", record.name),
+                format!("component '{}' is not installed", out.name),
                 "state",
                 None,
             ));
@@ -428,7 +708,7 @@ fn add_state_finding(
                 out.remediation_scope,
                 "install_component",
                 "install",
-                &record.name,
+                &out.name,
                 "install the component before running component-level diagnostics",
             ));
         }
@@ -437,7 +717,7 @@ fn add_state_finding(
             "component_degraded",
             format!(
                 "component '{}' is marked degraded in ANOLISA state",
-                record.name
+                out.name
             ),
             "state",
             None,
@@ -445,50 +725,100 @@ fn add_state_finding(
         "failed" => out.findings.push(finding(
             FindingSeverity::Error,
             "component_failed",
-            format!(
-                "component '{}' is marked failed in ANOLISA state",
-                record.name
-            ),
+            format!("component '{}' is marked failed in ANOLISA state", out.name),
             "state",
             None,
         )),
         other => out.findings.push(finding(
             FindingSeverity::Warning,
             "component_status_attention",
-            format!("component '{}' has status '{other}'", record.name),
+            format!("component '{}' has status '{other}'", out.name),
             "state",
             None,
         )),
     }
 }
 
-fn add_health_entries(
-    record: &ComponentRecord,
+fn add_persisted_health(
     object: Option<&Installation>,
     layout: &FsLayout,
     out: &mut DoctorComponent,
 ) {
-    for entry in &record.health {
-        out.health_checks.push(health_from_entry(entry));
-        let Some(severity) = severity_for_health_status(&entry.status) else {
+    let Some(object) = object else {
+        return;
+    };
+    let manifest_prefix = format!("{}:", object.name);
+    for entry in &object.health {
+        // Delegated packages are verified through rpmdb. Persisted raw-layout
+        // manifest probes expand paths under /usr/local and do not describe
+        // the files owned by the package manager.
+        if object.binding.is_delegated() && entry.name.starts_with(&manifest_prefix) {
             continue;
+        }
+        add_health_entry(entry, Some(object), layout, out);
+    }
+}
+
+fn add_owned_file_health(
+    snapshot: &ComponentSnapshot,
+    object: Option<&Installation>,
+    layout: &FsLayout,
+    checked_at: &str,
+    out: &mut DoctorComponent,
+) {
+    let ProbeEvidence::Present { value, .. } = snapshot.owned_files() else {
+        return;
+    };
+    for observation in &value.files {
+        if observation.status == IntegrityStatus::Skipped {
+            continue;
+        }
+        let reason = match &observation.status {
+            IntegrityStatus::ProbeLimitExceeded { size, limit } => Some(format!(
+                "file size {size} exceeds the {limit}-byte integrity probe ceiling; \
+                 the recorded digest was not re-checked this run"
+            )),
+            _ => None,
         };
-        out.findings.push(finding(
-            severity,
-            format!("health_{}", sanitize_code(&entry.status)),
-            format!("health check '{}' reported '{}'", entry.name, entry.status),
-            "health",
-            entry.reason.clone(),
-        ));
-        out.fix_plan.extend(suggestions_for_health(
-            out.remediation_scope,
-            &record.name,
-            &entry.name,
-            &entry.status,
+        add_health_entry(
+            &HealthEntry {
+                name: format!("integrity:{}", observation.path.display()),
+                status: observation.status.label().to_string(),
+                checked_at: checked_at.to_string(),
+                reason,
+            },
             object,
             layout,
-        ));
+            out,
+        );
     }
+}
+
+fn add_health_entry(
+    entry: &HealthEntry,
+    object: Option<&Installation>,
+    layout: &FsLayout,
+    out: &mut DoctorComponent,
+) {
+    out.health_checks.push(health_from_entry(entry));
+    let Some(severity) = severity_for_health_status(&entry.status) else {
+        return;
+    };
+    out.findings.push(finding(
+        severity,
+        format!("health_{}", sanitize_code(&entry.status)),
+        format!("health check '{}' reported '{}'", entry.name, entry.status),
+        "health",
+        entry.reason.clone(),
+    ));
+    out.fix_plan.extend(suggestions_for_health(
+        out.remediation_scope,
+        &out.name,
+        &entry.name,
+        &entry.status,
+        object,
+        layout,
+    ));
 }
 
 fn add_manifest_warning(
@@ -534,38 +864,20 @@ fn add_manifest_warning(
     out.fix_plan.extend(fixes);
 }
 
-fn add_structured_health(
-    manifest: Option<&ComponentManifest>,
+fn add_snapshot_manifest_health(
+    snapshot: &ComponentSnapshot,
     object: Option<&Installation>,
-    probe_ctx: &DoctorProbeContext<'_>,
+    layout: &FsLayout,
     out: &mut DoctorComponent,
 ) {
     let Some(object) = object else {
         return;
     };
-    let Some(manifest) = manifest else {
+    let ProbeEvidence::Present { value, .. } = snapshot.manifest_health() else {
         return;
     };
-    if object.binding.is_delegated() {
-        out.health_checks.push(DoctorHealthCheck {
-            name: "component.health_check".to_string(),
-            status: "skipped".to_string(),
-            source: "structured_health".to_string(),
-            detail: Some(
-                "RPM components are verified through rpmdb; raw-layout health probes are skipped"
-                    .to_string(),
-            ),
-            checked_at: None,
-        });
-        return;
-    }
-    let Some(spec) = manifest.health_spec() else {
-        return;
-    };
-    let skip_active_service_probe = object.status == LifecycleStatus::Disabled;
-    let outcome = run_doctor_check(&spec, Some(manifest), probe_ctx, skip_active_service_probe);
     let component = out.name.clone();
-    add_check_outcome(&component, object, probe_ctx.layout, &outcome, out);
+    add_check_outcome(&component, object, layout, &value.outcome, out);
 }
 
 fn run_doctor_check(
@@ -1228,8 +1540,8 @@ fn add_dependency_resolution(resolution: &DependencyResolution, out: &mut Doctor
 }
 
 fn add_rpm_drift(
+    snapshot: &ComponentSnapshot,
     object: Option<&Installation>,
-    rpm_query: &dyn PackageQuery,
     out: &mut DoctorComponent,
 ) {
     let Some(object) = object else {
@@ -1238,7 +1550,7 @@ fn add_rpm_drift(
     if !object.binding.is_delegated() {
         return;
     }
-    let Some((package, recorded_evr)) = status::drift_probe_identity(object) else {
+    let Some((package, recorded_evr)) = drift_probe_identity(object) else {
         out.health_checks.push(DoctorHealthCheck {
             name: "rpmdb".to_string(),
             status: "unverified".to_string(),
@@ -1265,7 +1577,7 @@ fn add_rpm_drift(
         ));
         return;
     };
-    match status::probe_rpm_drift(package, recorded_evr, rpm_query) {
+    match rpm_drift_from_evidence(snapshot.native_package(), recorded_evr) {
         Some(RpmDrift::Drifted { reason }) => {
             out.health_checks.push(DoctorHealthCheck {
                 name: format!("rpmdb:{package}"),
@@ -1848,7 +2160,11 @@ fn health_from_entry(entry: &HealthEntry) -> DoctorHealthCheck {
 
 fn severity_for_health_status(status: &str) -> Option<FindingSeverity> {
     match status {
-        "ok" | "skipped" | "unverified" => None,
+        // `probe_limit_exceeded` sits with `unverified`: the bytes were
+        // never examined, so there is no defect to report. The entry still
+        // appears verbatim in `health_checks` above, so the operator can
+        // see the file went unhashed without it being raised as a fault.
+        "ok" | "skipped" | "unverified" | "probe_limit_exceeded" => None,
         "not_supported" | "unsupported" | "unsupported_kind" | "out_of_bounds"
         | "unsupported_target" | "not_regular_file" | "timeout" => Some(FindingSeverity::Warning),
         _ => Some(FindingSeverity::Error),
@@ -2137,9 +2453,11 @@ mod tests {
     use anolisa_core::state_store::StateStore;
     use anolisa_core::transaction::Transaction;
     use anolisa_core::{
-        DependencyStatus, FakeServiceManager, HealthEntry, NotSupportedServiceManager, ServiceOp,
+        DependencyStatus, FakeServiceManager, HealthEntry, NotSupportedServiceManager, ObjectKind,
+        ServiceOp,
     };
-    use anolisa_platform::pkg_query::{PackageInfo, PackageQueryError};
+    use anolisa_platform::pkg_query::{PackageInfo, PackageQueryError, PackageVersion};
+    use std::cell::Cell;
     use std::path::PathBuf;
 
     struct MissingPackageQuery;
@@ -2157,25 +2475,27 @@ mod tests {
         }
     }
 
-    fn record(name: &str, status: &str) -> ComponentRecord {
-        ComponentRecord {
-            name: name.to_string(),
-            status: status.to_string(),
-            scope: "system".to_string(),
-            active: true,
-            mutable_by_current_invocation: true,
-            shadowed_by: None,
-            state_path: Some("/tmp/anolisa-system-state/installed.toml".to_string()),
-            version: Some("1.0.0".to_string()),
-            installed_at: None,
-            last_operation_id: None,
-            enabled_features: Vec::new(),
-            health: Vec::new(),
-            adapters: Vec::new(),
-            rpm_package: None,
-            rpm_evr: None,
-            rpm_source_repo: None,
-            provisioned_packages: Vec::new(),
+    struct CountingPackageQuery {
+        calls: Cell<usize>,
+    }
+
+    impl PackageQuery for CountingPackageQuery {
+        fn query_installed(&self, package: &str) -> Result<Option<PackageInfo>, PackageQueryError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(Some(PackageInfo {
+                name: package.to_string(),
+                version: PackageVersion {
+                    epoch: None,
+                    version: "1.0.0".to_string(),
+                    release: Some("1.al4".to_string()),
+                },
+                arch: "x86_64".to_string(),
+                origin: None,
+            }))
+        }
+
+        fn query_available(&self, _package: &str) -> Result<Vec<PackageInfo>, PackageQueryError> {
+            Ok(Vec::new())
         }
     }
 
@@ -2349,7 +2669,7 @@ mod tests {
             user_service: &user_service,
             dry_run: false,
         };
-        diagnose_from_view(&view, Some("cosh"), &view_ctx)
+        diagnose_from_view(&view, Some("cosh"), &view_ctx).expect("diagnose test view")
     }
 
     fn diagnose_inactive_owned(layout: &FsLayout) -> DoctorPayload {
@@ -2371,7 +2691,7 @@ mod tests {
             user_service: &user_service,
             dry_run: false,
         };
-        diagnose_from_view(&view, Some("agentsight"), &view_ctx)
+        diagnose_from_view(&view, Some("agentsight"), &view_ctx).expect("diagnose test view")
     }
 
     fn state_with_component(installation: Installation) -> StateStore {
@@ -2430,7 +2750,13 @@ mod tests {
         store
     }
 
-    fn scoped_doctor_view(user_state: StateStore, system_state: StateStore) -> StateView {
+    fn scoped_doctor_view(mut user_state: StateStore, mut system_state: StateStore) -> StateView {
+        for installation in &mut user_state.installations {
+            installation.scope = InstallationScope::User { uid: 1000 };
+        }
+        for installation in &mut system_state.installations {
+            installation.scope = InstallationScope::System;
+        }
         let user_root = ScopedStateRoot {
             scope: StateScope::User,
             layout: FsLayout::user_with_overrides(
@@ -2515,7 +2841,7 @@ mod tests {
             user_service: &user_service,
             dry_run: true,
         };
-        diagnose_from_view(view, component, &view_ctx)
+        diagnose_from_view(view, component, &view_ctx).expect("diagnose test view")
     }
 
     #[test]
@@ -2612,6 +2938,104 @@ mod tests {
     }
 
     #[test]
+    fn named_missing_component_uses_state_absent_snapshot() {
+        let view = system_only_doctor_view(StateStore::empty());
+
+        let payload = diagnose_test_view(&view, Some("ghost"));
+
+        assert_eq!(payload.components.len(), 1);
+        let component = &payload.components[0];
+        assert_eq!(component.name, "ghost");
+        assert_eq!(component.scope, "none");
+        assert!(!component.active);
+        assert!(!component.mutable_by_current_invocation);
+        assert_eq!(component.state_path, None);
+        assert_eq!(component.state_status.as_deref(), Some("not_installed"));
+        assert_eq!(component.status, "not_installed");
+    }
+
+    #[test]
+    fn doctor_queries_native_package_exactly_once() {
+        let object =
+            resolved_delegated_object("cosh", "copilot-shell", ManagementRelation::Observed);
+        let view = system_only_doctor_view(state_with_component(object));
+        let resolver_env = ResolverEnv::default();
+        let query = CountingPackageQuery {
+            calls: Cell::new(0),
+        };
+        let system_service = FakeServiceManager::new();
+        let user_service = FakeServiceManager::with_scope(ServiceScope::User);
+        let view_ctx = DoctorViewContext {
+            resolver_env: &resolver_env,
+            rpm_query: &query,
+            current_system_service: &system_service,
+            system_scope_service: &system_service,
+            user_service: &user_service,
+            dry_run: false,
+        };
+
+        let payload =
+            diagnose_from_view(&view, Some("cosh"), &view_ctx).expect("diagnose test view");
+
+        assert_eq!(query.calls.get(), 1);
+        assert!(
+            payload.components[0]
+                .health_checks
+                .iter()
+                .any(|check| check.name == "rpmdb:copilot-shell" && check.status == "ok")
+        );
+    }
+
+    #[test]
+    fn doctor_projects_owned_file_evidence_from_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let layout = FsLayout::system(Some(tmp.path().to_path_buf()));
+        let missing = layout.bin_dir.join("agentsight");
+        let mut object = owned_object("agentsight", LifecycleStatus::Installed);
+        push_owned_file(&mut object, missing.clone());
+        let view = system_view_with_layout(layout, state_with_component(object));
+
+        let payload = diagnose_test_view(&view, Some("agentsight"));
+
+        let component = &payload.components[0];
+        assert!(component.health_checks.iter().any(|check| {
+            check.name == format!("integrity:{}", missing.display())
+                && check.status == "missing_file"
+        }));
+        assert!(
+            component
+                .findings
+                .iter()
+                .any(|finding| finding.code == "health_missing_file")
+        );
+    }
+
+    #[test]
+    fn doctor_reports_installed_manifest_parse_failure_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let layout = FsLayout::system(Some(tmp.path().to_path_buf()));
+        write_manifest_snapshot(&layout, "agentsight", "invalid = [");
+        let view = system_view_with_layout(
+            layout,
+            state_with_component(owned_object("agentsight", LifecycleStatus::Installed)),
+        );
+
+        let payload = diagnose_test_view(&view, Some("agentsight"));
+
+        let manifest_findings = payload.components[0]
+            .findings
+            .iter()
+            .filter(|finding| finding.code == "manifest_unavailable")
+            .collect::<Vec<_>>();
+        assert_eq!(manifest_findings.len(), 1);
+        assert!(
+            manifest_findings[0].detail.as_deref().is_some_and(
+                |detail| detail.contains("failed to parse installed manifest snapshot")
+            )
+        );
+    }
+
+    #[test]
     fn system_doctor_view_uses_only_visible_system_root() {
         let view = system_only_doctor_view(state_with_component(delegated_object(
             "system-tool",
@@ -2658,7 +3082,8 @@ mod tests {
             dry_run: false,
         };
 
-        let payload = diagnose_from_view(&view, Some("agentsight"), &view_ctx);
+        let payload =
+            diagnose_from_view(&view, Some("agentsight"), &view_ctx).expect("diagnose test view");
 
         let service_ref = payload.components[0]
             .health_checks
@@ -2696,7 +3121,8 @@ mod tests {
             dry_run: false,
         };
 
-        let payload = diagnose_from_view(&view, Some("agent-memory"), &view_ctx);
+        let payload =
+            diagnose_from_view(&view, Some("agent-memory"), &view_ctx).expect("diagnose test view");
 
         let service_ref = payload.components[0]
             .health_checks
@@ -2756,7 +3182,8 @@ mod tests {
             dry_run: false,
         };
 
-        let payload = diagnose_from_view(&view, Some("agentsight"), &view_ctx);
+        let payload =
+            diagnose_from_view(&view, Some("agentsight"), &view_ctx).expect("diagnose test view");
 
         assert_eq!(
             system_service.calls(),
@@ -2817,7 +3244,8 @@ mod tests {
             dry_run: true,
         };
 
-        let payload = diagnose_from_view(&view, Some("agentsight"), &view_ctx);
+        let payload =
+            diagnose_from_view(&view, Some("agentsight"), &view_ctx).expect("diagnose test view");
 
         assert!(
             system_service.calls().is_empty() && user_service.calls().is_empty(),
@@ -2852,7 +3280,7 @@ mod tests {
     #[test]
     fn missing_component_recommends_install() {
         let mut component = empty_component("ghost");
-        add_state_finding(&record("ghost", "not_installed"), None, &mut component);
+        add_state_finding("not_installed", &mut component);
 
         assert_eq!(component.findings[0].code, "component_not_installed");
         assert_eq!(
@@ -2866,17 +3294,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let layout = FsLayout::system(Some(tmp.path().to_path_buf()));
         let missing = layout.bin_dir.join("agentsight");
-        let mut rec = record("agentsight", "installed");
-        rec.health.push(HealthEntry {
+        let entry = HealthEntry {
             name: format!("integrity:{}", missing.display()),
             status: "missing_file".to_string(),
             checked_at: "2026-06-01T00:00:00Z".to_string(),
             reason: Some("missing file".to_string()),
-        });
+        };
         let mut obj = owned_object("agentsight", LifecycleStatus::Installed);
         push_owned_file(&mut obj, missing);
-        let mut component = empty_component(&rec.name);
-        add_health_entries(&rec, Some(&obj), &layout, &mut component);
+        let mut component = empty_component("agentsight");
+        add_health_entry(&entry, Some(&obj), &layout, &mut component);
 
         assert_eq!(component.findings[0].severity, FindingSeverity::Error);
         assert_eq!(
@@ -3650,26 +4077,26 @@ mod tests {
 
     #[test]
     fn rpm_record_discards_raw_layout_manifest_health() {
-        let mut rec = record("agentsight", "failed");
-        rec.health.push(HealthEntry {
+        let mut obj = delegated_object("agentsight", LifecycleStatus::Installed);
+        obj.health.push(HealthEntry {
             name: "agentsight:command:launcher".to_string(),
             status: "command_error".to_string(),
             checked_at: "2026-06-01T00:00:00Z".to_string(),
             reason: Some("raw bindir probe failed".to_string()),
         });
-        rec.health.push(HealthEntry {
+        obj.health.push(HealthEntry {
             name: "persisted:last".to_string(),
             status: "ok".to_string(),
             checked_at: "2026-06-01T00:00:00Z".to_string(),
             reason: None,
         });
-        let obj = delegated_object("agentsight", LifecycleStatus::Installed);
+        let layout = FsLayout::system(None);
+        let mut component = empty_component("agentsight");
 
-        normalize_rpm_record(&mut rec, Some(&obj));
+        add_persisted_health(Some(&obj), &layout, &mut component);
 
-        assert_eq!(rec.status, "installed");
-        assert_eq!(rec.health.len(), 1);
-        assert_eq!(rec.health[0].name, "persisted:last");
+        assert_eq!(component.health_checks.len(), 1);
+        assert_eq!(component.health_checks[0].name, "persisted:last");
     }
 
     #[test]
@@ -3694,20 +4121,19 @@ mod tests {
 
     #[test]
     fn unverified_health_is_informational_when_state_is_clean() {
-        let mut rec = record("agent-memory", "degraded");
-        rec.health.push(HealthEntry {
+        let entry = HealthEntry {
             name: "integrity:/var/lib/anolisa/component-manifests/agent-memory/component.toml"
                 .to_string(),
             status: "unverified".to_string(),
             checked_at: "2026-06-01T00:00:00Z".to_string(),
             reason: None,
-        });
+        };
         let obj = owned_object("agent-memory", LifecycleStatus::Installed);
         let layout = FsLayout::system(None);
-        let mut component = empty_component(&rec.name);
+        let mut component = empty_component("agent-memory");
 
-        add_state_finding(&rec, Some(&obj), &mut component);
-        add_health_entries(&rec, Some(&obj), &layout, &mut component);
+        add_state_finding("installed", &mut component);
+        add_health_entry(&entry, Some(&obj), &layout, &mut component);
 
         assert!(component.findings.is_empty());
         assert!(component.fix_plan.is_empty());

@@ -61,11 +61,15 @@ impl Endpoint {
     ///
     /// `use_internal` selects the Aliyun internal vs public host (per the
     /// region probe); `logstore` is the component name.
+    ///
+    /// `self.project` is a project prefix (e.g. `anolisa`); the actual
+    /// SLS project name is `{prefix}-{region}` (e.g. `anolisa-cn-hangzhou`).
     pub fn track_url(&self, region: &str, use_internal: bool, logstore: &str) -> String {
+        let project = format!("{}-{region}", self.project);
         let host = if use_internal {
-            format!("{}.{}-internal.log.aliyuncs.com", self.project, region)
+            format!("{project}.{region}-internal.log.aliyuncs.com")
         } else {
-            format!("{}.{}.log.aliyuncs.com", self.project, region)
+            format!("{project}.{region}.log.aliyuncs.com")
         };
         format!("https://{host}/logstores/{logstore}/track")
     }
@@ -130,7 +134,7 @@ impl Default for UploaderConfig {
             identity_cache_path: PathBuf::from("/var/lib/anolisa/telemetry/identity.json"),
             metadata_url: "http://100.100.100.200/latest/meta-data/region-id".to_string(),
             endpoint: Endpoint {
-                project: env_or("SLS_PROJECT", "anolisa"),
+                project: env_or("SLS_PROJECT_PREFIX", "anolisa"),
             },
             sleep_secs: DEFAULT_SLEEP_SECS,
             topic: "anolisa-telemetry".to_string(),
@@ -346,10 +350,10 @@ impl Uploader {
         if let Ok(entries) = fs::read_dir(&self.config.ops_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        names.push(stem.to_string());
-                    }
+                if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                {
+                    names.push(stem.to_string());
                 }
             }
         }
@@ -407,23 +411,22 @@ impl Uploader {
                 // limit and retry forever. When the cap is hit the offset stays
                 // on the rotated file so the remainder drains next round.
                 let rotated = self.rotated_path(component);
-                if rotated.exists() {
-                    if let Ok((mut residue, res_consumed)) =
+                if rotated.exists()
+                    && let Ok((mut residue, res_consumed)) =
                         read_from(&rotated, o.offset, MAX_LINES_PER_ROUND)
-                    {
-                        lines.append(&mut residue);
-                        if lines.len() >= MAX_LINES_PER_ROUND {
-                            // Cap hit: keep the offset on the rotated file so
-                            // the remainder is drained next round instead of
-                            // being skipped.
-                            return Ok(Some((
-                                lines,
-                                FileOffset {
-                                    inode: o.inode,
-                                    offset: o.offset + res_consumed,
-                                },
-                            )));
-                        }
+                {
+                    lines.append(&mut residue);
+                    if lines.len() >= MAX_LINES_PER_ROUND {
+                        // Cap hit: keep the offset on the rotated file so
+                        // the remainder is drained next round instead of
+                        // being skipped.
+                        return Ok(Some((
+                            lines,
+                            FileOffset {
+                                inode: o.inode,
+                                offset: o.offset + res_consumed,
+                            },
+                        )));
                     }
                 }
                 0
@@ -933,15 +936,15 @@ mod tests {
         let ep = Endpoint {
             project: "proj".into(),
         };
-        // Not detected → public host.
+        // Prefix + region → full project name in the host.
         assert_eq!(
             ep.track_url("cn-hangzhou", false, "agent-sec-core"),
-            "https://proj.cn-hangzhou.log.aliyuncs.com/logstores/agent-sec-core/track"
+            "https://proj-cn-hangzhou.cn-hangzhou.log.aliyuncs.com/logstores/agent-sec-core/track"
         );
         // Detected → internal host.
         assert_eq!(
             ep.track_url("cn-beijing", true, "cosh"),
-            "https://proj.cn-beijing-internal.log.aliyuncs.com/logstores/cosh/track"
+            "https://proj-cn-beijing.cn-beijing-internal.log.aliyuncs.com/logstores/cosh/track"
         );
     }
 

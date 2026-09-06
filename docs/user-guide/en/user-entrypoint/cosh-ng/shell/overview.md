@@ -1,98 +1,66 @@
-# cosh-shell Overview
+# Interactive Terminal
 
-cosh-shell is the AI-enhanced interactive terminal of cosh-ng. It layers AI analysis capabilities, tool approval controls, and inline card rendering on top of a native bash/zsh PTY, providing users with a secure and observable Agent interaction experience.
+[中文版](../../../../zh/user-entrypoint/cosh-ng/shell/overview.md)
 
-## Positioning
+`cosh` starts in Enhanced Assisted mode. The `◇ ` prefix shows that Cosh may
+route natural-language input before bash or zsh executes it. Press `Shift+Tab`
+at an empty prompt for Enhanced Shell-only (`◌ `), or select Native at startup
+when the session must have no Cosh hooks, observation, or insights.
 
-cosh-shell is the user-facing frontend layer:
+## A typical workflow
 
-- Manages the PTY host (bash/zsh subprocess)
-- Connects to backends via AI adapters (default: cosh-core)
-- Renders approval cards and AI analysis results
-- Implements tool approval control protocol
+1. Change to the target directory and run `cosh`.
+2. Run familiar commands normally.
+3. Press `Shift+Tab` when ordinary input should remain Shell-only.
+4. Describe a task in Assisted mode and review cards before side effects.
+5. Use `/session status` before leaving a long-running investigation.
 
-## Run Modes
+Useful starts:
 
 ```bash
-# Default startup (uses configured adapter and shell)
-cosh-shell
-
-# Explicitly specify adapter (positional argument)
-cosh-shell raw cosh-core
-cosh-shell raw claude
-cosh-shell raw qwen
-
-# Specify underlying shell
-cosh-shell --shell zsh
-cosh-shell raw co --shell bash
-
-# Pass-through mode: execute single command then exit
-cosh-shell -c 'ls -la'
-cosh-shell -- git status
-
-# Login shell mode
-cosh-shell --login
-cosh-shell -l
-
-# Isolated mode (skip user rcfile)
-cosh-shell --isolated
+cosh
+cosh --shell zsh
+cosh --resume
+COSH_SHELL_INTEGRATION=native cosh
 ```
 
-## Supported AI Adapters
+## How input is routed
 
-| Adapter | Backend | Description |
-|---------|---------|-------------|
-| `cosh-core` | cosh-core process | Default adapter, full control protocol |
-| `claude` | Claude Code CLI | Claude adapter |
-| `qwen` | Qwen Code CLI | Qwen adapter |
-| `fake` | Mock | For development testing, no backend required |
+| Input | Native | Enhanced Shell-only `◌` | Enhanced Assisted `◇` |
+|---|---|---|---|
+| `git status` | Runs in the Shell. | Runs in the Shell; an execution insight may follow. | Runs in the Shell; an execution insight may follow. |
+| `hello` | The Shell normally reports a missing command. | The Shell normally reports a missing command. | The classifier evaluates it and currently leaves this ambiguous single word to the Shell. |
+| `why did the last command fail?` | The Shell handles the text. | The Shell handles the text. | Starts an Agent request with recent terminal evidence. |
+| `/session list` | The Shell handles the text. | The Shell handles the text. | Runs a Cosh control command. |
+| Agent tool request | Unavailable. | Available after explicitly accepting an insight or Agent entry. | Runs or shows an approval card according to the approval mode. |
 
-## Adapter Capabilities
+Native integration does not install Cosh `DEBUG`, `RETURN`, or `ERR` traps and
+does not enable `extdebug`, `functrace`, or `errtrace`. Enhanced is the default;
+select Native with `shell.integration = "native"` or
+`COSH_SHELL_INTEGRATION=native`. Restart `cosh` to switch integrations.
+`Shift+Tab` changes only the Enhanced routing substate, without restarting.
 
-| Capability | Description |
-|-----------|-------------|
-| `text_stream` | Text streaming output |
-| `thinking_stream` | Thinking process streaming output |
-| `session_resume` | Session resume |
-| `tool_intent` | Tool call intent awareness |
-| `user_question` | Ask user questions |
-| `cancellable` | Supports cancelling running requests |
-| `control_protocol` | Full control protocol support |
+Approved Shell commands in enhanced integration stay in the foreground Shell,
+so prompts, output, job control, and `Ctrl+C` remain usable. See
+[Tool approval](approval.md) for the safety rules.
 
-## Core Features
+## Sessions and proactive help
 
-| Feature | Description | Documentation |
-|---------|-------------|---------------|
-| PTY Interaction | Native bash/zsh terminal | [interactive-mode.md](interactive-mode.md) |
-| AI Analysis | Streaming command analysis | [ai-analysis.md](ai-analysis.md) |
-| Tool Approval | Visual approval cards | [approval.md](approval.md) |
+- Enhanced sessions are persisted by cosh-core and scoped to the workspace
+  where cosh started. Recovery restores model-visible conversation context,
+  not terminal processes or old terminal output. See
+  [Session recovery](session-recovery.md).
+- `smart` is the default analysis mode inside enhanced integration. Use
+  [AI analysis](ai-analysis.md) to choose how much proactive failure help appears.
+- `/help` is the source of truth for enhanced-mode commands; use
+  [Interactive commands](interactive-mode.md) for a concise reference.
 
-## Architecture Overview
+## Next steps
 
-```
-┌────────────────────────────────────────────┐
-│                 cosh-shell                 │
-│  ┌───────────┐  ┌──────────┐  ┌─────────┐  │
-│  │ PTY Host  │  │ Adapter  │  │   UI    │  │
-│  │ (bash/zsh)│  │(cosh-core│  │(ratatui)│  │
-│  └───────────┘  │/claude..)│  └─────────┘  │
-│  ┌───────────┐  └──────────┘  ┌─────────┐  │
-│  │  Hooks    │  ┌──────────┐  │Approval │  │
-│  │  Engine   │  │  Tools   │  │ Broker  │  │
-│  └───────────┘  └──────────┘  └─────────┘  │
-└────────────────────────────────────────────┘
-         │                │
-         ▼                ▼
-    bash/zsh PTY     cosh-core process
-```
-
-## Configuration
-
-cosh-shell specific configuration is in the `[ui]` and `[shell]` sections of `~/.copilot-shell/config.toml`. See [Configuration](../configuration.md) for details.
-
-## Project Trust
-
-cosh-shell maintains project-level trust storage. On first launch in a new project directory, it prompts the user to confirm whether to trust the project. Trust status determines:
-
-- Whether to load `.cosh/hooks` from the project directory
-- Whether to apply project-level configuration overrides
+- [Tool approval](approval.md)
+- [AI analysis](ai-analysis.md)
+- [Session recovery](session-recovery.md)
+- [Session compaction](session-compaction.md)
+- [Skills](../core/skills.md)
+- [MCP](../mcp.md)
+- [Extensions](../core/extensions.md)

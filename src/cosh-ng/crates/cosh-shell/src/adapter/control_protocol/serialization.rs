@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
-use super::ShellEvidenceResult;
+use super::{ShellEvidenceResult, CONTROL_PROTOCOL_VERSION};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostExecutedShellResult {
@@ -58,12 +58,69 @@ pub fn serialize_initialize(request_id: &str) -> String {
     .to_string()
 }
 
+/// Serializes one-shot shell initialization without SessionStart hooks.
+pub(crate) fn serialize_initialize_without_session_start(request_id: &str) -> String {
+    json!({
+        "request_id": request_id,
+        "type": "control_request",
+        "request": {
+            "subtype": "initialize",
+            "fire_session_start": false,
+            "protocol_version": CONTROL_PROTOCOL_VERSION,
+        }
+    })
+    .to_string()
+}
+
+/// Encodes the versioned initialize handshake used by persistent cosh-core,
+/// declaring the control capabilities this adapter implements. The core only
+/// moves trust-mode shell execution onto the approval channel when both are
+/// declared (#2067); foreign drivers (claude/qwen) keep the plain payload.
+pub fn serialize_cosh_core_initialize(request_id: &str) -> String {
+    json!({
+        "request_id": request_id,
+        "type": "control_request",
+        "request": {
+            "subtype": "initialize",
+            "protocol_version": CONTROL_PROTOCOL_VERSION,
+            "capabilities": {
+                "can_handle_can_use_tool": true,
+                "can_handle_host_executed_shell": true
+            }
+        }
+    })
+    .to_string()
+}
+
 pub fn serialize_user_message(content: &str, session_id: Option<&str>) -> String {
     let mut message = json!({
         "type": "user",
         "message": { "role": "user", "content": content },
         "parent_tool_use_id": null
     });
+    if let Some(session_id) = session_id {
+        message["session_id"] = Value::String(session_id.to_string());
+    }
+    message.to_string()
+}
+
+/// Serializes a cosh-core user message with the raw input used by hooks.
+///
+/// The field is omitted when unavailable so older cores and direct callers
+/// retain the original payload shape and continue to fall back to `content`.
+pub(crate) fn serialize_cosh_core_user_message(
+    content: &str,
+    raw_user_input: Option<&str>,
+    session_id: Option<&str>,
+) -> String {
+    let mut message = json!({
+        "type": "user",
+        "message": { "role": "user", "content": content },
+        "parent_tool_use_id": null
+    });
+    if let Some(raw_user_input) = raw_user_input {
+        message["message"]["raw_user_input"] = Value::String(raw_user_input.to_string());
+    }
     if let Some(session_id) = session_id {
         message["session_id"] = Value::String(session_id.to_string());
     }

@@ -7,6 +7,8 @@ mod config;
 #[macro_use]
 mod hooks;
 #[macro_use]
+mod hook_action;
+#[macro_use]
 mod debug;
 #[macro_use]
 mod modes;
@@ -104,4 +106,9 @@ collect_message_ids!([
     approval_system_control_ids,
     input_wait_hint_ids,
     startup_auth_hint_ids,
+    session_picker_footer_ids,
+    agent_composer_ids,
+    approval_trust_catalog_ids,
+    hook_action_ids,
+    enhanced_routing_mode_ids,
 ],);

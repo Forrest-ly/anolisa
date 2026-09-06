@@ -1,84 +1,125 @@
-# Quick Start
+# cosh-ng Quick Start
 
-cosh-ng (Computable Operating System Harness) provides deterministic cross-distribution system operation interfaces for AI Agents. It consists of three binaries:
+[中文版](../../../zh/user-entrypoint/cosh-ng/QUICKSTART.md)
 
-- **cosh-cli** — Structured JSON CLI covering package management, service management, workspace checkpoints, and security auditing
-- **cosh-core** — Headless JSONL backend integrating LLM providers, hooks, tools, and skills
-- **cosh-shell** — AI-enhanced interactive terminal with PTY host, streaming analysis, and tool approval
+cosh-ng starts in Enhanced Assisted mode, where bash or zsh remains interactive
+and Cosh may route natural-language requests to an Agent. Native integration is
+an explicit startup choice for sessions that must load no Cosh hooks.
 
-## Prerequisites
+## 1. Install
 
-- Linux (Alinux / CentOS / Ubuntu / Debian / Fedora / openSUSE) or macOS (limited functionality)
-- Rust 1.74+
-- pkg/svc commands require root or sudo privileges
-- checkpoint commands require a running ws-ckpt daemon
-
-## Build
+On Alibaba Cloud Linux 4, install the ANOLISA CLI, then install cosh-ng from
+the RPM backend in system scope:
 
 ```bash
-cd src/cosh-ng
-cargo build --workspace
+curl -fsSL https://get.agentic-os.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
+sudo "$HOME/.local/bin/anolisa" --install-mode system install cosh-ng --backend rpm
 ```
 
-Build artifacts are located under `target/debug/`: `cosh-cli`, `cosh-core`, `cosh-shell`.
-
-Release build:
+The public installer can combine the CLI and component installation. It prompts
+for `sudo` only when running the component action:
 
 ```bash
-cargo build --workspace --release
+curl -fsSL https://get.agentic-os.sh | bash -s -- --cosh-ng --backend rpm --install-mode system
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-## First Run
-
-### cosh-cli: Structured System Operations
+On macOS arm64, use user scope instead:
 
 ```bash
-# Install a package (JSON output)
-cosh-cli pkg install nginx
-# → {"ok":true,"data":{"package":"nginx","version":"1.24.0","already_installed":false},...}
-
-# Preview mode (no actual execution)
-cosh-cli pkg install nginx --dry-run
-
-# Check service status
-cosh-cli svc status nginx
-# → {"ok":true,"data":{"name":"nginx","active":true,"enabled":true,"recent_logs":[...]},...}
+curl -fsSL https://get.agentic-os.sh | bash -s -- --cosh-ng --backend raw --install-mode user
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### cosh-core: AI Agent Backend
+Alibaba Cloud Linux 4 users can also install the RPM directly:
 
 ```bash
-# Single prompt execution
-cosh-core --headless "Check disk usage"
-
-# Or pipe into headless mode
-echo '{"type":"user","message":{"role":"user","content":"List files in current directory"}}' | cosh-core --headless
+sudo yum install cosh-ng
 ```
 
-### cosh-shell: Interactive Terminal
+Verify both user-facing commands:
 
 ```bash
-# Start interactive AI Shell
-cosh-shell
-
-# Browse resumable conversations for the current workspace
-cosh-shell --resume
-
-# Or select a known provider session directly
-cosh-shell --resume <session-id>
+cosh --version
+cosh-cli --version
 ```
 
-## Configuration
+Package and service changes normally need root privileges. Workspace checkpoint commands also need a running `ws-ckpt` daemon.
 
-Configuration file is located at `~/.copilot-shell/config.toml`. A default configuration is automatically created on first run.
+The published Linux raw contract is not currently portable across all routed
+distributions, so it is not the recommended Linux installation path. The raw
+package supports macOS arm64, where Linux-only package and service operations
+remain unavailable. Source builds are for contributors; follow the
+[developer setup](../../../../developer-guide/en/cosh-ng/getting-started.md)
+after the packaged options above.
 
-See [Configuration](configuration.md) for details.
+## 2. Start the terminal
 
-## Next Steps
+Start `cosh` in the project or system directory where the Agent should work:
 
-- [cosh-cli Overview](cli/overview.md) — Learn about the CLI subsystems
-- [cosh-core Overview](core/overview.md) — Learn about headless mode and LLM integration
-- [cosh-shell Overview](shell/overview.md) — Learn about the interactive terminal
-- [Session Recovery](shell/session-recovery.md) — Resume, inspect, and safely clear Agent conversations
-- [Session Compaction](shell/session-compaction.md) — Reduce model-visible context without deleting the transcript
-- [Output Format](output-format.md) — Understand the JSON envelope and error codes
+```bash
+cd your-project
+cosh
+```
+
+The default Enhanced Assisted mode uses `◇ ` to show that submitted input may
+be classified and routed before Shell execution:
+
+```text
+◇ user@host:~/project$ git status
+◇ user@host:~/project$ investigate the last failed deployment
+```
+
+At an empty prompt, `Shift+Tab` switches to Enhanced Shell-only. The prefix
+becomes `◌ `, ordinary input stays with the Shell, and post-command insights
+remain available. Press `Shift+Tab` again to return to Assisted.
+
+Start Native when the session must have no Cosh hooks, observation, or insight:
+
+```bash
+COSH_SHELL_INTEGRATION=native cosh
+```
+
+Native and Enhanced integration are selected at startup; restart `cosh` to
+change between them. The Assisted and Shell-only substates switch in place.
+
+When an operation needs consent, cosh shows an approval or question card before it proceeds.
+
+Useful first commands in Enhanced Assisted mode:
+
+```text
+/auth
+/help
+/status
+/mode approval recommend
+/session list
+```
+
+`/auth` chooses or updates provider authentication, `/help` lists slash commands, `/status` shows runtime and session status, `/mode approval recommend` asks for confirmation before each Agent tool call, and `/session list` lists resumable conversations in this workspace.
+
+Use `/session list --all` to include conversations from other workspaces. Resume a conversation from the workspace where it was created.
+
+## 3. Reuse Skills
+
+List and inspect Skills available to the current workspace:
+
+```text
+/skills list
+/skills detail service-health
+```
+
+Workspace, user, extension, and system Skill directories are merged by priority. See [Skills](core/skills.md) for the search order and file format.
+
+## 4. Continue with a task
+
+| Goal | Read next |
+|---|---|
+| Control approval and safety | [Tool approval](shell/approval.md) |
+| Resume or compact conversations | [Session recovery](shell/session-recovery.md) |
+| Choose a model and authenticate | [Model providers](core/providers.md) |
+| Connect tools from another service | [Connect an MCP server](mcp.md) |
+| Automate package, service, checkpoint, or audit work | [Structured OS CLI](cli/overview.md) |
+| Integrate another frontend | [Headless mode](core/headless-mode.md) |
+
+The [full user guide](README.md) is organized by task.

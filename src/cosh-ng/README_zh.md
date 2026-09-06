@@ -2,260 +2,215 @@
 
 [English](README.md)
 
-## 什么是 cosh
+cosh-ng 是一个以现有 Shell 为基础的 AI 原生终端。`cosh` 默认使用 Enhanced
+Assisted 模式，保留隐式自然语言路由、Skills、审批卡片和可恢复 Agent 对话。
+如果要求 bash 或 zsh 独占会话，不加载 Cosh Hook、不观察也不提供洞察，可以
+在启动时选择 Native 集成。自动化或其他 Agent 集成仍可使用结构化 JSON 和
+JSONL 接口。
 
-**Computable Operating System Harness** — 面向 Agent 的确定性操作系统接口，为 AI Agent 提供跨发行版的结构化系统操作能力。
+## 为什么使用 cosh-ng
 
-## 架构
+| 传统终端 | cosh-ng |
+|---|---|
+| 需要把意图翻译成命令 | 默认 Assisted 模式可混合自然语言和命令 |
+| 自动化散落在脚本中 | 用 Skills 封装可复用工作流 |
+| AI 上下文绑定在单个聊天窗口 | 按工作空间恢复 Agent 对话 |
+| AI 操作难以检查 | 通过审批卡片和审计记录检查工具调用 |
+| 不同发行版使用不同系统命令 | 用 `cosh-cli` 获得稳定、结构化的系统操作 |
 
-5-crate 工作空间，严格依赖方向：
+交互程序、管道、重定向、任务控制、bash/zsh 配置和 `Ctrl+C` 都会在前台终端中
+照常工作。
 
-```
-cosh-types          cosh-platform          cosh-cli / cosh-core / cosh-shell
-  (纯类型)        ← (发行版检测 +        ← (CLI 入口、交互式 TUI、
-   零副作用)        后端路由)               AI 增强 Shell)
+## 安装
 
-依赖方向: cosh-cli / cosh-core / cosh-shell → cosh-platform → cosh-types
-```
-
-### Crate 布局
-
-```
-cosh-ng/
-├── crates/
-│   ├── cosh-types/       # 纯类型定义，零副作用
-│   │   └── src/          # checkpoint.rs, config.rs, error.rs, output.rs, pkg.rs, svc.rs
-│   ├── cosh-platform/    # 发行版检测 + 后端路由
-│   │   └── src/          # checkpoint.rs, detect.rs, pkg.rs, svc.rs
-│   ├── cosh-cli/         # CLI 入口 (二进制: cosh-cli)
-│   │   ├── src/          # main.rs, cmd/{pkg,svc,checkpoint,audit}.rs
-│   │   └── tests/        # CLI 集成测试
-│   ├── cosh-core/        # 交互式 TUI + 无头 JSONL 后端 (二进制: cosh-core)
-│   │   └── src/          # LLM 对话、工具执行、Hook 系统、会话管理
-│   └── cosh-shell/       # AI 增强交互式 Shell (二进制: cosh-shell)
-│       ├── src/          # PTY 宿主、OSC 标记、审批控制、流式 AI
-│       └── tests/        # 协议 + 集成测试
-└── Cargo.toml
-```
-
-## 快速开始
+在 Alibaba Cloud Linux 4 上，通过 ANOLISA CLI 和 RPM backend 把 cosh-ng
+安装到 system 范围。
 
 ```bash
-# 构建
-cargo build --workspace
-
-# 结构化 JSON 输出
-cosh-cli pkg install nginx
-# → {"ok":true,"data":{"package":"nginx","version":"1.24.0","already_installed":false},...}
-
-cosh-cli pkg install nginx --dry-run   # 预览不执行
-
-# 服务管理 (systemd)
-cosh-cli svc status nginx
-# → {"ok":true,"data":{"name":"nginx","active":true,"enabled":true,"recent_logs":[...]},...}
-
-cosh-cli svc restart nginx --dry-run
-
-# 工作空间快照（需要 ws-ckpt 守护进程）
-cosh-cli checkpoint create --workspace /home/agent/project --id step-042 -m "重构前"
-# → {"ok":true,"data":{"checkpoint_id":"step-042","step":42},...}
-
-cosh-cli checkpoint restore step-040 --workspace /home/agent/project
-
-# 安全审计
-cosh-cli audit check --action "rm -rf /var/log"
-# → {"ok":true,"data":{"outcome":"Deny","matched_rule":"shell-deny-destructive",...},...}
-
-# 检查并导出统一生产审计时间线
-cosh-cli audit status
-cosh-cli audit events --since 2h --limit 100
-cosh-cli audit export --since 2h --output ./audit-incident
-
-# 在当前工作空间恢复 Agent 对话
-cosh-shell --resume              # 打开交互式会话选择器
-cosh-shell --resume <session-id> # 选择已知的 provider 会话
+curl -fsSL https://get.agentic-os.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
+sudo "$HOME/.local/bin/anolisa" --install-mode system install cosh-ng --backend rpm
 ```
 
-在 cosh-shell 中，可使用 `/session` 浏览会话、`/session list` 复制完整会话
-ID、`/session list --all` 列出同一存储根下所有工作空间的会话，并通过
-`/session status` 查看已选择和已激活的身份。`/session new`
-（或 `/new`）会与当前 provider 对话分离，使下一次 Agent 请求开启全新对话，
-而无需重启 Shell；`/session clear ...` 会在确认后清理旧记录。会话恢复会还原
-模型可见的对话上下文，但不会伪装成已恢复历史终端证据。`/session compact`
-会在后台摘要任意完整对话前缀，包括仅有一个已完成 Agent run 的会话，同时保留
-完整 transcript。自动压缩则同时等待模型窗口压力和安全的旧 run 边界。从模型窗口中
-预留的回复空间与请求发送的 `max_tokens` 上限使用同一个值。未设置覆盖值时，已知
-模型取 `min(模型能力, 16384)`，未知模型取 `4096`，两者都限制在上下文窗口的一半
-以内。需要调整单次回复额度时，可以设置
-`session.compaction.model_max_output_tokens`。记录默认保存在
-`~/.copilot-shell/cosh-core/sessions/`，可通过 `session.persist_dir` 修改
-根目录。项目会话配置和相对存储路径均从 cosh-shell 传给 Core 的工作空间解析。
-详见
-[会话恢复指南](../../docs/user-guide/zh/user-entrypoint/cosh-ng/shell/session-recovery.md)
-和[会话压缩指南](../../docs/user-guide/zh/user-entrypoint/cosh-ng/shell/session-compaction.md)。
+公共安装脚本可以合并上述步骤。
 
-单次 Agent 请求默认为 50 个模型轮次。如果会话已经持久化后才达到上限，交互式
-shell 会请求批准，并在同一个 provider 对话中追加同等预算。可通过
-`agent.max_turns` 或 `COSH_MAX_TURNS` 覆盖该预算，详见
-[配置指南](../../docs/user-guide/zh/user-entrypoint/cosh-ng/configuration.md#agent-轮次预算)。
+```bash
+curl -fsSL https://get.agentic-os.sh | bash -s -- --cosh-ng --backend rpm --install-mode system
+export PATH="$HOME/.local/bin:$PATH"
+```
 
-`/auth` 选择器包含 Coding Plan 和 Token Plan。内置 endpoint 默认使用中国站；
-国际站设置 `COSH_SERVICE_SITE=international` 后使用国际站 endpoint 目录。
-可选别名和 fallback 行为见
-[配置指南](../../docs/user-guide/zh/user-entrypoint/cosh-ng/configuration.md#环境变量覆盖)。
+后续升级或卸载也使用同一个入口。
 
-调用大模型时，不同推理请求可能出现输入内容的重叠（如多轮对话）。上下文缓存
-（Context Cache）可以缓存这些公共前缀，减少重复计算，提升响应速度并降低成本。
-DashScope 提供两种工作模式：显式缓存（需主动开启，5 分钟内确定性命中，创建
-成本较高但命中成本更低）和隐式缓存（默认自动模式，命中率不确定，命中成本
-略高）。在 `[ai.providers.dashscope]` 下设置 `explicit_cache = true` 可切换为
-显式缓存，详见
-[配置指南](../../docs/user-guide/zh/user-entrypoint/cosh-ng/configuration.md#cosh-core-配置)。
+```bash
+curl -fsSL https://get.agentic-os.sh | bash -s -- --cosh-ng --install-mode system --upgrade
+curl -fsSL https://get.agentic-os.sh | bash -s -- --cosh-ng --install-mode system --uninstall
+```
 
-Core 和 Shell 还会把脱敏、版本化的审计时间线写入
-`$XDG_STATE_HOME/cosh/audit` 或 `~/.local/state/cosh/audit`。既有
-SLS/metrics 导出保持不变。配置、保留、追踪和事故导出方法见
-[审计运维指南](../../docs/user-guide/zh/user-entrypoint/cosh-ng/cli/audit.md)。
+在 macOS arm64 上改用 user 范围：
 
-## cosh-shell 扩展
+```bash
+curl -fsSL https://get.agentic-os.sh | bash -s -- --cosh-ng --backend raw --install-mode user
+export PATH="$HOME/.local/bin:$PATH"
+```
 
-扩展管理只通过 `cosh-shell` 内的 `/extensions` slash 命令暴露。`cosh`
-启动器继续保持薄 wrapper，`cosh-cli` 不增加扩展生命周期命令。
+在 Alibaba Cloud Linux 4 上，也可以直接安装 RPM。
+
+```bash
+sudo yum install cosh-ng
+```
+
+当前发布的 Linux raw 契约无法覆盖所有已路由的发行版，因此不作为推荐的
+Linux 安装路径。raw 包支持 macOS arm64，但依赖 Linux 的软件包和服务操作
+不可用。源码构建仅供贡献者使用，请参阅
+[开发者入门指南](../../docs/developer-guide/zh/cosh-ng/getting-started.md)。
+
+## 30 秒开始使用
+
+```bash
+cd your-project
+cosh
+```
+
+Enhanced Assisted 是默认模式。`◇ ` 前缀表示 Cosh 可能在前台 Shell 执行前
+分类并路由本次输入。
 
 ```text
-/extensions list
-/extensions info example.ops
-/extensions new ./example.ops --template mcp
-/extensions install ./example.ops
-/extensions install https://example.com/example.ops.git --ref main
-/extensions link ./example.ops
-/extensions update example.ops
-/extensions update --all
-/extensions enable example.ops
-/extensions disable example.ops
-/extensions settings set example.ops region cn-hangzhou --scope user
-/extensions settings list example.ops
-/extensions doctor
-/extensions reload
+◇ user@host:~/project$ git status
+◇ user@host:~/project$ 分析这个服务为什么反复重启
 ```
 
-install、link 和能力发生变化的 update 会先生成 preflight operation，并要求显式运行
-`/extensions consent <operation-id>`。敏感 setting 只保存到操作系统 secret store，
-展示时始终为 `[redacted]`；workspace setting 只对已信任项目生效。扩展 context
-有明确大小边界，并位于 project context 之后。local stdio MCP tool 使用完整
-`<extension>/mcp/<server>/<tool>` namespace，并经过正常 tool approval。
-钩子可声明 `env`，仅注入该钩子自身的子进程——宿主进程永不被修改；由于这属于可执行
-能力，它会计入扩展 capability 指纹，因此声明或修改需要重新确认。
-Agent definition 会被严格校验和列出，但在统一 subagent executor 接入前明确报告
-`executable=false`。registry mutation 会构建 candidate generation。shell 会话复用
-同一个长生命周期 core process：空闲时 `/extensions reload` 立即切换健康 candidate；
-Agent run 忙碌时只排队一次 safe-point reload。当前 run 继续固定在原 generation，
-下一次 run 使用新 generation。
+在空提示符按 `Shift+Tab` 可切换到 Enhanced Shell-only。`◌ ` 前缀表示普通
+输入交给 Shell，但仍可获得命令执行后的洞察。再次按下即可返回 Assisted。
 
-## 命令参考
-
-| 子命令 | 示例 | 后端 |
-|--------|------|------|
-| `cosh-cli pkg install <name>` | `cosh-cli pkg install nginx` | dnf / apt-get / zypper |
-| `cosh-cli pkg remove <name>` | `cosh-cli pkg remove nginx` | dnf / apt-get / zypper |
-| `cosh-cli pkg search <query>` | `cosh-cli pkg search "web server"` | dnf / apt-cache / zypper |
-| `cosh-cli svc status <name>` | `cosh-cli svc status nginx` | systemctl show |
-| `cosh-cli svc start/stop/restart` | `cosh-cli svc restart nginx` | systemctl |
-| `cosh-cli svc enable/disable` | `cosh-cli svc enable nginx` | systemctl |
-| `cosh-cli svc list` | `cosh-cli svc list --state running` | systemctl list-units |
-| `cosh-cli checkpoint create` | `cosh-cli checkpoint create --workspace /path --id snap-001 -m "msg"` | ws-ckpt daemon |
-| `cosh-cli checkpoint list` | `cosh-cli checkpoint list --workspace /path` | ws-ckpt daemon |
-| `cosh-cli checkpoint restore <id>` | `cosh-cli checkpoint restore step-003 --workspace /path` | ws-ckpt daemon |
-| `cosh-cli checkpoint status` | `cosh-cli checkpoint status` | ws-ckpt daemon |
-| `cosh-cli checkpoint init` | `cosh-cli checkpoint init --workspace /path` | ws-ckpt daemon |
-| `cosh-cli checkpoint delete` | `cosh-cli checkpoint delete --snapshot snap-001` | ws-ckpt daemon |
-| `cosh-cli checkpoint diff` | `cosh-cli checkpoint diff --workspace /path --from a --to b` | ws-ckpt daemon |
-| `cosh-cli audit check` | `cosh-cli audit check --action "rm -rf /"` | 策略引擎 |
-| `cosh-cli audit log` | `cosh-cli audit log --session abc123` | 策略引擎 |
-| `cosh-cli audit status/events/trace` | `cosh-cli audit trace <id>` | 统一审计存储 |
-| `cosh-cli audit export` | `cosh-cli audit export --since 2h --output ./incident` | 脱敏事故包 |
-| `cosh-cli audit prune --dry-run` | `cosh-cli audit prune --dry-run` | 保留计划预览 |
-| `cosh-cli audit policy show` | `cosh-cli audit policy show` | 策略引擎 |
-
-## 输出格式
-
-所有命令输出统一 JSON 信封（`CoshResponse<T>`）：
-
-```json
-{"ok":true,"data":{...},"meta":{"subsystem":"pkg","duration_ms":342,"distro":"alinux","dry_run":false}}
-```
-
-错误时：
-
-```json
-{"ok":false,"error":{"code":"PkgNotFound","message":"package 'nginx-extra' not found","recoverable":true,"hint":"try 'cosh-cli pkg search nginx'","subsystem":"pkg"},"meta":{...}}
-```
-
-Agent 关键字段：`ok`（是否成功？）、`error.recoverable`（值得重试？）、`error.hint`（下一步建议）。
-
-## Agent 价值
-
-1. **零学习成本** — Agent 无需知道 dnf 还是 apt
-2. **结构化输出** — JSON，无需正则文本解析
-3. **可逆操作** — checkpoint → 执行 → 失败时回滚
-4. **分类错误** — `recoverable` 告诉 Agent 是否该重试
-5. **预演模式** — 所有写操作支持 `--dry-run`，执行前预览
-
-## MCP 工具
-
-`cosh-core --headless` 可以通过 stdio 或 Streamable HTTP 连接受信任的 MCP Server，在启动时发现其工具，
-并以 `mcp__<server>__<tool>` 暴露给 Agent。MCP Server 仅从用户或系统级配置加载；
-除 `trust` 模式外，其工具调用都需要审批。可使用 `cosh-core mcp list`、`inspect`、`refresh`、
-`connect` 和 `disconnect` 管理已配置的 Server；状态输出不会包含凭据。详见
-[MCP 配置说明](../../docs/user-guide/zh/user-entrypoint/cosh-ng/configuration.md#mcp-server)。
-
-## 日志
-
-所有二进制使用 `tracing` 结构化日志。日志写入 `~/.copilot-shell/logs/`，按天轮转。
-
-### 日志级别控制
-
-| 方式 | 示例 | 作用域 |
-|------|------|--------|
-| 配置文件 | `[ui] log_level = "debug"` (cosh-shell) | 持久化 |
-| 配置文件 | `[logging] level = "info"` (cosh-core) | 持久化 |
-| 环境变量 | `COSH_LOG=debug cosh-shell raw` | 单次调用 |
-| CLI 标志 | `cosh-core --verbose` | 单次调用 |
-| 旧版 | `COSH_SHELL_DEBUG=1`（映射为 debug） | 单次调用 |
-
-优先级：`COSH_LOG` > `RUST_LOG` > `--verbose` > 配置文件 > 默认值（`warn`）
-
-有效级别：`error`、`warn`、`info`、`debug`、`trace`
-
-### 日志文件
-
-```
-~/.copilot-shell/logs/
-├── cosh-shell.log.2026-06-26    # 按天轮转
-├── cosh-core.log.2026-06-26
-└── ...
-```
-
-## 支持的发行版
-
-| 发行版 | 包管理器 | 服务管理器 |
-|--------|----------|-----------|
-| Alinux 2/3 | dnf | systemd |
-| CentOS 7/8/9 | dnf | systemd |
-| Fedora | dnf | systemd |
-| Ubuntu | apt-get | systemd |
-| Debian | apt-get | systemd |
-| openSUSE | zypper | systemd |
-
-## 构建和测试
+如果会话要求完全不加载 Cosh Hook、不观察也不提供洞察，可显式启动 Native。
 
 ```bash
-cargo build --workspace
-cargo test --workspace
-cargo test --package cosh-cli --test cli_integration  # 仅集成测试
+COSH_SHELL_INTEGRATION=native cosh
 ```
 
-**前置条件**：Linux，Rust 1.74+，pkg/svc 命令需要 root/sudo，checkpoint 命令需要 ws-ckpt 守护进程。
+```text
+$ hello
+bash: hello: command not found
+```
+
+用 `/auth` 选择 provider，用 `/help` 查看当前版本支持的命令。如果希望每次 Agent
+调用工具前都等待确认，运行 `/mode approval recommend`。Shell 和 Core 的审批设置
+统一使用 `recommend`、`auto` 或 `trust`。增强集成使用 cosh-core runtime 时，`/agent`
+会打开一次性 Composer，可在开头指定 `/skill:<name>`，并添加经过验证的工作空间内
+`@路径`引用。
+
+如果要在不进入交互式 Shell 的情况下运行本机已安装的 ACP Adapter，可以先检查
+Adapter，再通过 stdin 发送 prompt。
+
+下面的命令使用 ANOLISA 或 RPM 安装的 `cosh agent` launcher。源码构建或 unified build
+只安装 Gateway binary，此时请使用 `cosh-gateway doctor`、`cosh-gateway run` 或
+`cosh-gateway task`，其余参数保持不变。
+
+```bash
+cosh agent doctor --profile codex --workspace "$PWD"
+printf '%s\n' 'summarize the current changes' | \
+  cosh agent run --profile codex --workspace "$PWD"
+```
+
+首个版本只接受内置 `codex` 与 `claude-code` profile。对应的 `codex-acp` 或
+`claude-agent-acp` executable 需要单独安装。COSH 在 runtime 中不会调用 `npx`，也不会
+下载 Adapter。Permission callback 只在本地 controlling terminal 上提示；没有 TTY 或使用
+`--permission deny` 时，COSH 会取消请求。Once-only decision 会以脱敏 evidence 形式记录到
+private local state directory。
+
+Package Gateway 提供一个受 containment 保护的本地 Task Plane。它只在 package 安装的
+systemd service 中调度 Task；即使 Gateway hard crash，该 service 仍负责完整 Runtime
+cgroup。`gateway-brokered-v1` Core profile 有意保持为 task-only：Runtime inventory
+只有无副作用的 `ask_user_question` capability。该 profile 不提供 checkpoint、write、Shell、
+slash command、Web 或 remote capability，也没有需要 approval 的 side effect。
+
+配置 workspace 并启动按 account 命名的 Gateway instance。
+
+Core unit 默认把 `HOME` 设为 private systemd `StateDirectory` 下的
+`/var/lib/cosh-gateway-%i/core-home`。Core provider config 可以放在
+`/var/lib/cosh-gateway-$USER/core-home/.copilot-shell/config.toml`，也可以使用
+`/etc/copilot-shell/config.toml` system config。不要在
+`/etc/cosh/gateway-$USER.env` 中把 `HOME` 覆盖到该 `StateDirectory` 之外；environment
+file 的优先级高于安全默认值，而 admitted workspace 与其他 host path 在这个 unit 中是只读的。
+
+```bash
+sudo install -d -m 0755 /etc/cosh
+sudo install -m 0600 /dev/null "/etc/cosh/gateway-$USER.env"
+printf '%s\n' \
+  "COSH_GATEWAY_WORKSPACE=$PWD" | \
+  sudo tee "/etc/cosh/gateway-$USER.env" >/dev/null
+sudo systemctl start "cosh-gateway@$USER.service"
+gateway_socket="/run/cosh-gateway-$USER/gateway.sock"
+printf '%s\n' 'inspect the failed service' | \
+  cosh agent task --socket "$gateway_socket" submit \
+    --runtime core --runtime-profile gateway-brokered-v1 \
+    --idempotency-key '<stable-submit-key>'
+cosh agent task --socket "$gateway_socket" get '<tsk_UUID>'
+cosh agent task --socket "$gateway_socket" events '<tsk_UUID>' --after 0 --limit 64
+printf '%s\n' 'answer to the question' | \
+  cosh agent task --socket "$gateway_socket" append '<tsk_UUID>' \
+    --input-request-id '<inp_UUID>' --idempotency-key '<stable-input-key>'
+cosh agent task --socket "$gateway_socket" cancel '<tsk_UUID>' --run-id '<run_UUID>' \
+  --idempotency-key '<stable-cancel-key>'
+cosh agent task --socket "$gateway_socket" retry '<tsk_UUID>' \
+  --previous-run-id '<run_UUID>' --idempotency-key '<stable-retry-key>'
+```
+
+Daemon 首次启动时会生成并持久化 installation ID，也可以通过 `--installation-id` 显式 provision。
+请把示例中的 typed identifier 替换成 Task API 返回的值。Task API 支持 `submit`、`get`、
+`events`、`append`、`cancel`、`retry` 和 `resolve-approval`；`append` 用来回答 profile
+产生的 durable user question，而这个 profile 不会产生 approval request。
+Direct `serve` 没有 package unit 的 live `--systemd-unit` proof 时会 fail closed；Gateway 会在
+创建 socket 或 database 前完成校验。Daemon 会把 Unix peer 认证为 local OS actor，将 target
+固定为 `workspace/cosh/task-only-v1`，只接受 `core`/`gateway-brokered-v1` selector 与配置的
+canonical workspace，持久化 Runtime binding，并由 scheduler 投递 durable Outbox work。
+本地非托管 ACP interoperability 应使用 `doctor` 与 `run`，不能使用 `serve`；这两个 direct
+ACP command 不受 durable Task Plane 治理。
+Task Plane 不依赖 checkpoint 或 ws-ckpt。现有的 `cosh-cli checkpoint` 命令仍是独立的
+system-operations 路径，不会为这个 Gateway profile 增加 checkpoint capability。
+
+`SIGINT` 与 `SIGTERM` 会在 Daemon 退出前触发有界的 scheduler 与 Runtime shutdown。Daemon
+仍然只监听 Unix socket，不开放 remote listener。
+
+仓库为 direct ACP path 提供 Fake Adapter conformance coverage。具体安装在投入生产前，仍需
+另行执行真实 Codex/Claude Adapter 检查与人工 Terminal 验收。
+
+## 文档
+
+- [用户手册](../../docs/user-guide/zh/user-entrypoint/cosh-ng/README.md)
+- [接入 MCP server](../../docs/user-guide/zh/user-entrypoint/cosh-ng/mcp.md)
+- [交互式终端](../../docs/user-guide/zh/user-entrypoint/cosh-ng/shell/overview.md)
+- [配置](../../docs/user-guide/zh/user-entrypoint/cosh-ng/configuration.md)
+- [管理系统操作](../../docs/user-guide/zh/user-entrypoint/cosh-ng/cli/overview.md)
+- [Headless 集成](../../docs/user-guide/zh/user-entrypoint/cosh-ng/core/headless-mode.md)
+- [开发者入门](../../docs/developer-guide/zh/cosh-ng/getting-started.md)
+- [架构](../../docs/developer-guide/zh/cosh-ng/architecture.md)
+- [贡献指南](CONTRIBUTING_zh.md)
+
+## 数据采集
+
+cosh-ng 会采集匿名的运行指标用于改进服务质量，包括工具调用次数、token 用量、
+审批统计、操作系统类型/架构，以及一个持久的安装 UUID 用于跨会话
+关联。**不采集用户输入内容、代码内容或对话内容。**
+
+关闭当前用户的遥测：
+
+```bash
+mkdir -p ~/.copilot-shell
+touch ~/.copilot-shell/telemetry_disabled
+```
+
+系统管理员也可以通过创建系统级哨兵文件，为整台机器上的所有用户关闭遥测：
+
+```bash
+sudo mkdir -p /etc/anolisa
+sudo touch /etc/anolisa/.telemetry_disabled
+```
+
+## 参与贡献
+
+源码构建主要面向贡献者，请从[开发者指南](../../docs/developer-guide/zh/cosh-ng/getting-started.md)
+开始。
 
 ## 许可证
 

@@ -1,137 +1,83 @@
-# 交互模式
+# 交互命令
 
-cosh-shell 在原生 PTY 之上运行 bash/zsh，通过 OSC 转义序列标记命令边界，实现 AI 分析与工具审批的无缝集成。
+[English](../../../../en/user-entrypoint/cosh-ng/shell/interactive-mode.md)
 
-## PTY 主机
+本页介绍如何启动`cosh`并控制当前会话。运行`/help`可查看已安装版本实际支持的命令。
 
-cosh-shell 通过 `openpty()` 创建伪终端对，在 slave 端启动 bash 或 zsh 子进程：
+## 启动`cosh`
 
+| 命令 | 用途 |
+|---|---|
+| `cosh` | 启动 Enhanced Assisted（`◇ `），提供 Agent 和斜杠命令路由。 |
+| `COSH_SHELL_INTEGRATION=native cosh` | 启动不加载 Cosh Hook、不观察也不提供洞察的 Native。 |
+| `cosh --shell zsh` | 明确选择zsh。 |
+| `cosh --isolated` | 跳过用户rcfile。 |
+| `cosh --login` | 启动login shell。 |
+| `cosh --resume [id]` | 打开会话选择器或恢复指定会话。 |
+| `cosh -c '<command>'` | 通过Shell执行一条命令后退出。 |
+| `cosh -- <program> [args...]` | 直接执行程序后退出。 |
+
+未指定Shell时，`cosh`使用配置或检测到的bash/zsh，无法确定时回退到bash。
+集成状态在启动时确定，Enhanced 是默认值。需要长期使用无 Hook 会话时，在
+用户配置中设置 `shell.integration = "native"`；只使用一次时设置环境变量。
+
+## 输入和编辑
+
+- 原生集成把每个输入字节交给前台 bash 或 zsh。
+- Enhanced Assisted（`◇ `）把 Shell 语法交给前台 Shell，并可以把自然语言
+  请求转为 Agent 请求。
+- 在 Enhanced 的空提示符按 `Shift+Tab` 可切换到 Shell-only（`◌ `）。此时
+  包括行首 `/` 在内的普通输入都交给 Shell，但仍可获得命令执行后的洞察。
+  再次按下即可恢复 Assisted。
+- 行首 `/` 只在 Enhanced Assisted 中运行 Cosh 控制命令。Native 和 Enhanced
+  Shell-only 都把它留给 Shell。
+- 终端支持时，`Shift+Enter`插入换行；多行粘贴仍作为一次提交。
+- 上方向键历史包含Shell输入和斜杠命令。按`Ctrl+C`可取消当前命令或Agent请求。
+
+## 增强集成斜杠命令
+
+| 命令 | 用途 |
+|---|---|
+| `/help` | 查看已安装版本支持的命令。 |
+| `/agent` | 编辑一次性 cosh-core 请求，可选择 Skill 并引用工作空间路径。 |
+| `/health` | 运行本地健康检查。 |
+| `/status`（`/about`） | 查看运行时、Provider和会话状态。 |
+| `/stats [model\|tools]` | 查看模型身份或工具活动。 |
+| `/auth` | 选择或更新Provider认证。 |
+| `/config language [auto\|en-US\|zh-CN]` | 查看或设置界面语言。 |
+| `/mode approval [recommend\|auto\|trust]` | 查看或修改工具审批。 |
+| `/mode analysis [smart\|auto\|manual]` | 查看或修改主动分析。 |
+| `/session ...` | 新建、列出、恢复、清理或压缩会话。 |
+| `/recommendations [on\|off\|status\|privacy\|clear]` | 管理本地输入建议。 |
+| `/hooks <command>` | 查看Hook发现和信任状态。 |
+| `/extensions <command>` | 管理扩展包和设置。 |
+| `/skills [list\|detail\|enable\|disable]` | 管理Skills。 |
+| `/mcp [list\|connect\|inspect\|refresh\|disconnect\|login\|logout]` | 管理MCP服务器。 |
+
+`/details`、`/audit`和`/send-to-shell`等命令只有在当前卡片或任务提供所需上下文时才会出现。`/mcp login`需要按MCP指南说明在Shell中完成OAuth流程。
+
+## 编辑一次性 Agent 请求
+
+配置使用 cosh-core runtime 时，可以运行 `/agent`。Agent Composer 会打开多行
+编辑器，但不会改变后续 Shell 输入的路由方式。按 Enter 发送请求，按
+`Shift+Enter`插入换行，按`Esc`取消并恢复 Shell prompt。
+
+第一个 token 可以选择一个 Skill，后续任何以`@`开头、由空白分隔的 token 都可以
+引用当前工作空间内的文件或目录。
+
+```text
+/skill:repo-review inspect @Cargo.toml @src
 ```
-┌──────────────────────┐
-│    cosh-shell        │
-│  ┌────────────────┐  │       ┌──────────────┐
-│  │  PTY master    │──────────│  bash/zsh    │
-│  └────────────────┘  │       │  (PTY slave) │
-│  ┌────────────────┐  │       └──────────────┘
-│  │  OSC Parser    │  │
-│  └────────────────┘  │
-└──────────────────────┘
-```
 
-### Shell 选择
+- `/skill:<name>`必须是第一个 token。所选 Skill 会在其他 Agent tool 之前调用。
+- `@路径`必须指向工作空间内现有的文件或目录。绝对路径、父目录跳转、通过符号链接
+  逃出工作空间的路径和不支持的路径都会被拒绝。
+- 每次提交最多接受 16 个有效引用。目录默认不递归，除非请求明确要求遍历。
+- cosh-ng 只发送验证后的路径元数据，在构建请求时不会读取或嵌入文件内容。
+- Agent turn 开始前，界面会显示每个被拒绝引用的路径和原因；这些引用不会进入
+  结构化引用上下文。
 
-```bash
-cosh-shell                    # 默认使用 auto（自动检测）
-cosh-shell --shell zsh        # 使用 zsh
-cosh-shell raw qwen --shell zsh
-cosh-shell --resume           # Shell 启动后打开会话选择器
-cosh-shell --resume <id>      # 选择要恢复的 provider 对话
-```
+不指定 Skill 或引用的纯文本请求同样有效。其他 provider runtime 不提供`/agent`；
+增强会话仍可直接输入自然语言请求或使用多行输入。
 
-Shell 选择优先级：
-1. `--shell` 参数
-2. `COSH_SHELL_RAW_SHELL` 环境变量
-3. 配置文件 `shell.default`
-4. 自动检测（默认 bash）
-
-### 运行模式
-
-| 模式 | 说明 |
-|------|------|
-| 默认（无子命令） | 使用配置的适配器启动交互式 shell |
-| `raw [adapter]` | 显式指定适配器 |
-| `-c <command>` | 执行命令后退出（直通底层 shell） |
-| `-- <command>` | 直接执行命令后退出 |
-| `--isolated` | 隔离模式，不加载用户 rcfile |
-| `--login` / `-l` | 作为登录 shell 启动 |
-
-## OSC 标记系统
-
-cosh-shell 注入自定义 rcfile（bashrc/zshrc）到子 shell，通过 OSC 1337 转义序列标记命令生命周期：
-
-```
-ESC]1337;COSH;<payload>BEL
-```
-
-标记的事件包括：
-- Shell 就绪（prompt 显示）
-- 命令开始执行（preexec）
-- 命令执行结束（precmd，携带退出码）
-- 工作目录变更
-
-这些标记使 cosh-shell 精确识别：
-1. 用户何时输入命令
-2. 命令何时开始/结束
-3. 命令的退出码
-4. 当前工作目录
-
-## 输入分类
-
-用户在 shell 中的输入被分类为以下类型：
-
-| 类型 | 说明 | 示例 |
-|------|------|------|
-| Shell 命令 | 普通 shell 命令 | `ls -la`、`git status` |
-| Slash 命令 | `/` 开头的内置控制命令 | `/help`、`/mode` |
-| Natural Language | 自然语言提问 | 由 AI 适配器处理 |
-| Agent Marker | Agent 执行标记 | 内部使用 |
-
-## Slash 命令
-
-| 命令 | 说明 |
-|------|------|
-| `/help` | 显示帮助信息 |
-| `/mode [approval\|analysis] [value]` | 查看或切换模式 |
-| `/config [key] [value]` | 查看或修改运行时配置 |
-| `/hooks [list\|enable\|disable] [name]` | 管理钩子 |
-| `/extensions [list\|enable\|disable] [name]` | 管理扩展 |
-| `/skills [list\|enable\|disable] [name]` | 管理技能 |
-| `/session [status\|list\|resume <id>\|clear ...]` | 管理 provider 对话 |
-| `/session compact [status\|cancel]` | 启动、检查或取消后台会话压缩 |
-| `/resume [id]` | 会话选择器或会话选择的别名 |
-| `/debug [state\|events\|adapter]` | 调试信息 |
-| `/auth` | 触发认证流程 |
-
-选择器按键、工作空间作用域、清理确认和可恢复错误处理详见
-[会话恢复](session-recovery.md)。手动和自动压缩语义详见
-[会话压缩](session-compaction.md)。
-
-## 启动流程
-
-1. 解析命令行参数（shell 类型、适配器、模式）
-2. 安装终端恢复处理（SIGTERM/SIGHUP/panic 时恢复 termios）
-3. 加载配置（`~/.copilot-shell/config.toml`）
-4. 初始化日志（文件输出到 `~/.copilot-shell/logs/`）
-5. 创建 PTY 会话，启动 bash/zsh 子进程
-6. 注入 OSC 标记脚本
-7. 启动 AI 适配器连接
-8. 渲染启动横幅（COSH logo + 适配器/shell/审批模式信息）
-9. 进入主事件循环
-
-## 终端恢复
-
-cosh-shell 在以下场景自动恢复终端状态（termios）：
-
-- 进程收到 SIGTERM / SIGHUP / SIGQUIT
-- panic 触发
-- 正常退出
-
-确保异常退出时终端不会留在 raw mode。
-
-## Native 模式 vs 隔离模式
-
-| 特性 | Native 模式（默认） | 隔离模式（`--isolated`） |
-|------|---------------------|--------------------------|
-| 用户 rcfile | 加载（~/.bashrc 等） | 跳过 |
-| PS1 提示符 | 保留用户设置 | 使用 `cosh-osc$ ` |
-| 历史记录 | 加载 $HISTFILE | 不加载 |
-| 环境变量 | 继承 | 最小化 |
-
-## 会话工作目录
-
-cosh-shell 在 `~/.copilot-shell/` 下为每个会话创建工作目录，存储：
-
-- OSC 标记脚本
-- 命令输出引用（24 小时自动清理）
-- 终端恢复请求文件
-- Shell handoff 请求文件
+审批行为见[工具审批](approval.md)，主动的失败帮助见[AI分析](ai-analysis.md)。

@@ -1,11 +1,104 @@
 # Changelog
 
-## 0.9.1
+## 0.11.2
+
+### Features
+- Show historical agent activity. (#2817)
+
+### Fixes
+- Re-attach stale SSL uprobes after kernel-side consumer deregistration so capture self-heals without a restart. (#2792)
+- Restart agentsight after an OOM kill. (#2925)
+- Bound probe event channel by bytes to cap memory under event bursts. (#2925)
+- Align CLI and dashboard with docs and de-duplicate the guide sidebar. (#2899)
+- Trim oversized db by row fraction. (#2872)
+- Trim interruption db to size limit. (#2823)
+- Keep binding API state consistent. (#2794)
+
+### Docs
+- Expand the AgentSight user guide into task pages. (#2825)
+
+## 0.11.1
+
+### Fixes
+- Keep null-session interruptions in breakdowns so per-session and per-conversation counts always sum to the total. (#2796)
+- Add Bun SSL_do_handshake prologue pattern so Claude Code (Bun builds >= 2.1.113) LLM traffic is captured. (#2782)
+
+## 0.11.0
+
+### Changes
+- Version bump for RPM packaging; no functional changes since 0.10.3.
+
+## 0.10.3
+
+### Features
+- Add semantic search to the sessions list. (#2733)
+- Add dsh plugin for DeepSeek Harness.
+- Group agents by type in discovery.
+- Add filtered_count to agent-health.
+- Add /api/docs route inventory.
+- Show LLM latency metrics in agent health cards. (#2586)
+
+### Fixes
+- Drop hardcoded minus on savings. (#2754)
+- Classify analyzer calls as internal. (#2755)
+- Return savings rates as fractions. (#2732)
+- Match tool args in loop detection. (#2719)
+- Probe companion components for dashboard capabilities. (#2696)
+- Scope graceful reap to worker agents.
+- Count no_port gateways as healthy in dashboard. (#2694)
+- Print deadloop hint on fresh install.
+- Reload config on SIGHUP.
+- Fill provider and session_id in audit events.
+- Demote decompress fallback to debug level.
+- Exclude sftp-server from agent discovery.
+- Correct copilot cmdline rule typo.
+
+## 0.10.2
+
+### Features
+- Enforce size limits on sqlite stores. (#2644)
+- Make dashboard UI bilingual (en/zh). (#2612)
+- Add raw packaging for immutable release artifacts. (#2550)
+- Add LLM latency metrics API. (#2578)
+
+### Fixes
+- Match latency agents case-insensitively. (#2590)
+- Address latency metrics CI follow-ups. (#2583)
+
+## 0.10.1
+
+### Features
+- Bootstrap dashboard i18n with preferred browser locale matching.
+- Add agentscope framework to agent discovery rules.
+- Streamline component onboarding docs and clarify service startup.
+
+### Fixes
+- Treat pause_turn as a normal SSE finish. (#2320)
+- Keep tool_call name across SSE continuation deltas.
+- Report pids in the observer namespace. (#2360)
+- Validate enforcer RPM payload, preserve RPM staging targets, and suppress repeated enforcer errors.
+- Wrap extractor errors in JSON envelope and classify store errors by variant. (#2417, #2418)
+- Dedupe unavailable state and refine dashboard metadata sync.
+
+## 0.10.0
 
 ### Features
 - Add case containment lifecycle with policy handoff, no-gap replacement, dedicated API, and dashboard views.
 - Add system audit protocol, event storage, dashboard, and extract audit service into a dedicated crate.
 - Add ActPlane risk enforcement with enforcer service, hardened file controls, secure lifecycle, and risk enforcement dashboard.
+- Convert Codex rollout JSONL to ATIF and cover Codex routing and tool calls with tests.
+- Report process metadata on raw HTTPS events and carry it in the generic envelope.
+
+### Fixes
+- Keep turn open on tool-call stop and add user_message_count to turn.id bucket key.
+- Stream-decode fragmented zstd SSE responses.
+- Improve QwenCode trace data accuracy and add QwenCode allow rules to agentsight config.
+- Keep session across cosh restarts.
+- Map cosh session temporary file writes. (#2080)
+
+## 0.9.1
+
+### Features
 - Rework optimization dashboard views and add detour-based cost waste analysis.
 - Move agent health and interruptions to a dedicated dashboard page.
 
@@ -16,7 +109,6 @@
 - Skip message parse for non-LLM paths.
 - Encrypt optimization config API key.
 - Show known agent rules.
-- Map cosh session temporary file writes. (#2080)
 
 ### CI
 - Pin eBPF build to clang 15 and use dedicated runner pools.

@@ -20,12 +20,16 @@ pub(super) struct CardInputState {
     free_text: String,
     active_kind: Option<CardInputKind>,
     selected_options: Vec<usize>,
+    // Mirror toggles before emitting events so same-read Enter sees the
+    // effective marks.
+    session_marked_for_clear: Vec<bool>,
     pending_input: Vec<u8>,
     /// Multi-line draft state while a PromptDraft capture is active (#1721).
     draft: PromptDraftEditor,
     /// Bracketed paste passthrough inside the draft card: newlines paste as
     /// draft newlines instead of submitting.
     draft_paste: bool,
+    draft_completion: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +72,7 @@ enum CardInputKind {
 
 impl CardInputState {
     pub(super) fn apply_capture(&mut self, capture: &RawInputCapture) {
+        self.refresh_draft_completion(capture);
         let kind = match capture {
             RawInputCapture::Question {
                 id,
@@ -166,6 +171,12 @@ impl CardInputState {
                 _ => String::new(),
             };
             self.selected_options.clear();
+            self.session_marked_for_clear = match capture {
+                RawInputCapture::Session {
+                    marked_for_clear, ..
+                } => marked_for_clear.clone(),
+                _ => Vec::new(),
+            };
             self.pending_input.clear();
             self.draft = match capture {
                 RawInputCapture::PromptDraft { initial_text, .. } => {
@@ -182,6 +193,7 @@ impl CardInputState {
         self.selected = 0;
         self.free_text.clear();
         self.selected_options.clear();
+        self.session_marked_for_clear.clear();
         self.pending_input.clear();
         self.draft = PromptDraftEditor::default();
         self.draft_paste = false;
@@ -465,6 +477,11 @@ impl CardInputState {
                                 }
                             }
                             b' ' if !*confirming_clear && self.selected < *option_count => {
+                                if let Some(marked) =
+                                    self.session_marked_for_clear.get_mut(self.selected)
+                                {
+                                    *marked = !*marked;
+                                }
                                 events
                                     .push(RawInputEvent::SessionToggle(id.clone(), self.selected));
                             }
@@ -625,6 +642,9 @@ impl CardInputState {
             } => {
                 if *confirming_clear {
                     return Some(RawInputEvent::SessionClearConfirm(id.clone()));
+                }
+                if self.session_marked_for_clear.iter().any(|marked| *marked) {
+                    return Some(RawInputEvent::SessionDelete(id.clone()));
                 }
                 if *option_count == 0 || self.selected >= *option_count {
                     return None;

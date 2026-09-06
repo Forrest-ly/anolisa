@@ -5,6 +5,7 @@
 //! exposed via the HTTP API; this binary only handles daemon lifecycle.
 
 mod api;
+mod checkpoint_store;
 mod cli;
 mod daemon;
 mod error;
@@ -14,10 +15,12 @@ mod failpoint;
 #[path = "failpoint_disabled.rs"]
 mod failpoint;
 mod file_provider;
+mod guest;
 mod metrics;
 mod sandbox;
 mod spawner;
 mod state;
+mod state_store;
 
 use std::process::ExitCode;
 

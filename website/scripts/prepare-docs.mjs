@@ -1,4 +1,4 @@
-import {mkdir, readFile, rm, writeFile} from 'node:fs/promises';
+import {copyFile, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {
   exists,
@@ -15,6 +15,12 @@ const siteUrl = process.env.SITE_URL ?? 'https://agentic-os.sh';
 const baseUrl = process.env.BASE_URL ?? '/';
 const docsOutput = path.join(generatedDir, 'docs');
 const i18nOutput = path.join(generatedDir, 'i18n', 'zh', 'docusaurus-plugin-content-docs', 'current');
+const staticOutput = path.join(generatedDir, 'static');
+const imagePrefix = 'docs/images/';
+
+// Images referenced by documentation, collected while links are rewritten and
+// copied into the generated static directory afterwards.
+const referencedImages = new Set();
 
 function normalizedTarget(relativePath) {
   const parsed = path.posix.parse(toPosix(relativePath));
@@ -83,6 +89,24 @@ async function rewriteLinks(markdown, source) {
     const rawTarget = match[3].trim();
     if (/^(?:[a-z]+:|#|\/)/i.test(rawTarget)) continue;
     const [targetWithoutHash, hash = ''] = rawTarget.split('#', 2);
+
+    // Images live outside the generated docs tree, so relative paths cannot
+    // survive the copy. Point them at the static directory with a root-relative
+    // path: Docusaurus applies `baseUrl` itself, so hard-coding it here would
+    // double the prefix on sub-path deployments (fork Pages).
+    if (match[1] === '!') {
+      const resolvedImage = path.posix.normalize(path.posix.join(sourceDirectory, targetWithoutHash));
+      if (resolvedImage.startsWith(imagePrefix) && (await exists(path.join(repoRoot, resolvedImage)))) {
+        referencedImages.add(resolvedImage);
+        replacements.push({
+          start: match.index,
+          end: match.index + match[0].length,
+          value: `![${match[2]}](/${resolvedImage.slice('docs/'.length)})`,
+        });
+      }
+      continue;
+    }
+
     if (!targetWithoutHash.endsWith('.md')) continue;
 
     let resolved = path.posix.normalize(path.posix.join(sourceDirectory, targetWithoutHash));
@@ -112,6 +136,32 @@ async function rewriteLinks(markdown, source) {
     output = output.slice(0, replacement.start) + replacement.value + output.slice(replacement.end);
   }
   return output;
+}
+
+function stripLocaleSwitchLinks(markdown) {
+  let inFence = false;
+  let dropFollowingBlank = false;
+  return markdown
+    .split('\n')
+    .filter((line) => {
+      if (/^\s*(```|~~~)/.test(line)) {
+        inFence = !inFence;
+        dropFollowingBlank = false;
+        return true;
+      }
+      if (inFence) return true;
+      if (dropFollowingBlank && /^[ \t]*\r?$/.test(line)) {
+        dropFollowingBlank = false;
+        return false;
+      }
+      dropFollowingBlank = false;
+      if (/^\[(?:中文版|English)\]\([^)]+\)[ \t]*\r?$/.test(line)) {
+        dropFollowingBlank = true;
+        return false;
+      }
+      return true;
+    })
+    .join('\n');
 }
 
 function makeMdxSafe(markdown) {
@@ -148,6 +198,21 @@ function sidebarLabel(document, title, locale) {
   if (document.target.endsWith('/quickstart.md')) return locale === 'zh' ? '快速开始' : 'Quickstart';
   if (document.target.endsWith('/agent-memory.md')) return 'Agent Memory';
   if (document.target.endsWith('/tokenless.md')) return 'Tokenless';
+  const coshNgLabels = {
+    en: {
+      'user-guide/user-entrypoint/cosh-ng/mcp.md': 'MCP Integration',
+      'user-guide/user-entrypoint/cosh-ng/configuration.md': 'Configuration',
+      'user-guide/user-entrypoint/cosh-ng/supported-distros.md': 'Platform Support',
+      'user-guide/user-entrypoint/cosh-ng/output-format.md': 'Output Format',
+    },
+    zh: {
+      'user-guide/user-entrypoint/cosh-ng/mcp.md': '接入 MCP',
+      'user-guide/user-entrypoint/cosh-ng/configuration.md': '配置',
+      'user-guide/user-entrypoint/cosh-ng/supported-distros.md': '平台支持',
+      'user-guide/user-entrypoint/cosh-ng/output-format.md': '输出格式',
+    },
+  };
+  if (coshNgLabels[locale][document.target]) return coshNgLabels[locale][document.target];
   return title;
 }
 
@@ -194,12 +259,34 @@ const categoryNames = {
   },
 };
 
+const categoryPathNames = {
+  en: {
+    'user-guide/user-entrypoint/cosh-ng': 'cosh-ng',
+    'user-guide/user-entrypoint/cosh-ng/shell': 'Terminal',
+    'user-guide/user-entrypoint/cosh-ng/core': 'Automation and Integration',
+    'user-guide/user-entrypoint/cosh-ng/cli': 'System Operations',
+    'user-guide/agent-observability/agentsight': 'AgentSight',
+    'developer-guide/cosh-ng': 'cosh-ng',
+  },
+  zh: {
+    'user-guide/user-entrypoint/cosh-ng': 'cosh-ng',
+    'user-guide/user-entrypoint/cosh-ng/shell': '终端',
+    'user-guide/user-entrypoint/cosh-ng/core': '自动化与集成',
+    'user-guide/user-entrypoint/cosh-ng/cli': '系统操作',
+    'user-guide/agent-observability/agentsight': 'AgentSight',
+    'developer-guide/cosh-ng': 'cosh-ng',
+  },
+};
+
 // Sidebar ordering mirrors the architecture layers: entry points → token
 // saving → runtime → the cross-cutting observability/security layer.
 // Without explicit positions Docusaurus sorts categories alphabetically,
 // which reverses that reading order.
 const categoryPositions = {
   'user-guide/user-entrypoint': 3,
+  'user-guide/user-entrypoint/cosh-ng/shell': 3,
+  'user-guide/user-entrypoint/cosh-ng/core': 5,
+  'user-guide/user-entrypoint/cosh-ng/cli': 6,
   'user-guide/token-saving': 4,
   'user-guide/runtime': 5,
   'user-guide/agent-observability': 6,
@@ -208,6 +295,14 @@ const categoryPositions = {
 
 const documentPositions = {
   'user-guide/installation.md': 2,
+  'user-guide/user-entrypoint/copilot-shell/quickstart.md': 1,
+  'user-guide/user-entrypoint/cosh-ng/quickstart.md': 2,
+  'user-guide/token-saving/tokenless/quickstart.md': 1,
+  'user-guide/agent-security/agent-sec-core/quickstart.md': 1,
+  'user-guide/user-entrypoint/cosh-ng/mcp.md': 4,
+  'user-guide/user-entrypoint/cosh-ng/configuration.md': 7,
+  'user-guide/user-entrypoint/cosh-ng/supported-distros.md': 8,
+  'user-guide/user-entrypoint/cosh-ng/output-format.md': 9,
   'user-guide/troubleshooting.md': 8,
 };
 
@@ -229,7 +324,8 @@ async function writeCategories(outputRoot, documents, locale) {
   }
   for (const directory of [...directories].sort()) {
     const segment = path.posix.basename(directory);
-    const label = categoryNames[locale][segment] || humanize(segment);
+    const label =
+      categoryPathNames[locale][directory] || categoryNames[locale][segment] || humanize(segment);
     const indexId = `${directory}/index`;
     const hasIndex = documents.some((document) => document.target === `${indexId}.md`);
     const topLevelPosition =
@@ -249,7 +345,8 @@ async function writeCategories(outputRoot, documents, locale) {
 async function prepareLocale(documents, outputRoot, locale) {
   for (const document of documents) {
     const sourceMarkdown = await readFile(path.join(repoRoot, document.source), 'utf8');
-    const markdown = makeMdxSafe(await rewriteLinks(sourceMarkdown, document.source));
+    const websiteMarkdown = stripLocaleSwitchLinks(sourceMarkdown);
+    const markdown = makeMdxSafe(await rewriteLinks(websiteMarkdown, document.source));
     const output = path.join(outputRoot, document.target);
     await mkdir(path.dirname(output), {recursive: true});
     await writeFile(output, `${frontMatter(document, sourceMarkdown, locale)}${markdown}`);
@@ -259,10 +356,89 @@ async function prepareLocale(documents, outputRoot, locale) {
 
 await rm(docsOutput, {recursive: true, force: true});
 await rm(path.join(generatedDir, 'i18n'), {recursive: true, force: true});
+await rm(path.join(staticOutput, 'images'), {recursive: true, force: true});
 await prepareLocale(englishDocuments, docsOutput, 'en');
 await prepareLocale(chineseDocuments, i18nOutput, 'zh');
 
+for (const image of referencedImages) {
+  const destination = path.join(staticOutput, image.slice('docs/'.length));
+  await mkdir(path.dirname(destination), {recursive: true});
+  await copyFile(path.join(repoRoot, image), destination);
+}
+
 const translationRoot = path.join(generatedDir, 'i18n', 'zh');
+const docsTranslationRoot = path.join(translationRoot, 'docusaurus-plugin-content-docs');
+await mkdir(docsTranslationRoot, {recursive: true});
+await writeFile(
+  path.join(docsTranslationRoot, 'current.json'),
+  `${JSON.stringify(
+    {
+      'version.label': {message: '当前版本', description: 'The label for version current'},
+      'sidebar.userGuide.category.User Entry Points': {
+        message: '用户入口',
+        description: "The label for category 'User Entry Points' in sidebar 'userGuide'",
+      },
+      'sidebar.userGuide.category.category-user-guide-user-entrypoint-cosh-ng': {
+        message: 'cosh-ng',
+        description: "The label for category 'cosh-ng' in sidebar 'userGuide'",
+      },
+      'sidebar.userGuide.category.category-user-guide-user-entrypoint-cosh-ng-shell': {
+        message: '终端',
+        description: "The label for the cosh-ng terminal category in sidebar 'userGuide'",
+      },
+      'sidebar.userGuide.category.category-user-guide-user-entrypoint-cosh-ng-core': {
+        message: '自动化与集成',
+        description: "The label for the cosh-ng integration category in sidebar 'userGuide'",
+      },
+      'sidebar.userGuide.category.category-user-guide-user-entrypoint-cosh-ng-cli': {
+        message: '系统操作',
+        description: "The label for the cosh-ng system operations category in sidebar 'userGuide'",
+      },
+      'sidebar.userGuide.category.category-user-guide-user-entrypoint-copilot-shell': {
+        message: 'Copilot Shell',
+        description: "The label for category 'Copilot Shell' in sidebar 'userGuide'",
+      },
+      'sidebar.userGuide.category.Token Efficiency': {
+        message: 'Token 效率',
+        description: "The label for category 'Token Efficiency' in sidebar 'userGuide'",
+      },
+      'sidebar.userGuide.category.category-user-guide-token-saving-tokenless': {
+        message: 'Tokenless',
+        description: "The label for category 'Tokenless' in sidebar 'userGuide'",
+      },
+      'sidebar.userGuide.category.Runtime': {
+        message: '运行时',
+        description: "The label for category 'Runtime' in sidebar 'userGuide'",
+      },
+      'sidebar.userGuide.category.Observability': {
+        message: '可观测性',
+        description: "The label for category 'Observability' in sidebar 'userGuide'",
+      },
+      'sidebar.userGuide.category.Security': {
+        message: '安全',
+        description: "The label for category 'Security' in sidebar 'userGuide'",
+      },
+      'sidebar.userGuide.category.category-user-guide-agent-security-agent-sec-core': {
+        message: 'Agent Sec Core',
+        description: "The label for category 'Agent Sec Core' in sidebar 'userGuide'",
+      },
+      'sidebar.developerGuide.category.Copilot Shell': {
+        message: 'Copilot Shell',
+        description: "The label for category 'Copilot Shell' in sidebar 'developerGuide'",
+      },
+      'sidebar.developerGuide.category.category-developer-guide-copilot-shell-hooks': {
+        message: 'Hooks',
+        description: "The label for category 'Hooks' in sidebar 'developerGuide'",
+      },
+      'sidebar.developerGuide.category.Cosh-ng': {
+        message: 'cosh-ng',
+        description: "The label for category 'Cosh-ng' in sidebar 'developerGuide'",
+      },
+    },
+    null,
+    2,
+  )}\n`,
+);
 const themeTranslationRoot = path.join(translationRoot, 'docusaurus-theme-classic');
 await mkdir(themeTranslationRoot, {recursive: true});
 await writeFile(
@@ -270,7 +446,6 @@ await writeFile(
   `${JSON.stringify(
     {
       title: {message: 'ANOLISA', description: 'The title in the navbar'},
-      'item.label.Docs': {message: '文档', description: 'Navbar item with label Docs'},
       'item.label.User Guide': {message: '用户指南', description: 'Navbar item with label User Guide'},
       'item.label.Developer Guide': {message: '开发者指南', description: 'Navbar item with label Developer Guide'},
       'item.label.Changelog': {message: '变更日志', description: 'Navbar item with label Changelog'},
@@ -305,4 +480,4 @@ await writeFile(
   )}\n`,
 );
 
-console.log(`Prepared ${englishDocuments.length} English and ${chineseDocuments.length} Chinese documents in ${path.relative(websiteDir, generatedDir)}.`);
+console.log(`Prepared ${englishDocuments.length} English and ${chineseDocuments.length} Chinese documents and ${referencedImages.size} images in ${path.relative(websiteDir, generatedDir)}.`);

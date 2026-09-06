@@ -80,11 +80,16 @@ agentsight/
 
 **Linux**：完整 eBPF 追踪（probes → parser → aggregator → storage）。若 `features.trajectory_collection.enabled` 开启，同时运行轨迹采集器。
 
+**Linux 无特权环境**：`--no-ebpf` 跳过探针，仅运行轨迹采集器，使无特权沙箱与容器同样可以采集轨迹。该参数会强制启用轨迹采集，不受 `features.trajectory_collection.enabled` 影响，因为此模式下它是唯一的数据来源。依赖 eBPF 的数据 —— Token 计量、审计事件、中断检测 —— 在此模式下不可用。
+
 **macOS**：仅轨迹采集 — 扫描本地 JSONL 会话文件（Claude Code、Qoder、Codex、Cursor），转换为 ATIF v1.7 格式，存入 `trajectories.db`。无 eBPF。
 
 ```bash
 # 前台模式
 sudo agentsight trace
+
+# 仅轨迹采集 — 无需 root，无需 CAP_BPF
+agentsight trace --no-ebpf
 
 # 守护进程模式，配合 SLS 导出
 sudo agentsight trace --daemon \
@@ -93,22 +98,26 @@ sudo agentsight trace --daemon \
   --sls-logstore <logstore>
 ```
 
+> 使用 `--no-ebpf` 时，`trajectories.db` 在共享数据目录可写时写入该目录，否则写入 `$HOME/.local/share/agentsight/`。启动输出会打印实际路径和对应的 `serve --db` 命令。
+
 ### `agentsight token`
 
 查询 Token 用量数据。
 
+Linux systemd 服务写入的数据由 root 管理，查询时需要使用 `sudo`。
+
 ```bash
 # 查看今日 Token 用量
-agentsight token
+sudo agentsight token
 
 # 本周用量，与上周对比
-agentsight token --period week --compare
+sudo agentsight token --period week --compare
 
 # 按角色和类型的详细分解
-agentsight token --detail
+sudo agentsight token --detail
 
 # JSON 格式输出
-agentsight token --json
+sudo agentsight token --json
 ```
 
 ### `agentsight audit`
@@ -160,7 +169,7 @@ agentsight discover --verbose
 
 ## Dashboard
 
-Dashboard 是基于 React 的 Web 可视化界面，用于查看对话历史、Trace 详情和 Token 统计数据。它在编译时嵌入到 `agentsight serve` 二进制文件中。
+Dashboard 是基于 React 的 Web 可视化界面，用于查看对话历史、Trace 详情和 Token 统计数据。它在编译时嵌入到 `agentsight serve` 二进制文件中。Dashboard 默认根据浏览器语言选择 UI 语言；你可以手动切换语言，选择会被持久化并在刷新后保持。
 
 ### 构建 Dashboard
 
@@ -184,11 +193,14 @@ make build-all
 在两个终端中分别运行追踪器和 API 服务器：
 
 ```bash
+# 启动前台 tracer 前，先停止软件包提供的服务
+sudo systemctl stop agentsight.service
+
 # 终端 1：启动 eBPF 追踪（写入 SQLite）
 sudo agentsight trace
 
 # 终端 2：启动 API 服务器（读取同一 SQLite 文件）
-agentsight serve
+sudo agentsight serve
 ```
 
 **macOS**（仅轨迹采集）：
@@ -286,6 +298,29 @@ sudo yum install agentsight
 RPM 是 Linux system 包。两个单元会随包安装，但默认不会启用；当两个单元都运行时，
 AgentSight 会排在 enforcer 之后启动。
 
+### 启动服务
+
+两种包安装都会让单元保持停止且不启用。准备开始采集时，再启动主服务。
+
+```bash
+sudo systemctl enable --now agentsight.service
+sudo systemctl status agentsight.service
+```
+
+主服务会一起运行 eBPF trace 和 Dashboard，并按顺序带起 enforcer 依赖。
+服务进入 active 状态后，打开 `http://localhost:7396`。
+
+该单元以 root 身份和 `UMask=0077` 运行，因此
+`/var/log/sysak/.agentsight` 中的数据仅 root 可读。查询服务数据或读取
+Dashboard 访问信息时需要使用 `sudo`。启动前台 tracer 前也要先停止该单元。
+
+### Kubernetes DaemonSet
+
+如需在 Kubernetes 中进行节点级采集，使用 `src/agentsight/packaging/` 下的
+DaemonSet 清单与运行时镜像（`k8s/daemonset.yaml` 与 `docker/Dockerfile`）。
+前置条件与验证步骤见
+[部署指南](../../docs/user-guide/zh/agent-observability/agentsight/deployment.md#kubernetes-daemonset节点级)。
+
 ### 从源码构建
 
 ```bash
@@ -368,7 +403,7 @@ AgentSight 通过 `agentsight.json` 配置文件进行统一管理（默认路�
 
 ### 功能开关（`features`）
 
-所有可选功能**默认全开**。可通过 `agentsight.json` 的 `features` 区块逐个关闭以降低内存和 I/O 开销：
+各功能默认值见下表。可通过 `agentsight.json` 的 `features` 区块关闭可选功能，以降低内存和 I/O 开销：
 
 | 功能 | JSON 路径 | 默认值 | 说明 |
 |------|-----------|--------|------|
@@ -376,6 +411,7 @@ AgentSight 通过 `agentsight.json` 配置文件进行统一管理（默认路�
 | 本地 Tokenizer | `features.tokenizer.enabled` | `false` | HuggingFace 模型 fallback 计数（每个模型 50–100 MB） |
 | Session 映射 | `features.session_mapping.enabled` | `true` | responseId → sessionId 关联（LRU 10,000 条） |
 | SQLite 存储 | `features.sqlite_storage.enabled` | `true` | 持久化到磁盘 SQLite；关闭后用内存 noop store |
+| 资源采样 | `features.resource_sampling` | `false` | 每秒采集 Agent CPU/RSS；依赖 SQLite 存储 |
 | 中断检测 | `features.interruption_detection.enabled` | `true` | 死循环 / 崩溃 / 上下文溢出检测 |
 | 审计 | `features.audit` | `true` | LLM 调用审计事件持久化 |
 | Token 消费 | `features.token_consumption` | `false` | 聚合 Token 消费记录 |
@@ -390,6 +426,7 @@ AgentSight 通过 `agentsight.json` 配置文件进行统一管理（默认路�
 |--------|--------|------|
 | `event_channel_capacity` | 10,000 | Probe → 事件通道的有界容量 |
 | `event_channel_policy` | `"backpressure"` | 满载策略：`backpressure` / `drop_newest` / `sample` |
+| `event_channel_max_bytes_mb` | 64 | 排队事件的字节预算（单条 SSL 记录可达 4 MiB，仅靠槽位数无法限定内存）|
 | `pending_genai_max_count` | 1,000 | 等待 session_id 的最大事件数 |
 | `pending_genai_max_bytes_mb` | 64 | 等待 session_id 的最大字节数 |
 | `pid_cache_size` | 1,024 | PID → agent_name 的 LRU 缓存大小 |

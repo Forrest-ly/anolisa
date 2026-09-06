@@ -25,20 +25,29 @@
 //!    directory wins.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anolisa_platform::fs_layout::{FsLayout, InstallMode};
+use anolisa_platform::pkg_files::PackageFileQuery;
+use anolisa_platform::rpm_query::RpmPackageQuery;
 
 use super::AdapterError;
-use super::claim::{AdapterClaim, ClaimStatus};
+use super::claim::{
+    AdapterClaim, AdapterSourceRevision, ClaimResourceKind, ClaimStatus, DriverPayload,
+};
 use super::driver::{
     AdapterCondition, AdapterConditionKind, AdapterOps, AdapterStatusReport, AdapterSummary,
     CliOutput, ConditionStatus, DisableReport, DriverCtx, DriverPlan, EnableProgress,
-    FrameworkCommand, HostEnv,
+    FrameworkCommand, FrameworkRpcSession, HostEnv,
+};
+use super::managed_files::{
+    ManagedInventory, ManagedMatch, cleanup_replaced_materialized_files,
+    inventory_for_installation, materialized_files, plan_replaced_materialized_files,
+    source_revision, verify_managed_bundle, verify_materialized_bundle,
 };
 use super::registry::DriverRegistry;
 use crate::central_log::{CentralLog, LogKind, LogRecord, LogStatus, Severity};
@@ -93,6 +102,10 @@ pub struct EnableOptions {
     /// adapter. Even when set, the driver adds the framework's unsafe flag
     /// only if the host's install help exposes it.
     pub allow_unsafe_plugin_install: bool,
+    /// Explicit profiles for profile-scoped framework adapters such as dsh.
+    /// An empty list means no profiles were selected; profile-scoped drivers
+    /// reject that input rather than silently mutating an implicit profile.
+    pub profiles: Vec<String>,
 }
 
 /// Outcome of [`AdapterManager::disable`].
@@ -176,6 +189,7 @@ struct SourceProbe {
     status: AdapterSourceStatus,
     resource_root: Option<PathBuf>,
     reason: Option<String>,
+    revision: Result<super::claim::AdapterSourceRevision, String>,
 }
 
 /// Full result of [`AdapterManager::scan`].
@@ -347,8 +361,8 @@ impl AdapterDecl {
     }
 }
 
-/// Trust decision for the receipt symlink *targets* of one
-/// `(component, framework)`: the roots targets may resolve under, plus
+/// Trust decision for the external resources of one `(component, framework)`:
+/// the roots symlink targets may resolve under, plus
 /// whether the two-source condition — RPM provenance recorded in state
 /// **and** a contract-declared `[adapters.backends.rpm].resource_root`
 /// — currently grants external-root trust. This is the single decision
@@ -383,6 +397,19 @@ impl ExternalRootTrust {
         self.anchor.as_slice()
     }
 
+    /// Restore a Manager-written dsh home anchor as an allowed external
+    /// root. Unlike ordinary receipt data, this value was captured only
+    /// after the enable-time `DSH_HOME` boundary validated, so environment
+    /// drift cannot redirect later reads or cleanup commands.
+    fn extend_allowed_roots(&self, framework: &str, roots: &mut Vec<PathBuf>) {
+        if framework == "dsh"
+            && let Some(anchor) = &self.anchor
+            && !roots.contains(anchor)
+        {
+            roots.push(anchor.clone());
+        }
+    }
+
     /// Persist or clear the enable-time anchor under the same
     /// eligibility that governs anchor consumption — by construction the
     /// write condition and the read condition can never diverge. The
@@ -406,6 +433,18 @@ impl ExternalRootTrust {
         claim: &AdapterClaim,
         trusted_owned_roots: &[PathBuf],
     ) {
+        if claim.framework == "dsh" {
+            if let Some(root) = dsh_home_anchor(claim) {
+                state.upsert_adapter_trust_root(
+                    &claim.component,
+                    &claim.framework,
+                    root.to_path_buf(),
+                );
+            } else {
+                state.remove_adapter_trust_root(&claim.component, &claim.framework);
+            }
+            return;
+        }
         if self.anchor_eligible
             && claim.requires_external_symlink_trust(layout, trusted_owned_roots)
         {
@@ -417,6 +456,19 @@ impl ExternalRootTrust {
         } else {
             state.remove_adapter_trust_root(&claim.component, &claim.framework);
         }
+    }
+}
+
+/// Return the already-validated dsh home resource for anchor persistence.
+/// The driver's claim validation establishes the exact payload/resource
+/// relationship before [`ExternalRootTrust::sync_anchor`] is called.
+fn dsh_home_anchor(claim: &AdapterClaim) -> Option<&Path> {
+    let DriverPayload::Dsh(payload) = &claim.driver_payload else {
+        return None;
+    };
+    match &claim.resource(&payload.home_resource)?.kind {
+        ClaimResourceKind::ExternalPath { path } => Some(path),
+        _ => None,
     }
 }
 
@@ -455,6 +507,9 @@ pub struct AdapterManager {
     user_home: Option<PathBuf>,
     /// Identity recorded as the central-log actor.
     actor: String,
+    /// Read-only native package file inventory. Kept separate from lifecycle
+    /// version queries so adapter status can be tested without rpmdb.
+    package_files: Box<dyn PackageFileQuery>,
 }
 
 impl AdapterManager {
@@ -478,7 +533,13 @@ impl AdapterManager {
             visibility_warnings: Vec::new(),
             user_home,
             actor,
+            package_files: Box::new(RpmPackageQuery::system()),
         }
+    }
+
+    /// Replace the read-only native package file query (primarily for tests).
+    pub fn set_package_file_query(&mut self, query: Box<dyn PackageFileQuery>) {
+        self.package_files = query;
     }
 
     /// Replace the visible root set. Receipts still read/write only the
@@ -688,7 +749,7 @@ impl AdapterManager {
         }
 
         for claim in &state.adapter_claims {
-            let source = self.source_probe_for_claim(claim, &state);
+            let source = self.source_probe(&claim.component, &claim.framework, &state);
             let (driver_available, framework_detected) = self.driver_scan_facts(&claim.framework);
             let key = (claim.component.clone(), claim.framework.clone());
             let entry = entries.entry(key).or_insert_with(|| ScanEntry {
@@ -716,6 +777,11 @@ impl AdapterManager {
             entry.source_reason = source.reason;
         }
 
+        // A directory name alone cannot establish an unknown framework. Keep
+        // unknown rows only when a contract or receipt identifies them, so
+        // shared trees such as `adapters/tokenless/common` are not adapters.
+        entries.retain(|_, entry| entry.declared || entry.enabled || entry.driver_available);
+
         let mut warnings = self.visibility_warnings.clone();
         warnings.extend(declaration_warnings);
         Ok(ScanReport {
@@ -730,7 +796,8 @@ impl AdapterManager {
     /// when `None` and exactly one framework is present). When `dry_run`,
     /// returns the plan without mutating any state.
     ///
-    /// Takes the install lock for the whole operation.
+    /// Apply takes the install lock before loading state; dry-run remains
+    /// read-only and does not create or acquire the lock file.
     ///
     /// # Errors
     ///
@@ -740,8 +807,8 @@ impl AdapterManager {
     /// [`AdapterError::AmbiguousFramework`], [`AdapterError::UnsupportedAdapterType`],
     /// [`AdapterError::ResourceRootNotFound`],
     /// [`AdapterError::FrameworkNotDetected`], [`AdapterError::BundleInvalid`],
-    /// [`AdapterError::FrameworkCli`], [`AdapterError::ClaimValidation`], or
-    /// state/lock/log errors.
+    /// [`AdapterError::FrameworkCli`], [`AdapterError::ClaimValidation`],
+    /// [`AdapterError::ReenableCleanupIncomplete`], or state/lock/log errors.
     pub fn enable(
         &self,
         component: &str,
@@ -767,7 +834,11 @@ impl AdapterManager {
         dry_run: bool,
         options: EnableOptions,
     ) -> Result<EnableOutcome, AdapterError> {
-        let _lock = InstallLock::acquire(&self.layout.lock_file)?;
+        let _lock = if dry_run {
+            None
+        } else {
+            Some(InstallLock::acquire(&self.layout.lock_file)?)
+        };
         let mut state = self.load_state()?;
 
         let (manifest, scoped_datadir_roots, contract_datadir_root, rpm_provenance) =
@@ -802,6 +873,13 @@ impl AdapterManager {
                 component: component.to_string(),
                 framework: framework.clone(),
                 adapter_type: adapter_type.clone(),
+            });
+        }
+        if !options.profiles.is_empty() && framework != "dsh" {
+            return Err(AdapterError::InvalidAdapterInput {
+                component: component.to_string(),
+                framework: framework.clone(),
+                reason: "--profile is only valid for the dsh framework".to_string(),
             });
         }
 
@@ -896,7 +974,8 @@ impl AdapterManager {
             component.to_string(),
             label.clone(),
             vec![resource_root.clone()],
-        );
+        )
+        .with_invocation_logging(!dry_run);
         let probe_ctx = DriverCtx {
             component: component.to_string(),
             framework: framework.clone(),
@@ -904,6 +983,7 @@ impl AdapterManager {
             resource_root: resource_root.clone(),
             user_home: self.user_home.clone(),
             declared_plugin_id: declared_plugin_id.clone(),
+            requested_profiles: options.profiles.clone(),
             adapter_type: adapter_type.clone(),
             declared_skills: Vec::new(),
             declared_config: Vec::new(),
@@ -914,15 +994,16 @@ impl AdapterManager {
             ops: &probe_ops,
         };
         let mut allowed_roots = driver.allowed_external_roots(&probe_ctx);
+        trust.extend_allowed_roots(&framework, &mut allowed_roots);
         allowed_roots.push(resource_root.clone());
         // Skill sources that live outside the resource root (e.g.
         // `{datadir}/skills/<name>/`) must also be readable by the
         // Manager's controlled IO.
         for skill in &skills {
-            if let Some(ref src) = skill.source {
-                if !allowed_roots.iter().any(|r| src.starts_with(r)) {
-                    allowed_roots.push(src.clone());
-                }
+            if let Some(ref src) = skill.source
+                && !allowed_roots.iter().any(|r| src.starts_with(r))
+            {
+                allowed_roots.push(src.clone());
             }
         }
         drop(probe_ctx);
@@ -935,7 +1016,8 @@ impl AdapterManager {
             component.to_string(),
             label.clone(),
             allowed_roots,
-        );
+        )
+        .with_invocation_logging(!dry_run);
         let ctx = DriverCtx {
             component: component.to_string(),
             framework: framework.clone(),
@@ -943,6 +1025,7 @@ impl AdapterManager {
             resource_root: resource_root.clone(),
             user_home: self.user_home.clone(),
             declared_plugin_id,
+            requested_profiles: options.profiles.clone(),
             adapter_type,
             declared_skills: skills,
             declared_config: config,
@@ -953,10 +1036,44 @@ impl AdapterManager {
             ops: &ops,
         };
 
-        let bundle = driver.read_bundle(&ctx)?;
-
         if dry_run {
-            let plan = driver.plan_enable(&bundle, &ctx)?;
+            let bundle = driver.read_bundle(&ctx)?;
+            let mut plan = driver.plan_enable(&bundle, &ctx)?;
+            if let Some(prior) = state.find_adapter_claim(component, &framework) {
+                let mut claim_allowed_roots = driver.allowed_external_roots(&ctx);
+                trust.extend_allowed_roots(&framework, &mut claim_allowed_roots);
+                prior.validate_with_trust(
+                    &self.layout,
+                    &claim_allowed_roots,
+                    &trust.target_roots,
+                    trust.exact_targets(),
+                )?;
+                let mappings = driver.materialized_mappings(
+                    &resource_root,
+                    ctx.adapter_type.as_deref(),
+                    &ctx.declared_skills,
+                );
+                let next_files = if mappings.is_empty() {
+                    Vec::new()
+                } else {
+                    let inventory = self.managed_inventory(component, &state, &framework)?;
+                    materialized_files(&inventory, &mappings).map_err(|reason| {
+                        AdapterError::InvalidAdapterInput {
+                            component: component.to_string(),
+                            framework: framework.clone(),
+                            reason,
+                        }
+                    })?
+                };
+                let next_roots = driver.materialized_destination_roots(&bundle, &ctx)?;
+                let mut cleanup_actions = driver.plan_reenable_cleanup(prior, &ctx)?;
+                cleanup_actions.extend(plan_replaced_materialized_files(
+                    prior,
+                    &next_files,
+                    &next_roots,
+                )?);
+                plan.actions.splice(0..0, cleanup_actions);
+            }
             let notices = declared_notices(
                 &manifest,
                 &framework,
@@ -976,13 +1093,21 @@ impl AdapterManager {
             });
         }
 
+        // Preserve the driver's existing read-only input validation and error
+        // ordering. The authoritative integrity gate runs below after all
+        // pure preparation, immediately before replacement cleanup or apply
+        // can mutate framework state.
+        let bundle = driver.read_bundle(&ctx)?;
         let (mut claim, prepared) = driver.prepare_enable(&bundle, &ctx)?;
+        claim.bundle_digest = None;
         // Persist the manifest's static notices in the receipt so a later
         // disable can show `post_disable` notices from the receipt alone.
         // Inert text — never expanded or executed.
         claim.notices = all_notices;
-        let claim_allowed_roots = driver.allowed_external_roots(&ctx);
-        if let Some(prior) = state.find_adapter_claim(component, &framework).cloned() {
+        let mut claim_allowed_roots = driver.allowed_external_roots(&ctx);
+        trust.extend_allowed_roots(&framework, &mut claim_allowed_roots);
+        let prior = state.find_adapter_claim(component, &framework).cloned();
+        if let Some(prior) = &prior {
             // A forged prior receipt must not gain authority merely because a
             // driver preserves facts from it during re-enable.
             prior.validate_with_trust(
@@ -991,7 +1116,32 @@ impl AdapterManager {
                 &trust.target_roots,
                 trust.exact_targets(),
             )?;
-            driver.preserve_reenable_facts(&prior, &mut claim)?;
+            driver.preserve_reenable_facts(prior, &mut claim)?;
+        }
+        let mappings = driver.materialized_mappings(
+            &resource_root,
+            ctx.adapter_type.as_deref(),
+            &ctx.declared_skills,
+        );
+        let managed_inventory = self.managed_inventory(component, &state, &framework)?;
+        let revision =
+            source_revision(&managed_inventory, &resource_root, &mappings).map_err(|reason| {
+                AdapterError::InvalidAdapterInput {
+                    component: component.to_string(),
+                    framework: framework.clone(),
+                    reason,
+                }
+            })?;
+        claim.source_revision = Some(revision.clone());
+        if !mappings.is_empty() {
+            claim.materialized_files =
+                materialized_files(&managed_inventory, &mappings).map_err(|reason| {
+                    AdapterError::InvalidAdapterInput {
+                        component: component.to_string(),
+                        framework: framework.clone(),
+                        reason,
+                    }
+                })?;
         }
         // Defense in depth: the driver must not emit a claim that points
         // outside its own declared roots. Reject before persisting.
@@ -1002,6 +1152,43 @@ impl AdapterManager {
             trust.exact_targets(),
         )?;
         driver.validate_prepared_enable(&claim)?;
+        match verify_managed_bundle(&revision) {
+            ManagedMatch::Matched => {}
+            ManagedMatch::Changed(reason) | ManagedMatch::Unknown(reason) => {
+                return Err(AdapterError::InvalidAdapterInput {
+                    component: component.to_string(),
+                    framework: framework.clone(),
+                    reason,
+                });
+            }
+        }
+
+        if let Some(prior) = &prior {
+            // Do not overwrite the only durable ownership record until the
+            // driver has released resources the replacement cannot describe.
+            // A failed cleanup leaves the validated prior receipt untouched,
+            // so disable or a later re-enable can retry safely.
+            let report = driver.cleanup_replaced_claim(prior, &claim, &ctx)?;
+            if !report.cleanup_complete {
+                let reason = if report.messages.is_empty() {
+                    "driver reported incomplete cleanup without details".to_string()
+                } else {
+                    report.messages.join("; ")
+                };
+                return Err(AdapterError::ReenableCleanupIncomplete {
+                    component: component.to_string(),
+                    framework: framework.clone(),
+                    reason,
+                });
+            }
+            cleanup_replaced_materialized_files(prior, &claim, &ops).map_err(|err| {
+                AdapterError::ReenableCleanupIncomplete {
+                    component: component.to_string(),
+                    framework: framework.clone(),
+                    reason: format!("failed to prune stale materialized output: {err}"),
+                }
+            })?;
+        }
 
         state.upsert_adapter_claim(claim.clone());
         // Anchor lifecycle shares the trust decision above: it is recorded
@@ -1044,6 +1231,14 @@ impl AdapterManager {
             }
             return Err(err);
         }
+        claim.validate_with_trust(
+            &self.layout,
+            &claim_allowed_roots,
+            &trust.target_roots,
+            trust.exact_targets(),
+        )?;
+        state.upsert_adapter_claim(claim.clone());
+        state.save(&self.state_path)?;
         self.log_operation(&label, component, LogStatus::Ok, "adapter enabled", None);
 
         Ok(EnableOutcome::Enabled(Box::new(claim)))
@@ -1059,7 +1254,8 @@ impl AdapterManager {
     /// descriptive plan without mutating framework state, adapter receipts,
     /// or `installed.toml`.
     ///
-    /// Takes the install lock for the whole operation.
+    /// Apply takes the install lock before loading state; dry-run remains
+    /// read-only and does not create or acquire the lock file.
     ///
     /// # Errors
     ///
@@ -1073,7 +1269,11 @@ impl AdapterManager {
         framework: Option<&str>,
         dry_run: bool,
     ) -> Result<DisableOutcome, AdapterError> {
-        let _lock = InstallLock::acquire(&self.layout.lock_file)?;
+        let _lock = if dry_run {
+            None
+        } else {
+            Some(InstallLock::acquire(&self.layout.lock_file)?)
+        };
         let mut state = self.load_state()?;
 
         let framework = match framework {
@@ -1145,6 +1345,7 @@ impl AdapterManager {
             .discover_resource_root(component, &framework)
             .map(|(path, _)| path)
             .unwrap_or_else(|| claim.resource_root.clone());
+        let trust = self.external_root_trust_from_state(component, &framework, &state);
 
         let label = format!("adapter disable {component} {framework}");
         let probe_ops = ManagerOps::new(
@@ -1154,7 +1355,8 @@ impl AdapterManager {
             component.to_string(),
             label.clone(),
             vec![resource_root.clone()],
-        );
+        )
+        .with_invocation_logging(!dry_run);
         let probe_ctx = DriverCtx {
             component: component.to_string(),
             framework: framework.clone(),
@@ -1162,6 +1364,7 @@ impl AdapterManager {
             resource_root: resource_root.clone(),
             user_home: self.user_home.clone(),
             declared_plugin_id: None,
+            requested_profiles: Vec::new(),
             adapter_type: claim.adapter_type.clone(),
             declared_skills: Vec::new(),
             declared_config: Vec::new(),
@@ -1172,6 +1375,7 @@ impl AdapterManager {
             ops: &probe_ops,
         };
         let mut allowed_roots = driver.allowed_external_roots(&probe_ctx);
+        trust.extend_allowed_roots(&framework, &mut allowed_roots);
         allowed_roots.push(resource_root.clone());
         drop(probe_ctx);
         drop(probe_ops);
@@ -1183,7 +1387,8 @@ impl AdapterManager {
             component.to_string(),
             label.clone(),
             allowed_roots,
-        );
+        )
+        .with_invocation_logging(!dry_run);
         let ctx = DriverCtx {
             component: component.to_string(),
             framework: framework.clone(),
@@ -1191,6 +1396,7 @@ impl AdapterManager {
             resource_root,
             user_home: self.user_home.clone(),
             declared_plugin_id: None,
+            requested_profiles: Vec::new(),
             adapter_type: claim.adapter_type.clone(),
             declared_skills: Vec::new(),
             declared_config: Vec::new(),
@@ -1202,10 +1408,11 @@ impl AdapterManager {
         };
 
         // Re-validate the receipt before acting on it (forged-state guard).
-        let trust = self.external_root_trust_from_state(component, &framework, &state);
+        let mut claim_allowed_roots = driver.allowed_external_roots(&ctx);
+        trust.extend_allowed_roots(&framework, &mut claim_allowed_roots);
         claim.validate_with_trust(
             &self.layout,
-            &driver.allowed_external_roots(&ctx),
+            &claim_allowed_roots,
             &trust.target_roots,
             trust.exact_targets(),
         )?;
@@ -1284,7 +1491,7 @@ impl AdapterManager {
                 continue;
             }
             let framework = claim.framework.clone();
-            let source = self.source_probe_for_claim(claim, &state);
+            let source = self.source_probe(&claim.component, &claim.framework, &state);
             let driver = match self.registry.get(&framework) {
                 Some(d) => d,
                 None => {
@@ -1293,9 +1500,11 @@ impl AdapterManager {
                     entries.push(StatusEntry {
                         component: claim.component.clone(),
                         framework,
-                        report: with_source_condition(
+                        report: with_managed_conditions(
                             unverified_report("no built-in driver for framework"),
+                            claim,
                             &source,
+                            false,
                         ),
                     });
                     continue;
@@ -1310,6 +1519,7 @@ impl AdapterManager {
                         .map(|(path, _)| path)
                 })
                 .unwrap_or_else(|| claim.resource_root.clone());
+            let trust = self.external_root_trust_from_state(&claim.component, &framework, &state);
             let label = format!("adapter status {} {framework}", claim.component);
             // Two-phase ops mirroring enable/disable: probe to learn the
             // driver's external roots, then rebuild so a driver that verifies
@@ -1331,6 +1541,7 @@ impl AdapterManager {
                 resource_root: resource_root.clone(),
                 user_home: self.user_home.clone(),
                 declared_plugin_id: None,
+                requested_profiles: Vec::new(),
                 adapter_type: claim.adapter_type.clone(),
                 declared_skills: Vec::new(),
                 declared_config: Vec::new(),
@@ -1341,6 +1552,7 @@ impl AdapterManager {
                 ops: &probe_ops,
             };
             let mut allowed_roots = driver.allowed_external_roots(&probe_ctx);
+            trust.extend_allowed_roots(&framework, &mut allowed_roots);
             allowed_roots.push(resource_root.clone());
             drop(probe_ctx);
             drop(probe_ops);
@@ -1360,6 +1572,7 @@ impl AdapterManager {
                 resource_root,
                 user_home: self.user_home.clone(),
                 declared_plugin_id: None,
+                requested_profiles: Vec::new(),
                 adapter_type: claim.adapter_type.clone(),
                 declared_skills: Vec::new(),
                 declared_config: Vec::new(),
@@ -1370,14 +1583,20 @@ impl AdapterManager {
                 ops: &ops,
             };
 
-            let trust = self.external_root_trust_from_state(&claim.component, &framework, &state);
+            let mut claim_allowed_roots = driver.allowed_external_roots(&ctx);
+            trust.extend_allowed_roots(&framework, &mut claim_allowed_roots);
             claim.validate_with_trust(
                 &self.layout,
-                &driver.allowed_external_roots(&ctx),
+                &claim_allowed_roots,
                 &trust.target_roots,
                 trust.exact_targets(),
             )?;
-            let report = with_source_condition(driver.status(claim, &ctx)?, &source);
+            let report = with_managed_conditions(
+                driver.status(claim, &ctx)?,
+                claim,
+                &source,
+                driver.materialized_verification_applicable(claim),
+            );
             entries.push(StatusEntry {
                 component: claim.component.clone(),
                 framework,
@@ -1386,6 +1605,48 @@ impl AdapterManager {
         }
 
         Ok(StatusReport { entries })
+    }
+
+    /// Compare one receipt with the same authoritative source revision used by
+    /// [`Self::status`]. Component update uses this to avoid a second drift
+    /// definition.
+    pub fn source_revision_match(
+        &self,
+        claim: &AdapterClaim,
+        current_state: &StateStore,
+    ) -> ManagedMatch {
+        let source = self.source_probe(&claim.component, &claim.framework, current_state);
+        match source.revision {
+            Ok(current) => super::managed_files::compare_source_revision(claim, &current),
+            Err(reason) => ManagedMatch::Unknown(reason),
+        }
+    }
+
+    /// Capture every declared adapter's authoritative source revision.
+    ///
+    /// Missing package metadata is represented as `None` for that framework
+    /// so update reporting cannot mistake an unverifiable source for an
+    /// unchanged one.
+    pub fn source_revision_snapshot(
+        &self,
+        component: &str,
+        current_state: &StateStore,
+    ) -> BTreeMap<String, Option<AdapterSourceRevision>> {
+        let Ok((manifest, _, _, _)) =
+            self.load_visible_component_manifest(component, current_state)
+        else {
+            return BTreeMap::new();
+        };
+        declared_frameworks(&manifest)
+            .into_iter()
+            .map(|framework| {
+                let revision = self
+                    .source_probe(component, &framework, current_state)
+                    .revision
+                    .ok();
+                (framework, revision)
+            })
+            .collect()
     }
 
     // -- discovery helpers --------------------------------------------------
@@ -1402,14 +1663,6 @@ impl AdapterManager {
             })
             .unwrap_or(false);
         (driver_available, framework_detected)
-    }
-
-    fn source_probe_for_claim(
-        &self,
-        claim: &AdapterClaim,
-        current_state: &StateStore,
-    ) -> SourceProbe {
-        self.source_probe(&claim.component, &claim.framework, current_state)
     }
 
     fn source_probe(
@@ -1478,17 +1731,44 @@ impl AdapterManager {
             // leftover (e.g. the empty skeleton an uninstalled scope left
             // behind). Report Missing rather than letting a hollow
             // directory masquerade as a live source.
-            Ok((resource_root, _))
+            Ok((resource_root, effective_datadir))
                 if self.bundle_root_valid(
                     framework,
                     declared_bundle_entry(&manifest, framework).as_deref(),
                     &resource_root,
                 ) =>
             {
+                let revision = (|| {
+                    let mappings = if let Some(driver) = self.registry.get(framework) {
+                        let skills = resolve_skill_sources(
+                            declared_skills(&manifest, framework),
+                            &self.layout,
+                            &effective_datadir,
+                            component,
+                            framework,
+                            &resource_root,
+                        )
+                        .map_err(|err| format!("adapter skill sources are invalid: {err}"))?;
+                        driver.materialized_mappings(
+                            &resource_root,
+                            declared_adapter_type(&manifest, framework).as_deref(),
+                            &skills,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    self.current_source_revision(
+                        component,
+                        current_state,
+                        &resource_root,
+                        &mappings,
+                    )
+                })();
                 SourceProbe {
                     status: AdapterSourceStatus::Available,
-                    resource_root: Some(resource_root),
+                    resource_root: Some(resource_root.clone()),
                     reason: None,
+                    revision,
                 }
             }
             Ok((resource_root, _)) => source_missing(format!(
@@ -1614,6 +1894,66 @@ impl AdapterManager {
             }
         }
         Ok(None)
+    }
+
+    fn find_component_installation(
+        &self,
+        component: &str,
+        current_state: &StateStore,
+    ) -> Result<Option<Installation>, AdapterError> {
+        for vr in &self.visible_roots {
+            let found = if vr.state_dir == self.layout.state_dir {
+                current_state
+                    .find(ObjectKind::Component, component)
+                    .filter(|installation| is_adapter_visible(installation))
+                    .cloned()
+            } else {
+                let state_path = vr.state_dir.join("installed.toml");
+                Self::load_state_at(&state_path)?
+                    .find(ObjectKind::Component, component)
+                    .filter(|installation| is_adapter_visible(installation))
+                    .cloned()
+            };
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
+    }
+
+    fn managed_inventory(
+        &self,
+        component: &str,
+        current_state: &StateStore,
+        framework: &str,
+    ) -> Result<ManagedInventory, AdapterError> {
+        let installation = self
+            .find_component_installation(component, current_state)?
+            .ok_or_else(|| AdapterError::ComponentNotInstalled {
+                component: component.to_string(),
+            })?;
+        inventory_for_installation(&installation, self.package_files.as_ref()).map_err(|reason| {
+            AdapterError::InvalidAdapterInput {
+                component: component.to_string(),
+                framework: framework.to_string(),
+                reason,
+            }
+        })
+    }
+
+    fn current_source_revision(
+        &self,
+        component: &str,
+        current_state: &StateStore,
+        resource_root: &Path,
+        mappings: &[super::managed_files::MaterializedMapping],
+    ) -> Result<super::claim::AdapterSourceRevision, String> {
+        let installation = self
+            .find_component_installation(component, current_state)
+            .map_err(|err| format!("installed component state unavailable: {err}"))?
+            .ok_or_else(|| format!("component '{component}' is not installed"))?;
+        let inventory = inventory_for_installation(&installation, self.package_files.as_ref())?;
+        source_revision(&inventory, resource_root, mappings)
     }
 
     /// Adapter declarations from component contracts visible to the
@@ -2074,10 +2414,10 @@ impl AdapterManager {
         scoped_datadir_roots: &[PathBuf],
     ) -> Option<PathBuf> {
         for datadir in scoped_datadir_roots {
-            if let Ok(path) = self.expand_dest_template(dest_template, component, datadir) {
-                if self.bundle_root_valid(framework, declared_entry, &path) {
-                    return Some(path);
-                }
+            if let Ok(path) = self.expand_dest_template(dest_template, component, datadir)
+                && self.bundle_root_valid(framework, declared_entry, &path)
+            {
+                return Some(path);
             }
         }
         None
@@ -2259,6 +2599,9 @@ struct ManagerOps {
     /// under. Populated from the driver's `allowed_external_roots` plus
     /// the resource root.
     allowed_roots: Vec<PathBuf>,
+    /// Read-only previews may probe framework capabilities but must not
+    /// persist those invocations as operation records.
+    record_invocations: bool,
 }
 
 /// Persists incremental receipt facts while the Manager holds the enable
@@ -2305,12 +2648,21 @@ impl ManagerOps {
             component,
             label,
             allowed_roots,
+            record_invocations: true,
         }
+    }
+
+    fn with_invocation_logging(mut self, enabled: bool) -> Self {
+        self.record_invocations = enabled;
+        self
     }
 
     /// Record one framework CLI invocation. Best-effort; a log failure
     /// never propagates.
     fn record(&self, cmd: &FrameworkCommand, output: &CliOutput) {
+        if !self.record_invocations {
+            return;
+        }
         let severity = if output.success() {
             Severity::Debug
         } else {
@@ -2363,6 +2715,12 @@ impl AdapterOps for ManagerOps {
         Ok(output)
     }
 
+    fn run_framework_rpc(&self, session: FrameworkRpcSession) -> Result<CliOutput, AdapterError> {
+        let output = run_rpc_capture(&session, JSON_OUTPUT_CAP)?;
+        self.record(&session.command, &output);
+        Ok(output)
+    }
+
     fn copy_tree(&self, src: &Path, dst: &Path) -> Result<(), AdapterError> {
         validate_ops_path(src, &self.allowed_roots)?;
         validate_ops_path(dst, &self.allowed_roots)?;
@@ -2401,6 +2759,31 @@ impl AdapterOps for ManagerOps {
             source,
         })?;
         Ok(())
+    }
+
+    fn remove_path(&self, path: &Path) -> Result<bool, AdapterError> {
+        validate_ops_path(path, &self.allowed_roots)?;
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_dir() => {
+                std::fs::remove_dir(path).map_err(|source| AdapterError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                Ok(true)
+            }
+            Ok(_) => {
+                std::fs::remove_file(path).map_err(|source| AdapterError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                Ok(true)
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(AdapterError::Io {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
     }
 
     fn remove_tree(&self, path: &Path) -> Result<bool, AdapterError> {
@@ -2730,6 +3113,269 @@ fn run_capture_with_stdout_cap(
     })
 }
 
+/// Drive a line-delimited JSON-RPC session, holding the server's stdin open
+/// until `session.expected_responses` id-bearing replies have been read (or
+/// the command timeout elapses), then closing it so the child exits.
+///
+/// stdout is read line-by-line on a worker thread rather than drained to EOF,
+/// because the close decision depends on what has already been answered — a
+/// server that only exits once its stdin closes would otherwise deadlock
+/// against a drain-to-EOF reader.
+fn run_rpc_capture(
+    session: &FrameworkRpcSession,
+    stdout_cap: usize,
+) -> Result<CliOutput, AdapterError> {
+    let cmd = &session.command;
+    let mut command = Command::new(&cmd.program);
+    command
+        .args(&cmd.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    for key in &cmd.env_remove {
+        command.env_remove(key);
+    }
+    for (key, value) in &cmd.env_set {
+        command.env(key, value);
+    }
+    if !cmd.path_prepend.is_empty() {
+        command.env("PATH", prepend_path(&cmd.path_prepend));
+    }
+
+    let mut child = crate::process::spawn_retry_etxtbsy(&mut command).map_err(|source| {
+        AdapterError::FrameworkCli {
+            program: cmd.program.clone(),
+            reason: format!("failed to spawn: {source}"),
+        }
+    })?;
+
+    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(AdapterError::FrameworkCli {
+            program: cmd.program.clone(),
+            reason: "failed to open child stdio pipes".to_string(),
+        });
+    };
+    let stderr_handle = child.stderr.take().map(|r| spawn_drain(r, OUTPUT_CAP));
+
+    // The writer thread owns stdin and only drops it (signalling EOF) once
+    // `close_tx` is dropped by this thread.
+    let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
+    let payload: Vec<u8> = session
+        .requests
+        .iter()
+        .flat_map(|line| {
+            line.as_bytes()
+                .iter()
+                .copied()
+                .chain(std::iter::once(b'\n'))
+        })
+        .collect();
+    let writer = thread::spawn(move || {
+        let mut stdin = stdin;
+        let result = stdin.write_all(&payload).and_then(|()| stdin.flush());
+        // Park until the reader is done; `recv` returns Err on sender drop.
+        let _ = close_rx.recv();
+        result
+    });
+
+    enum RpcStdoutEvent {
+        Line(String),
+        LimitExceeded,
+        ReadFailed(String),
+    }
+
+    // A rendezvous channel prevents the reader from queuing output faster
+    // than this thread can account for it.
+    let (line_tx, line_rx) = std::sync::mpsc::sync_channel::<RpcStdoutEvent>(0);
+    let reader = thread::spawn(move || {
+        // Read at most one byte beyond the cap so overflow is detectable
+        // without allocating an arbitrarily large unterminated JSONL line.
+        let limit = (stdout_cap as u64).saturating_add(1);
+        let mut reader = std::io::BufReader::new(stdout).take(limit);
+        let mut total = 0usize;
+        let mut drain_after_disconnect = false;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(read) => {
+                    total = total.saturating_add(read);
+                    if total > stdout_cap {
+                        drain_after_disconnect =
+                            line_tx.send(RpcStdoutEvent::LimitExceeded).is_err();
+                        break;
+                    }
+                    if line.ends_with('\n') {
+                        line.pop();
+                        if line.ends_with('\r') {
+                            line.pop();
+                        }
+                    }
+                    if line_tx.send(RpcStdoutEvent::Line(line)).is_err() {
+                        drain_after_disconnect = true;
+                        break;
+                    }
+                }
+                Err(source) => {
+                    let _ = line_tx.send(RpcStdoutEvent::ReadFailed(source.to_string()));
+                    break;
+                }
+            }
+        }
+        if drain_after_disconnect {
+            let mut reader = reader.into_inner();
+            let mut chunk = [0u8; 8192];
+            while reader.read(&mut chunk).is_ok_and(|read| read != 0) {
+                // Keep draining after the RPC exchange completes so the child
+                // can flush and exit without retaining any additional output.
+            }
+        }
+    });
+
+    let start = Instant::now();
+    let mut kept = String::new();
+    let mut answered = 0usize;
+    let mut timed_out = false;
+    let mut stdout_failure = None;
+    while answered < session.expected_responses {
+        let Some(remaining) = cmd.timeout.checked_sub(start.elapsed()) else {
+            timed_out = true;
+            break;
+        };
+        match line_rx.recv_timeout(remaining) {
+            Ok(RpcStdoutEvent::Line(line)) => {
+                if kept.len().saturating_add(line.len()).saturating_add(1) > stdout_cap {
+                    stdout_failure = Some(format!(
+                        "app-server stdout exceeded the {stdout_cap}-byte limit"
+                    ));
+                    break;
+                }
+                if is_rpc_response(&line) {
+                    answered += 1;
+                }
+                kept.push_str(&line);
+                kept.push('\n');
+            }
+            Ok(RpcStdoutEvent::LimitExceeded) => {
+                stdout_failure = Some(format!(
+                    "app-server stdout exceeded the {stdout_cap}-byte limit"
+                ));
+                break;
+            }
+            Ok(RpcStdoutEvent::ReadFailed(reason)) => {
+                stdout_failure = Some(format!("failed to read app-server stdout: {reason}"));
+                break;
+            }
+            // The server closed stdout (or died) before answering.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                timed_out = true;
+                break;
+            }
+        }
+    }
+
+    // Unblock a reader waiting to publish another event. It will drain the
+    // pipe without retaining output once all expected replies are complete.
+    drop(line_rx);
+    // Closing stdin lets a well-behaved server flush and exit. If the
+    // exchange is incomplete, terminate the child before joining the writer:
+    // it may be blocked in `write_all` on a full pipe that the server stopped
+    // reading, and waiting for it first would defeat the session timeout.
+    drop(close_tx);
+    let incomplete = answered < session.expected_responses || stdout_failure.is_some();
+    let mut status = if incomplete {
+        match child.try_wait() {
+            Ok(Some(status)) => Some(status),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                child.wait().ok()
+            }
+        }
+    } else {
+        None
+    };
+    let write_result = writer.join();
+    if !incomplete {
+        status = wait_bounded(&mut child, start, cmd.timeout);
+        if status.is_none() {
+            timed_out = true;
+        }
+    }
+    let _ = reader.join();
+    let mut stderr = String::from_utf8_lossy(&collect_drain(stderr_handle)).into_owned();
+
+    // A failed stdin write is a symptom, not the diagnosis: a server that does
+    // not implement the subcommand exits before the request lands, and EPIPE
+    // would mask its exit code and stderr. Note it and let the caller judge
+    // the exchange by the replies it did or did not get.
+    let write_note = match write_result {
+        Ok(Err(source)) => Some(format!("failed to write server stdin: {source}")),
+        Err(_) => Some("stdin writer thread panicked".to_string()),
+        Ok(Ok(())) => None,
+    };
+    if let Some(note) = write_note.filter(|_| answered < session.expected_responses) {
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(&note);
+    }
+
+    if let Some(reason) = stdout_failure {
+        return Err(AdapterError::FrameworkCli {
+            program: cmd.program.clone(),
+            reason,
+        });
+    }
+
+    Ok(CliOutput {
+        status: status.and_then(|s| s.code()),
+        timed_out,
+        stdout: kept,
+        stderr,
+    })
+}
+
+/// Whether a server stdout line is a JSON-RPC *response* (carries an `id`)
+/// rather than a notification. Only responses count toward the session's
+/// expected reply count.
+fn is_rpc_response(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value.get("id").cloned())
+        .is_some_and(|id| !id.is_null())
+}
+
+/// Reap `child` within what remains of `timeout` measured from `start`,
+/// killing it on expiry. Returns `None` when the child had to be killed.
+fn wait_bounded(
+    child: &mut std::process::Child,
+    start: Instant,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// Build a `PATH` value with `prepend` dirs in front of the current one.
 fn prepend_path(prepend: &[PathBuf]) -> std::ffi::OsString {
     prepend_path_with_existing(prepend, std::env::var_os("PATH"))
@@ -3020,6 +3666,10 @@ fn allowed_adapter_types(framework: &str) -> Option<&'static [&'static str]> {
         // Qoder installs a directory-named plugin and activates it via
         // settings.json entries: plugin only (no extension / skill_bundle).
         "qoder" => Some(&["plugin"]),
+        // dsh bundles are native plugins registered per explicit profile.
+        "dsh" => Some(&["plugin"]),
+        // QwenPaw installs a directory-named plugin through its own CLI.
+        "qwenpaw" => Some(&["plugin"]),
         // Extension frameworks require an explicit type. Qwen Code delegates
         // artifact and activation mutations to its native CLI.
         "cosh" | "qwencode" => Some(&["extension"]),
@@ -3132,17 +3782,17 @@ fn declared_skills(
     // Framework-specific section takes precedence.
     match framework {
         "openclaw" => {
-            if let Some(ref oc) = adapter.openclaw {
-                if !oc.skills.is_empty() {
-                    return oc.skills.clone();
-                }
+            if let Some(ref oc) = adapter.openclaw
+                && !oc.skills.is_empty()
+            {
+                return oc.skills.clone();
             }
         }
         "hermes" => {
-            if let Some(ref h) = adapter.hermes {
-                if !h.skills.is_empty() {
-                    return h.skills.clone();
-                }
+            if let Some(ref h) = adapter.hermes
+                && !h.skills.is_empty()
+            {
+                return h.skills.clone();
             }
         }
         _ => {}
@@ -3234,12 +3884,11 @@ fn declared_config(
         None => return Vec::new(),
     };
     // Framework-specific section takes precedence.
-    if framework == "openclaw" {
-        if let Some(ref oc) = adapter.openclaw {
-            if !oc.config.is_empty() {
-                return oc.config.clone();
-            }
-        }
+    if framework == "openclaw"
+        && let Some(ref oc) = adapter.openclaw
+        && !oc.config.is_empty()
+    {
+        return oc.config.clone();
     }
     adapter.config.clone()
 }
@@ -3326,17 +3975,17 @@ fn declared_bundle_entry(manifest: &ComponentManifest, framework: &str) -> Optio
         .find(|a| a.framework.as_deref().map(str::trim) == Some(framework))?;
     match framework {
         "openclaw" => {
-            if let Some(ref oc) = adapter.openclaw {
-                if let Some(ref entry) = oc.bundle.entry {
-                    return Some(entry.clone());
-                }
+            if let Some(ref oc) = adapter.openclaw
+                && let Some(ref entry) = oc.bundle.entry
+            {
+                return Some(entry.clone());
             }
         }
         "hermes" => {
-            if let Some(ref h) = adapter.hermes {
-                if let Some(ref entry) = h.bundle.entry {
-                    return Some(entry.clone());
-                }
+            if let Some(ref h) = adapter.hermes
+                && let Some(ref entry) = h.bundle.entry
+            {
+                return Some(entry.clone());
             }
         }
         _ => {}
@@ -3371,12 +4020,13 @@ fn plan_disable_report(claim: &AdapterClaim) -> DisableReport {
 
     // Resource ids that a real disable actually acts on. Empty plugin ids
     // (skill-bundle receipts carry no plugin resource) are excluded.
-    // `hermes_plugin_id` is the plugin resource id for Hermes receipts:
-    // real Hermes disable first runs `hermes plugins disable <id>` before
-    // removing the plugin directory, so its dry-run plan needs the extra
-    // CLI-disable line that OpenClaw (registry-only) does not.
+    // `cli_step` names the plugin resource id and verb for receipts whose
+    // real disable first runs a framework CLI step (`hermes plugins disable
+    // <id>`, `qwenpaw plugin uninstall <id>`) before removing the plugin
+    // directory, so their dry-run plan needs the extra CLI line that
+    // OpenClaw (registry-only) does not.
     let mut cleanup_ids: Vec<&str> = Vec::new();
-    let hermes_plugin_id: Option<&str> = match &claim.driver_payload {
+    let cli_step: Option<(&str, &str)> = match &claim.driver_payload {
         DriverPayload::OpenClaw(oc) => {
             cleanup_ids.extend(oc.skill_resources.iter().map(String::as_str));
             if !oc.plugin_resource.is_empty() {
@@ -3390,7 +4040,7 @@ fn plan_disable_report(claim: &AdapterClaim) -> DisableReport {
                 None
             } else {
                 cleanup_ids.push(&h.plugin_resource);
-                Some(h.plugin_resource.as_str())
+                Some((h.plugin_resource.as_str(), "disable"))
             }
         }
         DriverPayload::Cosh(c) => {
@@ -3432,17 +4082,26 @@ fn plan_disable_report(claim: &AdapterClaim) -> DisableReport {
                 .push("would remove the Qwen Code activation policy via the qwen CLI".to_string());
             None
         }
+        DriverPayload::Dsh(dsh) => {
+            for profile in &dsh.profiles {
+                cleanup_ids.push(&profile.plugin_resource);
+            }
+            None
+        }
+        DriverPayload::QwenPaw(q) => {
+            cleanup_ids.push(&q.plugin_resource);
+            Some((q.plugin_resource.as_str(), "uninstall"))
+        }
     };
 
     // Whether disable uninstalls (Claude Code / Qoder semantics) rather than
     // unregisters (registry-only). Purely cosmetic for the plan text.
-    let plugin_verb = if matches!(
-        claim.driver_payload,
-        DriverPayload::ClaudeCode(_) | DriverPayload::Qoder(_) | DriverPayload::QwenCode(_)
-    ) {
-        "uninstall"
-    } else {
-        "unregister"
+    let plugin_verb = match claim.driver_payload {
+        DriverPayload::ClaudeCode(_) | DriverPayload::Qoder(_) | DriverPayload::QwenCode(_) => {
+            "uninstall"
+        }
+        DriverPayload::Dsh(_) => "remove",
+        _ => "unregister",
     };
 
     for resource in &claim.resources {
@@ -3475,12 +4134,17 @@ fn plan_disable_report(claim: &AdapterClaim) -> DisableReport {
                 messages.push(format!("would remove symlink {}", link.display()));
             }
             ClaimResourceKind::ExternalPath { path } => {
-                // Hermes stores its plugin as a directory (ExternalPath) but
-                // disable also runs a CLI step first — surface it.
-                if Some(resource.id.as_str()) == hermes_plugin_id
+                // Hermes and QwenPaw store the plugin as a directory
+                // (ExternalPath) but disable also runs a CLI step first —
+                // surface it.
+                if let Some((cli_resource, verb)) = cli_step
+                    && cli_resource == resource.id
                     && let Some(plugin_id) = claim.plugin_id.as_deref()
                 {
-                    messages.push(format!("would disable hermes plugin '{plugin_id}'"));
+                    messages.push(format!(
+                        "would {verb} {} plugin '{plugin_id}'",
+                        claim.framework
+                    ));
                 }
                 messages.push(format!("would remove {}", path.display()));
             }
@@ -3513,7 +4177,8 @@ fn source_missing(reason: String) -> SourceProbe {
     SourceProbe {
         status: AdapterSourceStatus::Missing,
         resource_root: None,
-        reason: Some(reason),
+        reason: Some(reason.clone()),
+        revision: Err(reason),
     }
 }
 
@@ -3529,17 +4194,78 @@ fn source_condition(source: &SourceProbe) -> AdapterCondition {
     }
 }
 
-fn with_source_condition(
+fn with_managed_conditions(
     mut report: AdapterStatusReport,
+    claim: &AdapterClaim,
     source: &SourceProbe,
+    materialized_applicable: bool,
 ) -> AdapterStatusReport {
-    if source.status == AdapterSourceStatus::Missing
-        && report.summary != AdapterSummary::CleanupFailed
-    {
-        report.summary = AdapterSummary::Degraded;
+    let (managed, revision) = match &source.revision {
+        Ok(current) => (
+            verify_managed_bundle(current),
+            super::managed_files::compare_source_revision(claim, current),
+        ),
+        Err(reason) => (
+            ManagedMatch::Unknown(reason.clone()),
+            ManagedMatch::Unknown(reason.clone()),
+        ),
+    };
+    let mut integrity = vec![
+        managed_condition(AdapterConditionKind::ManagedBundleMatches, managed),
+        managed_condition(AdapterConditionKind::SourceRevisionMatches, revision),
+    ];
+    if materialized_applicable {
+        let materialized = if claim.materialized_files.is_empty() {
+            ManagedMatch::Unknown(
+                "receipt has no materialized file inventory; re-enable the adapter".into(),
+            )
+        } else {
+            verify_materialized_bundle(claim)
+        };
+        integrity.push(managed_condition(
+            AdapterConditionKind::MaterializedBundleMatches,
+            materialized,
+        ));
     }
+
+    let has_false = integrity
+        .iter()
+        .any(|condition| condition.status == ConditionStatus::False);
+    let has_unknown = integrity
+        .iter()
+        .any(|condition| condition.status == ConditionStatus::Unknown);
+    if report.summary != AdapterSummary::CleanupFailed {
+        if source.status == AdapterSourceStatus::Missing || has_false {
+            report.summary = AdapterSummary::Degraded;
+        } else if has_unknown && report.summary == AdapterSummary::Healthy {
+            report.summary = AdapterSummary::Unknown;
+        }
+    }
+    report.conditions.retain(|condition| {
+        !matches!(
+            condition.kind,
+            AdapterConditionKind::ManagedBundleMatches
+                | AdapterConditionKind::SourceRevisionMatches
+                | AdapterConditionKind::MaterializedBundleMatches
+        )
+    });
     report.conditions.insert(0, source_condition(source));
+    report.conditions.splice(1..1, integrity);
     report
+}
+
+fn managed_condition(kind: AdapterConditionKind, verdict: ManagedMatch) -> AdapterCondition {
+    let (status, reason) = match verdict {
+        ManagedMatch::Matched => (ConditionStatus::True, None),
+        ManagedMatch::Changed(reason) => (ConditionStatus::False, Some(reason)),
+        ManagedMatch::Unknown(reason) => (ConditionStatus::Unknown, Some(reason)),
+    };
+    AdapterCondition {
+        kind,
+        status,
+        reason,
+        resource: None,
+    }
 }
 
 /// Reorder datadir roots so `preferred` is tried first, then the remaining
@@ -3583,6 +4309,79 @@ mod tests {
             None,
         );
         (layout, home)
+    }
+
+    #[test]
+    fn dsh_home_anchor_survives_environment_root_drift() {
+        use crate::adapter::claim::{
+            CLAIM_SCHEMA_VERSION, ClaimResource, DRIVER_SCHEMA_VERSION, DshClaim, DshProfileClaim,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (layout, _) = test_user_layout(tmp.path());
+        let enabled_home = tmp.path().join("first-dsh-home");
+        let claim = AdapterClaim {
+            claim_schema: CLAIM_SCHEMA_VERSION,
+            component: "tokenless".to_string(),
+            framework: "dsh".to_string(),
+            plugin_id: Some("@anolisa/dsh-tokenless".to_string()),
+            adapter_type: Some("plugin".to_string()),
+            enabled_at: "2026-08-16T00:00:00Z".to_string(),
+            resource_root: tmp.path().join("bundle"),
+            bundle_digest: None,
+            source_revision: None,
+            materialized_files: Vec::new(),
+            driver_schema: DRIVER_SCHEMA_VERSION,
+            status: ClaimStatus::Enabled,
+            notices: Vec::new(),
+            resources: vec![
+                ClaimResource {
+                    id: "dsh_home".to_string(),
+                    purpose: "dsh_home".to_string(),
+                    kind: ClaimResourceKind::ExternalPath {
+                        path: enabled_home.clone(),
+                    },
+                },
+                ClaimResource {
+                    id: "dsh_plugin_0".to_string(),
+                    purpose: "dsh_plugin_profile_web".to_string(),
+                    kind: ClaimResourceKind::FrameworkPlugin {
+                        framework: "dsh".to_string(),
+                        plugin_id: "@anolisa/dsh-tokenless".to_string(),
+                    },
+                },
+            ],
+            driver_payload: DriverPayload::Dsh(DshClaim {
+                package_name: "@anolisa/dsh-tokenless".to_string(),
+                home_resource: "dsh_home".to_string(),
+                profiles: vec![DshProfileClaim {
+                    name: "web".to_string(),
+                    plugin_resource: "dsh_plugin_0".to_string(),
+                }],
+            }),
+        };
+        let mut state = StateStore::empty();
+        let initial = ExternalRootTrust {
+            target_roots: Vec::new(),
+            anchor: None,
+            anchor_eligible: false,
+        };
+
+        initial.sync_anchor(&mut state, &layout, &claim, &[]);
+
+        let anchored = ExternalRootTrust {
+            target_roots: Vec::new(),
+            anchor: state
+                .find_adapter_trust_root("tokenless", "dsh")
+                .map(Path::to_path_buf),
+            anchor_eligible: false,
+        };
+        let mut later_roots = vec![tmp.path().join("second-dsh-home")];
+        anchored.extend_allowed_roots("dsh", &mut later_roots);
+        assert_eq!(
+            later_roots,
+            [tmp.path().join("second-dsh-home"), enabled_home]
+        );
     }
 
     /// The framework-agnostic Manager resolves the requirement by precedence
@@ -3793,6 +4592,235 @@ mod tests {
         assert!(matches!(err, AdapterError::FrameworkCli { .. }));
     }
 
+    // -- run_rpc_capture ------------------------------------------------------
+
+    /// A server that answers one line per request while stdin stays open, then
+    /// exits on EOF — the shape `codex app-server --stdio` has.
+    fn echo_rpc_session(
+        requests: Vec<String>,
+        expected: usize,
+        timeout: Duration,
+    ) -> FrameworkRpcSession {
+        FrameworkRpcSession {
+            command: FrameworkCommand {
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    r#"while IFS= read -r line; do
+                         id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+                         printf '{"method":"notify"}\n'
+                         printf '{"id":%s,"result":{}}\n' "$id"
+                       done"#
+                        .to_string(),
+                ],
+                stdin: None,
+                env_set: Vec::new(),
+                env_remove: Vec::new(),
+                path_prepend: Vec::new(),
+                timeout,
+            },
+            requests,
+            expected_responses: expected,
+        }
+    }
+
+    #[test]
+    fn run_rpc_capture_collects_every_reply_and_reaps_the_server() {
+        // The point of the RPC runner: a request written after `initialize`
+        // still gets answered, because stdin is held open until the replies
+        // arrive. Writing both lines and closing stdin — what
+        // `FrameworkCommand::stdin` does — loses the second one.
+        let session = echo_rpc_session(
+            vec![
+                r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#.to_string(),
+                r#"{"jsonrpc":"2.0","id":1,"method":"hooks/list"}"#.to_string(),
+            ],
+            2,
+            Duration::from_secs(10),
+        );
+        let out = run_rpc_capture(&session, JSON_OUTPUT_CAP).expect("session runs");
+        assert!(!out.timed_out, "server must exit once stdin closes");
+        assert_eq!(out.status, Some(0));
+        let ids: Vec<Option<u64>> = out
+            .stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|msg| msg.get("id").is_some())
+            .map(|msg| msg["id"].as_u64())
+            .collect();
+        assert_eq!(ids, vec![Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn run_rpc_capture_times_out_on_a_silent_server() {
+        let session = FrameworkRpcSession {
+            command: FrameworkCommand {
+                program: "/bin/sh".to_string(),
+                // Replace the shell so killing the child also closes the
+                // captured pipes; the app-server itself is likewise the
+                // direct child in production.
+                args: vec!["-c".to_string(), "exec sleep 30".to_string()],
+                stdin: None,
+                env_set: Vec::new(),
+                env_remove: Vec::new(),
+                path_prepend: Vec::new(),
+                timeout: Duration::from_millis(150),
+            },
+            requests: vec![r#"{"jsonrpc":"2.0","id":1,"method":"hooks/list"}"#.to_string()],
+            expected_responses: 1,
+        };
+        let out = run_rpc_capture(&session, JSON_OUTPUT_CAP).expect("session runs");
+        assert!(out.timed_out, "a server that never answers must time out");
+        assert!(out.stdout.is_empty());
+    }
+
+    #[test]
+    fn run_rpc_capture_timeout_unblocks_a_full_stdin_pipe() {
+        let session = FrameworkRpcSession {
+            command: FrameworkCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "while :; do :; done".to_string()],
+                stdin: None,
+                env_set: Vec::new(),
+                env_remove: Vec::new(),
+                path_prepend: Vec::new(),
+                timeout: Duration::from_millis(150),
+            },
+            // Larger than ordinary pipe capacity: a server that never reads
+            // stdin leaves the writer blocked until the child is killed.
+            requests: vec!["x".repeat(2 * 1024 * 1024)],
+            expected_responses: 1,
+        };
+        let started = Instant::now();
+        let out = run_rpc_capture(&session, JSON_OUTPUT_CAP).expect("session runs");
+        assert!(out.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "writer join exceeded the bounded timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_rpc_capture_returns_when_the_server_dies_early() {
+        // A codex too old to know `app-server` exits immediately. The runner
+        // must return the (empty) output rather than block for the timeout, so
+        // the driver can report the missing capability.
+        let session = FrameworkRpcSession {
+            command: FrameworkCommand {
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "echo 'unrecognized subcommand' >&2; exit 2".to_string(),
+                ],
+                stdin: None,
+                env_set: Vec::new(),
+                env_remove: Vec::new(),
+                path_prepend: Vec::new(),
+                timeout: Duration::from_secs(30),
+            },
+            requests: vec![r#"{"jsonrpc":"2.0","id":1,"method":"hooks/list"}"#.to_string()],
+            expected_responses: 1,
+        };
+        let out = run_rpc_capture(&session, JSON_OUTPUT_CAP).expect("session runs");
+        assert!(!out.timed_out, "must not wait out the timeout");
+        assert_eq!(out.status, Some(2));
+        assert!(out.stderr.contains("unrecognized subcommand"));
+    }
+
+    #[test]
+    fn run_rpc_capture_rejects_stdout_over_limit() {
+        let session = FrameworkRpcSession {
+            command: FrameworkCommand {
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    r#"IFS= read -r _; printf '{"id":1,"result":{"padding":"xxxxxxxx"}}\n'"#
+                        .to_string(),
+                ],
+                stdin: None,
+                env_set: Vec::new(),
+                env_remove: Vec::new(),
+                path_prepend: Vec::new(),
+                timeout: Duration::from_secs(10),
+            },
+            requests: vec![r#"{"jsonrpc":"2.0","id":1,"method":"hooks/list"}"#.to_string()],
+            expected_responses: 1,
+        };
+        let error = run_rpc_capture(&session, 16).expect_err("oversized response must fail");
+        assert!(error.to_string().contains("exceeded the 16-byte limit"));
+    }
+
+    #[test]
+    fn run_rpc_capture_rejects_unterminated_stdout_over_limit() {
+        let session = FrameworkRpcSession {
+            command: FrameworkCommand {
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "IFS= read -r _; printf '12345'; exec sleep 30".to_string(),
+                ],
+                stdin: None,
+                env_set: Vec::new(),
+                env_remove: Vec::new(),
+                path_prepend: Vec::new(),
+                timeout: Duration::from_secs(10),
+            },
+            requests: vec![r#"{"jsonrpc":"2.0","id":1,"method":"hooks/list"}"#.to_string()],
+            expected_responses: 1,
+        };
+        let started = Instant::now();
+        let error = run_rpc_capture(&session, 4).expect_err("unterminated stdout must fail");
+        assert!(error.to_string().contains("exceeded the 4-byte limit"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "overflow handling exceeded the bounded timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn rpc_response_detection_ignores_notifications() {
+        assert!(is_rpc_response(r#"{"id":1,"result":{}}"#));
+        assert!(is_rpc_response(r#"{"id":1,"error":{"code":-1}}"#));
+        assert!(!is_rpc_response(r#"{"method":"configWarning"}"#));
+        assert!(!is_rpc_response(r#"{"id":null,"result":{}}"#));
+        assert!(!is_rpc_response("not json at all"));
+    }
+
+    #[test]
+    fn default_ops_refuse_rpc_sessions_rather_than_degrading() {
+        struct PlainOps;
+        impl AdapterOps for PlainOps {
+            fn run_framework_cli(&self, _cmd: FrameworkCommand) -> Result<CliOutput, AdapterError> {
+                unreachable!("not exercised")
+            }
+            fn copy_tree(&self, _src: &Path, _dst: &Path) -> Result<(), AdapterError> {
+                unreachable!("not exercised")
+            }
+            fn copy_file(&self, _src: &Path, _dst: &Path) -> Result<(), AdapterError> {
+                unreachable!("not exercised")
+            }
+            fn remove_tree(&self, _path: &Path) -> Result<bool, AdapterError> {
+                unreachable!("not exercised")
+            }
+            fn write_file(&self, _path: &Path, _contents: &[u8]) -> Result<(), AdapterError> {
+                unreachable!("not exercised")
+            }
+            fn create_symlink(&self, _link: &Path, _target: &Path) -> Result<(), AdapterError> {
+                unreachable!("not exercised")
+            }
+            fn read_file(&self, _path: &Path) -> Result<Option<Vec<u8>>, AdapterError> {
+                unreachable!("not exercised")
+            }
+        }
+        let session = echo_rpc_session(Vec::new(), 0, Duration::from_secs(1));
+        let err = PlainOps
+            .run_framework_rpc(session)
+            .expect_err("the default must refuse");
+        assert!(err.to_string().contains("JSON-RPC"), "{err}");
+    }
+
     // -- declared_adapter_type ------------------------------------------------
 
     fn manifest_with_adapter_type(adapter_type: Option<&str>) -> ComponentManifest {
@@ -3937,12 +4965,23 @@ mod tests {
         assert!(ok("cosh", Some("extension")));
         assert!(ok("qoder", Some("plugin")));
         assert!(ok("qoder", None), "qoder defaults to plugin");
+        assert!(ok("dsh", Some("plugin")));
+        assert!(ok("dsh", None), "dsh defaults to plugin");
         assert!(ok("qwencode", Some("extension")));
+        assert!(ok("qwenpaw", Some("plugin")));
+        assert!(ok("qwenpaw", None), "qwenpaw defaults to plugin");
     }
 
     #[test]
     fn framework_type_matrix_rejects_extension_on_plugin_frameworks() {
-        for fw in ["openclaw", "hermes", "codex", "claude-code", "qoder"] {
+        for fw in [
+            "openclaw",
+            "hermes",
+            "codex",
+            "claude-code",
+            "qoder",
+            "qwenpaw",
+        ] {
             let err = validate_adapter_type_for_framework("tokenless", fw, Some("extension"))
                 .expect_err(&format!("{fw} + extension must be rejected"));
             assert!(
@@ -4301,6 +5340,8 @@ source = "adapters/openclaw"
             enabled_at: "2026-07-09T00:00:00Z".to_string(),
             resource_root,
             bundle_digest: None,
+            source_revision: None,
+            materialized_files: Vec::new(),
             driver_schema: DRIVER_SCHEMA_VERSION,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -4312,6 +5353,121 @@ source = "adapters/openclaw"
                 config_resources: Vec::new(),
             }),
         }
+    }
+
+    #[test]
+    fn unavailable_authoritative_inventory_never_reports_healthy() {
+        let claim = openclaw_claim("tokenless", PathBuf::from("/missing/source"));
+        let reason = "native package file query failed; re-enable the adapter".to_string();
+        let source = SourceProbe {
+            status: AdapterSourceStatus::Available,
+            resource_root: Some(claim.resource_root.clone()),
+            reason: None,
+            revision: Err(reason),
+        };
+        let report = with_managed_conditions(
+            AdapterStatusReport {
+                summary: AdapterSummary::Healthy,
+                conditions: Vec::new(),
+            },
+            &claim,
+            &source,
+            false,
+        );
+
+        assert_eq!(report.summary, AdapterSummary::Unknown);
+        assert!(report.conditions.iter().any(|condition| {
+            condition.kind == AdapterConditionKind::ManagedBundleMatches
+                && condition.status == ConditionStatus::Unknown
+        }));
+        assert!(report.conditions.iter().any(|condition| {
+            condition.kind == AdapterConditionKind::SourceRevisionMatches
+                && condition.status == ConditionStatus::Unknown
+        }));
+    }
+
+    #[test]
+    fn changed_managed_file_degrades_an_otherwise_healthy_report() {
+        use crate::adapter::claim::{AdapterSourceRevision, ManagedFileKind, ManagedSourceFile};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("plugin.json"), b"changed").expect("managed file");
+        let revision = AdapterSourceRevision {
+            source_root: tmp.path().to_path_buf(),
+            files: vec![ManagedSourceFile {
+                relative_path: PathBuf::from("plugin.json"),
+                kind: ManagedFileKind::File,
+                sha256: Some("0".repeat(64)),
+                symlink_target: None,
+            }],
+            materialized_sources: Vec::new(),
+        };
+        let mut claim = openclaw_claim("tokenless", tmp.path().to_path_buf());
+        claim.source_revision = Some(revision.clone());
+        let source = SourceProbe {
+            status: AdapterSourceStatus::Available,
+            resource_root: Some(tmp.path().to_path_buf()),
+            reason: None,
+            revision: Ok(revision),
+        };
+        let report = with_managed_conditions(
+            AdapterStatusReport {
+                summary: AdapterSummary::Healthy,
+                conditions: Vec::new(),
+            },
+            &claim,
+            &source,
+            false,
+        );
+
+        assert_eq!(report.summary, AdapterSummary::Degraded);
+        assert!(report.conditions.iter().any(|condition| {
+            condition.kind == AdapterConditionKind::ManagedBundleMatches
+                && condition.status == ConditionStatus::False
+        }));
+    }
+
+    #[test]
+    fn missing_materialized_inventory_is_unknown() {
+        use crate::adapter::claim::{AdapterSourceRevision, ManagedFileKind, ManagedSourceFile};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("plugin.json"), b"").expect("managed file");
+        let revision = AdapterSourceRevision {
+            source_root: tmp.path().to_path_buf(),
+            files: vec![ManagedSourceFile {
+                relative_path: PathBuf::from("plugin.json"),
+                kind: ManagedFileKind::File,
+                sha256: Some(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+                ),
+                symlink_target: None,
+            }],
+            materialized_sources: Vec::new(),
+        };
+        let mut claim = openclaw_claim("tokenless", tmp.path().to_path_buf());
+        claim.source_revision = Some(revision.clone());
+        let source = SourceProbe {
+            status: AdapterSourceStatus::Available,
+            resource_root: Some(tmp.path().to_path_buf()),
+            reason: None,
+            revision: Ok(revision),
+        };
+        let report = with_managed_conditions(
+            AdapterStatusReport {
+                summary: AdapterSummary::Healthy,
+                conditions: Vec::new(),
+            },
+            &claim,
+            &source,
+            true,
+        );
+
+        assert_eq!(report.summary, AdapterSummary::Unknown);
+        assert!(report.conditions.iter().any(|condition| {
+            condition.kind == AdapterConditionKind::MaterializedBundleMatches
+                && condition.status == ConditionStatus::Unknown
+        }));
     }
 
     fn seed_adapter_claim(
@@ -4498,6 +5654,8 @@ entry = "cosh-extension.json"
             enabled_at: "2026-07-09T00:00:00Z".to_string(),
             resource_root,
             bundle_digest: None,
+            source_revision: None,
+            materialized_files: Vec::new(),
             driver_schema: DRIVER_SCHEMA_VERSION,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -4998,6 +6156,53 @@ entry = "custom-entry.json"
         assert!(
             entry.resource_root.is_some(),
             "convention resource must be found by directory discovery"
+        );
+    }
+
+    #[test]
+    fn convention_discovery_ignores_shared_resource_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let datadir = tmp.path().join("data");
+
+        std::fs::create_dir_all(&state_dir).expect("mkdir state");
+        InstalledState::default()
+            .save(&state_dir.join("installed.toml"))
+            .expect("save empty state");
+
+        let adapters = datadir.join("adapters/tokenless");
+        let openclaw = adapters.join("openclaw");
+        std::fs::create_dir_all(&openclaw).expect("mkdir openclaw adapter");
+        std::fs::write(openclaw.join("openclaw.plugin.json"), b"{}").expect("adapter manifest");
+
+        let common = adapters.join("common/hooks");
+        std::fs::create_dir_all(&common).expect("mkdir shared hooks");
+        std::fs::write(common.join("rewrite.sh"), b"#!/bin/sh\n").expect("shared hook");
+
+        let layout = FsLayout::system(Some(tmp.path().to_path_buf()));
+        let mut manager =
+            AdapterManager::new(layout, Some(tmp.path().to_path_buf()), "test".into());
+        manager.state_path = state_dir.join("installed.toml");
+        manager.visible_roots = vec![VisibleRoot {
+            state_dir,
+            contract_datadir_roots: vec![datadir.clone()],
+        }];
+        manager.all_datadir_roots = vec![datadir];
+
+        let report = manager.scan().expect("scan");
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.component == "tokenless" && entry.framework == "openclaw"),
+            "real framework adapter must remain discoverable"
+        );
+        assert!(
+            report
+                .entries
+                .iter()
+                .all(|entry| entry.component != "tokenless" || entry.framework != "common"),
+            "shared common resources must not be reported as an adapter"
         );
     }
 
@@ -7385,6 +8590,8 @@ dest = "{datadir}/skills"
             enabled_at: "2026-06-30T00:00:00Z".to_string(),
             resource_root: PathBuf::from("/fake/adapters/test-comp/openclaw"),
             bundle_digest: None,
+            source_revision: None,
+            materialized_files: Vec::new(),
             driver_schema: 1,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -7570,6 +8777,8 @@ dest = "{datadir}/skills"
             enabled_at: "2026-06-30T00:00:00Z".to_string(),
             resource_root: PathBuf::from("/fake/adapters/test-comp/hermes"),
             bundle_digest: None,
+            source_revision: None,
+            materialized_files: Vec::new(),
             driver_schema: 1,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),
@@ -7626,6 +8835,76 @@ dest = "{datadir}/skills"
     }
 
     #[test]
+    fn plan_disable_report_qwenpaw_plugin_adapter() {
+        use crate::adapter::claim::{
+            CLAIM_SCHEMA_VERSION, ClaimResource, ClaimResourceKind, ClaimStatus,
+            DRIVER_SCHEMA_VERSION, DriverPayload, QwenPawClaim,
+        };
+
+        let claim = AdapterClaim {
+            claim_schema: CLAIM_SCHEMA_VERSION,
+            component: "test-comp".to_string(),
+            framework: "qwenpaw".to_string(),
+            plugin_id: Some("test-comp".to_string()),
+            adapter_type: Some("plugin".to_string()),
+            enabled_at: "2026-09-04T00:00:00Z".to_string(),
+            resource_root: PathBuf::from("/fake/adapters/test-comp/qwenpaw"),
+            bundle_digest: None,
+            source_revision: None,
+            materialized_files: Vec::new(),
+            driver_schema: DRIVER_SCHEMA_VERSION,
+            status: ClaimStatus::Enabled,
+            notices: Vec::new(),
+            resources: vec![
+                ClaimResource {
+                    id: "qwenpaw_home".to_string(),
+                    purpose: "qwenpaw_home".to_string(),
+                    kind: ClaimResourceKind::ExternalPath {
+                        path: PathBuf::from("/home/user/.qwenpaw"),
+                    },
+                },
+                ClaimResource {
+                    id: "qwenpaw_plugin".to_string(),
+                    purpose: "qwenpaw_plugin_dir".to_string(),
+                    kind: ClaimResourceKind::ExternalPath {
+                        path: PathBuf::from("/home/user/.qwenpaw/plugins/test-comp"),
+                    },
+                },
+            ],
+            driver_payload: DriverPayload::QwenPaw(QwenPawClaim {
+                home_resource: "qwenpaw_home".to_string(),
+                plugin_resource: "qwenpaw_plugin".to_string(),
+            }),
+        };
+
+        let report = plan_disable_report(&claim);
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|m| m == "would uninstall qwenpaw plugin 'test-comp'"),
+            "must describe the qwenpaw CLI uninstall step: {:#?}",
+            report.messages
+        );
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|m| m == "would remove /home/user/.qwenpaw/plugins/test-comp"),
+            "must describe the plugin directory removal: {:#?}",
+            report.messages
+        );
+        assert!(
+            !report
+                .messages
+                .iter()
+                .any(|m| m == "would remove /home/user/.qwenpaw"),
+            "must NOT claim to remove the qwenpaw working directory: {:#?}",
+            report.messages
+        );
+    }
+
+    #[test]
     fn plan_disable_report_hermes_skill_bundle_omits_plugin() {
         use crate::adapter::claim::{
             ClaimResource, ClaimResourceKind, ClaimStatus, DriverPayload, HermesClaim,
@@ -7642,6 +8921,8 @@ dest = "{datadir}/skills"
             enabled_at: "2026-06-30T00:00:00Z".to_string(),
             resource_root: PathBuf::from("/fake/adapters/test-comp/hermes"),
             bundle_digest: None,
+            source_revision: None,
+            materialized_files: Vec::new(),
             driver_schema: 1,
             status: ClaimStatus::Enabled,
             notices: Vec::new(),

@@ -14,7 +14,7 @@ anolisa status tokenless
 anolisa doctor tokenless
 anolisa adapter status tokenless
 tokenless stats status
-tokenless env-check --all --checklist
+tokenless env-check --all --json
 ```
 
 When one command fails, resolve that layer before continuing. Preview the install plan without modifying the system:
@@ -24,10 +24,12 @@ anolisa --dry-run install tokenless
 anolisa --dry-run --verbose install tokenless
 ```
 
-For a system-mode install, keep the same scope on all mutating anolisa commands:
+Run adapter diagnostics as the user who owns the target Agent configuration and
+adapter receipt. That user can inspect both user state and readable system
+state:
 
 ```bash
-sudo anolisa doctor tokenless
+anolisa doctor tokenless
 ```
 
 ## `tokenless: command not found`
@@ -100,7 +102,8 @@ Confirm that:
 
 - The target framework is detected.
 - The Tokenless adapter is enabled.
-- The adapter and component use the same user/system scope.
+- Adapter commands run as the user who owns the target framework configuration
+  and adapter receipt.
 - The agent CLI or IDE was restarted after enabling.
 
 ### 3. Verify the agent task
@@ -113,15 +116,57 @@ Run a task that actually passes through a hook, such as a shell command with vis
 env | grep '^TOKENLESS_'
 ```
 
-Confirm that `TOKENLESS_STATS_ENABLED=0` is not set unexpectedly and that any custom database path remains under the real user home.
+Confirm that `TOKENLESS_STATS_ENABLED=0` is not set unexpectedly and that any
+custom database path remains under the real user home or selected data
+directory.
+
+## Schema compression produces no statistics
+
+How schema compression plugs in depends on the host:
+
+- **cosh and Cosh-NG** run it on the `BeforeModel` hook before every model call; the warnings in this section come from that hook.
+- **OpenCode** runs it per tool definition through its `tool.definition` plugin hook, not through `BeforeModel`. MCP tools do not pass through that hook, so an MCP-only tool set produces no records there, and the `BeforeModel` warnings below never apply.
+- **Qwen Code** ships a `BeforeModel` hook entry in the extension manifest, but current Qwen Code releases do not implement that hook event: the hook registry skips unknown event names, so only the other hook groups are registered and the schema hook never runs. Zero `compress-schema` records on Qwen Code are expected; this section cannot diagnose them.
+
+When there are no `compress-schema` records on a host that actually runs the hook, check the following in order:
+
+### 1. Confirm there is something to compress
+
+Statistics only record invocations that save tokens; a result that is not smaller than the original is not recorded. Built-in tool descriptions are usually short (below the 256-character function and 160-character parameter truncation thresholds, with no `title` or `examples` to remove), so compression yields no savings and zero records are expected. Verify directly with the current tool declarations — replace the sample array below with your real declarations (a valid JSON array; do not keep any placeholder text, angle brackets, or surrounding quotes):
+
+```bash
+echo '[{"name":"example_tool","description":"A deliberately long example tool description that exceeds the 256-character truncation threshold so schema compression has something to remove. A deliberately long example tool description that exceeds the 256-character truncation threshold so schema compression has something to remove."}]' | tokenless compress-schema --batch
+```
+
+If stderr shows `did not reduce size`, the current tool set has nothing to compress; tool sets with long descriptions (for example some MCP tools) record normally.
+
+### 2. Confirm the BeforeModel hook actually fires
+
+On cosh and Cosh-NG, when a BeforeModel event carries nothing schema compression can work on, the hook emits one of the following warnings (each at most once per session) and passes the request through unchanged:
+
+```text
+[tokenless] WARNING: BeforeModel payload is not a JSON object ...
+[tokenless] WARNING: BeforeModel payload carries no llm_request object ...
+[tokenless] WARNING: BeforeModel event carries no tool declarations ...
+```
+
+The first warning means the hook received a payload that is not a JSON object; the second means the payload carries no `llm_request` object; the third means the host fires BeforeModel but its event format carries no tool declarations (`llm_request.config.tools` or `llm_request.tools`) — check or upgrade the host's hook protocol version. With neither a warning nor any records, BeforeModel is not firing at all:
+
+- The extension or plugin is installed and enabled (`anolisa adapter status tokenless`).
+- Hooks are not disabled in the host configuration.
+- The host version supports the BeforeModel event.
+
+Then continue with the generic steps in [No statistics appear after enabling the adapter](#no-statistics-appear-after-enabling-the-adapter).
 
 ## Adapter enable fails
 
 Common causes:
 
-- The target agent framework is not installed or detected.
+- The target Agent product is not installed or detected.
 - The framework version does not meet the adapter requirement.
-- Tokenless is installed in system scope but the adapter mutation uses user scope, or vice versa.
+- The adapter command ran as a different user from the one that owns the target
+  framework configuration or adapter receipt.
+- A directly installed Tokenless RPM has not been adopted into ANOLISA state.
 - An npm installation has no anolisa component record, but `anolisa adapter enable` was used.
 - OpenClaw security policy rejected the plugin's required unsafe-install override.
 
@@ -132,7 +177,15 @@ anolisa adapter scan
 anolisa --verbose adapter enable tokenless <framework>
 ```
 
-For npm installations, use [Framework integration · Manual integration after npm installation](framework-integration.md#manual-integration-after-npm-installation).
+For npm installations, use [Agent integration · Manual integration after npm installation](framework-integration.md#manual-integration-after-npm-installation).
+
+For a directly installed RPM, create the missing state record, then rerun the
+adapter command as the target framework user:
+
+```bash
+sudo yum install anolisa
+sudo anolisa --install-mode system adopt tokenless
+```
 
 For an anolisa-managed installation, the first attempt does not bypass OpenClaw's safety scan. If the error specifically recommends it, review the findings and retry with:
 
@@ -155,29 +208,22 @@ If `rtk` is missing:
 
 ```bash
 command -v rtk
-tokenless env-check --tool Shell
 ```
 
 If RTK works directly but not in the agent, inspect the framework support matrix, adapter status, and whether the session was restarted.
 
 `TOKENLESS_COMPRESSION_ENABLED=0` does not disable rewriting. Disable the adapter, or set OpenClaw's `rtk_enabled=false` when using that plugin, if the original shell input must be preserved.
 
-## Tool Ready reports `NOT_READY`
+## Tool Ready still reports `NOT_READY`
 
-View the complete checklist:
-
-```bash
-tokenless env-check --tool <name>
-tokenless env-check --all --checklist
-```
-
-`NOT_READY` means that a required dependency is absent. Resolve the specific binary, configuration, permission, or network issue in the report. Review the change before automatic repair:
+The current build hard-disables Tool Ready and cannot emit `NOT_READY` or block a tool. Confirm the active binary:
 
 ```bash
-tokenless env-check --tool <name> --fix
+tokenless --version
+tokenless env-check --tool <name> --json
 ```
 
-`--fix` may invoke a package manager or create links. Do not add `sudo` without understanding the output.
+The JSON result should contain `"status":"UNKNOWN"` and `"enabled":false`. A `NOT_READY` result indicates a mixed or stale deployment. Update both the Tokenless binary and shared adapter resources, then restart the agent. Setting the former `TOKENLESS_TOOL_READY_ENABLED` variable has no effect.
 
 ## Database errors
 
@@ -189,7 +235,7 @@ ls -l ~/.tokenless/stats.db*
 env | grep -E 'TOKENLESS_(DATA_DIR|STATS_DB|STASH_DB)='
 ```
 
-Confirm that the current user can write the selected data directory and database. The `tokenless` CLI accepts `TOKENLESS_DATA_DIR`, `TOKENLESS_STATS_DB`, and `TOKENLESS_STASH_DB` only under the real user home and falls back when an override is rejected. The bundled RTK statistics writer uses `TOKENLESS_STATS_DB` directly, so remove or correct an unexpected override in the agent environment as well.
+Confirm that the current user can write the selected data directory and database. `TOKENLESS_DATA_DIR` may be outside the real home, but it must be an absolute non-root directory without parent traversal. An invalid explicit data directory does not fall back to home. `TOKENLESS_STATS_DB` and `TOKENLESS_STASH_DB` must remain under the real home or selected data directory; the bundled RTK writer applies the same rule.
 
 Do not share one `stats.db` between users. AgentSight and Tokenless should run so that they can access the same user's database.
 
@@ -228,9 +274,17 @@ Expired or never-successfully-written content cannot be recovered.
 
 ## Statistics exist but the prompt is not smaller
 
-First check the framework's response-delivery path in the [support matrix](framework-integration.md#support-matrix). Qoder and Qwen Code emit `additionalContext`; legacy Copilot Shell appends it; Codex intentionally retains the original result and adds only analysis or a compressed alternative. These paths can record a smaller candidate without reducing the final prompt.
+First check the framework's response-delivery path in the
+[support matrix](framework-integration.md#agent-adapter-support-matrix). Qoder replaces output
+through `updatedToolOutput`. Qwen Code and legacy Copilot Shell pass post-tool output through because
+their current contracts provide no replacement field; compressed copies are not injected through
+`additionalContext`. Codex also avoids response compression and limits its PostToolUse context to
+classified environment failures. Measure Codex savings on RTK-rewritten shell calls.
 
-For Claude Code, response replacement requires version 2.1.121 or later. Older or unrecognized versions pass the original through. OpenClaw replaces persisted results, but TOON remains off unless `toon_compression_enabled=true`.
+For Claude Code, response replacement requires version 2.1.121 or later. Older or unrecognized
+versions pass the original through. OpenClaw optimizes supported persisted results when
+`post_tool_enabled` is on. Tokenless automatically chooses JSON cleanup or TOON when it produces a
+smaller valid result.
 
 ## Qoder plugin cache issue
 
@@ -261,14 +315,15 @@ No output is expected. Fully exit and restart Qoder IDE afterwards.
 If `dnf remove` or `rpm -e` was run directly:
 
 ```bash
-sudo anolisa repair tokenless
+sudo yum install anolisa
+sudo anolisa --install-mode system repair tokenless
 ```
 
 Follow the repair plan. Only when the RPM is still present and the output explicitly asks to recreate the record, run:
 
 ```bash
-sudo anolisa forget tokenless
-sudo anolisa adopt tokenless
+sudo anolisa --install-mode system forget tokenless
+sudo anolisa --install-mode system adopt tokenless
 ```
 
 `forget` deletes only anolisa state; it does not uninstall the RPM.

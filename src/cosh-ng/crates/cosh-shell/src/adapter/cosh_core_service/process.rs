@@ -20,7 +20,7 @@ use super::super::{
     ApprovalResponse, AuthResponse, PreparedInvocation, ProviderPromptArgMode, ProviderStdinMode,
 };
 use super::{
-    registry_timeout, PersistentCoshCoreRuntime, RegistryCommand, RegistryQueryError,
+    registry_timeout, PersistentCoshCoreRuntime, RegistryCommand, RegistryQueryError, RunCommand,
     ServiceCommand,
 };
 
@@ -300,6 +300,25 @@ pub(super) fn flush_pending_reload(
     }
 }
 
+pub(super) fn send_user_turn(
+    process: &mut PersistentProcess,
+    command: &RunCommand,
+    reload_pending: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    // Apply mutations observed while idle before the user turn is admitted.
+    flush_pending_reload(process, reload_pending, &command.run_id, &command.event_tx);
+    let session_id = process.session_id.clone();
+    send_json(
+        &process.stdin,
+        &user_message_with_raw_input(
+            &command.prepared.prompt,
+            command.raw_user_input.as_deref(),
+            session_id.as_deref(),
+            &command.session_scope,
+        ),
+    )
+}
+
 pub(super) fn execute_registry(
     process: &mut PersistentProcess,
     command: &RegistryCommand,
@@ -350,13 +369,18 @@ pub(super) fn execute_registry(
         {
             return Ok(response.get("data").cloned().unwrap_or(Value::Null));
         }
-        return Err(RegistryQueryError::Response(
-            response
+        return Err(RegistryQueryError::Response {
+            message: response
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown live registry error")
                 .to_string(),
-        ));
+            code: response
+                .get("data")
+                .and_then(|data| data.get("error_code"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
     }
 }
 
@@ -426,20 +450,29 @@ pub(super) fn control_request(subtype: &str, request_id: &str, fields: Value) ->
     .to_string()
 }
 
-pub(super) fn user_message(content: &str, session_id: Option<&str>, cwd: &str) -> String {
-    serde_json::json!({
+pub(super) fn user_message_with_raw_input(
+    content: &str,
+    raw_user_input: Option<&str>,
+    session_id: Option<&str>,
+    cwd: &str,
+) -> String {
+    let mut message = serde_json::json!({
         "type": "user",
         "message": {"role": "user", "content": content},
         "parent_tool_use_id": null,
         "session_id": session_id.unwrap_or("default"),
         "shell_context": {"cwd": cwd, "env": {}, "last_exit_code": 0},
-    })
-    .to_string()
+    });
+    if let Some(raw_user_input) = raw_user_input {
+        message["message"]["raw_user_input"] = Value::String(raw_user_input.to_string());
+    }
+    message.to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_registry_response_for;
+    use super::{is_registry_response_for, user_message_with_raw_input};
+    use serde_json::Value;
 
     #[test]
     fn registry_response_requires_discriminator_and_correlation_id() {
@@ -461,5 +494,18 @@ mod tests {
             "request_id": "reg-2",
         });
         assert!(!is_registry_response_for(&other_request, "reg-1"));
+    }
+
+    #[test]
+    fn user_message_omits_raw_input_for_legacy_payloads() {
+        let with_raw =
+            user_message_with_raw_input("envelope", Some("raw"), Some("session-1"), "/tmp");
+        let value: Value = serde_json::from_str(&with_raw).unwrap();
+        assert_eq!(value["message"]["content"], "envelope");
+        assert_eq!(value["message"]["raw_user_input"], "raw");
+
+        let without_raw = user_message_with_raw_input("legacy", None, None, "/tmp");
+        let value: Value = serde_json::from_str(&without_raw).unwrap();
+        assert!(value["message"].get("raw_user_input").is_none());
     }
 }

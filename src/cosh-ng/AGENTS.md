@@ -58,17 +58,19 @@ crates/cosh-shell/scripts/check-layout.sh
 
 该脚本必须保持通过；新增或迁移代码不能增加新的 violation group。脚本中的 registered debt 只表示迁移债务被 inventory 追踪，不代表最终验收已完成。
 
-Prerequisites: Linux (or macOS for limited functionality), Rust 1.74+. pkg/svc commands need root/sudo. Checkpoint commands need a running ws-ckpt daemon.
+Prerequisites: Linux (or macOS for limited functionality), Rust 1.88+. pkg/svc commands need root/sudo. Checkpoint commands need a running ws-ckpt daemon.
 
 ## Architecture
 
-5-crate workspace. Dependency direction: `cosh-cli` / `cosh-core` → `cosh-platform` → `cosh-types`; `cosh-shell` is standalone (no internal crate deps).
+7-crate workspace. Dependency direction: `cosh-cli` / `cosh-core` → `cosh-platform` → `cosh-types`; `cosh-shell` is standalone (no internal crate deps). `cosh-gateway` depends only on the side-effect-free `cosh-gateway-contracts` leaf among internal crates.
 
 - **cosh-types**: Pure types, zero side effects. Defines `CoshResponse<T>` envelope, `CoshError` (with error codes, recoverable flag, hint), and ws-ckpt IPC protocol types.
 - **cosh-platform**: Platform abstraction layer. Distro detection from `/etc/os-release`, package manager routing (dnf/apt/zypper/brew), systemd service adapter, ws-ckpt daemon Unix socket IPC client.
 - **cosh-cli**: CLI entry point (binary: `cosh-cli`). 4 command domains: `pkg`, `svc`, `checkpoint`, `audit`. All output is JSON via `CoshResponse<T>`. Uses clap derive for argument parsing.
 - **cosh-core**: Unified agent core (binary: `cosh-core`). Headless JSONL backend + LLM provider integration (OpenAI-compat, SysOM/Aliyun). Includes hooks, tools, skills, extensions, and config management. Interactive TUI mode is declared but not yet implemented.
 - **cosh-shell**: AI-augmented interactive shell (binary: `cosh-shell`). PTY wrapper over bash/zsh with OSC marker-based command boundary detection, streaming AI analysis (Claude/Qwen adapters), inline card rendering (ratatui), tool approval control protocol.
+- **cosh-gateway-contracts**: Side-effect-free Gateway Task, Runtime, Capability, identity, and error contracts. It must not own storage, processes, transports, providers, or OS execution.
+- **cosh-gateway**: Gateway control plane: authenticated local Unix daemon/client, durable Task and governance storage, Runtime scheduling and supervision, restart reconciliation, private core transport, ACP v1 codec/bridge, installed adapter profiles/entrypoint, and local once-only permission evidence. Remote channels and accepted real-adapter conformance evidence are not yet implemented.
 
 ### cosh-shell Code Organization
 
@@ -137,7 +139,6 @@ Strict [Conventional Commits](https://www.conventionalcommits.org/):
 - `type` is limited to `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, and `chore`. **Do not use `harden:` / `cleanup:`** — map them to a standard type.
 - `[crate_scope]` names the affected crate or crates, such as `[core]`, `[shell]`, or `[cli,platform]`.
 - The complete subject line is imperative, has no trailing period, and subject 不超过 50 字符；body 每行不超过 100 字符。
-- Detect the active Codex version at commit time and place `Assisted-by: Codex:<version>` above the `Signed-off-by` trailer generated from Git config.
 
 ## Git History Hygiene
 

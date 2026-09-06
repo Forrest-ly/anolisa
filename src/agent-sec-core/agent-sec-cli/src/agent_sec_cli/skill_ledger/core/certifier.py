@@ -9,9 +9,12 @@ logic.
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from agent_sec_cli.skill_ledger.config import remember_skill_dir
+from agent_sec_cli.skill_ledger.config import (
+    is_default_system_skill_dir,
+    remember_skill_dir,
+)
 from agent_sec_cli.skill_ledger.core.file_hasher import (
     compute_file_hashes,
     diff_file_hashes,
@@ -20,20 +23,18 @@ from agent_sec_cli.skill_ledger.core.live_root import (
     ResolvedSkillRoot,
     SkillRootInput,
     canonical_skill_operation,
+    ledger_update_access,
     resolve_skill_root,
     validate_resolved_skill_root,
 )
-from agent_sec_cli.skill_ledger.core.manifest_integrity import (
-    manifest_hash_error,
-    verify_manifest_integrity,
-    verify_manifest_signature,
+from agent_sec_cli.skill_ledger.core.manifest_helpers import (
+    load_newest_verified_version_manifest,
+    verify_latest_manifest_artifact,
 )
 from agent_sec_cli.skill_ledger.core.version_chain import (
     create_snapshot,
-    get_previous_signature,
-    list_version_ids,
+    list_version_artifact_ids,
     load_latest_manifest,
-    load_version_manifest,
     next_version_id,
     save_manifest,
 )
@@ -71,7 +72,7 @@ from agent_sec_cli.skill_ledger.utils import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
-_ManifestState = str  # missing | trusted | unsigned | drifted | tampered
+_ManifestState = Literal["missing", "verified_signed", "drifted", "tampered"]
 
 _RECOVERY_EVENT_TYPE = "tampered_recovered"
 
@@ -84,6 +85,24 @@ def _remember_skill_dir_best_effort(skill_dir: str) -> None:
         logger.debug(
             "auto-remember failed for %s, continuing", skill_dir, exc_info=True
         )
+
+
+def _readonly_system_skip_payload(
+    root: ResolvedSkillRoot,
+) -> dict[str, Any] | None:
+    """Return a batch skip result for a host-backed, read-only system Skill."""
+    if root.source != "host" or not is_default_system_skill_dir(root.canonical_dir):
+        return None
+    writable, _reason = ledger_update_access(root)
+    if writable:
+        return None
+    return {
+        "canonicalSkillDir": str(root.canonical_dir),
+        "skillName": root.skill_name,
+        "status": "skipped",
+        "reasonCode": "readonly_system_skill",
+        "persisted": False,
+    }
 
 
 def _sign_manifest(manifest: SignedManifest, backend: SigningBackend) -> SignedManifest:
@@ -260,66 +279,46 @@ def _safe_load_latest_manifest(skill_dir: str) -> tuple[SignedManifest | None, b
 
 
 def _classify_manifest(
+    skill_dir: str,
     manifest: SignedManifest | None,
     current_hashes: dict[str, str],
     backend: SigningBackend,
     *,
+    skill_name: str,
     corrupted: bool = False,
 ) -> _ManifestState:
     """Classify the existing manifest before a write-oriented operation."""
     if corrupted:
         return "tampered"
     if manifest is None:
-        return "missing"
-    if not diff_file_hashes(manifest.fileHashes, current_hashes)["match"]:
-        return "drifted"
-    if manifest_hash_error(manifest) is not None:
-        return "tampered"
-    if manifest.signature is None:
-        return "unsigned"
-    valid, _ = verify_manifest_signature(manifest, backend)
+        return "tampered" if list_version_artifact_ids(skill_dir) else "missing"
+
+    valid, _ = verify_latest_manifest_artifact(
+        skill_dir,
+        manifest,
+        backend,
+        expected_skill_name=skill_name,
+    )
     if not valid:
         return "tampered"
-    return "trusted"
+
+    if not diff_file_hashes(manifest.fileHashes, current_hashes)["match"]:
+        return "drifted"
+    return "verified_signed"
 
 
-def _is_verifiable_manifest(
-    manifest: SignedManifest,
-    backend: SigningBackend,
-) -> bool:
-    """Return True when a historical version hash and signature verify."""
-    valid, _ = verify_manifest_integrity(manifest, backend)
-    return valid
-
-
-def _last_trusted_version_manifest(
+def _last_verified_version_manifest(
     skill_dir: str,
     backend: SigningBackend,
+    *,
+    skill_name: str,
 ) -> SignedManifest | None:
-    """Return the newest version manifest whose own hash/signature verify."""
-    for version_id in reversed(list_version_ids(skill_dir)):
-        try:
-            manifest = load_version_manifest(skill_dir, version_id)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if manifest is not None and _is_verifiable_manifest(manifest, backend):
-            return manifest
-    return None
-
-
-def _previous_version_id(skill_dir: str, manifest: SignedManifest | None) -> str | None:
-    """Return the best available previous version id for a new manifest."""
-    if manifest is not None:
-        return manifest.versionId
-    existing = list_version_ids(skill_dir)
-    return existing[-1] if existing else None
-
-
-def _previous_signature(skill_dir: str, manifest: SignedManifest | None) -> str | None:
-    """Return the best available previous signature for a new manifest."""
-    if manifest is not None and manifest.signature is not None:
-        return manifest.signature.value
-    return get_previous_signature(skill_dir)
+    """Return the newest fully verified historical version artifact."""
+    return load_newest_verified_version_manifest(
+        skill_dir,
+        backend,
+        expected_skill_name=skill_name,
+    )
 
 
 def _new_manifest(
@@ -329,8 +328,15 @@ def _new_manifest(
     *,
     skill_name: str,
 ) -> SignedManifest:
-    """Create a new unsigned manifest object for the current skill contents."""
+    """Create an unsealed manifest for the current skill contents."""
     inherited_decision = None
+    previous_version_id = None
+    previous_signature = None
+    if previous_manifest is not None:
+        if previous_manifest.signature is None:
+            raise SkillLedgerError("verified predecessor has no signature")
+        previous_version_id = previous_manifest.versionId
+        previous_signature = previous_manifest.signature.value
     if (
         previous_manifest is not None
         and previous_manifest.userDecision is not None
@@ -338,13 +344,16 @@ def _new_manifest(
     ):
         inherited_decision = previous_manifest.userDecision
     return SignedManifest(
-        versionId=next_version_id(skill_dir),
-        previousVersionId=_previous_version_id(skill_dir, previous_manifest),
+        versionId=next_version_id(
+            skill_dir,
+            after_version_id=previous_version_id,
+        ),
+        previousVersionId=previous_version_id,
         skillName=skill_name,
         fileHashes=current_hashes,
         scanStatus="none",
         userDecision=inherited_decision,
-        previousManifestSignature=_previous_signature(skill_dir, previous_manifest),
+        previousManifestSignature=previous_signature,
     )
 
 
@@ -357,16 +366,25 @@ def _prepare_manifest_for_update(
 ) -> tuple[SignedManifest, _ManifestState, bool]:
     """Return a manifest ready to receive scan entries.
 
-    Missing, drifted, or tampered manifests create a new version. Unsigned
-    baselines are reused and signed in-place.
+    Only a fully verified current artifact is reused. Every other state creates
+    a new version linked to the newest verified historical artifact, if any.
     """
     effective_skill_name = skill_name or Path(skill_dir).name
     loaded, corrupted = _safe_load_latest_manifest(skill_dir)
-    state = _classify_manifest(loaded, current_hashes, backend, corrupted=corrupted)
+    state = _classify_manifest(
+        skill_dir,
+        loaded,
+        current_hashes,
+        backend,
+        skill_name=effective_skill_name,
+        corrupted=corrupted,
+    )
     if state in {"missing", "drifted", "tampered"}:
-        previous_manifest = loaded
-        if state == "tampered":
-            previous_manifest = _last_trusted_version_manifest(skill_dir, backend)
+        previous_manifest = _last_verified_version_manifest(
+            skill_dir,
+            backend,
+            skill_name=effective_skill_name,
+        )
         manifest = _new_manifest(
             skill_dir,
             current_hashes,
@@ -503,8 +521,13 @@ def scan_skill(
     """Run built-in scanners as needed and record signed scan results."""
     root = resolve_skill_root(skill_dir)
     validate_resolved_skill_root(root)
+    if _readonly_system_skip_payload(root) is not None:
+        raise SkillLedgerError(
+            f"cannot update read-only system skill: {root.canonical_dir}; "
+            "use 'agent-sec-cli skill-ledger analyze <skill_dir> --format json' "
+            "for read-only analysis"
+        )
     io_skill_dir = str(root.io_dir)
-    _remember_skill_dir_best_effort(str(root.canonical_dir))
 
     current_hashes = compute_file_hashes(io_skill_dir)
     registry = ScannerRegistry.from_config()
@@ -520,14 +543,18 @@ def scan_skill(
         skill_name=root.skill_name,
     )
 
-    if force or state in {"missing", "unsigned", "drifted", "tampered"}:
+    if force or state in {"missing", "drifted", "tampered"}:
         scanners_to_run = requested
     else:
         existing = _canonical_scan_name_set(manifest.scans)
         scanners_to_run = [name for name in requested if name not in existing]
 
     if not scanners_to_run:
-        return _result_payload(
+        if state in {"missing", "drifted", "tampered"}:
+            raise SkillLedgerError(
+                f"scan cannot recover {state} skill without scanner results"
+            )
+        result = _result_payload(
             manifest,
             root=root,
             new_version_created=False,
@@ -535,10 +562,16 @@ def scan_skill(
             skipped_scanners=requested,
             status="noop",
         )
+        _remember_skill_dir_best_effort(str(root.canonical_dir))
+        return result
 
     scan_entries = _auto_invoke_scanners(io_skill_dir, registry, scanners_to_run)
     if not scan_entries:
-        return _result_payload(
+        if state in {"missing", "drifted", "tampered"}:
+            raise SkillLedgerError(
+                f"scan cannot recover {state} skill without scanner results"
+            )
+        result = _result_payload(
             manifest,
             root=root,
             new_version_created=False,
@@ -546,6 +579,8 @@ def scan_skill(
             skipped_scanners=scanners_to_run,
             status="noop",
         )
+        _remember_skill_dir_best_effort(str(root.canonical_dir))
+        return result
 
     _persist_manifest_update(
         root,
@@ -564,7 +599,7 @@ def scan_skill(
                 scanners_run=scanners_run,
             )
         ]
-    return _result_payload(
+    result = _result_payload(
         manifest,
         root=root,
         new_version_created=new_version_created,
@@ -572,6 +607,8 @@ def scan_skill(
         skipped_scanners=[name for name in requested if name not in scanners_to_run],
         extra=extra,
     )
+    _remember_skill_dir_best_effort(str(root.canonical_dir))
+    return result
 
 
 def scan_batch(
@@ -585,9 +622,15 @@ def scan_batch(
     results: list[dict[str, Any]] = []
     for skill_dir in skill_dirs:
         try:
+            root = resolve_skill_root(skill_dir)
+            validate_resolved_skill_root(root)
+            skipped = _readonly_system_skip_payload(root)
+            if skipped is not None:
+                results.append(skipped)
+                continue
             results.append(
                 scan_skill(
-                    str(skill_dir),
+                    root,
                     backend,
                     scanner_names=scanner_names,
                     force=force,

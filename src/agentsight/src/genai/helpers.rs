@@ -21,7 +21,6 @@ pub(super) enum CallKind {
 }
 
 impl CallKind {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             CallKind::Main => "main",
@@ -35,7 +34,11 @@ impl CallKind {
 ///
 /// Conservative: unmatched → Main (zero false positives > recall).
 /// Signatures are from real captures (case-sensitive .contains()).
-#[allow(dead_code)]
+///
+/// **Best-effort matching**: patterns are tied to specific agent prompt text
+/// (e.g., QwenCode's "Managed memory has TWO directories"). When agents update
+/// their prompts, these patterns may need extending. Consider moving to
+/// config-driven rules if the list grows beyond a handful of agents.
 pub(super) fn classify_call_kind(request: &LLMRequest) -> CallKind {
     // Collect system instructions text
     let system_text: String = request
@@ -62,6 +65,10 @@ pub(super) fn classify_call_kind(request: &LLMRequest) -> CallKind {
         if system_text.contains("specialized context summarizer") {
             return CallKind::Recap;
         }
+        // QwenCode memory extraction subagent
+        if system_text.contains("managed memory extraction subagent") {
+            return CallKind::Recap;
+        }
     }
 
     // ② Check first-user text (Claude Code patterns + Cosh tool-output)
@@ -83,6 +90,20 @@ pub(super) fn classify_call_kind(request: &LLMRequest) -> CallKind {
                 .contains("Your task is to create a detailed summary of the conversation so far")
                 && text.contains("Do NOT call any tools"))
         {
+            return CallKind::Recap;
+        }
+        // Cosh-shell personal analyzer background summary (#2750): fixed
+        // prompt from cosh-ng recommendation/personal_analyzer.rs; runs in a
+        // setsid child process, must not surface as a user session.
+        if text.starts_with("Summarize only grounded work into the supplied JSON schema") {
+            return CallKind::Recap;
+        }
+        // QwenCode memory extraction subagent
+        if text.starts_with("Managed memory has TWO directories") {
+            return CallKind::Recap;
+        }
+        // QwenCode suggestion subagent
+        if text.starts_with("[SUGGESTION MODE:") {
             return CallKind::Recap;
         }
         // Claude Code web_search
@@ -143,10 +164,15 @@ pub(super) fn classify_call_kind_from_raw(
     if (sys_text.contains("summarizes internal chat history")
         && sys_text.contains("<state_snapshot>"))
         || sys_text.contains("specialized context summarizer")
+        || sys_text.contains("managed memory extraction subagent")
         || first_user_text.starts_with("Summarize the following tool output to be a maximum of")
         || (first_user_text
             .contains("Your task is to create a detailed summary of the conversation so far")
             && first_user_text.contains("Do NOT call any tools"))
+        || first_user_text.starts_with("Managed memory has TWO directories")
+        || first_user_text.starts_with("[SUGGESTION MODE:")
+        // Cosh-shell personal analyzer background summary (#2750)
+        || first_user_text.starts_with("Summarize only grounded work into the supplied JSON schema")
     {
         "recap"
     } else if first_user_text.contains("Perform a web search for the query:") {
@@ -180,6 +206,25 @@ impl PidAgentNameCache for lru::LruCache<u32, String> {
 }
 
 impl GenAIBuilder {
+    /// Path suffixes of the DashScope/Bailian **native** protocol.
+    ///
+    /// Full form: `POST https://{WorkspaceId}.{region}.maas.aliyuncs.com
+    /// /api/v1/services/aigc/{text,multimodal}-generation/generation`.
+    /// Distinct from the OpenAI-compatible mode
+    /// (`/compatible-mode/v1/chat/completions`), which already matches the
+    /// `/v1/chat/completions` pattern.
+    pub(super) const DASHSCOPE_NATIVE_PATHS: [&'static str; 2] = [
+        "/aigc/text-generation/generation",
+        "/aigc/multimodal-generation/generation",
+    ];
+
+    /// Whether the path belongs to the DashScope/Bailian native protocol.
+    pub(super) fn is_dashscope_native_path(path: &str) -> bool {
+        Self::DASHSCOPE_NATIVE_PATHS
+            .iter()
+            .any(|p| path.contains(p))
+    }
+
     /// Check if the path indicates an LLM API call
     pub(super) fn is_llm_api_path(&self, path: &str) -> bool {
         path.contains("/v1/chat/completions")
@@ -189,6 +234,7 @@ impl GenAIBuilder {
             || path.contains("/chat/completions")
             || path.contains("/completions")
             || path.contains("/api/v1/copilot/generate_copilot")
+            || Self::is_dashscope_native_path(path)
     }
 
     /// Check if request body contains SysOM POP API markers
@@ -202,10 +248,12 @@ impl GenAIBuilder {
 
     /// Normalize the messages array from a parsed request body.
     ///
-    /// Supports both formats:
+    /// Supports:
     /// - OpenAI chat completions: top-level `"messages"` array.
     /// - OpenAI Responses API (codex 0.137+ via dashscope `/v1/responses`):
     ///   top-level `"input"` array with sibling `"instructions"` string.
+    /// - DashScope/Bailian native protocol: top-level `"input"` **object**
+    ///   wrapping a `"messages"` array.
     ///
     /// Returns `(messages_vec, instructions_text)` where `instructions_text`
     /// is the system-prompt fallback used when the messages array has no
@@ -214,6 +262,9 @@ impl GenAIBuilder {
     /// - Anthropic Messages API: the top-level `"system"` field (string or
     ///   array of `{"type":"text","text":"..."}` blocks), since Anthropic
     ///   carries the system prompt outside the messages array.
+    ///
+    /// The native protocol needs no fallback: its system prompt lives inside
+    /// `input.messages`.
     pub(super) fn extract_messages_view(
         body: &serde_json::Value,
     ) -> Option<(Vec<serde_json::Value>, Option<String>)> {
@@ -221,12 +272,17 @@ impl GenAIBuilder {
             let system_text = body.get("system").and_then(Self::extract_system_text);
             return Some((arr.clone(), system_text));
         }
-        if let Some(arr) = body.get("input").and_then(|m| m.as_array()) {
-            let instructions = body
-                .get("instructions")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            return Some((arr.clone(), instructions));
+        if let Some(input) = body.get("input") {
+            if let Some(arr) = input.as_array() {
+                let instructions = body
+                    .get("instructions")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
+                return Some((arr.clone(), instructions));
+            }
+            if let Some(arr) = input.get("messages").and_then(|m| m.as_array()) {
+                return Some((arr.clone(), None));
+            }
         }
         None
     }
@@ -301,6 +357,8 @@ impl GenAIBuilder {
             Some("openai".to_string())
         } else if path.contains("/api/v1/copilot/generate_copilot") {
             Some("sysom".to_string())
+        } else if Self::is_dashscope_native_path(path) {
+            Some("dashscope".to_string())
         } else {
             None
         }
@@ -438,6 +496,25 @@ impl GenAIBuilder {
             })
     }
 
+    /// 统计请求中"真正的用户消息"条数：role=user 且包含至少一个非空 Text 部分。
+    ///
+    /// 仅含 `ToolCallResponse` 部分的 user message（Anthropic 风格的工具返回）不计入。
+    /// 同一轮工具调用循环内该值不变（工具结果是 role=tool 或仅含 tool_result 的
+    /// role=user），用户发送新消息时必然 +1，用于 conversation bucket key 的
+    /// 结构性去重。
+    pub(super) fn count_real_user_messages(request: &LLMRequest) -> usize {
+        request
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.parts
+                        .iter()
+                        .any(|p| matches!(p, MessagePart::Text { content } if !content.is_empty()))
+            })
+            .count()
+    }
+
     /// 提取清理后的 user query（去除 metadata 前缀，用于展示）
     pub(super) fn extract_last_user_query(request: &LLMRequest) -> Option<String> {
         Self::extract_last_user_raw(request).map(|raw| Self::strip_user_query_prefix(&raw))
@@ -457,13 +534,20 @@ impl GenAIBuilder {
     /// ```
     ///
     /// **OpenClaw**: 时间戳方括号
-    /// ```text
+    /// ````text
     /// Sender (untrusted metadata):
     /// ```json
     /// {"label":"...", ...}
     /// ```
     ///
     /// [Tue 2026-03-31 17:19 GMT+8] 用户实际输入
+    /// ````
+    ///
+    /// **QwenCode**: `<system-reminder>` 标签块
+    /// ```text
+    /// <system-reminder>...skills...</system-reminder>
+    /// <system-reminder>...context...</system-reminder>
+    /// 用户实际输入
     /// ```
     pub(super) fn strip_user_query_prefix(text: &str) -> String {
         // cosh-ng: find a line starting with "user_input:" (after trimming)
@@ -497,7 +581,32 @@ impl GenAIBuilder {
                 }
             }
         }
+
+        // QwenCode: strip <system-reminder>...</system-reminder> blocks
+        if text.contains("<system-reminder>") {
+            let stripped = Self::strip_system_reminder_tags(text);
+            if !stripped.is_empty() {
+                return stripped;
+            }
+        }
+
         text.to_string()
+    }
+
+    /// Remove all `<system-reminder>...</system-reminder>` blocks from text.
+    fn strip_system_reminder_tags(text: &str) -> String {
+        let mut result = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find("<system-reminder>") {
+            result.push_str(&rest[..start]);
+            if let Some(end_offset) = rest[start..].find("</system-reminder>") {
+                rest = &rest[start + end_offset + "</system-reminder>".len()..];
+            } else {
+                break;
+            }
+        }
+        result.push_str(rest);
+        result.trim().to_string()
     }
 
     /// Match a process context against the configured cmdline rules.
@@ -547,8 +656,8 @@ impl GenAIBuilder {
         if let Some(name) = cache.get_agent_name(&pid) {
             return Some(name.clone());
         }
-        // Read cmdline from /proc/{pid}/cmdline for accurate agent matching
-        let cmdline_args = std::fs::read(format!("/proc/{pid}/cmdline"))
+        // Read cmdline from <procfs root>/{pid}/cmdline for accurate agent matching
+        let cmdline_args = std::fs::read(crate::utils::procfs::proc_pid_entry(pid, "cmdline"))
             .ok()
             .map(|data| {
                 data.split(|&b| b == 0)
@@ -558,7 +667,7 @@ impl GenAIBuilder {
             })
             .unwrap_or_default();
 
-        let exe_path = std::fs::read_link(format!("/proc/{pid}/exe"))
+        let exe_path = std::fs::read_link(crate::utils::procfs::proc_pid_entry(pid, "exe"))
             .ok()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
@@ -569,8 +678,8 @@ impl GenAIBuilder {
             exe_path,
         };
         // Config rule match, else fall back to the *process* comm
-        // (/proc/{pid}/comm) — never the caller's per-event thread comm, which
-        // may be a library thread name such as "HTTP client".
+        // (`<procfs root>/{pid}/comm`) — never the caller's per-event thread
+        // comm, which may be a library thread name such as "HTTP client".
         Self::match_agent_by_ctx(&ctx).or_else(|| crate::discovery::scanner::read_comm(pid))
     }
 }
@@ -637,6 +746,35 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_cosh_personal_analyzer_recap() {
+        // cosh-shell personal analyzer background summary: fixed prompt from
+        // cosh-ng recommendation/personal_analyzer.rs build_fixed_prompt (#2750).
+        let req = make_llm_request(vec![InputMessage {
+            role: "user".to_string(),
+            parts: vec![MessagePart::Text {
+                content: "Summarize only grounded work into the supplied JSON schema. List every business entity mentioned by a summary or prompt in that item's entities field.\nSCHEMA:\n{}".to_string(),
+            }],
+            name: None,
+        }]);
+        assert_eq!(classify_call_kind(&req), CallKind::Recap);
+    }
+
+    #[test]
+    fn test_classify_similar_analyzer_wording_stays_main() {
+        // Similar summarize wording without the analyzer's fixed prefix must
+        // not be misclassified (#2750).
+        let req = make_llm_request(vec![InputMessage {
+            role: "user".to_string(),
+            parts: vec![MessagePart::Text {
+                content: "Please summarize only grounded work into a JSON report for me"
+                    .to_string(),
+            }],
+            name: None,
+        }]);
+        assert_eq!(classify_call_kind(&req), CallKind::Main);
+    }
+
+    #[test]
     fn test_classify_claude_web_search() {
         let req = make_llm_request(vec![InputMessage {
             role: "user".to_string(),
@@ -699,6 +837,18 @@ mod tests {
         assert!(!builder.is_llm_api_path("/v1/models"));
     }
 
+    /// DashScope/Bailian native protocol endpoints end in `/generation`, which
+    /// matched none of the compatible-mode patterns. Without them the whole
+    /// non-streaming call was dropped at the `build_llm_call` gate.
+    #[test]
+    fn test_is_llm_api_path_dashscope_native() {
+        let builder = GenAIBuilder::new();
+        assert!(builder.is_llm_api_path("/api/v1/services/aigc/text-generation/generation"));
+        assert!(builder.is_llm_api_path("/api/v1/services/aigc/multimodal-generation/generation"));
+        // Other aigc services (image synthesis, embeddings) stay out.
+        assert!(!builder.is_llm_api_path("/api/v1/services/aigc/text2image/image-synthesis"));
+    }
+
     #[test]
     fn test_is_sysom_pop_request() {
         assert!(GenAIBuilder::is_sysom_pop_request(&Some(
@@ -724,6 +874,28 @@ mod tests {
             Some("sysom".to_string())
         );
         assert_eq!(builder.extract_provider_from_path("/unknown"), None);
+    }
+
+    /// Native protocol calls used to fall through to `"unknown"` (streaming) or
+    /// be mislabelled `"anthropic"` via usage-shape detection (token record).
+    #[test]
+    fn test_extract_provider_from_path_dashscope_native() {
+        let builder = GenAIBuilder::new();
+        assert_eq!(
+            builder.extract_provider_from_path("/api/v1/services/aigc/text-generation/generation"),
+            Some("dashscope".to_string())
+        );
+        assert_eq!(
+            builder.extract_provider_from_path(
+                "/api/v1/services/aigc/multimodal-generation/generation"
+            ),
+            Some("dashscope".to_string())
+        );
+        // Compatible mode keeps reporting openai — it speaks the OpenAI schema.
+        assert_eq!(
+            builder.extract_provider_from_path("/compatible-mode/v1/chat/completions"),
+            Some("openai".to_string())
+        );
     }
 
     #[test]
@@ -829,6 +1001,41 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_user_query_prefix_qwencode_system_reminder() {
+        let text = "<system-reminder>\nskills list here\n</system-reminder>\
+                     <system-reminder>\nfolder structure\n</system-reminder>\
+                     1+1等于几";
+        assert_eq!(GenAIBuilder::strip_user_query_prefix(text), "1+1等于几");
+    }
+
+    #[test]
+    fn test_strip_user_query_prefix_qwencode_single_block() {
+        let text = "<system-reminder>context</system-reminder>hello world";
+        assert_eq!(GenAIBuilder::strip_user_query_prefix(text), "hello world");
+    }
+
+    #[test]
+    fn test_strip_user_query_prefix_qwencode_unclosed_tag() {
+        // Unclosed tag — should still strip what it can
+        let text =
+            "<system-reminder>some context</system-reminder><system-reminder>no end tag user input";
+        assert_eq!(
+            GenAIBuilder::strip_user_query_prefix(text),
+            "<system-reminder>no end tag user input"
+        );
+    }
+
+    #[test]
+    fn test_strip_user_query_prefix_qwencode_only_unclosed_tag() {
+        // No closing tag at all — nothing to strip, returns original trimmed
+        let text = "<system-reminder>some context without end tag and user input";
+        assert_eq!(
+            GenAIBuilder::strip_user_query_prefix(text),
+            "<system-reminder>some context without end tag and user input"
+        );
+    }
+
+    #[test]
     fn test_extract_last_user_query() {
         let req = LLMRequest {
             messages: vec![
@@ -862,6 +1069,142 @@ mod tests {
         assert_eq!(
             GenAIBuilder::extract_last_user_query(&req),
             Some("hi".to_string())
+        );
+    }
+
+    #[test]
+    fn test_count_real_user_messages_empty() {
+        let req = LLMRequest {
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop_sequences: None,
+            stream: false,
+            tools: None,
+            raw_body: None,
+        };
+        assert_eq!(GenAIBuilder::count_real_user_messages(&req), 0);
+    }
+
+    #[test]
+    fn test_count_real_user_messages_single_user() {
+        let req = LLMRequest {
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                parts: vec![MessagePart::Text {
+                    content: "hello".to_string(),
+                }],
+                name: None,
+            }],
+            temperature: None,
+            max_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop_sequences: None,
+            stream: false,
+            tools: None,
+            raw_body: None,
+        };
+        assert_eq!(GenAIBuilder::count_real_user_messages(&req), 1);
+    }
+
+    #[test]
+    fn test_count_real_user_messages_tool_result_only() {
+        let req = LLMRequest {
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                parts: vec![MessagePart::ToolCallResponse {
+                    id: Some("tool-1".to_string()),
+                    response: serde_json::json!({"result": "ok"}),
+                }],
+                name: None,
+            }],
+            temperature: None,
+            max_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop_sequences: None,
+            stream: false,
+            tools: None,
+            raw_body: None,
+        };
+        assert_eq!(
+            GenAIBuilder::count_real_user_messages(&req),
+            0,
+            "tool-result-only user messages should not count"
+        );
+    }
+
+    #[test]
+    fn test_count_real_user_messages_mixed() {
+        let req = LLMRequest {
+            messages: vec![
+                InputMessage {
+                    role: "system".to_string(),
+                    parts: vec![MessagePart::Text {
+                        content: "sys".to_string(),
+                    }],
+                    name: None,
+                },
+                InputMessage {
+                    role: "user".to_string(),
+                    parts: vec![MessagePart::Text {
+                        content: "first question".to_string(),
+                    }],
+                    name: None,
+                },
+                InputMessage {
+                    role: "assistant".to_string(),
+                    parts: vec![MessagePart::ToolCall {
+                        id: Some("tc-1".to_string()),
+                        name: "search".to_string(),
+                        arguments: None,
+                    }],
+                    name: None,
+                },
+                InputMessage {
+                    role: "user".to_string(),
+                    parts: vec![MessagePart::ToolCallResponse {
+                        id: Some("tc-1".to_string()),
+                        response: serde_json::json!({"data": "result"}),
+                    }],
+                    name: None,
+                },
+                InputMessage {
+                    role: "user".to_string(),
+                    parts: vec![MessagePart::Text {
+                        content: "second question".to_string(),
+                    }],
+                    name: None,
+                },
+            ],
+            temperature: None,
+            max_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop_sequences: None,
+            stream: false,
+            tools: None,
+            raw_body: None,
+        };
+        assert_eq!(
+            GenAIBuilder::count_real_user_messages(&req),
+            2,
+            "2 text-bearing user msgs, 1 tool-result-only, should count 2"
         );
     }
 
@@ -964,6 +1307,18 @@ mod tests {
     fn test_raw_classify_recap_claude_code() {
         let first_user = "Your task is to create a detailed summary of the conversation so far. Please Do NOT call any tools in this turn.";
         assert_eq!(classify_call_kind_from_raw(&None, first_user), "recap");
+    }
+
+    #[test]
+    fn test_raw_classify_recap_cosh_personal_analyzer() {
+        let first_user = "Summarize only grounded work into the supplied JSON schema. List every business entity mentioned by a summary or prompt in that item's entities field.\nSCHEMA:\n{}";
+        assert_eq!(classify_call_kind_from_raw(&None, first_user), "recap");
+    }
+
+    #[test]
+    fn test_raw_classify_similar_analyzer_wording_stays_main() {
+        let first_user = "Please summarize only grounded work into a JSON report for me";
+        assert_eq!(classify_call_kind_from_raw(&None, first_user), "main");
     }
 
     #[test]
@@ -1171,6 +1526,38 @@ mod tests {
             GenAIBuilder::extract_system_text(&serde_json::Value::Null),
             None
         );
+    }
+
+    /// DashScope/Bailian native protocol wraps the messages array inside an
+    /// `input` **object**, unlike the Responses API where `input` is an array.
+    #[test]
+    fn test_extract_messages_view_dashscope_native_input_object() {
+        let body = serde_json::json!({
+            "model": "qwen-plus",
+            "input": {
+                "messages": [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"}
+                ]
+            },
+            "parameters": {"result_format": "message"}
+        });
+        let (msgs, instructions) = GenAIBuilder::extract_messages_view(&body).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].get("role").and_then(|r| r.as_str()), Some("system"));
+        // Native protocol carries the system prompt inside the messages array,
+        // so no top-level instructions fallback is needed.
+        assert!(instructions.is_none());
+    }
+
+    /// An `input` object without a `messages` array carries no conversation.
+    #[test]
+    fn test_extract_messages_view_dashscope_native_input_object_without_messages() {
+        let body = serde_json::json!({
+            "model": "qwen-plus",
+            "input": {"prompt": "hi"}
+        });
+        assert!(GenAIBuilder::extract_messages_view(&body).is_none());
     }
 
     #[test]

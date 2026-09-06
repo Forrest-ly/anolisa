@@ -1,101 +1,64 @@
-# cosh-shell 总览
+# 交互式终端
 
-cosh-shell 是 cosh-ng 的 AI 增强交互式终端。它在原生 bash/zsh PTY 之上叠加
-AI 分析能力、工具审批控制和内联卡片渲染，为用户提供安全、可观测的 Agent
-交互体验。
+[English](../../../../en/user-entrypoint/cosh-ng/shell/overview.md)
 
-## 定位
+`cosh` 默认启动 Enhanced Assisted 模式。`◇ ` 前缀表示 Cosh 可能在 bash 或
+zsh 执行前路由自然语言输入。在空提示符按 `Shift+Tab` 可进入 Enhanced
+Shell-only（`◌ `）。如果要求不加载 Cosh Hook、不观察也不提供洞察，需要在
+启动时选择 Native。
 
-cosh-shell 是面向终端用户的前端层：
+## 典型工作流
 
-- 管理 PTY 主机（bash/zsh 子进程）
-- 通过 AI 适配器连接后端（默认 cosh-core）
-- 渲染审批卡片和 AI 分析结果
-- 实施工具审批控制协议
+1. 进入目标目录并运行`cosh`。
+2. 像平常一样执行熟悉的命令。
+3. 普通输入应只交给 Shell 时，按 `Shift+Tab`。
+4. 在 Assisted 模式描述任务，并在允许副作用前检查卡片。
+5. 离开长时间排查前运行`/session status`。
 
-## 运行模式
+常用启动方式：
 
 ```bash
-# 默认启动（使用配置中的适配器和 shell）
-cosh-shell
-
-# 显式指定适配器（位置参数）
-cosh-shell raw cosh-core
-cosh-shell raw claude
-cosh-shell raw qwen
-
-# 指定底层 shell
-cosh-shell --shell zsh
-cosh-shell raw co --shell bash
-
-# 直通模式：执行单条命令后退出
-cosh-shell -c 'ls -la'
-cosh-shell -- git status
-
-# 登录 shell 模式
-cosh-shell --login
-cosh-shell -l
-
-# 隔离模式（跳过用户 rcfile）
-cosh-shell --isolated
+cosh
+cosh --shell zsh
+cosh --resume
+COSH_SHELL_INTEGRATION=native cosh
 ```
 
-## 支持的 AI 适配器
+## 输入如何分流
 
-| 适配器 | 后端 | 说明 |
-|--------|------|------|
-| `cosh-core` | cosh-core 进程 | 默认适配器，完整控制协议 |
-| `claude` | Claude Code CLI | Claude 适配器 |
-| `qwen` | Qwen Code CLI | 通义千问适配器 |
-| `fake` | 模拟 | 开发测试用，无需后端 |
+| 输入 | Native | Enhanced Shell-only `◌` | Enhanced Assisted `◇` |
+|---|---|---|---|
+| `git status` | 在 Shell 中执行。 | 在 Shell 中执行，之后可能提供执行洞察。 | 在 Shell 中执行，之后可能提供执行洞察。 |
+| `hello` | Shell 通常报告命令不存在。 | Shell 通常报告命令不存在。 | 分类器会检查它，当前仍把这个有歧义的单词交给 Shell。 |
+| `why did the last command fail?` | 由 Shell 处理。 | 由 Shell 处理。 | 携带最近终端证据启动 Agent 请求。 |
+| `/session list` | 由 Shell 处理。 | 由 Shell 处理。 | 执行 Cosh 控制命令。 |
+| Agent 工具请求 | 不可用。 | 明确接受洞察或进入 Agent 后可用。 | 按审批模式执行或显示审批卡片。 |
 
-## 适配器能力
+Native 不会安装 Cosh `DEBUG`、`RETURN` 或 `ERR` trap，也不会开启
+`extdebug`、`functrace` 或 `errtrace`。Enhanced 是默认集成；使用
+`shell.integration = "native"` 或 `COSH_SHELL_INTEGRATION=native` 选择
+Native。切换集成需要重新启动 `cosh`，`Shift+Tab` 只切换 Enhanced 内部的
+路由子状态，不需要重启。
 
-| 能力 | 说明 |
-|------|------|
-| `text_stream` | 文本流式输出 |
-| `thinking_stream` | 思考过程流式输出 |
-| `session_resume` | 会话恢复 |
-| `tool_intent` | 工具调用意图感知 |
-| `user_question` | 向用户提问 |
-| `cancellable` | 支持取消运行中的请求 |
-| `control_protocol` | 完整控制协议支持 |
+增强集成中获批的 Shell 命令仍在前台 Shell 执行，prompt、输出、任务控制和
+`Ctrl+C` 都可用。安全规则见[工具审批](approval.md)。
 
-## 核心功能
+## 会话与主动帮助
 
-| 功能 | 说明 | 详细文档 |
-|------|------|----------|
-| PTY 交互 | bash/zsh 原生终端 | [interactive-mode.md](interactive-mode.md) |
-| AI 分析 | 流式命令分析 | [ai-analysis.md](ai-analysis.md) |
-| 工具审批 | 可视化审批卡片 | [approval.md](approval.md) |
+- 增强会话由 cosh-core 保存，并按启动 cosh 时所在工作空间隔离。恢复会话只
+  恢复模型可见的对话内容，不恢复终端进程或旧终端输出。详见
+  [会话恢复](session-recovery.md)。
+- `smart` 是增强集成中的默认分析模式。调整主动失败帮助的方法见
+  [AI 分析](ai-analysis.md)。
+- `/help` 是增强集成命令集合的准确信息，简要参考见
+  [交互命令](interactive-mode.md)。
 
-## 架构概览
+## 下一步
 
-```
-┌────────────────────────────────────────────┐
-│                 cosh-shell                 │
-│  ┌───────────┐  ┌──────────┐  ┌─────────┐  │
-│  │ PTY Host  │  │ Adapter  │  │   UI    │  │
-│  │ (bash/zsh)│  │(cosh-core│  │(ratatui)│  │
-│  └───────────┘  │/claude..)│  └─────────┘  │
-│  ┌───────────┐  └──────────┘  ┌─────────┐  │
-│  │  Hooks    │  ┌──────────┐  │Approval │  │
-│  │  Engine   │  │  Tools   │  │ Broker  │  │
-│  └───────────┘  └──────────┘  └─────────┘  │
-└────────────────────────────────────────────┘
-         │                │
-         ▼                ▼
-    bash/zsh PTY     cosh-core 进程
-```
-
-## 配置
-
-cosh-shell 特有配置位于 `~/.copilot-shell/config.toml` 的 `[ui]` 和 `[shell]`
-段。详见 [配置文档](../configuration.md)。
-
-## 项目信任
-
-cosh-shell 维护项目级信任存储。首次在新项目目录启动时，提示用户确认是否信任该项目。信任状态决定：
-
-- 是否加载项目目录下的 `.cosh/hooks`
-- 是否应用项目级配置覆盖
+- [工具审批](approval.md)
+- [AI分析](ai-analysis.md)
+- [会话恢复](session-recovery.md)
+- [会话压缩](session-compaction.md)
+- [Skills](../core/skills.md)
+- [MCP](../mcp.md)
+- [Extensions](../core/extensions.md)

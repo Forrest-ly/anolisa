@@ -101,6 +101,10 @@ impl GenAIBuilder {
         let user_query = Self::extract_last_user_query(&request);
         let first_user_raw = Self::extract_first_user_raw(&request).unwrap_or_default();
         let last_user_raw = Self::extract_last_user_raw(&request).unwrap_or_default();
+        let user_message_count = Self::count_real_user_messages(&request);
+
+        // Classify call kind (main / recap / web_search) from request content
+        let call_kind = super::helpers::classify_call_kind(&request).as_str();
 
         // 提取 LLM API 的 response_id（如 chatcmpl-xxx），用作 trace_id
         // 同时作为 call_id 的首选值：trace_id 有值时直接复用，避免两套 ID；
@@ -141,6 +145,7 @@ impl GenAIBuilder {
             pid_i32,
             &last_user_raw,
             &response_id,
+            user_message_count,
         );
 
         // 若本次响应的 finish_reason 表明本轮对话已经结束（非 tool_calls/tool_use 等
@@ -154,8 +159,31 @@ impl GenAIBuilder {
             .and_then(|m| m.finish_reason.as_deref())
         {
             if Self::is_turn_terminal_finish_reason(reason) {
-                self.id_resolver
-                    .finish_conversation(&agent_name, pid_i32, &last_user_raw);
+                // Some providers (e.g. DashScope with forced tool_choice) report
+                // finish_reason "stop" even when the response carries tool calls.
+                // A response that still asks for tool execution means the turn is
+                // not over, so keep the conversation anchor alive.
+                // Both finish_reason and the tool-call probe read the last output
+                // message: for multi-choice responses the last choice is decisive,
+                // matching the SSE aggregation semantics (finish_reason comes from
+                // the last chunk).
+                let has_tool_call = response
+                    .messages
+                    .last()
+                    .map(|m| {
+                        m.parts
+                            .iter()
+                            .any(|p| matches!(p, MessagePart::ToolCall { .. }))
+                    })
+                    .unwrap_or(false);
+                if !has_tool_call {
+                    self.id_resolver.finish_conversation(
+                        &agent_name,
+                        pid_i32,
+                        &last_user_raw,
+                        user_message_count,
+                    );
+                }
             }
         }
 
@@ -231,10 +259,10 @@ impl GenAIBuilder {
             token_usage,
             error,
             pid: pid_i32,
-            // Process name = the *process* comm (/proc/<pid>/comm), not the SSL
-            // event's per-event thread comm (which may be a library worker-thread
-            // name such as "HTTP client"). Falls back to the event comm only when
-            // /proc is unreadable (process already gone).
+            // Process name = the *process* comm (`<procfs root>/<pid>/comm`), not
+            // the SSL event's per-event thread comm (which may be a library
+            // worker-thread name such as "HTTP client"). Falls back to the event
+            // comm only when the entry is unreadable (process already gone).
             process_name: crate::discovery::scanner::read_comm(http.pid)
                 .unwrap_or_else(|| http.comm.clone()),
             agent_name: Some(agent_name.clone()),
@@ -244,6 +272,12 @@ impl GenAIBuilder {
                 meta.insert("path".to_string(), http.path.clone());
                 meta.insert("status_code".to_string(), http.status_code.to_string());
                 meta.insert("is_sse".to_string(), http.is_sse.to_string());
+                if let Some(timestamp_ns) = http.first_output_timestamp_ns {
+                    meta.insert(
+                        "first_output_timestamp_ns".to_string(),
+                        timestamp_ns.to_string(),
+                    );
+                }
                 meta.insert(
                     "sse_event_count".to_string(),
                     http.sse_event_count.to_string(),
@@ -287,21 +321,28 @@ impl GenAIBuilder {
                     meta.insert("session_id".to_string(), sid.clone());
                 }
                 meta.insert("pending_match_key".to_string(), pending_match_key);
+                // call_kind: main / recap / web_search
+                meta.insert("call_kind".to_string(), call_kind.to_string());
                 meta
             },
         })
     }
 
-    /// 判断 `finish_reason` 是否意味着本轮对话已经结束。
+    /// Returns whether a `finish_reason` value *by itself* marks the end of a turn.
     ///
-    /// `tool_calls`（OpenAI）/`tool_use`（Anthropic）/`function_call`（旧式 OpenAI）
-    /// 表示模型请求了工具调用，对话仍将在同一轮内继续；其余取值（`stop` /
-    /// `end_turn` / `length` / `max_tokens` / `content_filter` / `stop_sequence` 等）均意味着
-    /// 本轮对话已经得到最终回复，应视为轮结束。
+    /// `tool_calls` (OpenAI) / `tool_use` (Anthropic) / `function_call` (legacy
+    /// OpenAI) mean the model requested tool execution; `pause_turn` (Anthropic)
+    /// means a long-running turn was paused and will resume. Anything else
+    /// (`stop`, `end_turn`, `length`, ...) is treated as terminal.
+    ///
+    /// Note: the eviction site additionally checks whether the last assistant
+    /// message still carries a `MessagePart::ToolCall`; if so, the conversation
+    /// anchor is kept alive even for a terminal `finish_reason` (some providers,
+    /// e.g. DashScope with forced `tool_choice`, report `"stop"` for tool calls).
     fn is_turn_terminal_finish_reason(reason: &str) -> bool {
         !matches!(
             reason.to_ascii_lowercase().as_str(),
-            "tool_calls" | "tool_use" | "function_call"
+            "tool_calls" | "tool_use" | "function_call" | "pause_turn"
         )
     }
 
@@ -582,11 +623,19 @@ impl GenAIBuilder {
                                 crate::analyzer::message::AnthropicContentBlock::ToolResult {
                                     tool_use_id,
                                     content,
-                                    ..
+                                    is_error,
                                 } => {
-                                    // Anthropic tool_result: convert to MessagePart::ToolCallResponse
-                                    let response_val =
-                                        content.clone().unwrap_or(serde_json::Value::Null);
+                                    // Anthropic tool_result: convert to MessagePart::ToolCallResponse.
+                                    // `is_error` must ride along inside the wrapper so the ATIF
+                                    // converter can preserve it as a structured failure signal.
+                                    let response_val = match (content.clone(), *is_error) {
+                                        (Some(value), Some(flag)) => {
+                                            serde_json::json!({"content": value, "is_error": flag})
+                                        }
+                                        (Some(value), None) => value,
+                                        (None, Some(flag)) => serde_json::json!({"is_error": flag}),
+                                        (None, None) => serde_json::Value::Null,
+                                    };
                                     parts.push(MessagePart::ToolCallResponse {
                                         id: Some(tool_use_id.clone()),
                                         response: response_val,
@@ -723,6 +772,14 @@ impl GenAIBuilder {
                 }
             }
             msgs
+        } else if messages.is_empty() && Self::is_dashscope_native_path(&http.path) {
+            // Non-streaming DashScope/Bailian native protocol: no typed parser
+            // claims `/aigc/*-generation/generation`, so the `output` envelope
+            // has to be reconstructed from the raw response body.
+            http.response_body
+                .as_ref()
+                .and_then(|body| Self::parse_sse_response_body(body, finish_reason.as_deref()))
+                .unwrap_or(messages)
         } else {
             messages
         };
@@ -769,6 +826,7 @@ mod tests {
             response_headers: "{}".to_string(),
             response_body,
             duration_ns: 1_000_000,
+            first_output_timestamp_ns: None,
             is_sse: false,
             sse_event_count: 0,
         }
@@ -865,6 +923,89 @@ mod tests {
         let builder = GenAIBuilder::new();
         let token = TokenRecord::new(1, "x".to_string(), "openai".to_string(), 1, 2);
         assert!(build_call(&builder, &[AnalysisResult::Token(token)]).is_none());
+    }
+
+    /// DashScope native path for reference in the tests below.
+    const DASHSCOPE_TEXT_GEN_PATH: &str = "/api/v1/services/aigc/text-generation/generation";
+
+    /// Non-streaming native calls used to be dropped entirely by the
+    /// `!is_llm && !is_sse` gate, so nothing reached the Dashboard.
+    #[test]
+    fn test_build_llm_call_dashscope_native_non_streaming() {
+        let builder = GenAIBuilder::new();
+        let request_body = serde_json::json!({
+            "model": "qwen-plus",
+            "input": {"messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Count to 3"}
+            ]},
+            "parameters": {"result_format": "message"}
+        })
+        .to_string();
+        // Native responses have no top-level `model`, only output/usage/request_id.
+        let response_body = serde_json::json!({
+            "output": {"choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "1, 2, 3."}
+            }]},
+            "usage": {"input_tokens": 22, "output_tokens": 8, "total_tokens": 30},
+            "request_id": "req-native-1"
+        })
+        .to_string();
+
+        let http = make_http(
+            DASHSCOPE_TEXT_GEN_PATH,
+            Some(request_body),
+            Some(response_body),
+        );
+        let call = build_call(&builder, &[AnalysisResult::Http(http)])
+            .expect("native non-streaming call must build an LLMCall");
+
+        assert_eq!(call.provider, "dashscope");
+        assert_eq!(call.model, "qwen-plus", "model comes from the request body");
+
+        // Request side: `input` is an object, so extract_messages_view must
+        // reach into `input.messages`.
+        assert_eq!(call.request.messages.len(), 2);
+        assert_eq!(call.request.messages[0].role, "system");
+        assert_eq!(call.request.messages[1].role, "user");
+
+        // Response side: non-streaming native has no typed parser, so the
+        // envelope must be reconstructed from the raw body.
+        assert_eq!(call.response.messages.len(), 1);
+        assert!(matches!(
+            &call.response.messages[0].parts[0],
+            MessagePart::Text { content } if content == "1, 2, 3."
+        ));
+        assert_eq!(
+            call.response.messages[0].finish_reason.as_deref(),
+            Some("stop")
+        );
+        assert!(!call.is_semantically_empty());
+    }
+
+    /// The token record provider must not leak `anthropic` into the call, and a
+    /// model-less token record must not shadow the request-body model.
+    #[test]
+    fn test_build_llm_call_dashscope_native_provider_beats_token_record() {
+        let builder = GenAIBuilder::new();
+        let request_body =
+            serde_json::json!({"model": "qwen3-vl-plus", "input": {"messages": []}}).to_string();
+        let http = make_http(
+            "/api/v1/services/aigc/multimodal-generation/generation",
+            Some(request_body),
+            None,
+        );
+        // Simulates the pre-fix mislabelling reaching build_llm_call.
+        let token = TokenRecord::new(100, "python3".to_string(), "anthropic".to_string(), 30, 12)
+            .with_model(String::new());
+        let call = build_call(
+            &builder,
+            &[AnalysisResult::Http(http), AnalysisResult::Token(token)],
+        )
+        .expect("native call builds");
+        assert_eq!(call.provider, "dashscope");
+        assert_eq!(call.model, "qwen3-vl-plus");
     }
 
     #[test]
@@ -1656,5 +1797,343 @@ mod tests {
         let call = build_call(&builder, &[AnalysisResult::Http(http)]).unwrap();
         assert!(call.request.messages.is_empty());
         assert!(!call.request.stream);
+    }
+
+    #[test]
+    fn first_output_timestamp_reaches_latency_query() {
+        let mut http = make_http(
+            "/v1/chat/completions",
+            Some(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#
+                    .to_string(),
+            ),
+            Some(
+                r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
+                    .to_string(),
+            ),
+        );
+        http.duration_ns = 500_000_000;
+        http.first_output_timestamp_ns = Some(1_100_000_000);
+        http.is_sse = true;
+        http.sse_event_count = 4;
+
+        let builder = GenAIBuilder::new();
+        let call = build_call(&builder, &[AnalysisResult::Http(http)]).unwrap();
+        assert_eq!(
+            call.metadata.get("first_output_timestamp_ns"),
+            Some(&"1100000000".to_string())
+        );
+        assert_eq!(call.metadata.get("is_sse"), Some(&"true".to_string()));
+
+        let path = std::env::temp_dir().join(format!(
+            "agentsight_timing_pipeline_{}_{}.db",
+            std::process::id(),
+            1_100_000_000u64
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = crate::storage::sqlite::genai::GenAISqliteStore::new_with_path(&path).unwrap();
+        let event = crate::genai::semantic::GenAISemanticEvent::LLMCall(call);
+        store.complete_pending(&event).unwrap();
+
+        let metrics = store.get_latency_metrics(0, 2_000_000_000, None).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].streaming_call_count, 1);
+        assert_eq!(
+            metrics[0].ttft_ms.as_ref().map(|metric| metric.p50),
+            Some(100.0)
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_build_llm_call_call_kind_main() {
+        let builder = GenAIBuilder::new();
+        let body = serde_json::json!({
+            "model": "qwen3.6-plus",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "hello"}
+            ]
+        })
+        .to_string();
+        let http = make_http("/v1/chat/completions", Some(body), None);
+        let call = build_call(&builder, &[AnalysisResult::Http(http)]).unwrap();
+        assert_eq!(
+            call.metadata.get("call_kind").map(|s| s.as_str()),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn test_build_llm_call_call_kind_recap_memory_subagent() {
+        let builder = GenAIBuilder::new();
+        let body = serde_json::json!({
+            "model": "qwen3.6-plus",
+            "messages": [
+                {"role": "system", "content": "You are now acting as the managed memory extraction subagent."},
+                {"role": "user", "content": "Managed memory has TWO directories. Choose which one to write each memory into."}
+            ]
+        })
+        .to_string();
+        let http = make_http("/v1/chat/completions", Some(body), None);
+        let call = build_call(&builder, &[AnalysisResult::Http(http)]).unwrap();
+        assert_eq!(
+            call.metadata.get("call_kind").map(|s| s.as_str()),
+            Some("recap")
+        );
+    }
+
+    #[test]
+    fn test_build_llm_call_call_kind_recap_suggestion_subagent() {
+        let builder = GenAIBuilder::new();
+        let body = serde_json::json!({
+            "model": "qwen3.6-plus",
+            "messages": [
+                {"role": "user", "content": "[SUGGESTION MODE: Suggest what the user might naturally type next.]"}
+            ]
+        })
+        .to_string();
+        let http = make_http("/v1/chat/completions", Some(body), None);
+        let call = build_call(&builder, &[AnalysisResult::Http(http)]).unwrap();
+        assert_eq!(
+            call.metadata.get("call_kind").map(|s| s.as_str()),
+            Some("recap")
+        );
+    }
+
+    // ── Turn eviction vs. tool calls (issue #2262) ──────────────────────
+    //
+    // The conversation anchor must survive a response that still requests
+    // tool execution, even when the provider mislabels it with a terminal
+    // finish_reason such as "stop" (e.g. DashScope with forced tool_choice).
+
+    /// Builds an OpenAI-style request/response pair: a single user message
+    /// plus an assistant reply with the given finish_reason and tool_calls.
+    fn openai_turn_results(
+        user_text: &str,
+        response_id: &str,
+        finish_reason: &str,
+        tool_calls: Option<Vec<serde_json::Value>>,
+    ) -> Vec<AnalysisResult> {
+        let request = OpenAIRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![empty_chat_msg(MessageRole::User, Some(user_text))],
+            temperature: None,
+            max_tokens: None,
+            stream: None,
+            top_p: None,
+            n: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
+            parallel_tool_calls: None,
+        };
+        let mut assistant_msg = empty_chat_msg(MessageRole::Assistant, Some("ok"));
+        assistant_msg.tool_calls = tool_calls;
+        let response = OpenAIResponse {
+            id: response_id.to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "gpt-4".to_string(),
+            choices: vec![OpenAIChoice {
+                index: 0,
+                message: assistant_msg,
+                finish_reason: Some(finish_reason.to_string()),
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
+        };
+        let parsed = ParsedApiMessage::OpenAICompletion {
+            request: Some(request),
+            response: Some(response),
+        };
+        let http = make_http("/v1/chat/completions", None, None);
+        vec![AnalysisResult::Http(http), AnalysisResult::Message(parsed)]
+    }
+
+    fn conv_id(builder: &GenAIBuilder, results: &[AnalysisResult]) -> String {
+        build_call(builder, results)
+            .unwrap()
+            .metadata
+            .get("conversation_id")
+            .unwrap()
+            .clone()
+    }
+
+    fn sample_tool_calls() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({
+            "id": "tc_1",
+            "type": "function",
+            "function": {"name": "run_cmd", "arguments": "{}"}
+        })]
+    }
+
+    #[test]
+    fn test_tool_call_with_stop_finish_reason_keeps_turn_open() {
+        let builder = GenAIBuilder::new();
+        let user = "same user text";
+        let first = conv_id(
+            &builder,
+            &openai_turn_results(user, "resp-1", "stop", Some(sample_tool_calls())),
+        );
+        let second = conv_id(
+            &builder,
+            &openai_turn_results(user, "resp-2", "stop", Some(sample_tool_calls())),
+        );
+        assert_eq!(
+            first, second,
+            "a response carrying tool calls must not evict the conversation anchor"
+        );
+    }
+
+    #[test]
+    fn test_pure_text_stop_finish_reason_ends_turn() {
+        let builder = GenAIBuilder::new();
+        let user = "same user text";
+        let first = conv_id(&builder, &openai_turn_results(user, "resp-1", "stop", None));
+        let second = conv_id(&builder, &openai_turn_results(user, "resp-2", "stop", None));
+        assert_ne!(
+            first, second,
+            "a pure-text terminal response must still evict the conversation anchor"
+        );
+    }
+
+    #[test]
+    fn test_empty_tool_calls_with_stop_ends_turn() {
+        let builder = GenAIBuilder::new();
+        let user = "same user text";
+        let first = conv_id(
+            &builder,
+            &openai_turn_results(user, "resp-1", "stop", Some(vec![])),
+        );
+        let second = conv_id(
+            &builder,
+            &openai_turn_results(user, "resp-2", "stop", Some(vec![])),
+        );
+        assert_ne!(
+            first, second,
+            "an empty tool_calls array yields no ToolCall part and must still end the turn"
+        );
+    }
+
+    #[test]
+    fn test_pause_turn_finish_reason_keeps_turn_open() {
+        let builder = GenAIBuilder::new();
+        let user = "same user text";
+        let first = conv_id(
+            &builder,
+            &openai_turn_results(user, "resp-1", "pause_turn", None),
+        );
+        let second = conv_id(
+            &builder,
+            &openai_turn_results(user, "resp-2", "pause_turn", None),
+        );
+        assert_eq!(
+            first, second,
+            "pause_turn means the turn will resume, so the anchor must survive"
+        );
+    }
+
+    /// Builds an OpenAI SSE exchange: request body with a single user message
+    /// and a streamed response whose tool_call arrives as fragmented deltas,
+    /// with the last chunk reporting finish_reason "stop".
+    fn sse_stop_tool_call_results(user_text: &str, response_id: &str) -> Vec<AnalysisResult> {
+        let request_body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": user_text}]
+        })
+        .to_string();
+        let sse_body = format!(
+            concat!(
+                r#"[{{"id":"{rid}","choices":[{{"delta":{{"tool_calls":"#,
+                r#"[{{"index":0,"id":"tc_1","function":{{"name":"run_cmd","arguments":"{{\"c"}}}}]}},"#,
+                r#""finish_reason":null}}]}},"#,
+                r#"{{"id":"{rid}","choices":[{{"delta":{{"tool_calls":"#,
+                r#"[{{"index":0,"function":{{"arguments":"md\":1}}"}}}}]}},"finish_reason":"stop"}}]}}]"#
+            ),
+            rid = response_id
+        );
+        let mut http = make_http("/v1/chat/completions", Some(request_body), Some(sse_body));
+        http.is_sse = true;
+        vec![AnalysisResult::Http(http)]
+    }
+
+    #[test]
+    fn test_sse_tool_call_with_stop_keeps_turn_open() {
+        let builder = GenAIBuilder::new();
+        let user = "same user text";
+        let first = conv_id(&builder, &sse_stop_tool_call_results(user, "sse-resp-1"));
+        let second = conv_id(&builder, &sse_stop_tool_call_results(user, "sse-resp-2"));
+        assert_eq!(
+            first, second,
+            "an SSE-aggregated tool call with finish_reason stop must not evict the anchor"
+        );
+    }
+
+    /// Builds a SysOM exchange with a single user message and a tool_use
+    /// response; the SysOM path hardcodes finish_reason "stop".
+    fn sysom_tool_use_results(user_text: &str) -> Vec<AnalysisResult> {
+        let request = SysomRequest {
+            params: SysomLlmParams {
+                model: "qwen".to_string(),
+                messages: vec![SysMsg {
+                    role: "user".to_string(),
+                    content: user_text.to_string(),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: None,
+                }],
+                stream: false,
+                temperature: None,
+                max_tokens: None,
+                top_p: None,
+                tools: None,
+                use_dashscope: None,
+            },
+        };
+        let response = SysomResponse {
+            id: Some("chatcmpl-xx".to_string()),
+            choices: vec![SysomResponseChoice {
+                message: SysomResponseMessage {
+                    content: "answer".to_string(),
+                    tool_use: Some(vec![SysomToolUseItem {
+                        index: 0,
+                        id: "tu_1".to_string(),
+                        item_type: "function".to_string(),
+                        function: SysomFunction {
+                            name: "calc".to_string(),
+                            arguments: r#"{"x":1}"#.to_string(),
+                        },
+                    }]),
+                },
+            }],
+        };
+        let parsed = ParsedApiMessage::SysomMessage {
+            request: Some(request),
+            response: Some(response),
+        };
+        let http = make_http("/api/v1/copilot/generate_copilot", None, None);
+        vec![AnalysisResult::Http(http), AnalysisResult::Message(parsed)]
+    }
+
+    #[test]
+    fn test_sysom_tool_use_with_stop_keeps_turn_open() {
+        let builder = GenAIBuilder::new();
+        let user = "same user text";
+        let first = conv_id(&builder, &sysom_tool_use_results(user));
+        let second = conv_id(&builder, &sysom_tool_use_results(user));
+        assert_eq!(
+            first, second,
+            "a SysOM tool_use response (hardcoded finish_reason stop) must not evict the anchor"
+        );
     }
 }

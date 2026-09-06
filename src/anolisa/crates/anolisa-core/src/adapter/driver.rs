@@ -8,6 +8,7 @@
 //! stay centralized. The split is deliberate — **driver owns framework
 //! semantics, Manager owns dangerous-resource boundaries**.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use anolisa_platform::fs_layout::FsLayout;
 
 use super::AdapterError;
 use super::claim::AdapterClaim;
+use super::managed_files::MaterializedMapping;
 
 /// Read-only host facts a driver may inspect during [`FrameworkDriver::detect`].
 #[derive(Debug, Clone, Default)]
@@ -62,6 +64,9 @@ pub struct DriverCtx<'a> {
     /// Plugin id declared in the component's adapter manifest, if any.
     /// A driver may fall back to it when the bundle does not name one.
     pub declared_plugin_id: Option<String>,
+    /// Explicit framework profiles selected by the caller for profile-scoped
+    /// adapters. Drivers that are not profile-scoped ignore this list.
+    pub requested_profiles: Vec<String>,
     /// Adapter type declared in the component manifest. Absent means the
     /// legacy plugin adapter model.
     pub adapter_type: Option<String>,
@@ -110,9 +115,6 @@ impl DriverCtx<'_> {
 pub struct AdapterBundle {
     /// Resource root the bundle was read from.
     pub resource_root: PathBuf,
-    /// Digest of the resource tree, for drift/upgrade detection. `None`
-    /// when the driver declined to compute one.
-    pub digest: Option<String>,
     /// Framework-native plugin id resolved from the bundle (or the
     /// manifest-declared fallback).
     pub plugin_id: Option<String>,
@@ -265,8 +267,13 @@ pub enum AdapterConditionKind {
     SourceAvailable,
     /// The framework itself is detectable on the host.
     FrameworkDetected,
-    /// The installed resource bundle still matches the enable-time digest.
-    ResourceBundleMatches,
+    /// Package-manager-owned source files still match current package metadata.
+    ManagedBundleMatches,
+    /// The package-manager-owned adapter inputs still equal the enable-time
+    /// revision, including the resolved source root.
+    SourceRevisionMatches,
+    /// Files ANOLISA explicitly copied still match their receipt entries.
+    MaterializedBundleMatches,
     /// The plugin is still present in the framework registry.
     PluginRegistered,
     /// The framework reports the plugin's declared resources as loaded.
@@ -329,6 +336,30 @@ pub struct FrameworkCommand {
     pub timeout: Duration,
 }
 
+/// One line-delimited JSON-RPC session with a framework server that speaks
+/// stdio.
+///
+/// Distinct from [`FrameworkCommand::stdin`], which writes its bytes and
+/// immediately closes the pipe: a request/response server treats that EOF as
+/// a shutdown signal and may drop requests it has not dispatched yet (Codex's
+/// `app-server` answers only `initialize` before tearing down). The runner
+/// therefore keeps stdin open until [`Self::expected_responses`] id-bearing
+/// replies have been read, then closes it so the child exits.
+#[derive(Debug, Clone)]
+pub struct FrameworkRpcSession {
+    /// Command that starts the server in stdio mode. Its
+    /// [`FrameworkCommand::timeout`] bounds the whole session, and its
+    /// [`FrameworkCommand::stdin`] is ignored in favor of
+    /// [`Self::requests`].
+    pub command: FrameworkCommand,
+    /// Serialized JSON-RPC request objects, written in order, one per line.
+    pub requests: Vec<String>,
+    /// How many id-bearing responses to await before closing the child's
+    /// stdin. A session that times out before reaching this count still
+    /// returns whatever was read, with `timed_out` set.
+    pub expected_responses: usize,
+}
+
 /// Captured output of a [`FrameworkCommand`]. stdout/stderr are truncated
 /// to a bounded size before being returned and logged.
 #[derive(Debug, Clone)]
@@ -360,6 +391,9 @@ impl CliOutput {
 /// Codex/Claude Code drivers, and [`read_file`](AdapterOps::read_file)
 /// landed with the Qoder driver (which must read the user's
 /// `settings.json` back before merging into it).
+/// [`run_framework_rpc`](AdapterOps::run_framework_rpc) landed with Codex
+/// hook trust, whose framework-side read and write are only reachable through
+/// the `codex app-server` JSON-RPC protocol.
 pub trait AdapterOps {
     /// Spawn a framework CLI with a timeout, capture and truncate its
     /// output, and record the invocation in the central log. The argv is
@@ -390,6 +424,27 @@ pub trait AdapterOps {
         self.run_framework_cli(cmd)
     }
 
+    /// Drive a line-delimited JSON-RPC session against a framework server,
+    /// holding the child's stdin open until the expected replies arrive (see
+    /// [`FrameworkRpcSession`]). Returns the collected stdout lines under the
+    /// same bounded structured-output policy as
+    /// [`Self::run_framework_cli_json`].
+    ///
+    /// The default implementation refuses rather than degrading to
+    /// write-then-EOF, which would silently drop requests: an operation
+    /// provider that has not opted in must fail loudly.
+    ///
+    /// # Errors
+    ///
+    /// [`AdapterError::FrameworkCli`] when the process cannot be spawned or
+    /// the provider does not support RPC sessions.
+    fn run_framework_rpc(&self, session: FrameworkRpcSession) -> Result<CliOutput, AdapterError> {
+        Err(AdapterError::FrameworkCli {
+            program: session.command.program,
+            reason: "this operation provider does not support stdio JSON-RPC sessions".to_string(),
+        })
+    }
+
     /// Recursively copy a directory tree from `src` to `dst`. The Manager
     /// validates that `dst` is under an allowed external root before
     /// executing. `src` must be under the resource root or an allowed
@@ -409,6 +464,30 @@ pub trait AdapterOps {
     /// [`AdapterError::Io`] on filesystem failure;
     /// [`AdapterError::ClaimValidation`] if either path fails boundary check.
     fn copy_file(&self, src: &Path, dst: &Path) -> Result<(), AdapterError>;
+
+    /// Remove exactly one filesystem entry without recursively deleting a
+    /// directory. Files and symlinks are unlinked; empty directories are
+    /// removed so a materialized path can change from a directory prefix to
+    /// a file. Returns `Ok(false)` when the path does not exist.
+    ///
+    /// The Manager validates that `path` is under an allowed root. Refusing
+    /// non-empty directories preserves runtime-created files that were never
+    /// owned by an adapter receipt.
+    ///
+    /// # Errors
+    ///
+    /// [`AdapterError::Io`] on filesystem failure, including a non-empty
+    /// directory; [`AdapterError::ClaimValidation`] if `path` fails boundary
+    /// validation.
+    fn remove_path(&self, path: &Path) -> Result<bool, AdapterError> {
+        Err(AdapterError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "operation provider does not support exact path removal",
+            ),
+        })
+    }
 
     /// Remove a directory tree rooted at `path`. The Manager validates
     /// that `path` is under an allowed external root before executing.
@@ -521,6 +600,25 @@ pub trait FrameworkDriver: Send + Sync {
         ctx: &DriverCtx,
     ) -> Result<DriverPlan, AdapterError>;
 
+    /// Describe cleanup that will run before a validated prior receipt is
+    /// replaced during re-enable.
+    ///
+    /// The Manager prepends these descriptions to the ordinary enable plan,
+    /// preserving the real execution order. Implementations must remain
+    /// read-only; the default represents drivers whose replacement happens in
+    /// place and requires no separate cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a driver-specific receipt consistency error.
+    fn plan_reenable_cleanup(
+        &self,
+        _prior: &AdapterClaim,
+        _ctx: &DriverCtx,
+    ) -> Result<Vec<String>, AdapterError> {
+        Ok(Vec::new())
+    }
+
     /// Build the pure-data receipt for a future enable operation without
     /// mutating framework state, together with any driver-private
     /// [`PreparedEnable`] state (host capabilities resolved by read-only
@@ -561,6 +659,31 @@ pub trait FrameworkDriver: Send + Sync {
         Ok(())
     }
 
+    /// Release prior resources that the replacement receipt cannot continue
+    /// to own.
+    ///
+    /// The Manager calls this only after validating both receipts and keeps
+    /// the prior receipt durable until cleanup completes. Drivers should make
+    /// the operation idempotent and return `cleanup_complete = false` rather
+    /// than abandon any resource still requiring a later disable retry. The
+    /// default keeps existing re-enable behavior for drivers whose new receipt
+    /// fully supersedes the old one in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns a driver-specific cleanup error.
+    fn cleanup_replaced_claim(
+        &self,
+        _prior: &AdapterClaim,
+        _next: &AdapterClaim,
+        _ctx: &DriverCtx,
+    ) -> Result<DisableReport, AdapterError> {
+        Ok(DisableReport {
+            cleanup_complete: true,
+            messages: Vec::new(),
+        })
+    }
+
     /// Validate the final prepared receipt after re-enable facts have been
     /// preserved, but before the Manager persists it or mutates framework
     /// state.
@@ -574,6 +697,45 @@ pub trait FrameworkDriver: Send + Sync {
     /// Returns a driver-specific ownership or receipt consistency error.
     fn validate_prepared_enable(&self, _claim: &AdapterClaim) -> Result<(), AdapterError> {
         Ok(())
+    }
+
+    /// Source-to-resource copies this driver will explicitly materialize.
+    ///
+    /// The Manager maps only package-owned source entries through these
+    /// declarations before apply. Framework-native staging or copies remain
+    /// outside this contract.
+    fn materialized_mappings(
+        &self,
+        _resource_root: &Path,
+        _adapter_type: Option<&str>,
+        _declared_skills: &[DeclaredSkill],
+    ) -> Vec<MaterializedMapping> {
+        Vec::new()
+    }
+
+    /// Concrete destination roots for [`Self::materialized_mappings`].
+    ///
+    /// Dry-run cleanup compares these paths with the prior receipt so its
+    /// stale-output plan matches live re-enable even when a stable resource
+    /// id moves to a different framework path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same destination or identifier validation error as
+    /// [`Self::prepare_enable`].
+    fn materialized_destination_roots(
+        &self,
+        _bundle: &AdapterBundle,
+        _ctx: &DriverCtx,
+    ) -> Result<BTreeMap<String, PathBuf>, AdapterError> {
+        Ok(BTreeMap::new())
+    }
+
+    /// Whether this claim is expected to carry a materialized-file list.
+    /// Receipts with an empty list report `Unknown`; drivers whose framework
+    /// performs its own copy omit the condition entirely.
+    fn materialized_verification_applicable(&self, _claim: &AdapterClaim) -> bool {
+        false
     }
 
     /// Idempotently apply an already-persisted enable receipt to framework
@@ -631,7 +793,7 @@ pub fn find_binary_in_path(name: &str) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
         .map(|m| m.permissions().mode() & 0o111 != 0)
@@ -639,6 +801,6 @@ fn is_executable(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable(_path: &Path) -> bool {
+pub(crate) fn is_executable(_path: &Path) -> bool {
     true
 }

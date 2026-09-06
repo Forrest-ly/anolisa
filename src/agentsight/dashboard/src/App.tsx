@@ -14,6 +14,7 @@ import { SettingsPage } from './pages/SettingsPage';
 import { RiskEnforcementPage } from './pages/RiskEnforcementPage';
 import { SystemAuditPage } from './pages/SystemAuditPage';
 import { LoginPage } from './pages/LoginPage';
+import { useI18n } from './i18n';
 import { fetchAuthStatus, fetchAuthVerify, login } from './utils/apiClient';
 import type { AppCapability, AuthStatusResponse } from './utils/apiClient';
 
@@ -24,6 +25,7 @@ const DEFAULT_CAPABILITIES: AppCapability[] = [
   'optimization',
   'skills',
   'security',
+  'system_audit',
   'enforcement',
   'atif',
   'settings',
@@ -43,7 +45,7 @@ function pathAllowed(pathname: string, capabilities: AppCapability[]): boolean {
   if (pathname.startsWith('/optimization')) return capabilities.includes('optimization');
   if (pathname.startsWith('/skills')) return capabilities.includes('skills');
   if (pathname.startsWith('/security')) return capabilities.includes('security');
-  if (pathname.startsWith('/audit')) return capabilities.includes('security');
+  if (pathname.startsWith('/audit')) return capabilities.includes('system_audit');
   if (pathname.startsWith('/enforcement')) return capabilities.includes('enforcement');
   if (pathname.startsWith('/atif')) return capabilities.includes('atif');
   if (pathname.startsWith('/settings')) return capabilities.includes('settings');
@@ -61,6 +63,7 @@ const AuthGate: React.FC<{ children: (status: AuthStatusResponse | null) => Reac
   const [status, setStatus] = useState<AuthStatusResponse | null>(null);
   const navigate = useNavigate();
   const location = useLocation();
+  const { t } = useI18n();
 
   useEffect(() => {
     // Check for token in URL query parameter (e.g. ?token=xxx from CLI link)
@@ -126,7 +129,7 @@ const AuthGate: React.FC<{ children: (status: AuthStatusResponse | null) => Reac
   if (authState === 'loading') {
     return (
       <div className="min-h-screen flex items-center justify-center text-gray-400">
-        Loading...
+        {t('app.loading')}
       </div>
     );
   }
