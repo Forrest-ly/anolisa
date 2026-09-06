@@ -26,8 +26,8 @@ the unified-entry architecture (roadmap §5.4):
   envelopes keep their error attribution, and envelope-shaped output of a
   successful command is not misclassified as an error.
 
-Uses subprocesses with mock ``tokenless`` / ``rtk`` binaries, following the
-pattern of test_compress_response_hook.py and test_rewrite_hook.py.
+Uses subprocesses with mock ``tokenless`` binaries, following the pattern of
+test_compress_response_hook.py and test_rewrite_hook.py.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -60,6 +61,10 @@ _spec.loader.exec_module(hook_utils)
 
 COMPRESS_HOOK = _HOOKS_DIR / "compress_response_hook.py"
 REWRITE_HOOK = _HOOKS_DIR / "rewrite_hook.py"
+# Canonical Protocol v2 transport mock shared with the contract suite: Core
+# owns the PreTool rewrite decision, so the hook is exercised against the
+# same mock `tokenless` the contract goldens use.
+MOCK_TOKENLESS = Path(__file__).resolve().parent / "contract" / "mock_tokenless.py"
 
 
 def _write_exec(path: Path, content: str) -> None:
@@ -177,24 +182,6 @@ def _create_mock_tokenless(tmpdir: Path, behavior: str = "compress") -> Path:
     else:
         raise ValueError(f"Unknown behavior: {behavior}")
 
-    _write_exec(mock_script, script)
-    return mock_script
-
-
-def _create_mock_rtk(tmpdir: Path) -> Path:
-    """Create a mock rtk binary that rewrites commands for PreToolUse tests."""
-    mock_script = tmpdir / "rtk"
-    script = textwrap.dedent("""\
-        #!/usr/bin/env python3
-        import sys
-        if len(sys.argv) > 1 and sys.argv[1] == "--version":
-            print("rtk 0.43.0")
-            sys.exit(0)
-        if len(sys.argv) > 2 and sys.argv[1] == "rewrite":
-            print(f"rtk {sys.argv[2]}")
-            sys.exit(0)
-        sys.exit(1)
-    """)
     _write_exec(mock_script, script)
     return mock_script
 
@@ -575,10 +562,19 @@ class TestCoshNGRewriteIntegration(unittest.TestCase):
     def setUp(self) -> None:
         self._saved_env = os.environ.copy()
         self.tmp = tempfile.TemporaryDirectory()
-        self.home = Path(self.tmp.name)
-        self.mock_rtk = _create_mock_rtk(self.home)
-        # tokenless is checked for existence by rewrite_hook.
-        _create_mock_tokenless(self.home, behavior="passthrough")
+        root = Path(self.tmp.name)
+        self.home = root / "home"
+        self.bin_dir = root / "bin"
+        self.home.mkdir()
+        self.bin_dir.mkdir()
+        tokenless = self.bin_dir / "tokenless"
+        shutil.copy(MOCK_TOKENLESS, tokenless)
+        tokenless.chmod(
+            tokenless.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+        )
+        # The mock's shebang resolves through PATH: pin it to this interpreter.
+        (self.bin_dir / "python3").symlink_to(sys.executable)
+        self.request_log = root / "requests.jsonl"
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -590,8 +586,13 @@ class TestCoshNGRewriteIntegration(unittest.TestCase):
         env.pop("COSH_NG_VERSION", None)
         env.pop("COSH_RUNTIME", None)
         env["HOME"] = str(self.home)
-        env["PATH"] = str(self.mock_rtk.parent) + ":" + env.get("PATH", "")
+        env["PATH"] = f"{self.bin_dir}:/usr/bin:/bin"
         env["TOKENLESS_AGENT_ID"] = "copilot-shell"
+        # Keep the run hermetic: no stats/SLS side channels.
+        env["TOKENLESS_STATS_ENABLED"] = "0"
+        env["TOKENLESS_SLS_ENABLED"] = "0"
+        env["TOKENLESS_MOCK_BEHAVIOR"] = "applied"
+        env["TOKENLESS_MOCK_REQUEST_LOG"] = str(self.request_log)
         if env_overrides:
             env.update(env_overrides)
         proc = subprocess.run(
@@ -608,9 +609,15 @@ class TestCoshNGRewriteIntegration(unittest.TestCase):
             return {}
         return json.loads(stdout)
 
+    def _requests(self) -> list[dict]:
+        with self.request_log.open(encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
     def test_cosh_ng_pre_tool_emits_tool_input(self):
         """Cosh-NG PreToolUse output uses tool_input patch field."""
         stdin_data = {
+            "session_id": "session-1",
+            "tool_use_id": "call-1",
             "tool_name": "Bash",
             "hook_event_name": "PreToolUse",
             "tool_input": {"command": "git status"},
@@ -627,6 +634,12 @@ class TestCoshNGRewriteIntegration(unittest.TestCase):
         self.assertTrue(
             specific["tool_input"]["command"].endswith("git status")
         )
+        # The Cosh-NG runtime markers still win over the manifest-declared
+        # agent ID on the PreTool request Core receives.
+        requests = self._requests()
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["operation"], "pre_tool")
+        self.assertEqual(requests[0]["attribution"]["agent_id"], "cosh-ng")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
