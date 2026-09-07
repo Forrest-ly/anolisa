@@ -83,11 +83,15 @@ An environment override still wins after these commands. For example, `TOKENLESS
 | `TOKENLESS_AGENT_ID` | Agent identifier injected by an adapter |
 | `TOKENLESS_SESSION_ID` | Session identifier injected by an adapter |
 | `TOKENLESS_TOOL_USE_ID` | Tool-call identifier injected by an adapter |
+| `TOKENLESS_TRACEPARENT` | W3C trace context override stamped onto SLS records |
+| `TRACEPARENT` | Standard W3C trace context exported by an instrumented host |
 | `TOKENLESS_TOOL_READY_SPEC` | Override the Tool Ready dependency specification |
 | `TOKENLESS_ENV_FIX_SCRIPT` | Override the environment repair script |
 | `TOKENLESS_PACKAGE_MANAGER` | Override package-manager detection, mainly for tests |
 
 Tool Ready is hard-disabled in this build. Its specification and repair-script overrides are retained for the dormant legacy implementation but have no runtime effect. They are subject to trusted-path validation and are not recommended for normal users.
+
+`TOKENLESS_TRACEPARENT` and the standard `TRACEPARENT` carry a W3C trace context for SLS records. The override is read first, and an empty or unparsable override falls back to the standard variable so one typo cannot drop correlation for a whole session. Both are optional: a host that exports no trace context keeps the previous record shape, and the identity is stamped only onto the SLS JSONL — the local statistics database does not store it.
 
 Database path priority is:
 
@@ -144,7 +148,7 @@ TTL means that `retrieve` no longer returns an entry after one hour. Expired row
 
 ### SLS excludes original text
 
-Tokenless SLS JSONL includes the component, operation, session/tool-use identifiers, and character/token metrics. It does not include `before_text` or `after_text`. Identifiers can still be organizational runtime metadata and should follow the platform's log policy.
+Tokenless SLS JSONL includes the component, operation, session/tool-use identifiers, the host trace identity when one was propagated, and character/token metrics. It does not include `before_text` or `after_text`. Identifiers can still be organizational runtime metadata and should follow the platform's log policy.
 
 ## Guidance for sensitive workloads
 
