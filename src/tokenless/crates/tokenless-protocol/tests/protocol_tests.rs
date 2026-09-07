@@ -16,10 +16,9 @@ fn requests() -> Vec<RequestEnvelope> {
             request: Request::BeforeModel(BeforeModelRequest {
                 tools: vec![json!({"name": "read"})],
                 visible_context: json!({"messages": []}),
-                retrieve_tool_name: "tokenless_retrieve".into(),
                 capabilities: BeforeModelCapabilities {
                     replace_tools: true,
-                    publish_retrieve_tool: true,
+                    recovery: tokenless_protocol::RecoveryMethod::Shell,
                 },
             }),
         },
@@ -46,7 +45,7 @@ fn requests() -> Vec<RequestEnvelope> {
                 output_optimization: OutputOptimization::None,
                 capabilities: PostToolCapabilities {
                     replace_output: true,
-                    publish_retrieve_tool: false,
+                    recovery: tokenless_protocol::RecoveryMethod::None,
                     replace_with_text: true,
                 },
             }),
@@ -80,7 +79,6 @@ fn all_response_operations_round_trip_with_fixed_envelope() {
         Response::BeforeModel(BeforeModelResponse {
             tools: vec![],
             visible_markers: vec![],
-            retrieve_tool: None,
         }),
         Response::PreTool(PreToolResponse {
             arguments: json!({}),
@@ -91,7 +89,14 @@ fn all_response_operations_round_trip_with_fixed_envelope() {
             output: "{}".into(),
             disposition: Disposition::Applied,
             content_type: Some(ContentType::Json),
-            applied_operations: vec![AppliedOperation::JsonCleanup],
+            applied_operations: vec![
+                AppliedOperation::TerminalCleanup,
+                AppliedOperation::BuildLogReduction,
+                AppliedOperation::JsonCleanup,
+                AppliedOperation::JsonRecordReduction,
+                AppliedOperation::JsonTruncation,
+                AppliedOperation::Toon,
+            ],
             recoverability: Recoverability::Lossless,
             before_tokens: 10,
             after_tokens: 4,
@@ -118,10 +123,40 @@ fn all_response_operations_round_trip_with_fixed_envelope() {
 }
 
 #[test]
+fn record_reduction_has_a_stable_wire_name() {
+    assert_eq!(
+        serde_json::to_string(&AppliedOperation::JsonRecordReduction).unwrap(),
+        r#""json_record_reduction""#
+    );
+    assert_eq!(
+        serde_json::to_string(&AppliedOperation::TerminalCleanup).unwrap(),
+        r#""terminal_cleanup""#
+    );
+    assert_eq!(
+        serde_json::to_string(&AppliedOperation::BuildLogReduction).unwrap(),
+        r#""build_log_reduction""#
+    );
+    assert_eq!(
+        AppliedOperation::JsonRecordReduction.wire_str(),
+        "json_record_reduction"
+    );
+}
+
+#[test]
 fn operation_payloads_are_isolated_and_strict() {
     let mut value: serde_json::Value =
         serde_json::from_str(&requests()[0].to_json().unwrap()).unwrap();
     value["input"]["command_field"] = json!("command");
+    assert!(RequestEnvelope::from_json(&value.to_string()).is_err());
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(&requests()[0].to_json().unwrap()).unwrap();
+    value["input"]["retrieve_tool_name"] = json!("tokenless_retrieve");
+    assert!(RequestEnvelope::from_json(&value.to_string()).is_err());
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(&requests()[0].to_json().unwrap()).unwrap();
+    value["input"]["capabilities"]["publish_retrieve_tool"] = json!(true);
     assert!(RequestEnvelope::from_json(&value.to_string()).is_err());
 
     let mut value: serde_json::Value =
@@ -143,6 +178,17 @@ fn operation_payloads_are_isolated_and_strict() {
     };
     let mut value: serde_json::Value = serde_json::from_str(&response.to_json().unwrap()).unwrap();
     value["result"]["unexpected"] = json!(true);
+    assert!(ResponseEnvelope::from_json(&value.to_string()).is_err());
+
+    let response = ResponseEnvelope {
+        attribution: attribution(),
+        response: Response::BeforeModel(BeforeModelResponse {
+            tools: vec![],
+            visible_markers: vec![],
+        }),
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&response.to_json().unwrap()).unwrap();
+    value["result"]["retrieve_tool"] = json!(null);
     assert!(ResponseEnvelope::from_json(&value.to_string()).is_err());
 }
 

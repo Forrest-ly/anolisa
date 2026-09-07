@@ -12,6 +12,7 @@ import unittest
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from unittest import mock
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "python" / "tokenless" / "python"))
@@ -31,21 +32,6 @@ class _CompressionResult:
 class _Runtime:
     def __init__(self, data_dir=None, **_kwargs):
         self.data_dir = str(data_dir or "/tmp/tokenless-test")
-
-    @staticmethod
-    def _retrieve_tool_declaration_json(name):
-        return json.dumps(
-            {
-                "name": name,
-                "description": "Restore visible Tokenless content.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"hash_or_marker": {"type": "string"}},
-                    "required": ["hash_or_marker"],
-                    "additionalProperties": False,
-                },
-            }
-        )
 
 
 class _ResultState(StrEnum):
@@ -217,16 +203,19 @@ class MiddlewareTest(unittest.IsolatedAsyncioTestCase):
         )
         self.agent = _Agent("agent-2", _State("session-2"))
 
-    async def test_model_call_transforms_tools_and_stores_markers(self) -> None:
+    async def test_model_call_keeps_tools_static_while_markers_change(self) -> None:
         marker = "0123456789abcdef01234567"
+        marker_sets = iter((frozenset(), frozenset({marker})))
 
         async def before_model(request):
             self.assertEqual(request.tools[0]["function"]["name"], "api")
             self.assertEqual(request.tools[1], {"type": "web_search"})
+            self.assertEqual(
+                request.capabilities.recovery, core.RecoveryMethod.tool("tokenless_retrieve")
+            )
             return core.BeforeModelResponse(
                 tools=request.tools,
-                visible_markers=frozenset({marker}),
-                retrieve_tool=self.middleware.sdk.retrieve_tool_declaration(),
+                visible_markers=next(marker_sets),
             )
 
         self.middleware.sdk.before_model = before_model
@@ -236,27 +225,38 @@ class MiddlewareTest(unittest.IsolatedAsyncioTestCase):
             observed.update(kwargs)
             return "model-response"
 
+        input_kwargs = {
+            "messages": [],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "api", "parameters": {}},
+                },
+                {"type": "web_search"},
+                self.middleware._retrieve_declaration.as_function_tool(),
+            ],
+            "tool_choice": None,
+            "current_model": object(),
+        }
         result = await self.middleware.on_model_call(
             self.agent,
-            {
-                "messages": [],
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {"name": "api", "parameters": {}},
-                    },
-                    {"type": "web_search"},
-                    self.middleware._retrieve_declaration.as_function_tool(),
-                ],
-                "tool_choice": None,
-                "current_model": object(),
-            },
+            input_kwargs,
             next_handler,
         )
         self.assertEqual(result, "model-response")
+        first_tools = observed["tools"]
+        self.assertEqual(first_tools[-1]["function"]["name"], "tokenless_retrieve")
         self.assertEqual(
-            observed["tools"][-1]["function"]["name"], "tokenless_retrieve"
+            self.agent.state.middle_context["anolisa_tokenless"]["visible_markers"],
+            [],
         )
+        observed.clear()
+        await self.middleware.on_model_call(
+            self.agent,
+            {**input_kwargs, "tools": first_tools},
+            next_handler,
+        )
+        self.assertEqual(first_tools, observed["tools"])
         self.assertEqual(
             self.agent.state.middle_context["anolisa_tokenless"]["visible_markers"],
             [marker],
@@ -352,9 +352,7 @@ class MiddlewareTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.middleware.sdk.post_tool = post_tool
-        response = _ToolResponse(
-            [_TextBlock("command not found")], state=_ResultState.ERROR
-        )
+        response = _ToolResponse([_TextBlock("command not found")], state=_ResultState.ERROR)
 
         async def next_handler(**_kwargs):
             yield response
@@ -380,9 +378,7 @@ class MiddlewareTest(unittest.IsolatedAsyncioTestCase):
             return core.RetrieveResponse(hash=marker, payload="payload")
 
         self.middleware.sdk.retrieve = retrieve
-        result = await self.middleware.retrieve_tool.call(
-            marker.upper(), self.agent.state
-        )
+        result = await self.middleware.retrieve_tool.call(marker.upper(), self.agent.state)
         self.assertEqual(result.content[0].text, "payload")
 
     async def test_retrieve_response_bypasses_post_tool(self) -> None:
@@ -411,21 +407,77 @@ class MiddlewareTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(output[0], response)
 
     async def test_register_tools_rejects_collision(self) -> None:
-        declaration = self.middleware.sdk.retrieve_tool_declaration()
+        self.assertIn("Pass only the 24-character hash", self.middleware.retrieve_tool.description)
+        self.assertIn("not the whole instruction", self.middleware.retrieve_tool.description)
         self.assertEqual(
-            self.middleware.retrieve_tool.description, declaration.description
+            self.middleware.retrieve_tool.description,
+            self.middleware._retrieve_declaration.description,
         )
         self.assertEqual(
-            self.middleware.retrieve_tool.input_schema, declaration.input_schema
+            self.middleware.retrieve_tool.input_schema,
+            self.middleware._retrieve_declaration.input_schema,
         )
         toolkit = _Toolkit()
         await self.middleware.register_tools(toolkit)
-        self.assertIs(
-            await toolkit.get_tool("tokenless_retrieve"), self.middleware.retrieve_tool
-        )
+        self.assertIs(await toolkit.get_tool("tokenless_retrieve"), self.middleware.retrieve_tool)
         other = api.TokenlessMiddleware(_config=api.TokenlessConfig(rtk_enabled=False))
         with self.assertRaisesRegex(ValueError, "already contains"):
             await other.register_tools(toolkit)
+
+    async def test_app_factory_retrieve_uses_middleware_marker_state(self) -> None:
+        marker = "0123456789abcdef01234567"
+        integration = api.TokenlessAgentScope(
+            api.TokenlessConfig(data_dir="/tmp/tokenless-app", rtk_enabled=False),
+            tool_contracts={
+                "api": api.ToolContract(core.ContentOrigin.API_RESPONSE),
+            },
+        )
+        options = integration.app_options()
+        self.assertEqual(set(options), {"extra_agent_middlewares"})
+        middleware = (await options["extra_agent_middlewares"]("user", "agent", "session"))[0]
+        retrieve_tool = (await middleware.list_tools())[0]
+        self.assertIs(retrieve_tool, middleware.retrieve_tool)
+
+        state = types.SimpleNamespace(session_id="session", middle_context={})
+        agent = types.SimpleNamespace(name="agent", state=state)
+
+        async def before_model(request):
+            return core.BeforeModelResponse(
+                tools=request.tools,
+                visible_markers=frozenset({marker}),
+            )
+
+        async def retrieve(request):
+            self.assertEqual(request.visible_markers, frozenset({marker}))
+            return core.RetrieveResponse(hash=marker, payload="payload")
+
+        async def next_handler(**_kwargs):
+            return "model-response"
+
+        middleware.sdk.before_model = before_model
+        middleware.sdk.retrieve = retrieve
+        await middleware.on_model_call(
+            agent,
+            {"messages": [], "tools": []},
+            next_handler,
+        )
+        result = await retrieve_tool.call(marker, state)
+        self.assertEqual(result.content[0].text, "payload")
+
+        other = (await options["extra_agent_middlewares"]("user", "agent", "other-session"))[0]
+        self.assertNotEqual(other.data_dir, middleware.data_dir)
+
+    def test_app_factory_requires_modern_tool_abi(self) -> None:
+        integration = api.TokenlessAgentScope(
+            api.TokenlessConfig(data_dir="/tmp/tokenless-app", rtk_enabled=False)
+        )
+        module = importlib.import_module("tokenless_agentscope._v2")
+
+        with (
+            mock.patch.object(module, "ToolBase", type("LegacyToolBase", (), {})),
+            self.assertRaisesRegex(RuntimeError, "requires AgentScope 2.0.3"),
+        ):
+            integration.app_options()
 
     async def test_unknown_custom_tool_requires_contract(self) -> None:
         async def next_handler(**_kwargs):

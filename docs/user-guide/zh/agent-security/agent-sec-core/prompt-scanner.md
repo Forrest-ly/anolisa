@@ -45,6 +45,27 @@ ModelScope 仓库拉取。执行一次
 `ollama pull modelscope.cn/ANOLISA/Qwen3Guard-Gen-0.6B-GGUF` 即可（无需重命名），
 再执行 `agent-sec-cli scan-prompt warmup` 验证模型可用，避免首次扫描时才发现模型缺失。
 
+### 模型服务必须部署在本机
+
+L2/L4 的模型服务地址来自 `AGENT_SEC_MODEL_SERVICE_BASE_URL`（默认
+`http://localhost:11434`），只接受 loopback 主机——`localhost`、`127.x.x.x`、
+`::1`。交给扫描器的 prompt 经常含有凭据与个人数据，因此扫描器拒绝将它们
+发往本机以外的任何地址。主机由 HTTP 客户端所用的同一个 URL 解析器解析，因此
+`http://localhost@attacker.example/` 这类值也会被拒绝——真正的主机是 `@`
+之后的部分。
+
+把该变量指向其他主机时，`scan-prompt` 会在构造期失败，输出 `error` verdict
+并以 `1` 退出，报错信息会指明被拒绝的地址。只要主机仍为 loopback，使用
+非默认端口是允许的：
+
+```bash
+export AGENT_SEC_MODEL_SERVICE_BASE_URL=http://127.0.0.1:18434
+```
+
+由于六个宿主 hook 在 `scan-prompt` 非零退出时均为 fail-open，配置为远程地址后，
+该宿主将处于「完全没有 prompt 扫描」的状态——仅被审计为一次失败的 `prompt_scan` 事件，
+不拦截任何内容。改动该变量后，请检查 `agent-sec-cli scan-prompt warmup` 的 stderr 输出。
+
 ### 切换 L2 后端
 
 设置 `PROMPT_SCANNER_L2_MODEL` 可把 L2 换成 Warden-Gen（也可用 `--model` 临时指定，优先级 `--model` > 环境变量 > 默认）：
@@ -85,6 +106,18 @@ Scanner 将各层结果聚合为一个 verdict：
 | `error` | Scanner 内部错误（例如模型加载失败） |
 
 > `fast` 模式不运行 ML 层，任何 L1 命中都直接映射为 `deny`。
+
+## 各层能拦住什么、拦不住什么
+
+L1 是规则引擎，只匹配已经被写成 pattern 的措辞。这让它快且可解释 —— 每个命中都能归到具体 rule id —— 但它不具备泛化能力：保留意图、只换措辞的改写，在对应规则补上之前都可能漏检。规则本身也是有意收紧的：L1 的调优目标是不误报正常 prompt，而这一目标必然以召回率为代价。
+
+L2 和 L4 由模型支撑，负责规则做不到的部分：改写后的指令、事先无人预料的表达，以及只有跨多轮对话才能看出的意图。
+
+对使用的实际影响：
+
+- `fast` 模式只跑 L1，是用检测覆盖率换延迟 —— 延迟预算紧张时再选它，不要当作 `standard` 的轻量等价版本。
+- 模型后端不可达时，`standard` 不会直接失败，而是用存活的层继续扫描。此时结果会带 `degraded: true`，在 `layers_failed` 中列出不可用的层，summary 也会以 `Scan degraded:` 开头。把 `pass` 当成“没问题”之前，先看这几个字段。
+- `pass` 只说明实际运行过的层都没报告威胁，它不是安全证明 —— 这也是无论结果如何都会记录 `prompt_scan` Security Event 的原因。
 
 ## 宿主 Hook Policy
 

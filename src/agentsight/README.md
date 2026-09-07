@@ -328,6 +328,14 @@ The unit runs as root with `UMask=0077`, so its data under
 Dashboard access commands that read service-owned data. Stop the unit before
 starting a foreground tracer.
 
+### Kubernetes DaemonSet
+
+For node-wide collection in Kubernetes, use the DaemonSet manifest and runtime
+image under `src/agentsight/packaging/` (`k8s/daemonset.yaml` and
+`docker/Dockerfile`). See the
+[deployment guide](../../docs/user-guide/en/agent-observability/agentsight/deployment.md#kubernetes-daemonset-node-wide)
+for prerequisites and verification.
+
 ### Build from Source
 
 ```bash
@@ -412,7 +420,7 @@ AgentSight is configured via `agentsight.json` (default path `/etc/agentsight/co
 
 ### Feature Flags (`features`)
 
-All optional features are **enabled by default**. Disable them individually via the `features` block in `agentsight.json` to reduce memory and I/O overhead:
+Feature defaults are listed below. Disable optional features via the `features` block in `agentsight.json` to reduce memory and I/O overhead:
 
 | Feature | JSON Path | Default | Description |
 |---------|-----------|---------|-------------|
@@ -420,6 +428,7 @@ All optional features are **enabled by default**. Disable them individually via 
 | Local Tokenizer | `features.tokenizer.enabled` | `false` | HuggingFace model fallback (50–100 MB per model) |
 | Session Mapping | `features.session_mapping.enabled` | `true` | responseId → sessionId correlation (LRU 10,000) |
 | SQLite Storage | `features.sqlite_storage.enabled` | `true` | Persist to disk SQLite; disabled uses noop store |
+| Resource Sampling | `features.resource_sampling` | `false` | Sample Agent CPU/RSS once per second; requires SQLite storage |
 | Interruption Detection | `features.interruption_detection.enabled` | `true` | Dead loop / crash / context overflow detection |
 | Audit | `features.audit` | `true` | LLM call audit event persistence |
 | Token Consumption | `features.token_consumption` | `false` | Aggregated token consumption records |

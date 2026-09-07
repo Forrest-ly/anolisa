@@ -1,34 +1,49 @@
 # Reversible Compression (Stash)
 
-Tokenless compression is *inline lossy, end-to-end lossless*: when a compressor
-truncates content, the dropped payload is stashed under a BLAKE3-derived key and
-a `<<tokenless:KEY>>` marker is embedded in the compressed output. The LLM can
-quote the marker back to retrieve the original payload on demand, so no
-information is permanently lost even though the inline representation is
-smaller.
+When a compressor makes a recoverable omission, the payload is stashed under a
+BLAKE3-derived key and the output includes an optional recovery instruction.
+The model can retrieve that payload while it remains in Stash. This is not a
+promise that every removed field is saved, that the model will request recovery,
+or that retrieval reduces whole-session token use.
 
 This mirrors Headroom's CCR (Compress-Cache-Retrieve); the mechanism here is
 called **stash** to avoid the proprietary abbreviation.
 
 ## How it works
 
-1. **Compress**: `JsonCompressor` truncates oversized arrays (default:
-   keep the first 32 and the last 8 items). The dropped middle items are
-   serialized to JSON and `stash.stash(payload)` stores them, returning a
+1. **Compress**: `JsonCompressor` first prefers a complete-data representation
+   when it saves at least 15% of estimated tokens. Otherwise, a record array
+   (at least 33 JSON objects) may be reduced to a 32-record base budget while
+   preserving boundary, error, structural-anomaly, and numeric-outlier
+   records. The complete pre-transform array is serialized once and
+   `stash.stash(payload)` stores it. Other oversized arrays retain the first
+   32 and last 8 items and stash the dropped middle window. A successful write returns a
    24-hex BLAKE3 key plus a store-wide, monotonically increasing ownership
    token used if the write must later be rolled back. Tokens are never reused
    after expiry, deletion, or eviction.
-2. **Mark**: the truncation marker becomes
-   `<... N items truncated, retrieve with <<tokenless:KEY>>`.
-3. **Retrieve**: a trusted local operator can call `tokenless retrieve <KEY>`.
-   An agent uses the Protocol v2 `retrieve` operation, which authorizes the
-   key against the Marker set currently visible to the model before reading
-   Stash.
+2. **Mark**: the output contains an instruction such as
+   `32 of 64 records omitted. If needed, run in shell: tokenless retrieve HASH`.
+   AgentScope instead sees `If needed, call tool NAME with hash_or_marker=HASH`,
+   using its actual registered static Tool name.
+3. **Retrieve**: `tokenless retrieve <KEY>` reads the original payload through
+   the trusted same-user CLI boundary. Claude Code 2.1.121 or newer, Qoder CLI,
+   OpenCode, Cosh-NG, Hermes, and DSH let the Marker direct the model to this
+   existing shell command. Their adapters recognize only a successful,
+   standalone retrieve command with a valid Hash or Marker and classify its
+   output as an already recovered result, so it bypasses compression. AgentScope
+   instead keeps its static Retrieve Tool and authorizes the key against the
+   Marker set currently visible to the model before reading Stash.
+
+DSH removes inherited `TOKENLESS_*` variables from model shell commands. Its
+adapter therefore gives Core and the managed shell the same state directory,
+defaulting to `.tokenless` beneath the current session workspace. An absolute
+`TOKENLESS_DATA_DIR` set before DSH starts overrides that default when the DSH
+shell sandbox can access it.
 
 When no stash store is attached (`Option<Arc<dyn StashStore>>` = `None`),
-truncation is lossy and non-retrievable — the original pre-stash behavior.
-This keeps the stash off the core compression path unless a caller explicitly
-enables it.
+recognized record arrays are not reduced and do not fall back to positional
+array truncation. Other bounded transformations retain their existing lossy,
+non-retrievable behavior where the caller permits it.
 
 ## No-savings rollback
 
@@ -65,22 +80,28 @@ Session scope differs by compressor:
   `clear_stash_session()` after keeping output; otherwise a later rollback
   deletes those emitted markers.
 
-## Marker format
+## Recovery instructions and historical markers
 
 ```
-<<tokenless:HASH>>
+12 passing-test lines omitted. If needed, run in shell: tokenless retrieve HASH
+12 passing-test lines omitted. If needed, call tool tokenless_retrieve with hash_or_marker=HASH
 ```
 
 - `HASH` is the first 24 hex characters (12 bytes / 96 bits) of a BLAKE3 hash
   of the stashed payload. 96 bits makes a collision astronomically unlikely
   (2⁴⁸ birthday bound), so a key is treated as a unique handle.
-- The `tokenless:` namespace distinguishes these markers from Headroom's
-  `<<ccr:HASH>>` and from any user content.
-- `tokenless_ccr::parse_marker` accepts a string that is exactly a marker;
-  `tokenless_ccr::extract_hash` scans arbitrary text (e.g. a whole truncation
-  line) and returns the first embedded hash. Both reject malformed input
-  (wrong length, non-hex) by returning `None` rather than panicking, so
-  callers can pass untrusted LLM output directly.
+- `HASH` in these examples stands for the complete 24-hex value from the output.
+- `capabilities.recovery` is required: `none`, `shell`, or `tool` with a validated
+  static Tool name. Names allow 1–64 ASCII letters, digits, underscores, or hyphens.
+  The old `retrieval_available` boolean is rejected; callers and Core must migrate together.
+- CCR formats instructions before candidate sizing and arbitration. The ledger retains
+  only complete output references with valid hashes and explicit boundaries. Bare hashes
+  are not references, and tool instructions must match the currently declared name.
+- BeforeModel collects complete shell instructions, matching tool instructions, and historical
+  `<<tokenless:HASH>>` markers from actual visible strings. It returns sorted, deduplicated
+  lowercase hashes. Only `tool` enables recoverable schema truncation; `shell` does not.
+- New output never generates angle-bracket markers. `parse_marker` and CLI retrieval keep
+  historical read support; `extract_hash` also recognizes complete shell instructions.
 
 ## Backends
 
@@ -122,21 +143,21 @@ signed SQLite generation limit is exhausted.
 
 ```bash
 # Compress with stash on by default — dropped array items become retrievable.
-echo '[1,2,...,200]' | tokenless compress-response --truncate-arrays-at 5
-# -> [1,2,3,4,5,"<... 187 items truncated, retrieve with <<tokenless:c30c…>>",193,…,200]
+python3 -c 'import json; print(json.dumps(list(range(200))))' \
+  | tokenless compress-response --truncate-arrays-at 5
 
 # Retrieve the original dropped items (same stash db, separate process).
 tokenless retrieve c30ccf5ed1125e0ed871ba8e
-# -> [6,7,8,…,192]
 
-# Pass the whole truncation line; the hash is extracted automatically.
-tokenless retrieve "<... 187 items truncated, retrieve with <<tokenless:c30c…>>"
+# Historical marker syntax is still accepted.
+tokenless retrieve '<<tokenless:c30ccf5ed1125e0ed871ba8e>>'
 
 # Opt out of stash (lossy truncation, the pre-stash behavior).
-echo '[...]' | tokenless compress-response --no-stash
+python3 -c 'import json; print(json.dumps(list(range(200))))' \
+  | tokenless compress-response --no-stash
 
 # Override the stash db path under the home or selected data directory.
-tokenless retrieve <hash> --stash-db ~/.tokenless/alt-stash.db
+tokenless retrieve c30ccf5ed1125e0ed871ba8e --stash-db ~/.tokenless/alt-stash.db
 ```
 
 `TOKENLESS_DATA_DIR` relocates both SQLite databases, producing
@@ -160,8 +181,12 @@ Existing database files must be regular files rather than symlinks. The CLI
 and bundled RTK writer use the same path policy.
 
 `retrieve` queries are parameterized SQL. Invalid input fails before a Stash
-read. Agent-facing Protocol v2 retrieval also rejects an unauthorized hash
-before the read and does not record that attempt as a Hit or Miss.
+read. AgentScope retrieval also rejects an unauthorized hash before the read
+and does not record that attempt as a Hit or Miss. Marker-command recovery does
+not add a second authorization layer: it deliberately uses the same trusted,
+same-user CLI boundary as a direct local invocation. The 96-bit content hash is
+the unguessable handle, and the adapter's strict command classification exists
+to prevent recovered output from being compressed again.
 
 ## Fail-open policy
 
@@ -177,19 +202,22 @@ before the read and does not record that attempt as a Hit or Miss.
 
 ## What is not stashed
 
-`JsonCompressor` stashes complete long strings, dropped array windows, and
-depth-truncated subtrees when a trusted recovery path is available. Structural
+`JsonCompressor` stashes complete record arrays, complete long strings, dropped
+non-record array windows, and depth-truncated subtrees when a trusted recovery
+path is available. Structural
 cleanup—blacklisted diagnostic fields, `null`, and empty values—is classified
 as lossless and does not emit recovery markers.
 
 The former stateless MCP Retrieve server was removed. It accepted hashes
 without verified model-visibility context, so it cannot serve as an authorized
-agent recovery endpoint. Protocol v2 `retrieve` is the agent-facing path;
-`tokenless retrieve` remains the trusted local operations path.
+Retrieve Tool. AgentScope uses the Marker-authorized lifecycle path. Supported
+local CLI adapters expose the existing `tokenless retrieve` command indirectly
+through the Marker and their ordinary shell tool; this does not change the
+CLI's same-user trust boundary.
 
 Schema description truncation **is** stashed when a store is attached (CLI
 default): `SchemaCompressor::truncate_description` writes the verbatim
-original and appends a `<<tokenless:KEY>>` marker. It stays lossy only when
+original and appends the declared recovery instruction. It stays lossy only when
 stash is off or the stash write fails.
 
 ## Mapping to Headroom CCR
@@ -197,8 +225,8 @@ stash is off or the stash write fails.
 | Headroom | Tokenless | Notes |
 |---|---|---|
 | CCR Store | stash store (`StashStore` trait) | InMemory / SQLite(WAL) / Redis* |
-| `<<ccr:HASH>>` | `<<tokenless:HASH>>` | 24-hex BLAKE3, same key length |
-| `headroom_retrieve` (MCP) | Protocol v2 `retrieve` | Requires current visible Markers; trusted local CLI remains separate |
+| Recovery reference | Optional shell or static Tool instruction | 24-hex BLAKE3; historical Tokenless markers remain readable |
+| `headroom_retrieve` (MCP) | AgentScope static Retrieve Tool or Marker-directed `tokenless retrieve` | AgentScope requires visible Markers; supported CLI agents use the same-user local command |
 | DashMap `remove_if` TOCTOU fix | `BEGIN IMMEDIATE` ownership transaction | SQLite path |
 | default TTL 5 min / cap 1000 | InMemory 5 min / 1000; SQLite 1 h / 10 000 | tuned for hook process model |
 

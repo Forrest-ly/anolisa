@@ -220,6 +220,9 @@ agent-sec-cli scan-prompt --mode standard --text "ignore previous instructions"
 # PII 检测
 agent-sec-cli scan-pii --text "contact alice@example.com" --source manual
 
+# 验证默认安装根目录中的发布签名 Skill
+agent-sec-cli verify
+
 # Skill 完整性检查
 agent-sec-cli skill-ledger check /path/to/skill
 
@@ -229,6 +232,26 @@ agent-sec-cli events --summary
 
 完整 CLI 说明与各宿主集成步骤见
 [AgentSecCore 用户指南](../../docs/user-guide/zh/agent-security/agent-sec-core/QUICKSTART.md)。
+
+### 资产验证
+
+`agent-sec-cli verify` 用于检查 GPG 签名的分发 manifest 和 SHA-256 文件覆盖。它与
+Skill Ledger 职责不同：`verify` 验证发布或部署签名，`skill-ledger` 维护本地 Ed25519
+运行时完整性历史。
+
+批量验证会从两个可选系统根目录发现直接、非隐藏的 Skill 子目录：RPM 安装使用
+`/usr/share/anolisa/skills`，标准 ANOLISA raw 安装使用
+`/usr/local/share/anolisa/skills`。缺失或为空的根目录会被跳过，指向同一 canonical path
+的重复根目录只扫描一次。至少找到一个候选且全部通过时 outcome 为 `verified`；任何候选
+失败时为 `failed`；没有发现候选时为 `no_candidates`。`no_candidates` 会成功退出，
+但不代表已验证任何资产。
+
+这两个根目录是固定的包默认值，不会从任意安装 prefix 动态推导。对于重定位或自定义
+Skill，请使用 `agent-sec-cli verify --skill /path/to/skill`。配置、受信密钥和根目录枚举
+异常仍属于操作失败；候选 Skill 的签名、manifest、哈希、未签名文件或访问失败会产生
+`failed` outcome。
+
+详见 [资产验证用户指南](../../docs/user-guide/zh/agent-security/agent-sec-core/asset-verification.md)。
 
 ## Prompt Scanner
 
@@ -306,6 +329,14 @@ agent-sec-cli scan-pii --input ./sample.log --include-low-confidence
 
 六种完整性状态为 `pass` / `none` / `drifted` / `warn` / `deny` / `tampered`。
 
+`scan` 和默认的 `init` baseline 都会写入签名账本；如需只读内容 findings，
+请使用 `analyze`。批量模式下，如果 `/usr/share/anolisa/skills/` 或
+`/usr/local/share/anolisa/skills/` 下由 host 提供的已打包 Skill 无法写入账本状态，
+命令会返回 `status=skipped`、`reasonCode=readonly_system_skill`、
+`persisted=false`。这个运行状态不是 `pass` 结果，也不构成认证；显式执行
+`scan <dir>` 仍会报错。如果跳过项此前没有任何账本 artifact，`check` 和 `status`
+仍会分别报告 `none` / `unscanned`；二者都不表示 `pass`。
+
 ### 核心命令
 
 | 命令 | 说明 |
@@ -322,6 +353,11 @@ agent-sec-cli scan-pii --input ./sample.log --include-low-confidence
 | `status` | 系统级健康概览（密钥、配置、聚合完整性） |
 | `audit <dir>` | 查看版本历史与签名链 |
 | `check --all` / `scan --all` | 对所有已注册 Skill 目录批量执行 |
+
+`decide` 是记录用户决策的受支持入口。早期隐藏的 `set-policy` 占位命令从未实现，
+现在也不是受支持的命令；继续调用会得到 unknown-command 用法错误和退出码 2。
+隐藏的 `rotate-keys` 预留入口同样尚不可用：直接执行会以非零退出码结束，且不会修改
+签名密钥。
 
 ### 快速示例
 

@@ -80,6 +80,27 @@ export interface TraceEventDetail {
   conversation_id: string | null;
 }
 
+export interface ResourceSample {
+  timestamp_ns: number;
+  pid: number;
+  agent_name: string | null;
+  cpu_percent: number;
+  memory_bytes: number;
+}
+
+export interface SessionPhase {
+  kind: 'llm' | 'tool_call' | 'idle';
+  start_timestamp_ns: number;
+  end_timestamp_ns: number;
+  tool_call_id?: string;
+}
+
+export interface SessionResourceTimeline {
+  session_id: string;
+  samples: ResourceSample[];
+  phases: SessionPhase[];
+}
+
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
 export class ApiRequestError extends Error {
@@ -391,6 +412,21 @@ export async function fetchTraces(
   const suffix = qs ? `?${qs}` : '';
   return apiFetch<TraceSummary[]>(
     `${API_BASE}/api/sessions/${encodeURIComponent(sessionId)}/traces${suffix}`
+  );
+}
+
+/** Fetch process CPU/RSS observations and inferred activity phases for a Session. */
+export async function fetchSessionResources(
+  sessionId: string,
+  startNs?: number | null,
+  endNs?: number | null,
+  maxPoints = 2_000,
+): Promise<SessionResourceTimeline> {
+  const params = new URLSearchParams({ max_points: String(maxPoints) });
+  if (startNs != null) params.set('start_ns', String(startNs));
+  if (endNs != null) params.set('end_ns', String(endNs));
+  return apiFetch<SessionResourceTimeline>(
+    `${API_BASE}/api/sessions/${encodeURIComponent(sessionId)}/resources?${params.toString()}`,
   );
 }
 
@@ -935,6 +971,7 @@ export interface SessionInterruptionCount {
 }
 
 export interface ConversationInterruptionCount {
+  session_id: string;
   conversation_id: string;
   total: number;
   by_severity: {
@@ -944,6 +981,23 @@ export interface ConversationInterruptionCount {
     low: number;
   };
   types: InterruptionTypeDetail[];
+}
+
+/**
+ * Key for the per-conversation breakdown, which the backend groups by
+ * (session_id, conversation_id).
+ *
+ * Both halves are needed: an interruption detected before its session was
+ * resolved carries the unassigned session bucket, and must not be looked up
+ * under the real session that owns the same conversation.
+ *
+ * Invariant: neither id contains U+0000, so the joined key cannot collide.
+ * Both are either a UUID, a 32-hex fallback hash, or the `__unassigned__`
+ * sentinel — an id carrying a NUL byte would already have failed to round-trip
+ * through the SQLite TEXT columns these values come from.
+ */
+export function conversationInterruptionKey(sessionId: string, conversationId: string): string {
+  return `${sessionId}\u0000${conversationId}`;
 }
 
 /**

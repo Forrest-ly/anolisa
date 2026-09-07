@@ -2,7 +2,8 @@
 // byte-identical to the pre-split marker.rs; golden coverage lives in
 // osc_tests.rs and tests/shell_host/marker.rs.
 pub(in crate::shell_host) fn zsh_marker_script() -> &'static str {
-    r#"
+    concat!(
+        r#"
 if [[ -n "${COSH_OSC_MARKER_LOADED:-}" ]]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -131,6 +132,27 @@ _cosh_json_escape() {
 _cosh_now_ms() {
   date +%s000
 }
+_cosh_shell_path_names_fragment() { # Line-init can mutate the namespace after this snapshot.
+  local -a names suffixes quoted_names quoted_suffixes; local name total=0
+  if [[ -n "${widgets[zle-line-init]:-}" ]]; then REPLY=',"shell_path_names":null,"shell_path_suffixes":null'; return; fi
+  for name in ${(k)functions} ${(k)aliases} ${(k)galiases}; do
+    [[ "$name" == */* ]] && names+=("$name")
+  done
+  suffixes=("${(k)saliases}"); if (( ${#names} > 128 || ${#suffixes} > 128 )); then REPLY=',"shell_path_names":null,"shell_path_suffixes":null'; return; fi
+  for name in "${names[@]}"; do
+    if [[ "$name" == *[[:cntrl:]]* || "$name" == *'"'* || "$name" == *\\* ]] || (( (total += ${#name} + 3) > 8192 )); then
+      REPLY=',"shell_path_names":null,"shell_path_suffixes":null'; return
+    fi
+    quoted_names+=("\"$name\"")
+  done
+  for name in "${suffixes[@]}"; do
+    if [[ "$name" == *[[:cntrl:]]* || "$name" == *'"'* || "$name" == *\\* ]] || (( (total += ${#name} + 3) > 8192 )); then
+      REPLY=',"shell_path_names":null,"shell_path_suffixes":null'; return
+    fi
+    quoted_suffixes+=("\"$name\"")
+  done
+  REPLY=",\"shell_path_names\":[${(j:,:)quoted_names}],\"shell_path_suffixes\":[${(j:,:)quoted_suffixes}]"
+}
 _cosh_emit_marker() {
   local event="$1"
   local command="$2"
@@ -142,6 +164,8 @@ _cosh_emit_marker() {
   # lines carry a token, every other marker stays byte-identical.
   local handoff_fragment=""
   local physical_cwd_fragment=""
+  local shell_path_names_fragment=""
+  local REPLY=""
   if [[ -n "${_COSH_HANDOFF_TOKEN:-}" ]]; then
     handoff_fragment=",\"handoff\":\"$(_cosh_json_escape "$_COSH_HANDOFF_TOKEN")\""
   fi
@@ -157,8 +181,10 @@ _cosh_emit_marker() {
     if [[ "$physical_cwd" == /* ]]; then
       physical_cwd_fragment=",\"physical_cwd\":\"$(_cosh_json_escape "$physical_cwd")\""
     fi
+    _cosh_shell_path_names_fragment
+    shell_path_names_fragment="$REPLY"
   fi
-  printf '\033]1337;COSH;{"event":"%s","token":"%s","session_id":"%s","timestamp_ms":%s,"cwd":"%s","command":"%s","status":%s,"path":"%s","path_trusted":%s,"generation":%s%s%s}\a' \
+  printf '\033]1337;COSH;{"event":"%s","token":"%s","session_id":"%s","timestamp_ms":%s,"cwd":"%s","command":"%s","status":%s,"path":"%s","path_trusted":%s,"generation":%s%s%s%s}\a' \
     "$(_cosh_json_escape "$event")" \
     "$(_cosh_json_escape "$COSH_MARKER_TOKEN")" \
     "$(_cosh_json_escape "$COSH_SESSION_ID")" \
@@ -170,6 +196,7 @@ _cosh_emit_marker() {
     "$path_trusted" \
     "${_COSH_ATTEMPT_GENERATION:-0}" \
     "$physical_cwd_fragment" \
+    "$shell_path_names_fragment" \
     "$handoff_fragment"
 }
 _cosh_emit_intercept_marker() {
@@ -381,33 +408,9 @@ _cosh_restore_handoff_pager_policy() {
   done
   return 0
 }
-_cosh_command_has_secret() {
-  local lower="${(L)1}"
-  case "$lower" in
-    *"-----begin "*"private key-----"*|*"bearer "*|*"://"*":"*"@"*|*ghp_*|*github_pat_*|*glpat-*|*npm_*|*hf_*|*xox?-*|*aiza*)
-      return 0
-      ;;
-    *ltai????????????*)
-      return 0
-      ;;
-    *akia????????????????*|*asia????????????????*)
-      return 0
-      ;;
-    sk-*|sk_live_*|sk_test_*|*" sk-"*|*"=sk-"*|*":sk-"*|*"\"sk-"*|*"'sk-"*|*" sk_live_"*|*" sk_test_"*|*"=sk_live_"*|*"=sk_test_"*)
-      return 0
-      ;;
-  esac
-  local key
-  for key in password passwd passphrase token access_token access-token refresh_token refresh-token id_token id-token secret client_secret client-secret api_key api-key apikey access_key_id access-key-id access_key_secret access-key-secret security_token security-token authorization cookie set-cookie; do
-    case "$lower" in
-      *"$key="*|*"$key:"*|*"--$key "*|*"--$key="*)
-        return 0
-        ;;
-    esac
-  done
-  return 1
-}
-_cosh_zshaddhistory_marker() {
+"#,
+        include_str!("zsh_secret_detector.zsh"),
+        r#"_cosh_zshaddhistory_marker() {
   setopt localoptions noxtrace
   local command="${1%$'\n'}"
   if _cosh_is_handoff_wrapper "$command"; then
@@ -683,10 +686,6 @@ _cosh_precmd_marker() {
     _cosh_emit_marker "prompt_ready" "" "$exit_status" false
   fi
 }
-# ── Hook setup (re-set after user rcfile may have overridden) ──
-# Slash command function stubs — prevent "zsh: no such file or directory" for
-# commands starting with / that zsh would try to exec as an absolute path.
-# The actual interception and marker emission happens in _cosh_preexec_marker.
 for _cosh_sc in about agent allow answer approval-mode approve audit auth cancel clear config copy debug deny details explain extensions health help hooks mcp mode new recommendations resume select send-to-shell session shell skills stats status; do
   functions[/$_cosh_sc]='_cosh_assistance_enabled || command "$0" "$@"'
 done
@@ -695,5 +694,6 @@ autoload -Uz add-zsh-hook
 add-zsh-hook zshaddhistory _cosh_zshaddhistory_marker
 add-zsh-hook preexec _cosh_preexec_marker
 add-zsh-hook precmd _cosh_precmd_marker
-"#
+"#,
+    )
 }
