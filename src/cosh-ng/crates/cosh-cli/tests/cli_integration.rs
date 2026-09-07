@@ -1168,8 +1168,71 @@ fn test_clap_error_no_subcommand_emits_json_envelope() {
     );
 }
 
-/// --help and --version must still print text to stdout and exit 0
-/// (not a JSON envelope).
+/// Every clap error path must keep stderr empty: the JSON envelope on
+/// stdout is the only machine-facing channel, so a rendered clap error on
+/// stderr would let an agent act on free text that contradicts `ok=false`.
+#[test]
+fn test_clap_error_paths_keep_stderr_empty() {
+    for args in [
+        // MissingSubcommand
+        Vec::new(),
+        // UnknownArgument
+        vec!["--no-such-flag"],
+        // InvalidSubcommand
+        vec!["bogus"],
+        // MissingSubcommand: a subcommand without its nested action
+        vec!["pkg"],
+    ] {
+        let output = cosh_bin().args(&args).output().unwrap();
+        let label = if args.is_empty() {
+            "<no args>".to_string()
+        } else {
+            args.join(" ")
+        };
+
+        assert_eq!(output.status.code(), Some(1), "{label}: exit code");
+        assert!(
+            output.stderr.is_empty(),
+            "{label}: stderr must stay empty, got {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("{label}: stdout must be a JSON envelope");
+        assert_eq!(json["ok"], false, "{label}: envelope must report failure");
+        assert_eq!(
+            json["error"]["code"], "InvalidInput",
+            "{label}: clap errors map to InvalidInput"
+        );
+    }
+}
+
+/// `--version` is a clap "error" (DisplayVersion) that must keep the legacy
+/// text behaviour: exit 0, plain text on stdout, no JSON envelope.
+#[test]
+fn test_version_still_prints_text_not_json() {
+    let output = cosh_bin().arg("--version").output().unwrap();
+    assert!(output.status.success());
+    assert!(
+        output.stderr.is_empty(),
+        "version output should not write to stderr, got {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.starts_with('{'),
+        "version output should not be a JSON envelope"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err(),
+        "version output must not parse as JSON"
+    );
+    assert!(stdout.contains("cosh-cli"));
+}
+
+/// --help must still print text to stdout and exit 0 (not a JSON envelope).
+/// `test_version_still_prints_text_not_json` covers the DisplayVersion path.
 #[test]
 fn test_help_still_prints_text_not_json() {
     let output = cosh_bin().arg("--help").output().unwrap();
