@@ -47,7 +47,9 @@ async fn run() -> ExitCode {
     };
     let repository = Arc::new(ProcessLocalPapRepository::default());
     let pap = PapService::new(repository, Arc::new(PolicyTemplateCompiler));
-    let principal_policy = Arc::new(RootManagedPrincipalPolicy::default());
+    let principal_policy = Arc::new(RootManagedPrincipalPolicy::with_admin_uids(
+        cli.policy_admin_uids,
+    ));
     let policy_for_handler: Arc<dyn PrincipalPolicy> = principal_policy.clone();
     let dispatcher = Arc::new(DaemonDispatcher::new(pap, policy_for_handler));
     eprintln!("asc-daemon: warning: PAP state is process-local and is lost on restart");

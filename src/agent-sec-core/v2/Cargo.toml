@@ -3,7 +3,9 @@
 [workspace]
 resolver = "3"
 members = [
+    "apps/asc-cli",
     "apps/asc-daemon",
+    "crates/daemon/asc-daemon-client",
     "crates/daemon/asc-daemon-core",
     "crates/daemon/asc-daemon-handler",
     "crates/daemon/asc-daemon-protocol",
@@ -24,6 +26,8 @@ repository = "https://github.com/alibaba/anolisa"
 publish = false
 
 [workspace.dependencies]
+asc-daemon = { path = "apps/asc-daemon" }
+asc-daemon-client = { path = "crates/daemon/asc-daemon-client" }
 asc-daemon-core = { path = "crates/daemon/asc-daemon-core" }
 asc-daemon-handler = { path = "crates/daemon/asc-daemon-handler" }
 asc-daemon-protocol = { path = "crates/daemon/asc-daemon-protocol" }
@@ -33,8 +37,10 @@ asc-pap = { path = "crates/policy/asc-pap" }
 asc-pap-repository-memory = { path = "crates/policy/asc-pap-repository-memory" }
 asc-policy-engine = { path = "crates/policy/asc-policy-engine" }
 asc-policy-types = { path = "crates/policy/asc-policy-types" }
+clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+socket2 = "0.6"
 sha2 = "0.10"
 thiserror = "2"
 time = { version = "=0.3.44", features = ["parsing"] }

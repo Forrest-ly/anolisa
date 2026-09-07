@@ -7,6 +7,11 @@ foreground process bootstrap used by later AgentSecCore V2 work packages. It
 deliberately contains no concrete persistence, Policy runtime, reconciliation
 worker, outbox, or target Adapter.
 
+The Rust `agent-sec-cli` exposes all 15 Policy, Scope and Binding CRUD commands through
+an explicit daemon socket. Its Cargo package and source directory remain `asc-cli`;
+the executable target is `agent-sec-cli`. See the [CLI reference](../../../docs/user-guide/en/agent-security/agent-sec-core/policy-cli.md)
+and [CLI acceptance record](../docs/design/POLICY_CLI_ACCEPTANCE_zh.md).
+
 The current crates are:
 
 - `asc-foundation-types`: bounded transport-independent identifiers and revisions.
@@ -33,6 +38,14 @@ The current crates are:
 - `asc-daemon-service`: bounded UDS admission, one-request framing, kernel peer
   credentials, dispatcher/rejection-encoder injection, connection isolation,
   dispatch cancellation, and controlled drain.
+- `asc-daemon-client`: synchronous UDS client preserving complete responses, with
+  a single connect/write/read deadline and no retries or local fallback. It uses
+  standard-library blocking I/O and `socket2` for bounded connect; neither it nor
+  the CLI binary requires a Tokio runtime.
+- `asc-cli`: command parsing, typed Policy request construction and Policy output;
+  server dependencies are test-only. `commands.rs` registers and dispatches the
+  top-level commands; `commands/{policy,scope,binding}.rs` own their arguments and
+  request mappings, with pagination and encoding helpers in `commands/common.rs`.
 - `asc-daemon`: foreground process and composition root that configures and
   injects concrete adapters into the daemon service.
 
@@ -90,10 +103,12 @@ startup. It also requires an explicit absolute socket path because
 packaging-owned system paths, singleton/stale-socket policy, runtime directory
 hardening, and readiness remain later process-integration work.
 
-UID 0 is always a Policy administrator. Other UIDs are denied until root adds
-them to the process-local allowlist. Delegated administrators cannot delegate
-other UIDs. Loading, persisting, and exposing management RPCs for that allowlist
-remain later daemon state/configuration work.
+UID 0 is always a Policy administrator. A deployment operator can add other UIDs
+at startup with repeatable `--policy-admin-uid <UID>` options. Omitted means root
+only. Configured administrators cannot delegate other UIDs at runtime; that API
+still requires root. The allowlist is process-local and must be supplied on each
+startup. Configuration-file loading, persistence and management RPCs remain later
+work. Authorization does not change OS socket permissions or deployment topology.
 
 Run the independent transport process in the foreground:
 
@@ -123,9 +138,10 @@ statuses, and deterministic digests. Server-generated request and resource UUIDs
 use named placeholders so the same fixture can assert their format and identity
 flow across later requests. A UDS integration E2E always executes the complete
 scenario with a server-authorized test principal. The `asc-daemon` bootstrap E2E
-also starts the real binary and repeats that scenario when the process is root;
-a non-root binary run instead verifies the product's default
-`permission_denied` policy.
+also starts the real binary with `--policy-admin-uid` set to the test UID and
+executes the complete scenario without root. A separate default-config case
+verifies non-root `permission_denied` (or full CRUD when root). CLI process tests
+use an in-process daemon service; a combined CLI and daemon binary E2E is deferred.
 
 Binding create/update accepts desired state and returns `PENDING_APPLY`; delete
 returns `PENDING_DELETE`. These responses prove PAP acceptance only. They do not
@@ -245,7 +261,7 @@ Binding replacement and its reconcile intent atomically, then let the future
 Reconciler consume one complete `BindingView` whose embedded revision fences
 claim, retry, completion, failure, restart recovery, and cancellation.
 
-CLI client, concrete persistence, Policy runtime, reconciliation worker, outbox,
+Concrete persistence, Policy runtime, reconciliation worker, outbox,
 and target Adapter belong to later work packages and are intentionally absent
 from this slice. The compiler included here is limited to the one golden-backed
 `prevent_file_deletion` lowering described above.

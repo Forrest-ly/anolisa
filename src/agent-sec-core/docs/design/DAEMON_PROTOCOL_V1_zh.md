@@ -438,8 +438,9 @@ template、Binding 内嵌快照、revision、status 和确定性 digest。daemon
 UUID 使用具名占位符：fixture 不冻结随机值本身，但必须验证 UUID 格式、CREATE 捕获值在后续
 请求/响应中的一致性，以及不同资源 identity 不混用。该 fixture 同时由 protocol 类型测试、
 使用服务端授权测试 Principal 的必跑 UDS integration E2E，以及真实 `asc-daemon` 子进程
-bootstrap E2E 消费。binary 测试在 root 身份下重复完整成功场景，非 root 身份验证默认
-`permission_denied`；不得为测试加入产品授权旁路。
+bootstrap E2E 消费。binary 测试通过服务端启动配置 `--policy-admin-uid <测试 UID>`
+执行完整成功场景，无需 root；另行验证非 root 默认 `permission_denied`。root 环境同时
+验证默认授权成功路径，不使用跳过授权的测试开关。
 `v2/crates/daemon/asc-daemon-protocol/tests/fixtures/pap-invalid-requests.json` 冻结 method
 params 构造失败时的 `invalid_request` code 和有界、安全 message，并由真实 UDS integration
 fixture 消费。
@@ -450,9 +451,13 @@ Policy Administrator Principal；request 中不得携带可信 UID、role 或 sc
 `PreparedScope`、`BindingView` 以及 foundation 的 `ResourceId`、`Revision`，不得复制
 Policy domain DTO。
 
-当前 bootstrap 的首版策略固定允许 UID 0 管理 Policy；其它 UID 默认拒绝。root 可以向
-process-local allowlist 添加额外管理员 UID，但被授权 UID 不获得继续委派权限。allowlist 的
-持久化、加载和管理 RPC 尚未进入本 slice，在这些能力完成前 daemon 重启后只保留 root 权限。
+当前 bootstrap 始终允许 UID 0 管理 Policy，其它 UID 默认拒绝。部署者可在 daemon
+启动时用可重复的 `--policy-admin-uid <UID>` 配置额外管理员，值为十进制 u32；授权仍
+依据内核 peer UID，不接受请求中的 UID/role。控制启动配置属于服务端部署权限；生产
+服务的启动参数由部署者管理。这不会改变 system-level 部署形态或提升进程 OS 权限，
+也不会修改 socket 文件访问权限。root 仍可通过内部 `allow_uid` API 动态委派，但被授权
+管理员不能继续委派。名单仅存放在进程内存，每次启动需重新提供配置；不带该参数重启
+恢复 root-only。配置文件加载、持久化和管理 RPC 不在本 slice。
 
 | method | params | result |
 | --- | --- | --- |
@@ -585,7 +590,7 @@ handler 与 core 的校验职责必须保持以下三层边界：
 同一 invalid-input fixture 必须同时覆盖 V1 oracle 和 V2 daemon compatibility adapter，确保
 错误不会因语言或入口实现不同而在 `bad_request` 与失败 `ActionResult` 之间漂移。
 
-旧 daemon 对 `action.*` 返回 `unknown_method`，证明该 action 没有被接受执行；V2 asc-cli
+旧 daemon 对 `action.*` 返回 `unknown_method`，证明该 action 没有被接受执行；V2 agent-sec-cli
 必须报告稳定的 version/capability mismatch，不转入 PyO3 或本地业务路径。request 已发送
 后的 timeout、EOF 或协议错误仍然状态不明，不能由 client 重放。
 
@@ -740,7 +745,7 @@ client 读取第一条 response 后忽略同一次 read 已取得的 trailing by
 - auth 模式下握手或 frame authentication 失败。
 
 这类失败不证明 daemon 未执行请求。V2 没有通用本地 fallback；request 是否发送都不得由
-asc-cli 触发 PyO3、Python backend 或第二套本地业务执行。
+agent-sec-cli 触发 PyO3、Python backend 或第二套本地业务执行。
 
 ## 10. 兼容性规则
 
@@ -786,7 +791,7 @@ asc-cli 触发 PyO3、Python backend 或第二套本地业务执行。
 | DPV1-017 | 八个 action method 的 timeout、queue/resource、access-log、blocking 和 cancellation metadata 已冻结并逐项验证 |
 | DPV1-018 | 多 UID 共用 system socket；trusted Principal/QueryScope 隔离 owner，`caller/trace_context` 不参与授权 |
 | DPV1-019 | CLI/TUI 不能用 RPC filter 绕过服务端 QueryScope，也不能直读 SQLite 替代授权查询 |
-| DPV1-020 | 15 个 PAP method 的 strict params、完整请求/响应 CRUD fixture、直接领域 result、错误投影、server-owned Principal；必跑 UDS integration 经 Dispatcher/PapHandler → PapService → Policy Compiler/Repository 执行完整 fixture，真实 `asc-daemon` 子进程 bootstrap 在 root 下重复成功场景、非 root 下验证默认拒绝 |
+| DPV1-020 | 15 个 PAP method 的 strict params、完整请求/响应 CRUD fixture、直接领域 result、错误投影、server-owned Principal；必跑 UDS integration 经 Dispatcher/PapHandler → PapService → Policy Compiler/Repository 执行完整 fixture，真实 `asc-daemon` 子进程通过启动管理员 UID 配置完成非 root 成功场景，同时验证默认拒绝；root 环境验证默认成功 |
 
 协议测试必须使用 socket bytes 和解析后 JSON 比较；只测试某个 Python dataclass 或 Rust
 struct 的构造函数不足以证明 wire compatibility。
