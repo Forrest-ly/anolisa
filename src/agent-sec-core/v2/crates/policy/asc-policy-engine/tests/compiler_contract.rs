@@ -16,6 +16,25 @@ fn golden_freezes_the_compiler_input_and_output() {
 }
 
 #[test]
+fn prevent_file_deletion_is_limited_to_path_entry_deletes() {
+    let contract: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/compiler-contract.json")).unwrap();
+    let input: TemplateEnvelope = serde_json::from_value(contract["input"].clone()).unwrap();
+
+    let output = serde_json::to_value(PolicyTemplateCompiler.lower(&input).unwrap()).unwrap();
+
+    assert_eq!(
+        output["payload"]["resources"][0]["matchers"][0]["resolution"]["type"],
+        "path_entry"
+    );
+    assert_eq!(
+        output["payload"]["rules"][0]["when"]["atom"]["operation"],
+        "delete"
+    );
+    assert_eq!(output["payload"]["rules"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn rejects_empty_files_and_unimplemented_template_kinds() {
     let policy_id = PolicyId::new("unsupported").unwrap();
     let revision = Revision::new(1).unwrap();

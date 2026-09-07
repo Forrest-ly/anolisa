@@ -198,6 +198,29 @@ fn request_and_response_envelopes_are_strict_and_mutually_exclusive() {
 }
 
 #[test]
+fn daemon_error_messages_are_bounded_at_construction_and_decode() {
+    let response = DaemonResponse::<Value>::error(
+        RequestId::new("request-bounded-error").unwrap(),
+        error_code::INVALID_REQUEST,
+        &"x".repeat(512),
+    );
+    let DaemonResponse::Error(response) = response else {
+        panic!("the error constructor must return an error response");
+    };
+    assert_eq!(response.error.message().len(), 256);
+    assert!(response.error.message().ends_with("..."));
+
+    let oversized_wire = json!({
+        "requestId": "request-oversized-error",
+        "error": {
+            "code": "invalid_request",
+            "message": "x".repeat(257)
+        }
+    });
+    assert!(serde_json::from_value::<DaemonResponse>(oversized_wire).is_err());
+}
+
+#[test]
 fn identifiers_revisions_and_pagination_are_bounded() {
     for invalid in [
         json!({"id": "invalid/id", "revision": 1}),

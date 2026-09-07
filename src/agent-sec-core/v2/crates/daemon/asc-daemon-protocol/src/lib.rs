@@ -20,5 +20,6 @@ pub use pap::{
     UpdatePolicyParams, UpdateScopeParams,
 };
 pub use response::{
-    DaemonError, DaemonResponse, ErrorCode, ErrorResponse, RequestId, SuccessResponse, error_code,
+    DaemonError, DaemonResponse, ErrorCode, ErrorResponse, MAX_DAEMON_ERROR_MESSAGE_BYTES,
+    RequestId, SuccessResponse, error_code,
 };

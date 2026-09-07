@@ -15,6 +15,8 @@ The current crates are:
 - `asc-policy-engine`: deterministic `prevent_file_deletion` authoring-template
   compiler with a frozen Canonical Policy IR golden. Other template kinds remain
   explicitly unsupported until their lowering and Adapter evidence are defined.
+  The implemented template covers path-entry deletion only; rename, move, and
+  other namespace mutations are outside its contract.
 - `asc-pap`: transport-independent current-record Policy/Scope/Binding CRUD with
   monotonic revisions over explicit compiler and repository ports.
 - `asc-pap-repository-memory`: explicitly temporary process-local Repository
@@ -33,6 +35,10 @@ The current crates are:
   dispatch cancellation, and controlled drain.
 - `asc-daemon`: foreground process and composition root that configures and
   injects concrete adapters into the daemon service.
+
+The crate relationships, acceptance types, executable pass/fail matrix,
+compatibility report, direct-consumer evidence, and rollback boundary are recorded
+in [`PAP_DAEMON_API_ACCEPTANCE_zh.md`](../docs/design/PAP_DAEMON_API_ACCEPTANCE_zh.md).
 
 ## Daemon service boundary
 

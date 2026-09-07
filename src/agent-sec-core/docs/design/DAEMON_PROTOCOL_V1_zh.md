@@ -481,8 +481,10 @@ Policy CREATE/UPDATE 在 PAP 内同步调用 `PolicyCompiler::lower(TemplateEnve
 PolicyEnvelope`。当前产品 compiler 只实现 `prevent_file_deletion`，其输入与完整 Canonical
 Policy IR 输出由
 `v2/crates/policy/asc-policy-engine/tests/fixtures/compiler-contract.json` 冻结；输出语义是
-`ResourceOperation::Delete + FileResolution::PathEntry`。其它 `PolicyTemplate` kind 在各自
-lowering 与直接 Adapter conformance 完成前返回 `invalid_argument`，不得生成占位 IR。
+`ResourceOperation::Delete + FileResolution::PathEntry`。该模板只覆盖对匹配目录项的删除操作，
+例如 unlink/rmdir；rename/move、link、truncate、内容修改和其它 namespace mutation 不在其
+保护范围内。其它 `PolicyTemplate` kind 在各自 lowering 与直接 Adapter conformance 完成前
+返回 `invalid_argument`，不得生成占位 IR。
 
 参数 object 拒绝未知字段。新 authored Scope 只接受正数 PID 或 cgroup ID，不接受仅用于读取
 旧数据的 `LegacyExecutionDomain`。LIST 的 `limit` 为 `1..=1000`，`offset` 为 `u32`；total 是

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde_json::Value;
@@ -9,6 +9,7 @@ use uuid::Uuid;
 pub async fn run_frozen_pap_crud_scenario(path: &Path, fixture: &Value) {
     let objects = fixture["objects"].as_object().unwrap();
     let mut variables = BTreeMap::new();
+    let mut request_ids = BTreeSet::new();
 
     for step in fixture["steps"].as_array().unwrap() {
         let step_name = step["name"].as_str().unwrap();
@@ -20,6 +21,10 @@ pub async fn run_frozen_pap_crud_scenario(path: &Path, fixture: &Value) {
             .unwrap_or_else(|| panic!("{step_name} did not return a requestId"));
         Uuid::parse_str(request_id)
             .unwrap_or_else(|error| panic!("{step_name} returned a non-UUID requestId: {error}"));
+        assert!(
+            request_ids.insert(request_id.to_owned()),
+            "{step_name} reused daemon requestId {request_id}"
+        );
         variables.insert(
             "request_id".to_owned(),
             Value::String(request_id.to_owned()),

@@ -430,7 +430,7 @@ fn unknown_methods_and_invalid_method_params_use_distinct_errors() {
             panic!("{method} should fail");
         };
         assert_eq!(error.error.code.as_str(), expected_code);
-        assert_eq!(error.error.message, expected_message);
+        assert_eq!(error.error.message(), expected_message);
     }
 }
 
@@ -846,14 +846,11 @@ async fn run_method_param_error_matrix(path: &Path) -> Vec<String> {
         }),
     )
     .await;
-    let full_message = format!("unknown field `{oversized_field}`, expected `limit` or `offset`");
-    let mut expected_message = full_message[..253].to_owned();
-    expected_message.push_str("...");
     record_error_response(
         &mut failures,
-        "oversized parameter error is bounded",
+        "oversized parameter error does not reflect caller input",
         &response,
-        &json!({"code": "invalid_request", "message": expected_message}),
+        &json!({"code": "invalid_request", "message": "request parameters are invalid"}),
     );
     failures
 }

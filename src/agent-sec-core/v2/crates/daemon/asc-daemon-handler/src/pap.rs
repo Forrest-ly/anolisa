@@ -6,12 +6,11 @@ use asc_daemon_core::{PolicyAdministration, PolicyAdministrationError, Principal
 use asc_daemon_protocol::method::{BindingMethod, PapMethod, PolicyMethod, ScopeMethod};
 use asc_daemon_protocol::{
     CreateBindingParams, CreatePolicyParams, CreateScopeParams, DaemonResponse, ListParams,
-    ListResult, RequestId, ResourceParams, RevisionParams, UpdateBindingParams, UpdatePolicyParams,
-    UpdateScopeParams, error_code,
+    ListResult, MAX_DAEMON_ERROR_MESSAGE_BYTES, RequestId, ResourceParams, RevisionParams,
+    UpdateBindingParams, UpdatePolicyParams, UpdateScopeParams, error_code,
 };
 
-const MAX_PUBLIC_ERROR_BYTES: usize = 256;
-const ERROR_MESSAGE_SUFFIX: &str = "...";
+const INVALID_PARAMETER_MESSAGE: &str = "request parameters are invalid";
 
 /// PAP-specific protocol adapter with repository/compiler types erased.
 pub(super) struct PapHandler {
@@ -183,19 +182,12 @@ fn decode<T: serde::de::DeserializeOwned>(
 }
 
 fn bounded_parameter_error(error: &serde_json::Error) -> String {
-    bounded_error_message(&error.to_string())
-}
-
-fn bounded_error_message(message: &str) -> String {
-    if message.len() <= MAX_PUBLIC_ERROR_BYTES {
-        return message.to_owned();
+    let message = error.to_string();
+    if message.len() > MAX_DAEMON_ERROR_MESSAGE_BYTES {
+        INVALID_PARAMETER_MESSAGE.to_owned()
+    } else {
+        message
     }
-
-    let mut end = MAX_PUBLIC_ERROR_BYTES - ERROR_MESSAGE_SUFFIX.len();
-    while !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{ERROR_MESSAGE_SUFFIX}", &message[..end])
 }
 
 fn encode<T: serde::Serialize>(value: T) -> Result<serde_json::Value, PapDispatchError> {
@@ -234,7 +226,7 @@ fn project_application_error(error: &PolicyAdministrationError) -> (&'static str
         PolicyAdministrationError::ResourceExhausted => error_code::RESOURCE_EXHAUSTED,
         PolicyAdministrationError::Internal => error_code::INTERNAL,
     };
-    (code, bounded_error_message(&error.to_string()))
+    (code, error.to_string())
 }
 
 #[cfg(test)]
@@ -242,22 +234,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parameter_errors_are_specific_but_bounded() {
+    fn parameter_errors_are_specific_but_do_not_reflect_oversized_input() {
         let invalid_limit = decode::<ListParams>(serde_json::json!({"limit": 0}));
         let Err(PapDispatchError::BadRequest(message)) = invalid_limit else {
             panic!("an invalid pagination limit must fail parameter decoding");
         };
         assert_eq!(message, "limit must be between 1 and 1000");
 
-        let long_field = "x".repeat(MAX_PUBLIC_ERROR_BYTES * 2);
+        let long_field = "x".repeat(MAX_DAEMON_ERROR_MESSAGE_BYTES * 2);
         let mut params = serde_json::Map::new();
         params.insert(long_field, serde_json::Value::Null);
         let oversized = decode::<ListParams>(serde_json::Value::Object(params));
         let Err(PapDispatchError::BadRequest(message)) = oversized else {
             panic!("an unknown parameter must fail decoding");
         };
-        assert!(message.len() <= MAX_PUBLIC_ERROR_BYTES);
-        assert!(message.ends_with("..."));
+        assert_eq!(message, INVALID_PARAMETER_MESSAGE);
     }
 
     #[test]

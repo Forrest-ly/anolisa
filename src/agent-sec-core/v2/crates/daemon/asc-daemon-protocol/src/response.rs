@@ -4,6 +4,11 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+/// Maximum encoded UTF-8 bytes in a public daemon error message.
+pub const MAX_DAEMON_ERROR_MESSAGE_BYTES: usize = 256;
+
+const ERROR_MESSAGE_SUFFIX: &str = "...";
+
 /// Stable daemon-generated response correlation identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -95,7 +100,8 @@ pub struct DaemonError {
     /// Machine-readable category.
     pub code: ErrorCode,
     /// Sanitized operator-facing explanation.
-    pub message: String,
+    #[serde(deserialize_with = "deserialize_error_message")]
+    message: String,
 }
 
 impl DaemonError {
@@ -106,8 +112,39 @@ impl DaemonError {
     pub fn new(code: &str, message: &str) -> Self {
         Self {
             code: ErrorCode::new(code).expect("daemon error constants must be canonical"),
-            message: message.to_owned(),
+            message: bounded_error_message(message),
         }
+    }
+
+    /// Returns the bounded public explanation.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+fn bounded_error_message(message: &str) -> String {
+    if message.len() <= MAX_DAEMON_ERROR_MESSAGE_BYTES {
+        return message.to_owned();
+    }
+
+    let mut end = MAX_DAEMON_ERROR_MESSAGE_BYTES - ERROR_MESSAGE_SUFFIX.len();
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{ERROR_MESSAGE_SUFFIX}", &message[..end])
+}
+
+fn deserialize_error_message<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let message = String::deserialize(deserializer)?;
+    if message.len() > MAX_DAEMON_ERROR_MESSAGE_BYTES {
+        Err(D::Error::custom(
+            "daemon error message must not exceed 256 bytes",
+        ))
+    } else {
+        Ok(message)
     }
 }
 

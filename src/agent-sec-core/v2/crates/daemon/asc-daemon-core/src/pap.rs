@@ -84,10 +84,10 @@ fn project_pap_error(
             PolicyInputError::new(format!("invalid policy name: {message}")),
         ),
         PapError::InvalidPolicy(error) => {
-            project_validation_error(&error, "template", "invalid policy")
+            project_validation_error(&error, &["template"], "invalid policy")
         }
         PapError::InvalidScope(error) => {
-            project_validation_error(&error, "selector", "invalid scope")
+            project_validation_error(&error, &["selector", "pid", "cgroupId"], "invalid scope")
         }
         PapError::InvalidPagination => PolicyAdministrationError::InvalidArgument(
             PolicyInputError::new("invalid pagination: limit must be between 1 and 1000"),
@@ -114,12 +114,16 @@ fn project_pap_error(
 
 fn project_validation_error(
     error: &ValidationError,
-    authored_root: &str,
+    authored_roots: &[&str],
     public_prefix: &str,
 ) -> PolicyAdministrationError {
-    let suffix = error.path.strip_prefix(authored_root);
-    let is_authored_path = suffix.is_some_and(|suffix| {
-        suffix.is_empty() || suffix.starts_with('.') || suffix.starts_with('[')
+    let is_authored_path = authored_roots.iter().any(|authored_root| {
+        error
+            .path
+            .strip_prefix(authored_root)
+            .is_some_and(|suffix| {
+                suffix.is_empty() || suffix.starts_with('.') || suffix.starts_with('[')
+            })
     });
     if is_authored_path {
         PolicyAdministrationError::InvalidArgument(PolicyInputError::new(format!(
@@ -558,6 +562,17 @@ mod tests {
             project_pap_error(PapError::ReferencedScopeRevisionNotFound, None),
             PolicyAdministrationError::NotFound(NotFoundResource::ReferencedScopeRevision)
         );
+        for path in ["pid", "cgroupId"] {
+            assert_eq!(
+                project_pap_error(
+                    PapError::InvalidScope(ValidationError::new(path, "must be positive")),
+                    None
+                ),
+                PolicyAdministrationError::InvalidArgument(PolicyInputError::new(format!(
+                    "invalid scope: {path}: must be positive"
+                )))
+            );
+        }
         assert_eq!(
             project_pap_error(
                 PapError::InvalidPolicy(ValidationError::new(
