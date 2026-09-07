@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+asc-policy-repository = { workspace = true }
 asc-daemon-protocol = { workspace = true }
 asc-foundation-types = { workspace = true }
 asc-policy-types = { workspace = true }

@@ -79,9 +79,6 @@ impl AgentSightAdapter {
 }
 
 fn translate_scope(scope: &PreparedScope) -> Result<AgentSightScopePlan, TranslationRejection> {
-    if scope.template.lifetime.expires_at.is_some() {
-        return Err(rejection("UNSUPPORTED_SCOPE_LIFETIME"));
-    }
     let ScopeSelector::Pid { pid } = &scope.selector else {
         return Err(rejection("UNSUPPORTED_SCOPE_SELECTOR"));
     };

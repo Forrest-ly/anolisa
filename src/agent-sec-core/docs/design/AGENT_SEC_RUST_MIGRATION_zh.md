@@ -241,7 +241,7 @@ asc-state-migrator 必须定义并验证：
 - 产品入口：asc-daemon、agent-sec-cli、asc-state-migrator；
 - daemon：asc-daemon-protocol、asc-daemon-service、asc-daemon-handler、asc-daemon-core；
 - action：asc-action-types、asc-evidence-types、asc-action-runtime 和各 asc-capability-*；
-- policy：asc-policy-types、asc-policy-target-contracts、asc-policy-engine、asc-policy-runtime、asc-pap、asc-pcp；
+- policy：asc-policy-types、asc-policy-target-contracts、asc-policy-repository、asc-policy-engine、asc-policy-runtime、asc-pap、asc-pcp；
   其中 asc-policy-target-contracts 只定义共享 Adapter/Client trait，依赖纯数据契约
   asc-policy-types；Reconciler 与具体 PEP 实现均依赖该共享层，而不互相依赖实现。
 - data：asc-security-events、asc-observability、asc-session、asc-state、
