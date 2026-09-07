@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib.resources import files
@@ -21,6 +22,44 @@ class PreToolAction(StrEnum):
     PASSTHROUGH = "passthrough"
     REPLACE_ARGUMENTS = "replace_arguments"
     BLOCK_AND_SUGGEST = "block_and_suggest"
+
+
+@dataclass(frozen=True)
+class RecoveryMethod:
+    """Declared model recovery entry point, not a compression policy switch."""
+
+    kind: str = "none"
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"none", "shell", "tool"}:
+            raise ValueError(f"unknown recovery kind: {self.kind!r}")
+        if self.kind == "tool":
+            if not isinstance(self.name, str) or not re.fullmatch(
+                r"[A-Za-z0-9_-]{1,64}", self.name
+            ):
+                raise ValueError(
+                    "recovery tool name must contain 1–64 ASCII letters, digits, '_' or '-'"
+                )
+        elif self.name is not None:
+            raise ValueError("only tool recovery accepts a name")
+
+    @classmethod
+    def shell(cls) -> RecoveryMethod:
+        """Uses the host's existing shell tool and trusted local CLI."""
+        return cls("shell")
+
+    @classmethod
+    def tool(cls, name: str) -> RecoveryMethod:
+        """Uses an already registered, reference-authorized tool."""
+        return cls("tool", name)
+
+    def as_dict(self) -> dict[str, str]:
+        """Serializes the strict operation capability."""
+        result = {"kind": self.kind}
+        if self.name is not None:
+            result["name"] = self.name
+        return result
 
 
 class OutputOptimization(StrEnum):
@@ -85,7 +124,10 @@ class AppliedOperation(StrEnum):
     """Concrete transformations applied by Core."""
 
     SCHEMA_COMPRESSION = "schema_compression"
+    TERMINAL_CLEANUP = "terminal_cleanup"
+    BUILD_LOG_REDUCTION = "build_log_reduction"
     JSON_CLEANUP = "json_cleanup"
+    JSON_RECORD_REDUCTION = "json_record_reduction"
     JSON_TRUNCATION = "json_truncation"
     TOON = "toon"
 
@@ -122,8 +164,10 @@ class TokenlessConfig:
     rtk_enabled: bool = True
 
     def __post_init__(self) -> None:
-        if not self.retrieve_tool_name:
-            raise ValueError("retrieve_tool_name must not be empty")
+        try:
+            RecoveryMethod.tool(self.retrieve_tool_name)
+        except ValueError as error:
+            raise ValueError(f"retrieve_tool_name: {error}") from error
         if self.data_dir is not None:
             data_dir = Path(self.data_dir).expanduser()
             if not data_dir.is_absolute():
@@ -133,10 +177,13 @@ class TokenlessConfig:
 
 @dataclass(frozen=True)
 class BeforeModelCapabilities:
-    """Host capabilities relevant to BeforeModel."""
+    """Host capabilities relevant to BeforeModel.
+
+    Only static-tool recovery permits recoverable schema truncation.
+    """
 
     replace_tools: bool
-    publish_retrieve_tool: bool
+    recovery: RecoveryMethod
 
 
 @dataclass(frozen=True)
@@ -145,38 +192,16 @@ class BeforeModelRequest:
 
     tools: tuple[Any, ...]
     visible_context: Any
-    retrieve_tool_name: str
     capabilities: BeforeModelCapabilities
     attribution: Attribution
 
 
 @dataclass(frozen=True)
-class RetrieveToolDeclaration:
-    """Canonical declaration for the marker-authorized Retrieve tool."""
-
-    name: str
-    description: str
-    input_schema: dict[str, Any]
-
-    def as_function_tool(self) -> dict[str, Any]:
-        """Returns an OpenAI-compatible function declaration."""
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.input_schema,
-            },
-        }
-
-
-@dataclass(frozen=True)
 class BeforeModelResponse:
-    """Transformed tools, visible markers, and optional Retrieve declaration."""
+    """Transformed tools and the marker authorization set."""
 
     tools: tuple[Any, ...]
     visible_markers: frozenset[str]
-    retrieve_tool: RetrieveToolDeclaration | None
 
 
 @dataclass(frozen=True)
@@ -217,10 +242,13 @@ class PreToolResponse:
 
 @dataclass(frozen=True)
 class PostToolCapabilities:
-    """Host capabilities relevant to PostTool."""
+    """Host capabilities relevant to PostTool.
+
+    Recovery uses either the existing shell tool or a static authorized tool.
+    """
 
     replace_output: bool
-    publish_retrieve_tool: bool
+    recovery: RecoveryMethod
     replace_with_text: bool
 
 
@@ -301,10 +329,9 @@ class TokenlessSdk:
                 {
                     "tools": request.tools,
                     "visible_context": request.visible_context,
-                    "retrieve_tool_name": request.retrieve_tool_name,
                     "capabilities": {
                         "replace_tools": request.capabilities.replace_tools,
-                        "publish_retrieve_tool": request.capabilities.publish_retrieve_tool,
+                        "recovery": request.capabilities.recovery.as_dict(),
                     },
                 }
             ),
@@ -343,7 +370,7 @@ class TokenlessSdk:
         )
 
     async def post_tool(self, request: PostToolRequest) -> PostToolResponse:
-        """Runs Core PostTool routing and the JSON-only Pipeline."""
+        """Runs Core PostTool routing and the content-domain Pipeline."""
         response = await asyncio.to_thread(
             self.runtime._post_tool_json,
             _json_dumps(
@@ -356,7 +383,7 @@ class TokenlessSdk:
                     "output_optimization": request.output_optimization,
                     "capabilities": {
                         "replace_output": request.capabilities.replace_output,
-                        "publish_retrieve_tool": request.capabilities.publish_retrieve_tool,
+                        "recovery": request.capabilities.recovery.as_dict(),
                         "replace_with_text": request.capabilities.replace_with_text,
                     },
                 }
@@ -368,9 +395,7 @@ class TokenlessSdk:
         return PostToolResponse(
             output=value["output"],
             disposition=Disposition(value["disposition"]),
-            content_type=(
-                ContentType(content_type) if content_type is not None else None
-            ),
+            content_type=(ContentType(content_type) if content_type is not None else None),
             applied_operations=tuple(
                 AppliedOperation(item) for item in value["applied_operations"]
             ),
@@ -396,13 +421,6 @@ class TokenlessSdk:
         )
         value = _json_object(response)
         return RetrieveResponse(hash=value["hash"], payload=value["payload"])
-
-    def retrieve_tool_declaration(self) -> RetrieveToolDeclaration:
-        """Returns Core's canonical declaration for the configured Retrieve tool."""
-        value = _json_object(
-            self.runtime._retrieve_tool_declaration_json(self.config.retrieve_tool_name)
-        )
-        return _retrieve_tool_declaration(value)
 
     def _resolve_rtk(self) -> Path:
         resource = files("anolisa_tokenless").joinpath("_bin", "rtk")
@@ -437,26 +455,9 @@ def _json_object(value: str) -> dict[str, Any]:
     return decoded
 
 
-def _retrieve_tool_declaration(value: dict[str, Any]) -> RetrieveToolDeclaration:
-    input_schema = value["input_schema"]
-    if not isinstance(input_schema, dict):
-        raise TypeError("Core returned a non-object Retrieve input schema")
-    return RetrieveToolDeclaration(
-        name=value["name"],
-        description=value["description"],
-        input_schema=input_schema,
-    )
-
-
 def _before_model_response(value: str) -> BeforeModelResponse:
     decoded = _json_object(value)
-    declaration = decoded.get("retrieve_tool")
     return BeforeModelResponse(
         tools=tuple(decoded["tools"]),
         visible_markers=frozenset(decoded["visible_markers"]),
-        retrieve_tool=(
-            _retrieve_tool_declaration(declaration)
-            if isinstance(declaration, dict)
-            else None
-        ),
     )

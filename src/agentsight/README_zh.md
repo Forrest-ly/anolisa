@@ -314,6 +314,13 @@ sudo systemctl status agentsight.service
 `/var/log/sysak/.agentsight` 中的数据仅 root 可读。查询服务数据或读取
 Dashboard 访问信息时需要使用 `sudo`。启动前台 tracer 前也要先停止该单元。
 
+### Kubernetes DaemonSet
+
+如需在 Kubernetes 中进行节点级采集，使用 `src/agentsight/packaging/` 下的
+DaemonSet 清单与运行时镜像（`k8s/daemonset.yaml` 与 `docker/Dockerfile`）。
+前置条件与验证步骤见
+[部署指南](../../docs/user-guide/zh/agent-observability/agentsight/deployment.md#kubernetes-daemonset节点级)。
+
 ### 从源码构建
 
 ```bash
@@ -396,7 +403,7 @@ AgentSight 通过 `agentsight.json` 配置文件进行统一管理（默认路�
 
 ### 功能开关（`features`）
 
-所有可选功能**默认全开**。可通过 `agentsight.json` 的 `features` 区块逐个关闭以降低内存和 I/O 开销：
+各功能默认值见下表。可通过 `agentsight.json` 的 `features` 区块关闭可选功能，以降低内存和 I/O 开销：
 
 | 功能 | JSON 路径 | 默认值 | 说明 |
 |------|-----------|--------|------|
@@ -404,6 +411,7 @@ AgentSight 通过 `agentsight.json` 配置文件进行统一管理（默认路�
 | 本地 Tokenizer | `features.tokenizer.enabled` | `false` | HuggingFace 模型 fallback 计数（每个模型 50–100 MB） |
 | Session 映射 | `features.session_mapping.enabled` | `true` | responseId → sessionId 关联（LRU 10,000 条） |
 | SQLite 存储 | `features.sqlite_storage.enabled` | `true` | 持久化到磁盘 SQLite；关闭后用内存 noop store |
+| 资源采样 | `features.resource_sampling` | `false` | 每秒采集 Agent CPU/RSS；依赖 SQLite 存储 |
 | 中断检测 | `features.interruption_detection.enabled` | `true` | 死循环 / 崩溃 / 上下文溢出检测 |
 | 审计 | `features.audit` | `true` | LLM 调用审计事件持久化 |
 | Token 消费 | `features.token_consumption` | `false` | 聚合 Token 消费记录 |

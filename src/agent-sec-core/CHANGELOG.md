@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.12.0
+
+**cosh & Cosh-NG Hook Integration**
+
+- Normalized legacy cosh and Cosh-NG Skill invocation payloads in the cosh Skill Ledger hook so Cosh-NG invocations follow the configured policy instead of bypassing the check. (#2871)
+
+**Skill Ledger Runtime**
+
+- Tightened six Skill scanner detector patterns to remove deterministic false positives and bumped the static scanner identifier to `cisco-static-only-0.1.1`. (#2928)
+- Completed the `skill-ledger` and `check` help output with all eight integrity statuses and their production conditions. (#2707)
+
+**Daemon Runtime**
+
+- Added a POSIX shell `daemon.health` probe that avoids Python cold start for container health checks. (#2879)
+
+**Rust v2 Framework**
+
+- Added the v2 foundation and policy type crates as the base for the Rust security core migration. (#3007)
+- Added the v2 daemon service framework with UDS server, request dispatch, and shutdown handling. (#3040)
+- Added the v2 PAP service with Policy, Scope, and Binding CRUD over a repository abstraction. (#3027)
+
+**Build & Packaging**
+
+- Raised the `cryptography` runtime floor to 50.0.1 and refreshed the lock and exported requirements. (#3015)
+
+**Documentation**
+
+- Added design docs for the current daemon protocols and the v2 framework requirements. (#2881)
+
+## 0.11.1
+
+**Prompt Scanner**
+
+- Restricted the invisible-character injection rule so emoji ZWJ sequences, Persian ZWNJ, and leading BOM no longer score as critical injections. (#2900)
+- Refused non-loopback model service base URLs derived from the environment in both the Rust and Python model service paths. (#2893)
+- Reported `daemon.health` prompt_scan state as untracked instead of unconditionally ready now that scanning runs in-process. (#2892)
+- Dropped the dead prompt model preload environment flag and the obsolete scan-prompt protocol document. (#2886)
+
+**Skill Ledger Runtime**
+
+- Skipped host-backed read-only system Skills in batch `scan --all` and default `init` instead of failing them. (#2906)
+- Rejected the placeholder `set-policy` and `rotate-keys` commands so they no longer report false success. (#2876)
+
+**Asset Verification**
+
+- Reported explicit `CHECKED` / `PASSED` / `FAILED` counters and a distinct zero-candidate outcome for `agent-sec-cli verify`. (#2875)
+
+**Security Events & CLI**
+
+- Enforced owner-only permissions on files created by the CLI. (#2873)
+
+**Documentation**
+
+- Documented the five hidden `agent-sec-cli` integration commands and their contract caveats. (#2887)
+- Documented the rule-only L1 detection boundary and how to read `pass` together with degraded fields. (#2895)
+
 ## 0.11.0
 
 **Prompt Scanner**

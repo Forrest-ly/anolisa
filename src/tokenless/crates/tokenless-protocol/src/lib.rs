@@ -5,7 +5,7 @@
 //! cross-process transports.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// The protocol version implemented by this crate.
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -84,6 +84,9 @@ pub enum ProtocolError {
     /// Serialization failed.
     #[error("protocol serialization failed: {0}")]
     Serialize(#[source] serde_json::Error),
+    /// A host recovery-tool identifier cannot safely appear in an instruction.
+    #[error("recovery tool name must contain 1–64 ASCII letters, digits, '_' or '-': {0:?}")]
+    InvalidRecoveryToolName(String),
 }
 
 /// Lifecycle operation carried by a transport envelope.
@@ -139,16 +142,101 @@ impl Attribution {
     }
 }
 
+/// Recovery entry point available to the model, independent of compression policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecoveryMethod {
+    /// No reachable recovery entry point.
+    #[default]
+    None,
+    /// The host can run the trusted local CLI through its existing shell tool.
+    Shell,
+    /// A statically registered tool enforces current-reference authorization.
+    Tool {
+        /// Actual host tool name; Core does not register or rename it.
+        name: RecoveryToolName,
+    },
+}
+
+impl<'de> Deserialize<'de> for RecoveryMethod {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Empty struct variants reject fields that Serde's tagged unit variants ignore.
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            None {},
+            Shell {},
+            Tool { name: RecoveryToolName },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::None {} => Self::None,
+            Wire::Shell {} => Self::Shell,
+            Wire::Tool { name } => Self::Tool { name },
+        })
+    }
+}
+
+impl RecoveryMethod {
+    /// Whether a caller has declared a reachable recovery entry point.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Declares an existing, marker-authorized host tool.
+    ///
+    /// # Errors
+    /// Returns an error when the name is not 1–64 ASCII letters, digits, `_`, or `-`.
+    pub fn tool(name: impl Into<String>) -> Result<Self, ProtocolError> {
+        Ok(Self::Tool {
+            name: name.into().try_into()?,
+        })
+    }
+}
+
+/// Validated host tool identifier, safe to embed in a recovery instruction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RecoveryToolName(String);
+
+impl RecoveryToolName {
+    /// Returns the host tool's unchanged name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for RecoveryToolName {
+    type Error = ProtocolError;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        if !(1..=64).contains(&name.len())
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+        {
+            return Err(ProtocolError::InvalidRecoveryToolName(name));
+        }
+        Ok(Self(name))
+    }
+}
+
+impl From<RecoveryToolName> for String {
+    fn from(name: RecoveryToolName) -> Self {
+        name.0
+    }
+}
+
 /// Host capabilities relevant to BeforeModel.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BeforeModelCapabilities {
     /// The host can replace tool declarations.
     #[serde(default)]
     pub replace_tools: bool,
-    /// The host can publish the returned Retrieve tool declaration.
-    #[serde(default)]
-    pub publish_retrieve_tool: bool,
+    /// Only an authorized static tool permits recoverable schema truncation.
+    pub recovery: RecoveryMethod,
 }
 
 /// Input for the BeforeModel lifecycle operation.
@@ -159,44 +247,8 @@ pub struct BeforeModelRequest {
     pub tools: Vec<Value>,
     /// Model-visible request context with tool declarations removed.
     pub visible_context: Value,
-    /// Name to use for a conditionally published Retrieve tool.
-    pub retrieve_tool_name: String,
     /// Host capabilities for applying the result.
     pub capabilities: BeforeModelCapabilities,
-}
-
-/// Declaration of the agent-facing Retrieve tool.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RetrieveToolDeclaration {
-    /// Tool name selected by the adapter.
-    pub name: String,
-    /// Human-readable behavior summary.
-    pub description: String,
-    /// JSON Schema accepted by the tool.
-    pub input_schema: Value,
-}
-
-impl RetrieveToolDeclaration {
-    /// Builds the canonical declaration used to publish marker-scoped retrieval.
-    #[must_use]
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            description: "Restore content referenced by a visible Tokenless marker.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "hash_or_marker": {
-                        "type": "string",
-                        "description": "A visible <<tokenless:HASH>> marker or its hash"
-                    }
-                },
-                "required": ["hash_or_marker"],
-                "additionalProperties": false
-            }),
-        }
-    }
 }
 
 /// Result of the BeforeModel lifecycle operation.
@@ -207,9 +259,6 @@ pub struct BeforeModelResponse {
     pub tools: Vec<Value>,
     /// Sorted, deduplicated lowercase markers visible to the model.
     pub visible_markers: Vec<String>,
-    /// Retrieve declaration to publish, when both needed and supported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retrieve_tool: Option<RetrieveToolDeclaration>,
 }
 
 /// Host capabilities relevant to PreTool.
@@ -321,15 +370,14 @@ impl ContentOrigin {
 }
 
 /// Host capabilities relevant to PostTool.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostToolCapabilities {
     /// The host can replace the model-visible output.
     #[serde(default)]
     pub replace_output: bool,
-    /// A trusted agent-facing Retrieve tool is available.
-    #[serde(default)]
-    pub publish_retrieve_tool: bool,
+    /// Recovery entry point used by the final candidate's instructions.
+    pub recovery: RecoveryMethod,
     /// The replacement slot accepts arbitrary text.
     #[serde(default)]
     pub replace_with_text: bool,
@@ -367,7 +415,7 @@ pub enum Disposition {
     Passthrough,
     /// A candidate did not save both characters and tokens.
     NoSavings,
-    /// A lossy candidate was rejected because no trusted Retrieve path exists.
+    /// A lossy candidate was rejected because no marker-authorized recovery path exists.
     RecoverabilityUnavailable,
     /// The pipeline exhausted its time budget.
     Timeout,
@@ -442,8 +490,14 @@ impl ContentType {
 pub enum AppliedOperation {
     /// Function schema descriptions were compacted.
     SchemaCompression,
+    /// ANSI SGR presentation sequences were removed from a build log.
+    TerminalCleanup,
+    /// Repeated build/test progress was reduced behind retrieval markers.
+    BuildLogReduction,
     /// Empty and diagnostic JSON fields were removed.
     JsonCleanup,
+    /// A JSON record collection was reduced with retrievable omissions.
+    JsonRecordReduction,
     /// Oversized JSON values were truncated.
     JsonTruncation,
     /// JSON was encoded as TOON.
@@ -456,7 +510,10 @@ impl AppliedOperation {
     pub fn wire_str(self) -> &'static str {
         match self {
             Self::SchemaCompression => "schema_compression",
+            Self::TerminalCleanup => "terminal_cleanup",
+            Self::BuildLogReduction => "build_log_reduction",
             Self::JsonCleanup => "json_cleanup",
+            Self::JsonRecordReduction => "json_record_reduction",
             Self::JsonTruncation => "json_truncation",
             Self::Toon => "toon",
         }

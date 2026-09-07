@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from anolisa_tokenless import (
+    AppliedOperation,
     Attribution,
     BeforeModelCapabilities,
     BeforeModelRequest,
@@ -21,6 +22,7 @@ from anolisa_tokenless import (
     PreToolAction,
     PreToolCapabilities,
     PreToolRequest,
+    RecoveryMethod,
     ResultKind,
     RetrieveRequest,
     TokenlessConfig,
@@ -33,10 +35,27 @@ from anolisa_tokenless import (
 class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
     """Exercise all four lifecycle boundaries against the native runtime."""
 
-    def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory(
-            prefix="tokenless-sdk-test-"
+    def test_recovery_method_wire_and_validation(self) -> None:
+        self.assertEqual(RecoveryMethod().as_dict(), {"kind": "none"})
+        self.assertEqual(RecoveryMethod.shell().as_dict(), {"kind": "shell"})
+        self.assertEqual(
+            RecoveryMethod.tool("tenant-retrieve_2").as_dict(),
+            {"kind": "tool", "name": "tenant-retrieve_2"},
         )
+        for name in ("", "x" * 65, "tool name", "tool\nname", "工具", "tool;command"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                RecoveryMethod.tool(name)
+        for kind, name in (
+            ("unknown", None),
+            ("shell", "unexpected"),
+            ("none", "unexpected"),
+            ("tool", None),
+        ):
+            with self.subTest(kind=kind, name=name), self.assertRaises(ValueError):
+                RecoveryMethod(kind, name)
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory(prefix="tokenless-sdk-test-")
         self.attribution = Attribution("sdk-test", "session-a")
 
     def tearDown(self) -> None:
@@ -48,6 +67,20 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
                 data_dir=Path(self.temporary_directory.name),
                 **overrides,
             )
+        )
+
+    def test_record_reduction_operation_uses_the_core_wire_value(self) -> None:
+        self.assertEqual(
+            AppliedOperation("json_record_reduction"),
+            AppliedOperation.JSON_RECORD_REDUCTION,
+        )
+        self.assertEqual(
+            AppliedOperation("terminal_cleanup"),
+            AppliedOperation.TERMINAL_CLEANUP,
+        )
+        self.assertEqual(
+            AppliedOperation("build_log_reduction"),
+            AppliedOperation.BUILD_LOG_REDUCTION,
         )
 
     async def test_before_model_compresses_schema_and_scopes_retrieve(self) -> None:
@@ -64,10 +97,9 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         request = BeforeModelRequest(
             tools=(tool, {"type": "web_search"}),
             visible_context="",
-            retrieve_tool_name="tokenless_retrieve",
             capabilities=BeforeModelCapabilities(
                 replace_tools=True,
-                publish_retrieve_tool=True,
+                recovery=RecoveryMethod.tool("tokenless_retrieve"),
             ),
             attribution=self.attribution,
         )
@@ -76,15 +108,12 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool["function"]["description"], description)
         self.assertEqual(result.tools[1], {"type": "web_search"})
         marker = re.search(
-            r"<<tokenless:([0-9a-f]{24})>>",
+            r"If needed, call tool tokenless_retrieve with hash_or_marker=([0-9a-f]{24})",
             result.tools[0]["function"]["description"],
         )
         self.assertIsNotNone(marker)
         assert marker is not None
         self.assertIn(marker.group(1), result.visible_markers)
-        self.assertIsNotNone(result.retrieve_tool)
-        assert result.retrieve_tool is not None
-        self.assertEqual(result.retrieve_tool.name, "tokenless_retrieve")
 
         recovered = await sdk.retrieve(
             RetrieveRequest(
@@ -95,19 +124,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(recovered.payload, description)
         with self.assertRaisesRegex(TokenlessError, "not authorized"):
-            await sdk.retrieve(
-                RetrieveRequest(marker.group(1), frozenset(), self.attribution)
-            )
-
-    def test_retrieve_declaration_is_owned_by_core(self) -> None:
-        sdk = self.sdk(rtk_enabled=False)
-        declaration = sdk.retrieve_tool_declaration()
-        self.assertEqual(declaration.name, "tokenless_retrieve")
-        self.assertEqual(declaration.input_schema["required"], ["hash_or_marker"])
-        self.assertEqual(
-            declaration.as_function_tool()["function"]["parameters"],
-            declaration.input_schema,
-        )
+            await sdk.retrieve(RetrieveRequest(marker.group(1), frozenset(), self.attribution))
 
     def test_config_contains_only_runtime_resources(self) -> None:
         with self.assertRaisesRegex(ValueError, "absolute path"):
@@ -115,6 +132,17 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {field.name for field in fields(TokenlessConfig)},
             {"data_dir", "retrieve_tool_name", "rtk_enabled"},
+        )
+
+    def test_config_identifies_invalid_retrieve_tool_names(self) -> None:
+        for name in ("", "x" * 65, "tool.name", "tool:name", "tool name", "工具"):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError, r"^retrieve_tool_name: recovery tool name"
+            ):
+                TokenlessConfig(retrieve_tool_name=name)
+        self.assertEqual(
+            TokenlessConfig(retrieve_tool_name="tenant-retrieve_2").retrieve_tool_name,
+            "tenant-retrieve_2",
         )
 
     def test_packaged_rtk_requires_a_stable_filesystem_resource(self) -> None:
@@ -150,6 +178,25 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
             result.arguments["command"],
         )
 
+    async def test_pre_tool_leaves_build_log_commands_for_post_tool(self) -> None:
+        sdk = self.sdk()
+        original_arguments = {"command": "cargo test --workspace", "timeout": 120}
+        result = await sdk.pre_tool(
+            PreToolRequest(
+                tool_name="shell",
+                arguments=original_arguments,
+                command_field="command",
+                capabilities=PreToolCapabilities(
+                    replace_arguments=True,
+                    block_and_suggest=False,
+                ),
+                attribution=Attribution("sdk-agent", "sdk-session", "call-build"),
+            )
+        )
+        self.assertEqual(result.action, PreToolAction.PASSTHROUGH)
+        self.assertEqual(result.output_optimization, OutputOptimization.NONE)
+        self.assertEqual(result.arguments, original_arguments)
+
     def test_post_tool_tool_kind_requires_call_identity_for_wire_strings(self) -> None:
         with self.assertRaisesRegex(ValueError, "tool_use_id"):
             PostToolRequest(
@@ -159,7 +206,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
                 status=ToolResultStatus.SUCCESS,
                 content_origin=ContentOrigin.API_RESPONSE,
                 output_optimization=OutputOptimization.NONE,
-                capabilities=PostToolCapabilities(True, True, True),
+                capabilities=PostToolCapabilities(True, RecoveryMethod.shell(), True),
                 attribution=self.attribution,
             )
 
@@ -167,7 +214,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         sdk = self.sdk(rtk_enabled=False)
         capabilities = PostToolCapabilities(
             replace_output=True,
-            publish_retrieve_tool=True,
+            recovery=RecoveryMethod.tool("tokenless_retrieve"),
             replace_with_text=True,
         )
         attribution = Attribution("sdk-agent", "sdk-session", "call-8")
@@ -219,8 +266,10 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_post_tool_uses_core_json_pipeline(self) -> None:
         sdk = self.sdk(rtk_enabled=False)
+        records = [{"name": "same", "value": index, "message": "x" * 80} for index in range(300)]
         original = json.dumps(
-            {"items": [{"name": "same", "value": index} for index in range(300)]}
+            {"items": records},
+            separators=(",", ":"),
         )
         result = await sdk.post_tool(
             PostToolRequest(
@@ -232,14 +281,28 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
                 output_optimization=OutputOptimization.NONE,
                 capabilities=PostToolCapabilities(
                     replace_output=True,
-                    publish_retrieve_tool=True,
-                    replace_with_text=True,
+                    recovery=RecoveryMethod.tool("tokenless_retrieve"),
+                    replace_with_text=False,
                 ),
                 attribution=Attribution("sdk-agent", "sdk-session", "call-9"),
             )
         )
         self.assertLess(len(result.output.encode()), len(original.encode()))
-        self.assertTrue(result.applied_operations)
+        self.assertIn(
+            AppliedOperation.JSON_RECORD_REDUCTION,
+            result.applied_operations,
+        )
+        self.assertEqual(result.recoverability.value, "retrievable")
+        self.assertEqual(len(result.stash_keys), 1)
+
+        restored = await sdk.retrieve(
+            RetrieveRequest(
+                result.stash_keys[0],
+                frozenset(result.stash_keys),
+                Attribution("sdk-agent", "sdk-session", "call-9"),
+            )
+        )
+        self.assertEqual(json.loads(restored.payload), records)
 
     def test_stats_client_is_lazy_and_uses_runtime_data_dir(self) -> None:
         sdk = self.sdk(rtk_enabled=False)

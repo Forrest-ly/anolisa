@@ -6,22 +6,23 @@
 
 Token-Less combines complementary strategies to minimize LLM token consumption:
 
-- **Lifecycle-aware Compression** — Protocol v2 owns BeforeModel schema handling, PreTool RTK rewriting, PostTool routing, and authorized Retrieve; the PostTool Pipeline currently compresses JSON only.
+- **Lifecycle-aware Compression** — Protocol v2 owns BeforeModel schema handling, PreTool RTK rewriting, PostTool routing, and authorized Retrieve; the PostTool Pipeline compresses JSON and recognized build/test command logs.
 - **TOON Context Compression** — Encodes JSON responses to TOON (Token-Oriented Object Notation) format via the `toon-format` library linked into `tokenless`, reducing syntax overhead for suitable structured data.
 - **Command Rewriting** — Integrates [RTK](https://github.com/rtk-ai/rtk) to filter and rewrite CLI command output, eliminating noise that would otherwise waste 60–90% of tokens.
 - **Tool Ready (legacy, hard-disabled)** — Its pre-call dependency checks are retained in source but unconditionally bypassed while the readiness model is redesigned.
 
 Agent adapters are available for:
 
-- **OpenClaw plugin** — covers command rewriting and response/TOON compression in one plugin.
+- **OpenClaw plugin** — delegates PreTool RTK rewriting and PostTool optimization to Protocol v2 Core.
 - **copilot-shell hook** — intercepts Shell commands via a PreToolUse hook and delegates to RTK for command rewriting + output filtering.
-- **Hermes Agent plugin** — response compression, TOON encoding, command rewriting (block + suggest), and registered but hard-disabled Tool Ready via Hermes's native plugin system.
-- **Qoder CLI plugin** — registered but hard-disabled Tool Ready, command rewriting, and response compression via Qoder's native hook system.
-- **Claude Code plugin** — RTK command rewriting, response/TOON compression, and registered but hard-disabled Tool Ready via Claude Code's official plugin marketplace.
+- **Hermes Agent plugin** — delegates block-and-suggest command rewriting and model-bound result optimization to Core, with Marker-directed recovery through its shell tool.
+- **Qoder CLI plugin** — registered but hard-disabled Tool Ready, command rewriting, response compression, and Marker-directed recovery via Qoder's native hook system.
+- **Claude Code plugin** — RTK command rewriting, response/TOON compression, Marker-directed recovery, and registered but hard-disabled Tool Ready via Claude Code's official plugin marketplace.
 - **Codex plugin** — RTK command rewriting, environment-failure diagnostics, and registered but hard-disabled Tool Ready via Codex's native hook system.
-- **OpenCode plugin** — schema/response/TOON compression, registered but hard-disabled Tool Ready, and command rewriting via OpenCode's local plugin API.
+- **OpenCode plugin** — schema/response/TOON compression, Marker-directed recovery, registered but hard-disabled Tool Ready, and command rewriting via OpenCode's local plugin API.
 - **Qwen Code extension** — command rewriting and registered but hard-disabled Tool Ready; current host releases cannot replace post-tool output and skip the declared schema event.
-- **DeepSeek Harness plugin** — native response compression and environment-error attribution through DSH's `tools/post-execute` seam.
+- **QwenPaw plugin** — schema compression, RTK command rewriting, response/TOON compression, and static-tool recovery through an AgentScope middleware registered by QwenPaw's plugin system; the plugin embeds the `anolisa_tokenless` wheel in-process.
+- **DeepSeek Harness plugin** — native response compression, Marker-directed recovery, and environment-error attribution through DSH's `tools/post-execute` seam.
 
 For framework developers, the Python SDK has a framework-neutral layer and an **AgentScope-specific
 layer**. Together they cover schema compression, RTK rewriting, response compression, TOON,
@@ -32,25 +33,27 @@ retrieval, and attribution.
 | Capability | Savings indicator | Details |
 |---|---|---|
 | Schema compression | 47.3% on reference fixture | Compresses OpenAI Function Calling tool schemas |
-| Content-aware response compression | 65.8% on the JSON reference fixture | Routes successful JSON through `JsonCompressor`; non-JSON domains currently pass through |
-| Reversible compression (stash) | — | Dropped array items are stashed and retrievable via `<<tokenless:KEY>>` markers |
+| Content-aware response compression | 36.3% lossless savings on the JSON reference fixture | Routes successful JSON through `JsonCompressor`; lossless candidates saving at least 15% take priority, while recoverable record arrays can be reduced to a 32-record base budget |
+| Build-log compression | workload-dependent | Cleans terminal control output and reduces repeated routine progress in recognized Cargo, pytest, npm/Jest, Go, Make/C, and generic command logs while preserving diagnostics, summaries, phases, and stack traces |
+| Reversible compression (stash) | — | Omitted record collections and bounded values are stashed; supported agents run `tokenless retrieve HASH` or call their static Retrieve Tool when full data is needed |
 | TOON context compression | 17.0% on reference response | Encodes JSON to TOON format for LLMs |
 | Command rewriting | 60–90% | Filters CLI output via RTK (70+ commands supported) |
 | Tool Ready | reduces retry waste | Legacy pre-call check, auto-fix, and blocking; hard-disabled |
-| OpenClaw plugin | — | Command rewriting ✅, Response compression ✅, optional TOON ✅, Schema compression — |
-| copilot-shell hooks | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Protocol v2 PostTool; Common BeforeModel passes schemas through until trusted Retrieve is available |
-| Hermes Agent plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅, TOON ✅, Schema compression ⏳ |
-| Qoder CLI plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅ |
-| Claude Code plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅, TOON ✅ |
+| OpenClaw plugin | — | RTK ✅, lossless transcript PostTool ✅, Schema/Retrieve unavailable in the host |
+| copilot-shell hooks | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅; Cosh-NG supports response compression and Marker-command recovery, while legacy copilot-shell remains lossless-only; Common BeforeModel passes schemas through without authorized Retrieve |
+| Hermes Agent plugin | — | Tool Ready ⛔ hard-disabled, Core-owned command rewriting/response/TOON ✅, Marker-command recovery ✅, Schema unavailable |
+| Qoder CLI plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅, Marker-command recovery ✅ |
+| Claude Code plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅, TOON ✅, Marker-command recovery ✅ on Claude Code 2.1.121 or newer |
 | Codex plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Environment diagnostics ✅, Response compression — protocol-blocked |
-| OpenCode plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Schema compression ✅, Response compression ✅, TOON ✅ |
+| OpenCode plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Schema compression ✅, Response compression ✅, TOON ✅, Marker-command recovery ✅ |
 | Qwen Code extension | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response/Schema replacement unavailable in current host |
-| DeepSeek Harness plugin | — | Response compression ✅, Environment-error attribution ✅ |
+| QwenPaw plugin | — | Schema compression ✅, Command rewriting ✅, Response compression ✅, TOON ✅, Retrieve Tool recovery ✅ |
+| DeepSeek Harness plugin | — | Response compression ✅, Marker-command recovery ✅, Environment-error attribution ✅ |
 | AgentScope framework integration | — | Schema ✅, RTK ✅, Response ✅, TOON ✅, Retrieval ✅ |
 | Zero runtime deps | — | Pure Rust, single static binary |
 
-The schema, response, and TOON figures above are isolated Tokenless 0.7.11
-results on the repository's committed reference fixtures; they are neither a
+The schema, response, and TOON figures above are isolated results on the
+repository's committed reference fixtures; they are neither a
 production range nor additive. Compression depends on payload size and shape,
 removable fields, configured thresholds, and the share of tool data in the
 session. Short or already compact payloads may save only a few percent or pass
@@ -68,7 +71,7 @@ on the share and shape of that content in the session.
 
 | Workload | Primary strategy | Why |
 |----------|-----------------|-----|
-| Shell-heavy (build/test/triage) | Command rewriting (RTK) | `cargo`/`npm`/`go`/`pytest` output carries lots of progress/warning noise; RTK cuts 60–90% |
+| Shell-heavy (build/test/triage) | Build-log compression + RTK | Recognized build/test commands keep their native output for PostTool compression; other supported shell commands use RTK |
 | API/fetch-heavy (REST, web_fetch) | Response compression + TOON | JSON may carry removable debug/null/empty fields; sufficiently large, regular structures also have reducible syntax overhead |
 | Agents with many tools | Schema compression | Many Function Calling definitions carry verbose descriptions and removable metadata |
 | Long responses that must stay faithful | Reversible compression (Stash) | Truncated content is `retrieve`-able end-to-end lossless; thresholds can be tightened safely |
@@ -100,7 +103,7 @@ on the share and shape of that content in the session.
 
 Example: dashboard shows 60% compression rate, but if tool responses account for 20% of total consumption, the actual savings rate is 60% × 20% = **12%**. This is why savings feel "lighter than a feather" in experiments consuming 15 million tokens — tokenless only optimizes the ~3 million tokens of tool responses.
 
-> Stash makes compression **end-to-end lossless**: you can tighten truncation thresholds for higher inline savings and recover the original via the `<<tokenless:KEY>>` marker when needed, with no correctness impact. Use `TOKENLESS_COMPRESSION_ENABLED=0/1` dual runs to compare real savings.
+> Recoverable omissions include an optional action: `If needed, run in shell: tokenless retrieve HASH`. AgentScope instead sees `If needed, call tool tokenless_retrieve with hash_or_marker=HASH` (using its configured static Tool name). Recovery returns the saved payload while it remains in Stash; it costs additional tokens and is not required for every omission. Historical `<<tokenless:HASH>>` markers remain readable but are no longer generated. Use `TOKENLESS_COMPRESSION_ENABLED=0/1` dual runs to compare real savings.
 > See [user manual](../../docs/user-guide/en/token-saving/tokenless/user-manual.md) for per-strategy trigger conditions.
 
 ## Architecture
@@ -111,7 +114,7 @@ Token-Less/
 ├── crates/tokenless-ccr/      # Reversible compression stash (Compress-Cache-Retrieve)
 ├── crates/tokenless-runtime/  # Lifecycle API and Runtime-owned PostTool pipeline
 ├── crates/tokenless-protocol/ # Versioned adapter contract and token estimator
-├── crates/tokenless-compressors/ # JSON compressor plus standalone text engines
+├── crates/tokenless-compressors/ # JSON and build-log domain compressors
 ├── crates/tokenless-cli/      # CLI binary: `tokenless` command (env-check, compress, retrieve, stats)
 ├── python/tokenless/          # PyO3 package: `anolisa_tokenless`
 ├── python/agentscope/         # Pure-Python AgentScope integration package
@@ -129,6 +132,7 @@ Token-Less/
 │   ├── claude-code/             # Claude Code plugin + marketplace + hooks
 │   ├── codex/                   # Codex plugin + scripts
 │   ├── opencode/                # OpenCode local plugin + scripts
+│   ├── qwenpaw/                 # QwenPaw plugin (AgentScope middleware) + scripts
 │   └── dsh/                     # Native DeepSeek Harness bundle
 ├── third_party/rtk/           # RTK vendored source (justfile clone+patch from GitHub)
 ├── third_party/patches/      # Patches for vendored third_party sources
@@ -268,14 +272,25 @@ Agent adapters may apply separate pre-check thresholds; see the
 
 ### compress
 
-Shared Agent hooks send a strict Protocol v2 lifecycle request to `tokenless compress`.
-The tagged envelope selects `before_model`, `pre_tool`, `post_tool`, or
-`retrieve`; only successful, non-bypassed PostTool JSON enters the Runtime-owned
-Pipeline. Common Hooks have no trusted Retrieve capability, so Core applies
-lossless PostTool candidates and rejects truncation that cannot be recovered.
-The current `SchemaCompressor` transformations are lossy, so Common BeforeModel
-passes tools through unchanged and creates no schema-compression Stats rows in
-this migration phase. See the
+Shared Agent hooks send lifecycle requests to `tokenless compress`; only
+successful, non-bypassed PostTool JSON and eligible command-output build logs
+enter the Runtime-owned Pipeline. Tool errors bypass compression and keep their
+original output while Core attaches environment-diagnostic context.
+
+PreTool leaves recognized Cargo, pytest, npm/Jest, Go, and Make build/test
+commands unchanged so their native output has a single PostTool owner. Other
+supported commands may be rewritten by RTK, and their results continue to
+bypass PostTool compression.
+
+Claude Code 2.1.121 or newer, Qoder CLI, OpenCode, and Cosh-NG can replace the
+live result. Their PostTool requests enable recovery when bare `tokenless`
+also resolves on the shell `PATH`. A compression Marker then tells the model to
+run the exact `tokenless retrieve` command through the existing shell tool. The
+hook recognizes only a successful, standalone command
+with a valid Hash or Marker and sends its output through the Retrieve bypass,
+preventing a second compression pass. Legacy copilot-shell and other hosts that
+cannot replace the result remain lossless-only. BeforeModel Schema compression
+still requires its separate authorized recovery capability. See the
 [CLI reference](../../docs/user-guide/en/token-saving/tokenless/cli-reference.md#compress)
 for the request/response contract and an executable example.
 
@@ -336,9 +351,8 @@ hash or any text containing a `<<tokenless:HASH>>` marker:
 # Bare hash
 tokenless retrieve c30ccf5ed1125e0ed871ba8e
 
-# Or paste the whole truncation line — the hash is extracted automatically.
-# (Use the FULL 24-hex hash from your output; the value below is shorthand.)
-tokenless retrieve "<... 160 items truncated, run: tokenless retrieve '<<tokenless:c30ccf5ed1125e0ed871ba8e>>'>"
+# Historical markers remain accepted
+tokenless retrieve '<<tokenless:c30ccf5ed1125e0ed871ba8e>>'
 ```
 
 ### compress-toon / decompress-toon
@@ -408,7 +422,7 @@ The adapter provides hooks that are auto-discovered by copilot-shell via the cos
 | Tool Ready (hard-disabled) | PreToolUse (all tools) | `tool_ready_hook.sh` | Silent pass-through; no check, repair, context, or block |
 | Command rewriting | PreToolUse (Shell) | `rewrite_hook.py` | Rewrite commands via RTK |
 | Response compression + attribution + TOON | PostToolUse | `compress_response_hook.py` | Compress + env error attribution + TOON |
-| Schema compression | BeforeModel | `compress_schema_hook.py` | Protocol v2 passthrough until the Common Hook can publish trusted Retrieve |
+| Schema compression | BeforeModel | `compress_schema_hook.py` | Passes through lossy transformations until the host exposes marker-authorized recovery |
 
 ### Install
 
@@ -485,49 +499,69 @@ String format `"jq"` is also supported (auto-converts to object).
 
 ## OpenClaw Plugin
 
-The plugin hooks into the OpenClaw agent loop at two stages:
+The plugin translates two OpenClaw events into Protocol v2 lifecycle operations:
 
 | Hook | Event | Action | Status |
 |---|---|---|---|
 | Tool Ready | `before_tool_call` | Registered silent pass-through; no check, repair, context, or block | ⛔ Hard-disabled |
-| Command rewriting | `before_tool_call` | Rewrites `exec` commands to RTK equivalents for filtered output | ✅ Active |
-| Response compression | `tool_result_persist` | Compresses tool results before they enter the context window | ✅ Active |
-| Schema compression | — | Not supported by OpenClaw's hook system | ⏳ → ✅ |
+| PreTool | `before_tool_call` | Sends `exec` arguments to Core and applies the returned RTK rewrite | ✅ Active |
+| PostTool | `tool_result_persist` | Rewrites supported OpenClaw-owned transcript tool results | ✅ Active |
+| BeforeModel / Retrieve | — | OpenClaw exposes neither a reliable schema-transform seam nor marker-authorized recovery | — |
 
-**Response compression details:**
-- Automatically compresses results from all tool types (`web_search`, `web_fetch`, `read_file`, etc.)
-- Skips `exec` tool results when RTK is enabled — RTK already produces optimized output, avoiding double-compression
-- Observed savings: **~78%** on `web_fetch` results, varies by content type
+Core owns RTK execution, JSON detection, cleanup, TOON selection, thresholds, diagnostics, and final
+arbitration. The plugin carries Core's per-call `output_optimization` from PreTool into the matching
+PostTool request, so RTK output is not compressed twice. The local CLI recovery command is a trusted
+operator entry rather than Agent authorization, so the plugin applies only lossless candidates.
 
-Each hook degrades gracefully — if the corresponding binary (`rtk` or `tokenless`) is not installed, that hook is silently skipped.
+`tool_result_persist` is a synchronous OpenClaw transcript seam. It can replace a persisted string,
+a structured value, or a single text block while preserving the surrounding Tool Result envelope;
+media and multi-block results pass through. It does not replace a tool result already consumed by
+the model in the same turn, and it does not cover non-OpenClaw transcript implementations.
+
+Both operations use the single `tokenless compress` entry point and fail open if Tokenless is
+missing or returns an invalid response.
 
 ### Configuration
+
+The adapter requires OpenClaw Plugin API `2026.4.22` or newer; package metadata enforces this
+minimum during installation on hosts that support compatibility checks.
 
 Options in `openclaw.plugin.json`:
 
 | Option | Default | Description |
 |---|---|---|
 | `rtk_enabled` | `true` | Enable RTK command rewriting |
-| `schema_compression_enabled` | `true` | Enable tool schema compression (pending OpenClaw support) |
-| `response_compression_enabled` | `true` | Enable tool response compression via `tool_result_persist` |
-| `verbose` | `true` | Log detailed rewrite/compression info |
+| `post_tool_enabled` | `true` | Enable Protocol v2 PostTool handling of persisted tool results |
+| `tool_ready_enabled` | `true` | Register the currently hard-disabled Tool Ready hook |
+| `verbose` | `false` | Log lifecycle rewrites and applied PostTool results |
+
+The previous response, TOON, skip-tool, and shell-tool configuration keys are removed; Core now
+owns those decisions.
 
 ## Hermes Agent Plugin
 
-The plugin registers hooks at three Hermes events, covering five strategies:
+The plugin registers hooks at three Hermes events while Core owns the lifecycle policy:
 
 | Strategy | Event | Action | Status |
 |---|---|---|---|
 | Tool Ready | `pre_tool_call` | Registered silent pass-through; no check, repair, context, or block | ⛔ Hard-disabled |
-| Command rewriting | `pre_tool_call` | Blocks original command, suggests `rtk`-rewritten version (one extra round-trip) | ✅ Active |
-| Response compression | `transform_tool_result` | Compresses tool results via `tokenless compress-response` | ✅ Active |
-| TOON encoding | `transform_tool_result` | Pipeline step after response compression — encodes JSON to TOON format | ✅ Active |
+| Command rewriting | `pre_tool_call` | Sends the command to Core, then blocks and suggests the returned RTK form | ✅ Active |
+| PostTool optimization | `transform_tool_result` | Sends the final model-bound result to Core and applies accepted output | ✅ Active |
 | Session tracking | `on_session_start` | Propagates agent/session IDs for stats recording | ✅ Active |
-| Schema compression | — | Not supported by Hermes hook system (no hook exposes tool schemas) | ⏳ Blocked |
+| Schema compression | — | Hermes exposes no schema-transform seam | — |
+| Marker recovery | `transform_tool_result` | Labels a successful standalone `tokenless retrieve` shell result for the Core bypass | ✅ Active |
 
-**How command rewriting works in Hermes**: Hermes's `pre_tool_call` hook can only block tool execution (not modify arguments), so the plugin blocks the original shell command and returns a message suggesting the RTK-rewritten version. The agent then re-executes with the optimized command, adding one extra tool-call round-trip. This is safe — `rtk rewrite` only does text substitution and never executes the command.
+**How command rewriting works in Hermes**: to remain compatible with Hermes releases that only
+support blocking, the plugin asks Core for a rewrite, blocks the original shell command, and tells
+the agent to retry with the returned command. The retry adds one tool-call round-trip. The final
+hook recognizes Core's attributed RTK wrapper from the command Hermes actually executed, so RTK
+output bypasses a second compression pass without correlating two different tool-call IDs.
 
-Each hook degrades gracefully — if the corresponding binary is not installed, that hook is silently skipped.
+When compression omits recoverable data, the Marker tells Hermes to run
+`tokenless retrieve` through its existing shell tool. The adapter checks the
+actual executed command; a successful standalone retrieve is returned unchanged
+and never compressed again. If the Tokenless operation is unavailable or fails,
+the hook leaves the host value unchanged.
 
 ### Install
 
@@ -561,6 +595,10 @@ The plugin registers hooks at three Qoder events, covering three strategies:
 
 Each hook degrades gracefully — if the corresponding binary is not installed, that hook is silently skipped.
 
+When a compressed result contains a Retrieve Marker, Qoder can execute its
+command through the existing shell tool. The successful result bypasses response
+compression so the recovered payload reaches the model unchanged.
+
 ### Install
 
 ```bash
@@ -579,6 +617,10 @@ The plugin registers hooks at two Claude Code events, covering four strategies:
 | TOON encoding | `PostToolUse` | Pipeline step after response compression — encodes JSON to TOON format | ✅ Active |
 
 Claude Code v2 requires plugins to be sourced from a registered marketplace. We expose the adapter's `claude-code/` directory as a single-plugin marketplace (`anolisa-tokenless`), then install `tokenless@anolisa-tokenless` from it. The marketplace name is component-scoped so multiple ANOLISA components can each register their own without colliding.
+
+On Claude Code 2.1.121 or newer, a compressed result can direct the model to
+run `tokenless retrieve` through Bash. The successful command result bypasses
+compression and restores the complete payload.
 
 ### Install
 
@@ -631,13 +673,55 @@ The installer creates a `tokenless.js` symbolic link in OpenCode's global
 `OPENCODE_CONFIG_DIR`, `XDG_CONFIG_HOME`, and the explicit
 `TOKENLESS_OPENCODE_CONFIG_DIR` override.
 
+If a response contains a Retrieve Marker, OpenCode can run the embedded
+`tokenless retrieve` command through its existing shell tool. The adapter sends
+the successful recovery result through the Core bypass without recompressing it.
+
+## QwenPaw Plugin
+
+The QwenPaw adapter is a native QwenPaw plugin. Its `plugin.py` registers an
+AgentScope middleware through `api.register_middleware` and a
+`tokenless_retrieve` tool through `api.register_tool`, and calls the in-process
+`anolisa_tokenless.TokenlessSdk` directly:
+
+| Feature | Middleware hook | Behavior | Status |
+|---|---|---|---|
+| Schema compression | `on_model_call` | Compresses tool schemas and appends the retrieve tool | ✅ Active |
+| Command rewriting | `on_acting` | Rewrites `execute_shell_command` input via RTK after QwenPaw's approval step | ✅ Active |
+| Response + TOON compression | `on_acting` | Replaces text blocks of the tool result for QwenPaw's built-in tools; file readers and tools outside the built-in table pass through untouched | ✅ Active |
+| Recovery | `tokenless_retrieve` tool | Restores omitted content from the hash in a visible recovery instruction | ✅ Active |
+
+```bash
+make qwenpaw-install
+```
+
+The installer runs `qwenpaw plugin install <bundle> --force`; QwenPaw copies the
+bundle into `<working dir>/plugins/tokenless/` (`QWENPAW_WORKING_DIR`, else
+`COPAW_WORKING_DIR`, else an existing `~/.copaw`, else `~/.qwenpaw`) and installs
+the `anolisa_tokenless` wheel listed in `requirements.txt` from the matching
+GitHub Release. Records are written under `<workspace>/.tokenless`.
+
 ## DeepSeek Harness Plugin
 
-The native DSH bundle compresses successful single-block JSON tool results
-through `tools/post-execute` and keeps the original result unless the Tokenless
-CLI returns strictly smaller valid JSON. Content-retrieval tools remain
-lossless by default. Environment-error attribution stays active when response
-compression is disabled, skipped, or unable to reduce the result.
+The native DSH bundle sends replaceable single-text tool results through
+Tokenless PostTool Core on `tools/post-execute`. Core owns content detection,
+JSON cleanup, TOON selection, acceptance, and environment-error diagnostics.
+When a reduced response contains a Retrieve Marker, DSH can run the embedded
+`tokenless retrieve` command through its existing shell tool. The adapter
+classifies the successful standalone command from `exec.arguments.command` and
+sends its output through the Core Retrieve bypass, so it remains unchanged.
+Recoverable compression is enabled only when bare `tokenless` resolves on the
+shell `PATH` to the same executable selected by `tokenlessBin` or
+`TOKENLESS_BIN` for Core. An absolute plugin-only or different binary is not
+sufficient because the Marker emits the bare command.
+DSH removes inherited `TOKENLESS_*` variables from model shell commands, so the
+adapter publishes the selected state directory and optional statistics/Stash
+database overrides as managed DSH shell facts. Core uses the same paths. The
+data directory defaults to `.tokenless` in the session workspace and contains
+a self-ignoring `.gitignore`; set `TOKENLESS_DATA_DIR`, `TOKENLESS_STATS_DB`, or
+`TOKENLESS_STASH_DB` before starting DSH to select other absolute paths that
+DSH's shell sandbox can access.
+Error guidance stays active when response compression is disabled.
 
 Enable the bundle for every desired DSH profile in one command by repeating
 `--profile`:
@@ -726,7 +810,7 @@ agent = Agent(
 )
 ```
 
-AgentScope App is supported from 2.0.1. It derives an isolated Tokenless data
+AgentScope App is supported from 2.0.3. It derives an isolated Tokenless data
 directory for every user/agent/session below the configured absolute base
 directory:
 
@@ -736,15 +820,18 @@ from agentscope.app import create_app
 app = create_app(..., **integration.app_options())
 ```
 
+`app_options()` supplies one Middleware factory. AgentScope publishes that
+Middleware instance's static Retrieve Tool through `list_tools()` and persists
+Marker authorization in `AgentState.middle_context`.
+
 Set a unique `retrieve_tool_name` in `TokenlessConfig` if the application
 already defines `tokenless_retrieve`; App assembly does not expose the other
 tools to this factory for a preflight collision check.
 
-AgentScope 2.0.0 does not expose App-level Agent middleware or Tool injection,
-so that patch release supports direct Agent construction only. The existing
-`TokenlessMiddleware` 2.x API remains available for compatibility; new code
-should use `TokenlessAgentScope` so it does not depend on patch-specific
-Toolkit mutation or automatic Tool collection.
+AgentScope 2.0.0 through 2.0.2 support direct Agent construction only; their App
+APIs do not provide both Middleware-owned Tool publication and persisted
+Middleware state. The existing `TokenlessMiddleware` 2.x API remains available
+for compatibility; new code should use `TokenlessAgentScope`.
 
 AgentScope supplies explicit contracts for its known shell, file, and API tools.
 Register every custom tool with `ToolContract`: select `COMMAND_OUTPUT`,
@@ -754,9 +841,10 @@ at the model boundary rather than guessing from output text. Compression
 thresholds, TOON selection, diagnostics, and retrieval authorization remain in
 Rust Core.
 
-The read-only retrieval Tool is published to the
-model only when a marker is visible and accepts only a hash from the exact
-marker set retained for that model call. Pass a different absolute `data_dir`
+The read-only retrieval Tool has a static declaration and remains in the model
+tool list across calls, avoiding tool-list churn when Marker visibility changes.
+It accepts only a hash from the exact Marker set retained for the current model
+call. Pass a different absolute `data_dir`
 to each user or tenant for direct Agents;
 `TOKENLESS_DATA_DIR` is only a process-wide fallback when `data_dir` is omitted.
 Retain the default one-hour stash TTL unless the application has a deliberate
@@ -771,6 +859,10 @@ transformed. Tool Ready remains hard-disabled.
 
 
 ## Build
+
+For installed-package checks and optional real Agent tasks, see the
+[release regression suite](tests/release_regression/README.md). It reports
+tool-output savings and retrieval overhead separately.
 
 | Target | Description |
 |---|---|
@@ -803,6 +895,8 @@ transformed. Tool Ready remains hard-disabled.
 | `make codex-uninstall` | Remove Codex plugin |
 | `make opencode-install` | Install OpenCode local plugin |
 | `make opencode-uninstall` | Remove OpenCode local plugin |
+| `make qwenpaw-install` | Install QwenPaw plugin via the qwenpaw CLI |
+| `make qwenpaw-uninstall` | Remove QwenPaw plugin |
 | `make setup` | Full setup: build + install + all adapters |
 
 Override install paths:
@@ -850,7 +944,7 @@ layout and single-target interface.
 |---|---|
 | `crates/tokenless-cli/` | CLI binary — `tokenless` command (compress, stats, env-check) |
 | `crates/tokenless-schema/` | BeforeModel tool-schema compression — `SchemaCompressor` |
-| `crates/tokenless-compressors/` | Content-domain engines — phase one wires only `JsonCompressor` into PostTool |
+| `crates/tokenless-compressors/` | Content-domain engines — `JsonCompressor` and `BuildLogCompressor` are connected to PostTool |
 | `crates/tokenless-runtime/` | Lifecycle API and Runtime-owned `PostToolPipeline`, shared by CLI and language bindings |
 | `crates/tokenless-protocol/` | Versioned adapter contract and shared `heuristic-v1` token estimator |
 | `python/tokenless/` | PyO3 package exposing `anolisa_tokenless` for CPython 3.11+ |
@@ -861,6 +955,7 @@ layout and single-target interface.
 | `adapters/tokenless/claude-code/` | Claude Code adapter — marketplace + plugin + hooks dispatcher |
 | `adapters/tokenless/codex/` | Codex adapter — plugin + Python hook scripts |
 | `adapters/tokenless/opencode/` | OpenCode adapter — local JavaScript plugin + lifecycle scripts |
+| `adapters/tokenless/qwenpaw/` | QwenPaw adapter — plugin manifest, AgentScope middleware, wheel requirements + lifecycle scripts |
 | `third_party/rtk/` | RTK vendored source — command rewriting engine (justfile clone+patch) |
 | `third_party/patches/` | Patches for vendored third_party sources |
 | `packaging/raw/` | Component-owned ANOLISA raw packer and target validation |

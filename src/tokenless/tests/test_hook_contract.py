@@ -155,6 +155,65 @@ class ResponseHookContract(unittest.TestCase):
                 result = self.run_case(agent, "applied")
                 self.assertEqual(result.envelope, self.expected_replacement(agent))
                 self.assertEqual(result.spawns, ["compress"])
+                self.assertEqual(
+                    result.requests[0]["input"]["capabilities"]["recovery"]["kind"], "shell"
+                )
+
+    def test_retrieve_command_is_bypassed(self):
+        marker = "<<tokenless:0123456789abcdef01234567>>"
+        payload = json.loads(self.fixture)
+        payload.update(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": f"tokenless retrieve '{marker}'"},
+            }
+        )
+        for agent in self.REPLACEMENT_AGENTS:
+            with self.subTest(agent=agent):
+                result = contract_runner.run_case(
+                    corpus.RESPONSE_HOOK,
+                    json.dumps(payload),
+                    corpus.RESPONSE_AGENTS[agent],
+                    "applied",
+                )
+                self.assertEqual(result.envelope, {})
+                self.assertEqual(result.spawns, ["compress"])
+                request = result.requests[0]["input"]
+                self.assertEqual(request["result_kind"], "retrieve")
+                self.assertEqual(request["capabilities"]["recovery"]["kind"], "none")
+
+    def test_fallback_binary_does_not_advertise_marker_recovery(self):
+        result = contract_runner.run_case(
+            corpus.RESPONSE_HOOK,
+            self.fixture,
+            corpus.RESPONSE_AGENTS["claude-code"],
+            "applied",
+            tokenless_on_path=False,
+        )
+
+        self.assertEqual(result.spawns, ["compress"])
+        self.assertEqual(result.requests[0]["input"]["capabilities"]["recovery"]["kind"], "none")
+
+    def test_failed_retrieve_command_remains_a_tool_error(self):
+        marker = "<<tokenless:0123456789abcdef01234567>>"
+        payload = json.loads(self.fixture)
+        payload.update(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": f"tokenless retrieve '{marker}'"},
+                "is_error": True,
+            }
+        )
+        result = contract_runner.run_case(
+            corpus.RESPONSE_HOOK,
+            json.dumps(payload),
+            corpus.RESPONSE_AGENTS["claude-code"],
+            "passthrough",
+        )
+        request = result.requests[0]["input"]
+        self.assertEqual(request["status"], "error")
+        self.assertEqual(request["result_kind"], "tool")
+        self.assertEqual(request["capabilities"]["recovery"]["kind"], "none")
 
     def test_fail_open_classes_pass_through(self):
         for agent in self.REPLACEMENT_AGENTS:
@@ -170,6 +229,10 @@ class ResponseHookContract(unittest.TestCase):
                 result = self.run_case("qwencode", behavior)
                 self.assertEqual(result.envelope, {})
                 self.assertEqual(result.spawns, ["compress"])
+                if result.requests:
+                    self.assertEqual(
+                        result.requests[0]["input"]["capabilities"]["recovery"], {"kind": "none"}
+                    )
 
     def test_missing_binary_passes_through(self):
         for agent in self.REPLACEMENT_AGENTS:
@@ -232,6 +295,9 @@ class SchemaHookContract(unittest.TestCase):
                 result = self.run_case(agent, "applied")
                 self.assertEqual(result.envelope, expected)
                 self.assertEqual(result.spawns, ["compress"])
+                self.assertEqual(
+                    result.requests[0]["input"]["capabilities"]["recovery"]["kind"], "none"
+                )
 
     def test_no_savings_wraps_the_original(self):
         # The historical schema-hook behavior: a well-formed response whose

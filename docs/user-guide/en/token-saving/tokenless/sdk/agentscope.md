@@ -15,21 +15,21 @@ AgentScope layer. Product adapters such as Claude Code and OpenCode are document
 | AgentScope version | Supported entry point |
 |--------------------|-----------------------|
 | 1.0.11 through 1.0.x | Tokenless Toolkit plus `install(..., session_id=...)` |
-| 2.0.0 | Direct Agent construction with `integration.tools` and `integration.middlewares` |
-| 2.0.1 through 2.0.x | Direct Agent construction or App through `integration.app_options()` |
+| 2.0.0 through 2.0.2 | Direct Agent construction with `integration.tools` and `integration.middlewares` |
+| 2.0.3 through 2.0.x | Direct Agent construction or App through `integration.app_options()` |
 
 ## Install
 
 The AgentScope integration wheel requires the exact same version of the native Runtime wheel.
 Install both assets from the same Tokenless GitHub Release in one command. For example, install
-[v0.7.14](https://github.com/alibaba/anolisa/releases/tag/tokenless/v0.7.14) on Linux x86_64:
+[v0.8.0](https://github.com/alibaba/anolisa/releases/tag/tokenless/v0.8.0) on Linux x86_64:
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install \
-  "https://github.com/alibaba/anolisa/releases/download/tokenless/v0.7.14/anolisa_tokenless-0.7.14-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
-  "https://github.com/alibaba/anolisa/releases/download/tokenless/v0.7.14/anolisa_tokenless_agentscope-0.7.14-py3-none-any.whl"
+  "https://github.com/alibaba/anolisa/releases/download/tokenless/v0.8.0/anolisa_tokenless-0.8.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
+  "https://github.com/alibaba/anolisa/releases/download/tokenless/v0.8.0/anolisa_tokenless_agentscope-0.8.0-py3-none-any.whl"
 ```
 
 For Linux aarch64 or macOS Apple silicon, replace the native Runtime URL with the matching asset
@@ -105,7 +105,7 @@ behavior.
 
 ## AgentScope App
 
-AgentScope App is supported from 2.0.1. `app_options()` derives an isolated Tokenless data directory
+AgentScope App is supported from 2.0.3. `app_options()` derives an isolated Tokenless data directory
 for every user/agent/session below the configured absolute base directory:
 
 ```python
@@ -118,8 +118,12 @@ integration = TokenlessAgentScope(
 app = create_app(..., **integration.app_options())
 ```
 
-AgentScope 2.0.0 does not provide App-level Agent middleware or Tool injection, so it supports
-direct Agent construction only.
+`app_options()` supplies one Middleware factory. AgentScope publishes that Middleware instance's
+static Retrieve Tool through `list_tools()` and persists Marker authorization in
+`AgentState.middle_context`.
+
+AgentScope 2.0.0 through 2.0.2 support direct Agent construction only; their App APIs do not
+provide both Middleware-owned Tool publication and persisted Middleware state.
 
 ## Configuration and behavior
 
@@ -143,9 +147,10 @@ objects, and transforms only copied call arguments and final model-visible text.
 the original whenever an optimization fails or does not make the UTF-8 result strictly smaller.
 `DataBlock` values are never changed.
 
-The integration exposes a retrieval Tool named `tokenless_retrieve` by default. It is published to
-the model only when a marker is visible and accepts a complete marker or exact 24-character
-hexadecimal hash retained for that model call. Retrieve output bypasses PostTool.
+The integration exposes a retrieval Tool named `tokenless_retrieve` by default. Its declaration is
+static and remains in the model tool list across calls, so Marker visibility does not churn the
+tool list. It accepts only a complete marker or exact 24-character hexadecimal hash retained for
+the current model call. Retrieve output bypasses PostTool.
 
 Pass a separate absolute `data_dir` for every user or tenant. `TOKENLESS_DATA_DIR` is only a
 process-wide fallback and must not be shared by multiple tenants. Retrieval does not work across
