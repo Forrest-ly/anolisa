@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use tokenless_ccr::StashStore;
+use tokenless_ccr::{SqliteStore, StashStore, extract_hash};
 use tokenless_runtime::{CompressOptions, MIN_TOON_CHARS, compress_response_with_store};
 use tokenless_stats::{
     CompressionMode, OperationType, StatsRecord, StatsRecorder, estimate_tokens,
@@ -524,7 +524,7 @@ fn compress_response_stats_use_unicode_aware_estimates() {
         .args([
             "compress-response",
             "--truncate-strings-at",
-            "80",
+            "120",
             "--no-stash",
             "--agent-id",
             "integration-agent",
@@ -668,8 +668,8 @@ fn no_stash_response_to_toon_roundtrip_is_decodable() {
     // success. The marker now carries the `, not stashed` clause, which
     // forces TOON quoting, so the whole pipeline must round-trip and the
     // paired decoder must accept the TOON output.
-    let bad: Vec<serde_json::Value> = (0..60)
-        .map(|i| serde_json::json!({ "id": i, "value": "x" }))
+    let bad: Vec<String> = (0..60)
+        .map(|i| format!("result-{i}-{}", "x".repeat(80)))
         .collect();
     let good: Vec<serde_json::Value> = (0..5)
         .map(|i| serde_json::json!({ "identifier": i, "repeated_field_alpha": "alpha-value" }))
@@ -780,7 +780,7 @@ fn retrieve_stdout_is_byte_exact_without_extra_trailing_newline() {
         .args([
             "compress-response",
             "--truncate-strings-at",
-            "80",
+            "120",
             "--stash-db",
         ])
         .arg(&stash_db)
@@ -800,14 +800,8 @@ fn retrieve_stdout_is_byte_exact_without_extra_trailing_newline() {
         String::from_utf8_lossy(&compressed.stderr)
     );
     let compressed_text = String::from_utf8_lossy(&compressed.stdout);
-    let marker_start = compressed_text
-        .find("<<tokenless:")
-        .expect("compressed output should contain a stash marker");
-    let marker_end = compressed_text[marker_start..]
-        .find(">>")
-        .map(|i| marker_start + i + 2)
-        .expect("stash marker should be closed");
-    let marker = &compressed_text[marker_start..marker_end];
+    let marker = tokenless_ccr::extract_hash(&compressed_text)
+        .expect("compressed output should contain a recovery instruction");
 
     let retrieved = fixture
         .command()
@@ -862,14 +856,8 @@ fn retrieve_records_events_and_summary_reports_attribution() {
     let response: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
     let marker_text = response["result"]["output"].as_str().unwrap();
-    let marker_start = marker_text
-        .find("<<tokenless:")
-        .expect("array truncation should emit a stash marker");
-    let marker_end = marker_text[marker_start..]
-        .find(">>")
-        .map(|i| marker_start + i + 2)
-        .expect("stash marker should be closed");
-    let marker = &marker_text[marker_start..marker_end];
+    let marker = tokenless_ccr::extract_hash(marker_text)
+        .expect("array truncation should emit a recovery instruction");
 
     let hit = fixture
         .command()
@@ -1776,7 +1764,7 @@ fn spawn_with_stdin(
         .unwrap()
 }
 
-fn post_tool_request_json(content: &str, retrieval_available: bool, session_id: &str) -> String {
+fn post_tool_request_json(content: &str, recovery_available: bool, session_id: &str) -> String {
     serde_json::json!({
         "protocol_version": 2,
         "operation": "post_tool",
@@ -1794,7 +1782,7 @@ fn post_tool_request_json(content: &str, retrieval_available: bool, session_id: 
             "output_optimization": "none",
             "capabilities": {
                 "replace_output": true,
-                "retrieval_available": retrieval_available,
+                "recovery": {"kind": if recovery_available { "shell" } else { "none" }},
                 "replace_with_text": false
             }
         }
@@ -1852,6 +1840,168 @@ fn compress_post_tool_uses_the_v2_result_envelope() {
 }
 
 #[test]
+fn compress_post_tool_dry_run_previews_record_reduction_without_stash_writes() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let records = (0..200)
+        .map(|index| {
+            serde_json::json!({
+                "id": index,
+                "message": format!("record-{index}-{}", "x".repeat(80))
+            })
+        })
+        .collect::<Vec<_>>();
+    let content = serde_json::to_string(&records).unwrap();
+    let output = spawn_with_stdin(
+        fixture
+            .command()
+            .env("TOKENLESS_COMPRESSION_ENABLED", "0")
+            .env("TOKENLESS_STATS_ENABLED", "0")
+            .env("TOKENLESS_SLS_ENABLED", "0"),
+        &["compress"],
+        &post_tool_request_json(&content, true, "record-dry-run"),
+    );
+
+    assert!(
+        output.status.success(),
+        "compress failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["result"]["disposition"], "dry_run");
+    assert_eq!(response["result"]["output"], content);
+    assert!(
+        response["result"]["after_tokens"].as_u64().unwrap()
+            < response["result"]["before_tokens"].as_u64().unwrap()
+    );
+
+    let store = SqliteStore::new(fixture.data_dir.join("stash.db")).unwrap();
+    assert_eq!(store.len(), 0);
+}
+
+fn build_log_request(content: &str, status: &str, session_id: &str) -> String {
+    serde_json::json!({
+        "protocol_version": 2,
+        "operation": "post_tool",
+        "attribution": {
+            "agent_id": "integration-agent",
+            "session_id": session_id,
+            "tool_use_id": "call-1"
+        },
+        "input": {
+            "result_kind": "tool",
+            "tool_name": "Bash",
+            "content": content,
+            "status": status,
+            "content_origin": "command_output",
+            "output_optimization": "none",
+            "capabilities": {
+                "replace_output": true,
+                "recovery": {"kind": "shell"},
+                "replace_with_text": true
+            }
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn compress_post_tool_reduces_and_restores_build_logs() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let mut content = "$ cargo build\n".to_owned();
+    for index in 0..30 {
+        content.push_str(&format!(
+            "Compiling package-{index:03} v0.1.{index} with extended progress output\n"
+        ));
+    }
+    content.push_str("Finished `dev` profile [unoptimized] target(s) in 1.2s\n");
+    let output = spawn_with_stdin(
+        fixture
+            .command()
+            .env("TOKENLESS_COMPRESSION_ENABLED", "1")
+            .env("TOKENLESS_STATS_ENABLED", "0")
+            .env("TOKENLESS_SLS_ENABLED", "0"),
+        &["compress"],
+        &build_log_request(&content, "success", "build-log"),
+    );
+    assert!(
+        output.status.success(),
+        "compress failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["result"]["disposition"], "applied");
+    assert_eq!(response["result"]["content_type"], "build_log");
+    assert_eq!(
+        response["result"]["applied_operations"],
+        serde_json::json!(["build_log_reduction"])
+    );
+    assert_eq!(response["result"]["recoverability"], "retrievable");
+    let compressed = response["result"]["output"].as_str().unwrap();
+    let hash = extract_hash(compressed).unwrap();
+    let retrieve = fixture
+        .command()
+        .env("TOKENLESS_STATS_ENABLED", "0")
+        .args(["retrieve", hash])
+        .output()
+        .unwrap();
+    assert!(retrieve.status.success());
+    assert!(
+        String::from_utf8(retrieve.stdout)
+            .unwrap()
+            .contains("package-015")
+    );
+}
+
+#[test]
+fn compress_post_tool_error_build_log_stays_original_with_diagnosis() {
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let mut content = "$ cargo build\n".to_owned();
+    for index in 0..30 {
+        content.push_str(&format!(
+            "Compiling package-{index:03} v0.1.{index} with extended progress output\n"
+        ));
+    }
+    content.push_str("error: linker command not found\n");
+    let output = spawn_with_stdin(
+        fixture
+            .command()
+            .env("TOKENLESS_COMPRESSION_ENABLED", "1")
+            .env("TOKENLESS_STATS_ENABLED", "0")
+            .env("TOKENLESS_SLS_ENABLED", "0"),
+        &["compress"],
+        &build_log_request(&content, "error", "build-log-error"),
+    );
+    assert!(
+        output.status.success(),
+        "compress failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["result"]["disposition"], "tool_error");
+    assert_eq!(response["result"]["content_type"], "build_log");
+    assert_eq!(response["result"]["output"], content);
+    assert_eq!(
+        response["result"]["applied_operations"],
+        serde_json::json!([])
+    );
+    assert!(
+        response["result"]["additional_context"]
+            .as_str()
+            .unwrap()
+            .contains("ENV_DEPENDENCY_MISSING")
+    );
+}
+
+#[test]
 fn compress_before_model_and_retrieve_operations_are_dispatched() {
     let fixture = match TempDataDir::new() {
         Some(fixture) => fixture,
@@ -1873,7 +2023,7 @@ fn compress_before_model_and_retrieve_operations_are_dispatched() {
             "visible_context": {"messages": []},
             "capabilities": {
                 "replace_tools": true,
-                "retrieval_available": true
+                "recovery": {"kind": "tool", "name": "tokenless_retrieve"}
             }
         }
     });

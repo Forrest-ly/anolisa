@@ -3,8 +3,9 @@
 Hermes cannot replace tool arguments on older supported releases, so PreTool
 blocks a shell call and suggests the Core-rewritten command. PostTool sends the
 final model-bound result to Core and applies only the returned disposition.
-Schema compression and trusted agent-facing Retrieve are not available from
-the Hermes hook surface. Tool Ready remains product-wide hard-disabled.
+Schema compression is not available from the Hermes hook surface. Marker-directed
+recovery uses Hermes's existing shell tool and the trusted local Tokenless CLI.
+Tool Ready remains product-wide hard-disabled.
 
 Activation is controlled by the Hermes plugin system — list ``tokenless`` in
 ``plugins.enabled`` in ``config.yaml``, or enable via
@@ -87,6 +88,7 @@ def _resolve_hook_utils() -> tuple[str, list[str]]:
     # (NOT $HOME — env-controllable).
     try:
         import pwd as _pwd
+
         real_home = _pwd.getpwuid(os.getuid()).pw_dir
     except (ImportError, KeyError):
         real_home = ""
@@ -105,11 +107,14 @@ def _resolve_hook_utils() -> tuple[str, list[str]]:
     xdg_data = os.environ.get("XDG_DATA_HOME", "")
     if xdg_data and os.path.isabs(xdg_data):
         candidates.append(
-            os.path.join(xdg_data, "anolisa", "adapters", "tokenless", "common", "hooks"))
+            os.path.join(xdg_data, "anolisa", "adapters", "tokenless", "common", "hooks")
+        )
     if real_home:
         candidates.append(
-            os.path.join(real_home, ".local", "share",
-                         "anolisa", "adapters", "tokenless", "common", "hooks"))
+            os.path.join(
+                real_home, ".local", "share", "anolisa", "adapters", "tokenless", "common", "hooks"
+            )
+        )
 
     rejections: list[str] = []
     for candidate in candidates:
@@ -134,18 +139,22 @@ def _resolve_hook_utils() -> tuple[str, list[str]]:
 _HOOK_UTILS_RESOLVED, _HOOK_UTILS_CANDIDATES = _resolve_hook_utils()
 
 from hook_utils import (
-    _TOKENLESS_FALLBACK,
-    _TOKENLESS_LOCAL_SHARE,
-    _TOKENLESS_LOCAL_LIB,
     _RTK_FALLBACK,
-    _RTK_LOCAL_SHARE,
     _RTK_LOCAL_LIB,
-    resolve_binary,
-    SKIP_TOOLS as _SKIP_TOOLS_SHARED,
-    SHELL_TOOLS as _SHELL_TOOLS_SHARED,
+    _RTK_LOCAL_SHARE,
+    _TOKENLESS_FALLBACK,
+    _TOKENLESS_LOCAL_LIB,
+    _TOKENLESS_LOCAL_SHARE,
+)
+from hook_utils import SHELL_TOOLS as _SHELL_TOOLS_SHARED
+from hook_utils import SKIP_TOOLS as _SKIP_TOOLS_SHARED
+from hook_utils import (
     build_post_tool_request,
     build_pre_tool_request,
+    is_tokenless_retrieve_command,
+    resolve_binary,
     run_compress,
+    tokenless_retrieve_command_available,
 )
 
 logger = logging.getLogger(__name__)
@@ -158,7 +167,8 @@ AGENT_ID = "hermes-agent"
 _COMPRESS_TIMEOUT_SECONDS = 8
 
 _SKIP_TOOLS: set[str] = _SKIP_TOOLS_SHARED | {
-    "session_search", "list_sessions",
+    "session_search",
+    "list_sessions",
 }
 
 # Use shared SHELL_TOOLS directly - all tools (including "terminal") are now
@@ -285,9 +295,7 @@ def on_pre_tool_call(
         replace_arguments=False,
         block_and_suggest=True,
     )
-    result = run_compress(
-        tokenless_bin, request, _COMPRESS_TIMEOUT_SECONDS, "pre_tool"
-    )
+    result = run_compress(tokenless_bin, request, _COMPRESS_TIMEOUT_SECONDS, "pre_tool")
     if not isinstance(result, dict):
         return None
     rewritten_args = result.get("arguments")
@@ -326,27 +334,62 @@ def on_transform_tool_result(
     tokenless_bin = _resolve_binary("tokenless", _TOKENLESS_FALLBACK)
     if not tokenless_bin:
         return None
+    output_optimization = _output_optimization(args)
+    retrieve_result = protocol_status == "success" and is_tokenless_retrieve_command(
+        tool_name, args
+    )
+
+    # Hermes's terminal tool returns a JSON envelope whose `output` field is
+    # the model-visible command output. Compress that field so structured JSON
+    # produced by the command remains visible to JsonCompressor, then restore
+    # the host envelope below. Other tools already expose their model-bound
+    # result directly and must keep the existing path.
+    shell_envelope = None
+    content = result
+    if tool_name in _SHELL_TOOLS:
+        try:
+            parsed_result = json.loads(result)
+        except json.JSONDecodeError:
+            parsed_result = None
+        if isinstance(parsed_result, dict) and isinstance(parsed_result.get("output"), str):
+            shell_envelope = parsed_result
+            content = parsed_result["output"]
+
     request = build_post_tool_request(
-        result,
+        content,
         AGENT_ID,
         tool_name,
         protocol_status,
         _content_origin(tool_name),
-        _output_optimization(args),
-        str(session_id),
-        str(tool_call_id),
+        output_optimization,
+        result_kind="retrieve" if retrieve_result else "tool",
+        recovery={
+            "kind": (
+                "shell"
+                if (
+                    protocol_status == "success"
+                    and output_optimization == "none"
+                    and not retrieve_result
+                    and tokenless_retrieve_command_available()
+                )
+                else "none"
+            )
+        },
+        session_id=str(session_id),
+        tool_use_id=str(tool_call_id),
         replace_output=True,
         replace_with_text=True,
     )
-    response = run_compress(
-        tokenless_bin, request, _COMPRESS_TIMEOUT_SECONDS, "post_tool"
-    )
+    response = run_compress(tokenless_bin, request, _COMPRESS_TIMEOUT_SECONDS, "post_tool")
     if not isinstance(response, dict):
         return None
     if response.get("disposition") == "applied":
         output = response.get("output")
         if isinstance(output, str):
             logger.info("tokenless: Core optimized %s", tool_name)
+            if shell_envelope is not None:
+                shell_envelope["output"] = output
+                return json.dumps(shell_envelope, ensure_ascii=False)
             return output
         return None
     if response.get("disposition") == "tool_error":

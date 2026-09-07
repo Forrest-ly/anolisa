@@ -4,13 +4,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokenless_ccr::StashStore;
+use tokenless_ccr::{InMemoryStore, StashStore, StashWrite};
 use tokenless_compressors::{
-    JsonCompressionConfig, JsonCompressionContext, JsonCompressor, JsonOperation,
+    BuildLogCompressor, BuildLogOperation, JsonCompressionConfig, JsonCompressionContext,
+    JsonCompressor, JsonOperation,
 };
 use tokenless_protocol::{
     AppliedOperation, BYTE_ESTIMATOR_ID, ContentOrigin, ContentType, Disposition, PostToolRequest,
-    PostToolResponse, Recoverability, TOKENIZER_ID, estimate_tokens, estimate_tokens_from_bytes,
+    PostToolResponse, Recoverability, TOKENIZER_ID, ToolResultStatus, estimate_tokens,
+    estimate_tokens_from_bytes,
 };
 
 use super::arbitration::{ArbitrationInput, Verdict, decide};
@@ -37,14 +39,14 @@ pub(crate) struct PostToolPipelineConfig {
 pub(crate) struct PostToolRun {
     pub(crate) response: PostToolResponse,
     pub(crate) candidate: Option<String>,
-    pub(crate) operations: Vec<JsonOperation>,
+    pub(crate) operations: Vec<AppliedOperation>,
     pub(crate) stash_writes: Option<usize>,
     pub(crate) stash_errors: Option<usize>,
     pub(crate) stash_size: Option<usize>,
     pub(crate) unrecoverable_truncations: Option<usize>,
 }
 
-/// The first Runtime-owned PostTool pipeline, dispatching only JSON.
+/// Runtime-owned PostTool pipeline for statically dispatched content domains.
 pub(crate) struct PostToolPipeline;
 
 /// Error returned when the selected domain compressor fails.
@@ -71,6 +73,9 @@ impl PostToolPipeline {
         }
         let before_tokens = estimate_tokens(&request.content) as u64;
         let content_type = detect(&request.content);
+        if request.status == ToolResultStatus::Error {
+            return Ok(passthrough(request, before_tokens, content_type));
+        }
         if !request.capabilities.replace_output
             || request.content_origin == ContentOrigin::FileContent
             || request.content.chars().count() < config.min_input_chars
@@ -81,47 +86,85 @@ impl PostToolPipeline {
         let json_candidate = config.force_json
             || content_type == ContentType::Json
             || is_wrapped_structured_json(&request.content);
-        if !json_candidate {
+        let build_log_candidate = content_type == ContentType::BuildLog
+            && request.content_origin == ContentOrigin::CommandOutput;
+        if !json_candidate && !build_log_candidate {
             return Ok(passthrough(request, before_tokens, content_type));
         }
 
-        let attached_store = if config.stash_enabled
-            && config.compression_enabled
-            && request.capabilities.retrieval_available
-        {
-            stash_store
+        let dry_run_store = (!config.compression_enabled
+            && config.stash_enabled
+            && request.capabilities.recovery.is_available()
+            && stash_store.is_some())
+        .then(InMemoryStore::new);
+        let attached_store: Option<&dyn StashStore> =
+            if config.stash_enabled && request.capabilities.recovery.is_available() {
+                if config.compression_enabled {
+                    stash_store.map(AsRef::as_ref)
+                } else {
+                    dry_run_store.as_ref().map(|store| store as &dyn StashStore)
+                }
+            } else {
+                None
+            };
+        let candidate = if json_candidate {
+            let context = JsonCompressionContext {
+                recovery: &request.capabilities.recovery,
+                stash: attached_store,
+                allow_toon: config.allow_toon && request.capabilities.replace_with_text,
+                preserve_top_level_shape: config.preserve_top_level_shape,
+                min_toon_chars: config.min_toon_chars,
+                allow_unrecoverable: !config.require_reversibility || !config.compression_enabled,
+            };
+            let outcome = JsonCompressor::new(config.json.clone())
+                .compress(&request.content, &context)
+                .map_err(|error| PostToolPipelineError(error.to_string()))?;
+            DomainCandidate {
+                output: outcome.output,
+                operations: json_operations(&outcome.operations),
+                recoverability: outcome.recoverability,
+                stash_writes: outcome.stash_writes,
+                stash_errors: outcome.metrics.stash_errors,
+                unrecoverable_truncations: outcome
+                    .operations
+                    .contains(&JsonOperation::Truncation)
+                    .then_some(outcome.metrics.unrecoverable_truncations),
+            }
         } else {
-            None
+            let outcome = BuildLogCompressor.compress_with_recovery(
+                &request.content,
+                attached_store,
+                &request.capabilities.recovery,
+            );
+            DomainCandidate {
+                output: outcome.output,
+                operations: build_log_operations(&outcome.operations),
+                recoverability: outcome.recoverability,
+                stash_writes: outcome.stash_writes,
+                stash_errors: outcome.metrics.stash_errors,
+                unrecoverable_truncations: None,
+            }
         };
-        let context = JsonCompressionContext {
-            stash: attached_store.map(AsRef::as_ref),
-            allow_toon: config.allow_toon && request.capabilities.replace_with_text,
-            preserve_top_level_shape: config.preserve_top_level_shape,
-            min_toon_chars: config.min_toon_chars,
-        };
-        let outcome = JsonCompressor::new(config.json.clone())
-            .compress(&request.content, &context)
-            .map_err(|error| PostToolPipelineError(error.to_string()))?;
 
         let mut ledger = StashLedger::default();
-        for write in outcome.stash_writes {
+        for write in candidate.stash_writes {
             ledger.record(write);
         }
         let verdict = decide(&ArbitrationInput {
             original: &request.content,
-            candidate: &outcome.output,
-            has_operations: !outcome.operations.is_empty(),
-            recoverability: outcome.recoverability,
+            candidate: &candidate.output,
+            has_operations: !candidate.operations.is_empty(),
+            recoverability: candidate.recoverability,
             require_reversibility: config.require_reversibility && config.compression_enabled,
             dry_run: !config.compression_enabled,
             timed_out: started.elapsed() > config.timeout,
         });
 
-        let store = attached_store.map(AsRef::as_ref);
+        let store = attached_store;
         let (output, disposition, stash_keys) = match verdict {
             Verdict::Apply => {
-                let keys = ledger.commit(&outcome.output, store);
-                (outcome.output.clone(), Disposition::Applied, keys)
+                let keys = ledger.commit(&candidate.output, store, &request.capabilities.recovery);
+                (candidate.output.clone(), Disposition::Applied, keys)
             }
             Verdict::DryRun => {
                 ledger.rollback(store);
@@ -134,35 +177,37 @@ impl PostToolPipeline {
         };
         let selected = matches!(verdict, Verdict::Apply | Verdict::DryRun);
         let after_tokens = if selected {
-            estimate_tokens(&outcome.output) as u64
+            estimate_tokens(&candidate.output) as u64
         } else {
             before_tokens
         };
         let response_operations = if matches!(verdict, Verdict::Apply) {
-            applied_operations(&outcome.operations)
+            candidate.operations.clone()
         } else {
             Vec::new()
         };
         let recoverability = if matches!(verdict, Verdict::Apply) {
-            protocol_recoverability(outcome.recoverability)
+            protocol_recoverability(candidate.recoverability)
         } else {
             Recoverability::Lossless
         };
-        let unrecoverable_truncations = if !outcome.operations.contains(&JsonOperation::Truncation)
-            || !config.compression_enabled
-        {
+        let unrecoverable_truncations = if !config.compression_enabled {
             None
-        } else if attached_store.is_some() || selected {
-            Some(outcome.metrics.unrecoverable_truncations)
         } else {
-            None
+            candidate
+                .unrecoverable_truncations
+                .filter(|_| attached_store.is_some() || selected)
         };
-        let store_attached = attached_store.is_some();
+        let persistent_store_attached = config.compression_enabled && attached_store.is_some();
         Ok(PostToolRun {
             response: PostToolResponse {
                 output,
                 disposition,
-                content_type: Some(ContentType::Json),
+                content_type: Some(if json_candidate {
+                    ContentType::Json
+                } else {
+                    ContentType::BuildLog
+                }),
                 applied_operations: response_operations,
                 recoverability,
                 before_tokens,
@@ -171,14 +216,28 @@ impl PostToolPipeline {
                 tokenizer_id: TOKENIZER_ID.to_owned(),
                 additional_context: None,
             },
-            candidate: Some(outcome.output),
-            operations: outcome.operations,
-            stash_writes: store_attached.then(|| ledger.live_writes()),
-            stash_errors: store_attached.then(|| outcome.metrics.stash_errors + ledger.errors()),
-            stash_size: attached_store.map(|store| store.len()),
+            candidate: Some(candidate.output),
+            operations: candidate.operations,
+            stash_writes: persistent_store_attached.then(|| ledger.live_writes()),
+            stash_errors: persistent_store_attached
+                .then(|| candidate.stash_errors + ledger.errors()),
+            stash_size: if persistent_store_attached {
+                attached_store.map(StashStore::len)
+            } else {
+                None
+            },
             unrecoverable_truncations,
         })
     }
+}
+
+struct DomainCandidate {
+    output: String,
+    operations: Vec<AppliedOperation>,
+    recoverability: tokenless_compressors::Recoverability,
+    stash_writes: Vec<StashWrite>,
+    stash_errors: usize,
+    unrecoverable_truncations: Option<usize>,
 }
 
 fn is_wrapped_structured_json(content: &str) -> bool {
@@ -209,13 +268,24 @@ fn passthrough(
     }
 }
 
-fn applied_operations(operations: &[JsonOperation]) -> Vec<AppliedOperation> {
+fn json_operations(operations: &[JsonOperation]) -> Vec<AppliedOperation> {
     operations
         .iter()
         .map(|operation| match operation {
             JsonOperation::Cleanup => AppliedOperation::JsonCleanup,
+            JsonOperation::RecordReduction => AppliedOperation::JsonRecordReduction,
             JsonOperation::Truncation => AppliedOperation::JsonTruncation,
             JsonOperation::Toon => AppliedOperation::Toon,
+        })
+        .collect()
+}
+
+fn build_log_operations(operations: &[BuildLogOperation]) -> Vec<AppliedOperation> {
+    operations
+        .iter()
+        .map(|operation| match operation {
+            BuildLogOperation::TerminalCleanup => AppliedOperation::TerminalCleanup,
+            BuildLogOperation::ProgressReduction => AppliedOperation::BuildLogReduction,
         })
         .collect()
 }
@@ -282,7 +352,7 @@ mod tests {
             output_optimization: OutputOptimization::None,
             capabilities: PostToolCapabilities {
                 replace_output: true,
-                retrieval_available: true,
+                recovery: tokenless_protocol::RecoveryMethod::Shell,
                 replace_with_text: true,
             },
         }
@@ -308,6 +378,21 @@ mod tests {
         }
     }
 
+    fn record_array(count: usize) -> String {
+        serde_json::to_string(
+            &(0..count)
+                .map(|index| {
+                    serde_json::json!({
+                        "id": index,
+                        "message": format!("record-{index}-{}", "x".repeat(80)),
+                        "status": "ok"
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn one_json_domain_trace_reaches_one_stash_commit() {
         let input = serde_json::to_string(&serde_json::json!({
@@ -330,7 +415,10 @@ mod tests {
         assert_eq!(run.response.disposition, Disposition::Applied);
         assert_eq!(
             run.operations,
-            [JsonOperation::Cleanup, JsonOperation::Truncation]
+            [
+                AppliedOperation::JsonCleanup,
+                AppliedOperation::JsonTruncation
+            ]
         );
         assert_eq!(
             run.response.applied_operations,
@@ -357,6 +445,67 @@ mod tests {
         .unwrap();
 
         assert_eq!(run.response.disposition, Disposition::NoSavings);
+        assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(concrete.delete_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(concrete.len(), 0);
+    }
+
+    #[test]
+    fn record_reduction_has_one_final_commit_and_protocol_operation() {
+        let concrete = Arc::new(CountingStore::default());
+        let store: Arc<dyn StashStore> = concrete.clone();
+        let run = PostToolPipeline::run(
+            &request(&record_array(40)),
+            &config(Duration::from_secs(1), 32),
+            Some(&store),
+        )
+        .unwrap();
+
+        assert_eq!(run.response.disposition, Disposition::Applied);
+        assert_eq!(run.operations, [AppliedOperation::JsonRecordReduction]);
+        assert_eq!(
+            run.response.applied_operations,
+            [AppliedOperation::JsonRecordReduction]
+        );
+        assert_eq!(run.response.recoverability, Recoverability::Retrievable);
+        assert_eq!(run.response.stash_keys.len(), 1);
+        assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(concrete.delete_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(concrete.len(), 1);
+    }
+
+    #[test]
+    fn record_reduction_dry_run_uses_only_a_temporary_store() {
+        let concrete = Arc::new(CountingStore::default());
+        let store: Arc<dyn StashStore> = concrete.clone();
+        let mut dry_run = config(Duration::from_secs(1), 32);
+        dry_run.compression_enabled = false;
+        dry_run.require_reversibility = true;
+
+        let input = record_array(40);
+        let run = PostToolPipeline::run(&request(&input), &dry_run, Some(&store)).unwrap();
+
+        assert_eq!(run.response.disposition, Disposition::DryRun);
+        assert_eq!(run.response.output, input);
+        assert_eq!(run.operations, [AppliedOperation::JsonRecordReduction]);
+        assert!(run.response.after_tokens < run.response.before_tokens);
+        assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(concrete.delete_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(concrete.len(), 0);
+    }
+
+    #[test]
+    fn record_candidate_with_no_savings_rolls_back_its_single_write() {
+        let input = serde_json::to_string(&vec![serde_json::json!({}); 33]).unwrap();
+        let concrete = Arc::new(CountingStore::default());
+        let store: Arc<dyn StashStore> = concrete.clone();
+        let mut no_cleanup = config(Duration::from_secs(1), 32);
+        no_cleanup.json.drop_empty_fields = false;
+
+        let run = PostToolPipeline::run(&request(&input), &no_cleanup, Some(&store)).unwrap();
+
+        assert_eq!(run.response.disposition, Disposition::NoSavings);
+        assert_eq!(run.response.output, input);
         assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 1);
         assert_eq!(concrete.delete_calls.load(Ordering::Relaxed), 1);
         assert_eq!(concrete.len(), 0);
@@ -400,6 +549,95 @@ mod tests {
         assert!(run.response.applied_operations.is_empty());
         assert_eq!(run.response.recoverability, Recoverability::Lossless);
         assert!(run.response.after_tokens < run.response.before_tokens);
+    }
+
+    fn build_log() -> String {
+        let mut output = "$ cargo build\n".to_owned();
+        for index in 0..30 {
+            output.push_str(&format!(
+                "Compiling package-{index:03} v0.1.{index} with extended progress output\n"
+            ));
+        }
+        output.push_str("Finished `dev` profile [unoptimized] target(s) in 1.2s\n");
+        output
+    }
+
+    fn go_test_log() -> String {
+        (0..30)
+            .map(|index| format!("ok  \tgithub.com/acme/pkg{index:02}\t0.{index:03}s\n"))
+            .collect()
+    }
+
+    fn build_log_config() -> PostToolPipelineConfig {
+        let mut config = config(Duration::from_secs(1), 32);
+        config.force_json = false;
+        config.require_reversibility = true;
+        config
+    }
+
+    #[test]
+    fn one_build_log_domain_reaches_one_final_commit() {
+        let concrete = Arc::new(CountingStore::default());
+        let store: Arc<dyn StashStore> = concrete.clone();
+        let run = PostToolPipeline::run(&request(&build_log()), &build_log_config(), Some(&store))
+            .unwrap();
+
+        assert_eq!(run.response.disposition, Disposition::Applied);
+        assert_eq!(run.response.content_type, Some(ContentType::BuildLog));
+        assert_eq!(run.operations, [AppliedOperation::BuildLogReduction]);
+        assert_eq!(
+            run.response.applied_operations,
+            [AppliedOperation::BuildLogReduction]
+        );
+        assert_eq!(run.response.recoverability, Recoverability::Retrievable);
+        assert_eq!(run.response.stash_keys.len(), 1);
+        assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(concrete.delete_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(concrete.len(), 1);
+    }
+
+    #[test]
+    fn native_go_test_rows_reach_build_log_reduction() {
+        let concrete = Arc::new(CountingStore::default());
+        let store: Arc<dyn StashStore> = concrete.clone();
+        let run =
+            PostToolPipeline::run(&request(&go_test_log()), &build_log_config(), Some(&store))
+                .unwrap();
+
+        assert_eq!(run.response.disposition, Disposition::Applied);
+        assert_eq!(run.response.content_type, Some(ContentType::BuildLog));
+        assert_eq!(run.operations, [AppliedOperation::BuildLogReduction]);
+        assert_eq!(run.response.recoverability, Recoverability::Retrievable);
+        assert_eq!(run.response.stash_keys.len(), 1);
+        assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn build_log_dry_run_uses_only_the_temporary_store() {
+        let concrete = Arc::new(CountingStore::default());
+        let store: Arc<dyn StashStore> = concrete.clone();
+        let mut config = build_log_config();
+        config.compression_enabled = false;
+        let input = build_log();
+
+        let run = PostToolPipeline::run(&request(&input), &config, Some(&store)).unwrap();
+
+        assert_eq!(run.response.disposition, Disposition::DryRun);
+        assert_eq!(run.response.output, input);
+        assert_eq!(run.operations, [AppliedOperation::BuildLogReduction]);
+        assert!(run.response.after_tokens < run.response.before_tokens);
+        assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(concrete.delete_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn build_log_from_non_command_origin_passes_through() {
+        let mut request = request(&build_log());
+        request.content_origin = ContentOrigin::ApiResponse;
+        let run = PostToolPipeline::run(&request, &build_log_config(), None).unwrap();
+        assert_eq!(run.response.disposition, Disposition::Passthrough);
+        assert_eq!(run.response.content_type, Some(ContentType::BuildLog));
+        assert!(run.operations.is_empty());
     }
 
     #[test]

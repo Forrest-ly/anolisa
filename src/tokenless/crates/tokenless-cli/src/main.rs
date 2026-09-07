@@ -92,18 +92,21 @@ enum Commands {
         #[arg(long)]
         truncate_strings_at: Option<usize>,
         /// Array length that triggers truncation; the first n items are
-        /// kept plus a tail window (see --array-tail-preserve)
+        /// kept plus a tail window (see --array-tail-preserve). Arrays of
+        /// at least 33 JSON objects use record reduction instead.
         #[arg(long)]
         truncate_arrays_at: Option<usize>,
-        /// Items preserved from the tail of truncated arrays (default: 8)
+        /// Items preserved from the tail of truncated arrays (default: 8).
+        /// Does not apply to record reduction.
         #[arg(long)]
         array_tail_preserve: Option<usize>,
         /// Max nesting depth before truncation
         #[arg(long)]
         max_depth: Option<usize>,
-        /// Disable reversible stash. By default, dropped array items are
-        /// stashed so they can be retrieved via `tokenless retrieve`; this
-        /// flag makes truncation lossy (the pre-stash behavior).
+        /// Disable reversible stash. By default, dropped array items and
+        /// the complete arrays behind record reduction are stashed so they
+        /// can be retrieved via `tokenless retrieve`; this flag makes
+        /// truncation lossy and skips record reduction.
         #[arg(long)]
         no_stash: bool,
         /// Override the stash database path. Defaults to
@@ -334,13 +337,31 @@ pub fn get_home_dir() -> String {
     tokenless_stats::get_home_dir()
 }
 
+/// Read a state override, including its DSH-managed shell alias.
+fn state_path_override(primary: &str, dsh_managed: &str) -> Option<String> {
+    std::env::var(primary)
+        .ok()
+        .filter(|path| !path.is_empty())
+        .or_else(|| {
+            if std::env::var("DSH_SHELL").as_deref() == Ok("1") {
+                std::env::var(dsh_managed)
+                    .ok()
+                    .filter(|path| !path.is_empty())
+            } else {
+                None
+            }
+        })
+}
+
 /// Resolve the directory containing tokenless SQLite databases.
 ///
 /// `TOKENLESS_DATA_DIR` affects `stats.db` and `stash.db` only and may be an
-/// absolute directory outside the real home. An invalid explicit override is
-/// returned as an error so state never silently moves back to the default.
+/// absolute directory outside the real home. DSH's managed shell supplies the
+/// same path through `DSH_TOKENLESS_DATA_DIR` because it removes inherited
+/// `TOKENLESS_*` variables. An invalid explicit override is returned as an
+/// error so state never silently moves back to the default.
 fn get_data_dir(home: &str) -> Result<PathBuf, String> {
-    let override_path = std::env::var("TOKENLESS_DATA_DIR").ok();
+    let override_path = state_path_override("TOKENLESS_DATA_DIR", "DSH_TOKENLESS_DATA_DIR");
     let home = (!home.is_empty()).then(|| Path::new(home));
     resolve_data_dir(home, override_path.as_deref()).map_err(|error| error.to_string())
 }
@@ -374,14 +395,11 @@ impl DatabasePathResolver {
 fn get_db_path_with(paths: &DatabasePathResolver) -> Result<PathBuf, String> {
     let home = paths.home();
     let data_dir = paths.data_dir();
-    match std::env::var("TOKENLESS_STATS_DB") {
-        Ok(env_path) if !env_path.is_empty() => {
-            match validate_db_path(Path::new(&env_path), home, data_dir.ok()) {
-                Ok(path) => return Ok(path),
-                Err(reason) => eprintln!("[tokenless] ignoring TOKENLESS_STATS_DB: {reason}"),
-            }
+    if let Some(env_path) = state_path_override("TOKENLESS_STATS_DB", "DSH_TOKENLESS_STATS_DB") {
+        match validate_db_path(Path::new(&env_path), home, data_dir.ok()) {
+            Ok(path) => return Ok(path),
+            Err(reason) => eprintln!("[tokenless] ignoring TOKENLESS_STATS_DB: {reason}"),
         }
-        _ => {}
     }
     let data_dir = data_dir.map_err(str::to_string)?;
     let path = data_dir.join("stats.db");
@@ -440,9 +458,7 @@ fn get_stash_db_path_with(
             Err(reason) => eprintln!("[tokenless] rejecting --stash-db {p}: {reason}"),
         }
     }
-    if let Ok(env_path) = std::env::var("TOKENLESS_STASH_DB")
-        && !env_path.is_empty()
-    {
+    if let Some(env_path) = state_path_override("TOKENLESS_STASH_DB", "DSH_TOKENLESS_STASH_DB") {
         match validate_db_path(Path::new(&env_path), home, data_dir.ok()) {
             Ok(path) => return Ok(path),
             Err(reason) => eprintln!("[tokenless] ignoring TOKENLESS_STASH_DB: {reason}"),
@@ -500,21 +516,22 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             // echo, so no fail-open response can be built: exit 2.
             let request = RequestEnvelope::from_json(&input).map_err(|e| (e.to_string(), 2))?;
 
-            // Load config before deciding on the stash so we can skip it
-            // entirely when compression is disabled (dry-run). Attaching the
-            // stash in dry-run would write entries whose `<<tokenless:KEY>>`
-            // markers never reach the LLM (the original input is emitted),
-            // orphaning them.
+            // PostTool dry-runs still open the configured store to verify that
+            // recovery is available. The pipeline substitutes an in-memory
+            // store for candidate generation, so the persistent store receives
+            // no Stash entries while the original result is emitted.
             let config = TokenlessConfig::load();
             let database_paths = DatabasePathResolver::default();
             let compression_on = config.is_compression_enabled();
             let needs_stash = match &request.request {
                 Request::BeforeModel(value) => {
-                    compression_on && value.capabilities.retrieval_available
+                    compression_on
+                        && matches!(
+                            value.capabilities.recovery,
+                            tokenless_protocol::RecoveryMethod::Tool { .. }
+                        )
                 }
-                Request::PostTool(value) => {
-                    compression_on && value.capabilities.retrieval_available
-                }
+                Request::PostTool(value) => value.capabilities.recovery.is_available(),
                 Request::Retrieve(_) => true,
                 Request::PreTool(_) => false,
             };

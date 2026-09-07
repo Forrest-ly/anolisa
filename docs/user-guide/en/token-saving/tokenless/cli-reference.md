@@ -91,7 +91,7 @@ jq -n \
       output_optimization: "none",
       capabilities: {
         replace_output: true,
-        retrieval_available: false,
+        recovery: {kind: "none"},
         replace_with_text: true
       }
     }
@@ -114,12 +114,21 @@ Operations:
 - Retrieve results, interrupted or denied calls, and RTK-optimized output bypass compression.
 - Tool errors pass through unchanged and may include bounded `additional_context` diagnostics.
 - Successful JSON uses `JsonCompressor`; compact JSON or TOON may be selected.
-- Every non-JSON content type passes through until its domain compressor is connected.
+- Recognized successful build/test command output uses `BuildLogCompressor`; terminal cleanup and
+  recoverable routine-progress reduction may be selected.
+- Every other non-JSON content type passes through until its domain compressor is connected.
 
 Only `disposition: "applied"` means `output` differs from the original. `dry_run`, `passthrough`,
 `no_savings`, `recoverability_unavailable`, `timeout`, and `tool_error` carry the original content.
 `content_type: "json"` replaces the old JSON label, and `applied_operations` reports the actual
 transformations instead of a configured compressor list.
+
+`before_model` and `post_tool` require `capabilities.recovery`: `{"kind":"none"}`,
+`{"kind":"shell"}`, or `{"kind":"tool","name":"tokenless_retrieve"}`. Tool names contain
+1–64 ASCII letters, digits, underscores, or hyphens. Unknown fields, missing recovery, and the former
+`retrieval_available` boolean are rejected; update Core and callers together. The protocol version
+remains 2. Only a static Tool enables recoverable BeforeModel schema truncation; shell recovery
+applies to PostTool and does not add or change Agent tools.
 
 Exit codes are part of the transport contract:
 
@@ -131,6 +140,8 @@ Exit codes are part of the transport contract:
 
 The `pre_tool` operation resolves the separately packaged `rtk` executable from `PATH` and supported
 install layouts, skipping candidates older than 0.35.0 before trying the next packaged location.
+Recognized Cargo, pytest, npm/Jest, Go, and Make build/test commands stay native so their output has
+a single PostTool owner; other supported commands may be rewritten by RTK.
 Agent-facing `retrieve` authorizes the requested hash against `visible_markers` before reading Stash.
 The standalone `tokenless retrieve` command below is a separate trusted local operations path and
 does not require model-visibility context.
@@ -211,8 +222,8 @@ By default it removes exact, case-sensitive blacklisted keys, `null`, and empty 
 |--------|---------|-------------|
 | `-f, --file <path>` | stdin | Input file |
 | `--truncate-strings-at <n>` | `4096` | String truncation threshold |
-| `--truncate-arrays-at <n>` | `32` | Array length that triggers truncation; the first `n` items are kept |
-| `--array-tail-preserve <n>` | `8` | Items preserved from the tail of truncated arrays; `0` disables tail preservation |
+| `--truncate-arrays-at <n>` | `32` | Array length that triggers truncation; the first `n` items are kept. Object record arrays use record reduction instead (see below) |
+| `--array-tail-preserve <n>` | `8` | Items preserved from the tail of truncated arrays; `0` disables tail preservation. Does not apply to object record arrays |
 | `--max-depth <n>` | `8` | Maximum nesting depth |
 | `--agent-id <id>` | `cli` | Agent identifier in statistics |
 | `--session-id <id>` | — | Session identifier in statistics |
@@ -221,6 +232,8 @@ By default it removes exact, case-sensitive blacklisted keys, `null`, and empty 
 | `--stash-db <path>` | `~/.tokenless/stash.db` | Override the Stash database; an invalid path is rejected as an override and the CLI falls back to the environment or default path |
 
 Array truncation keeps a head window of `--truncate-arrays-at` items and a tail window of `--array-tail-preserve` items, with a truncation marker in between. Middle items are dropped only when the array is longer than both windows combined, so under the defaults a command can retain `n + 8` items plus the marker; when the two windows cover the whole array, every item is retained without a marker. Set `--array-tail-preserve 0` for head-only truncation.
+
+Object record arrays are an exception. Any array of at least 33 JSON objects is reduced against a base budget of 32 records plus a retrieval marker, regardless of the `--truncate-arrays-at` and `--array-tail-preserve` values. The selection keeps the first 4 and last 4 records, records carrying error or anomaly signals, numeric outliers, and a stable sample of the remaining records; critical records can exceed the base budget. The complete original array is written to the Stash as one entry so `tokenless retrieve` can restore it. Record reduction requires the Stash, so with `--no-stash` every record of such an array is kept instead of reduced.
 
 Override thresholds:
 
@@ -239,7 +252,7 @@ debug, trace, traces, stack, stacktrace, logs, logging
 
 Field matching and truncation change the response representation seen by the model. Save representative samples and compare the result before processing critical payloads.
 
-Stash applies only to truncation of strings, the dropped middle segment of truncated arrays, and deep subtrees. Tail items are kept inline, not stashed. Blacklisted fields, `null`, and empty values are removed without a retrieval marker.
+Stash applies to complete original arrays used by record reduction, truncated strings, the dropped middle segment of other truncated arrays, and deep subtrees. Tail items are kept inline, not stashed. Blacklisted fields, `null`, and empty values are removed without a retrieval marker.
 
 Most adapters override these standalone defaults. Their shared shell profile uses `65536`, `128`, and `8`; the other-structured-tool profile uses `1048576`, `65536`, and `32`. Content-retrieval tools are skipped. See [Agent integration · Adapter processing rules](framework-integration.md#adapter-processing-rules).
 
@@ -271,10 +284,10 @@ echo '{"name":"test","value":42}' \
 
 ## `retrieve`
 
-This marker in compressed output means that removed content was written to Stash:
+This optional instruction in compressed output means that removed content was written to Stash:
 
 ```text
-<<tokenless:0123456789abcdef01234567>>
+12 passing-test lines omitted. If needed, run in shell: tokenless retrieve 0123456789abcdef01234567
 ```
 
 Retrieve by bare hash:
@@ -283,11 +296,16 @@ Retrieve by bare hash:
 tokenless retrieve 0123456789abcdef01234567
 ```
 
-You may also paste a complete line containing the marker:
+AgentScope uses its configured static Tool instead of a shell command:
+
+```text
+12 passing-test lines omitted. If needed, call tool tokenless_retrieve with hash_or_marker=0123456789abcdef01234567
+```
+
+Historical markers remain accepted but are no longer generated:
 
 ```bash
-tokenless retrieve \
-  '<... 12 items truncated, retrieve with <<tokenless:0123456789abcdef01234567>>'
+tokenless retrieve '<<tokenless:0123456789abcdef01234567>>'
 ```
 
 Override the database:

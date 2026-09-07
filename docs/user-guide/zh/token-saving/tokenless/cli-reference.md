@@ -87,7 +87,7 @@ jq -n \
       output_optimization: "none",
       capabilities: {
         replace_output: true,
-        retrieval_available: false,
+        recovery: {kind: "none"},
         replace_with_text: true
       }
     }
@@ -110,12 +110,20 @@ jq -n \
 - Retrieve Result、Interrupted/Denied 调用和 RTK 已优化输出绕过压缩。
 - Tool Error 原样透传，并可携带限长 `additional_context` 诊断。
 - 成功 JSON 使用 `JsonCompressor`，并可能选择 Compact JSON 或 TOON。
-- 在对应领域 Compressor 接入前，所有非 JSON 内容类型都原样透传。
+- 已识别的成功构建/测试命令输出使用 `BuildLogCompressor`，可选择 Terminal Cleanup 和可恢复的
+  Routine Progress Reduction。
+- 在对应领域 Compressor 接入前，其他非 JSON 内容类型都原样透传。
 
 只有 `disposition: "applied"` 表示 `output` 与原文不同。`dry_run`、`passthrough`、
 `no_savings`、`recoverability_unavailable`、`timeout` 和 `tool_error` 都携带原始内容。
 JSON 的 `content_type` 现在是 `json`；`applied_operations` 报告实际发生的变换，而不是配置的
 Compressor 列表。
+
+`before_model` 和 `post_tool` 必须提供 `capabilities.recovery`：`{"kind":"none"}`、
+`{"kind":"shell"}` 或 `{"kind":"tool","name":"tokenless_retrieve"}`。Tool 名称限 1–64 个
+ASCII 字母、数字、下划线或连字符。未知字段、缺失 recovery 和旧的 `retrieval_available`
+布尔字段均会被拒绝，Core 与调用方必须一起更新；协议版本保持 2。只有静态 Tool 能启用
+BeforeModel Schema 的可恢复截断；Shell 恢复用于 PostTool，不新增或改变 Agent 工具。
 
 退出码属于 Transport 契约：
 
@@ -126,7 +134,9 @@ Compressor 列表。
 - `2`：JSON 格式错误、不支持的协议版本，或 Envelope/Payload Shape 无效。
 
 `pre_tool` 从 `PATH` 和支持的安装布局解析独立打包的 `rtk`；低于 0.35.0 的候选会被跳过，
-并继续尝试后续打包位置。Agent-facing `retrieve` 在读取 Stash 前根据 `visible_markers` 授权
+并继续尝试后续打包位置。已识别的 Cargo、pytest、npm/Jest、Go 和 Make 构建/测试命令保持
+原生形式，使其输出只有一个 PostTool 所有者；其他受支持命令仍可由 RTK 改写。Agent-facing
+`retrieve` 在读取 Stash 前根据 `visible_markers` 授权
 请求 Hash。下文的独立 `tokenless retrieve` 是受信本地运维入口，不要求模型可见性上下文。
 
 ## `compress-schema`
@@ -204,8 +214,8 @@ tokenless compress-response -f response.json
 |------|--------|------|
 | `-f, --file <path>` | stdin | 输入文件 |
 | `--truncate-strings-at <n>` | `4096` | 字符串截断阈值 |
-| `--truncate-arrays-at <n>` | `32` | 触发数组截断的长度阈值；保留前 `n` 个元素 |
-| `--array-tail-preserve <n>` | `8` | 截断数组时从尾部保留的元素数；`0` 禁用尾部保留 |
+| `--truncate-arrays-at <n>` | `32` | 触发数组截断的长度阈值；保留前 `n` 个元素。对象记录数组改用记录缩减（见下文） |
+| `--array-tail-preserve <n>` | `8` | 截断数组时从尾部保留的元素数；`0` 禁用尾部保留。不适用于对象记录数组 |
 | `--max-depth <n>` | `8` | 最大嵌套深度 |
 | `--agent-id <id>` | `cli` | 统计中的 Agent 标识 |
 | `--session-id <id>` | — | 统计中的 Session 标识 |
@@ -214,6 +224,8 @@ tokenless compress-response -f response.json
 | `--stash-db <path>` | `~/.tokenless/stash.db` | 覆盖 Stash 数据库；无效路径会被拒绝为覆盖值，CLI 随后回退到环境变量或默认路径 |
 
 数组截断会保留 `--truncate-arrays-at` 个头部元素和 `--array-tail-preserve` 个尾部元素，并在两者之间插入截断标记。只有当数组长度超过首尾窗口之和时才会丢弃中间元素：默认配置下单条命令可保留 `n + 8` 个元素（外加截断标记）；当两个窗口覆盖整个数组时，所有元素都会保留且不插入标记。设置 `--array-tail-preserve 0` 可恢复纯头部截断。
+
+对象记录数组是例外：任何包含至少 33 个 JSON Object 的数组都会按 32 条记录的基础预算进行缩减，并追加一个取回标记，与 `--truncate-arrays-at` 和 `--array-tail-preserve` 的取值无关。选取会保留前 4 条和后 4 条记录、携带错误或异常信号的记录、数值异常记录，以及其余记录的稳定采样；关键记录可以突破基础预算。完整原始数组作为一个条目写入 Stash，可通过 `tokenless retrieve` 恢复。记录缩减依赖 Stash，因此使用 `--no-stash` 时会保留此类数组的全部记录而不做缩减。
 
 覆盖阈值：
 
@@ -232,7 +244,7 @@ debug, trace, traces, stack, stacktrace, logs, logging
 
 字段匹配和截断会改变模型看到的响应表示。处理关键 Payload 前，应先保存样例并对比压缩结果。
 
-Stash 只作用于字符串、截断数组中被丢弃的中间段和深层子树截断。尾部元素直接保留在输出中，不进入 Stash。黑名单字段、`null` 和空值会直接移除，不会生成取回标记。
+Stash 会保存 Record Reduction 使用的完整原始数组、被截断的字符串、其他截断数组中被丢弃的中间段和深层子树。尾部元素直接保留在输出中，不进入 Stash。黑名单字段、`null` 和空值会直接移除，不会生成取回标记。
 
 大多数 Adapter 会覆盖这些独立 CLI 默认值。共享 Shell 策略使用 `65536`、`128`、`8`；其他结构化工具策略使用 `1048576`、`65536`、`32`。内容读取类工具会被跳过。详见[Agent 集成 · Adapter 处理规则](framework-integration.md#adapter-处理规则)。
 
@@ -264,10 +276,10 @@ echo '{"name":"test","value":42}' \
 
 ## `retrieve`
 
-压缩输出中出现以下标记时，说明被截断的内容已写入 Stash：
+压缩输出中出现以下按需操作提示时，说明被省略的内容已写入 Stash：
 
 ```text
-<<tokenless:0123456789abcdef01234567>>
+12 passing-test lines omitted. If needed, run in shell: tokenless retrieve 0123456789abcdef01234567
 ```
 
 使用裸 Hash 取回：
@@ -276,11 +288,16 @@ echo '{"name":"test","value":42}' \
 tokenless retrieve 0123456789abcdef01234567
 ```
 
-也可以粘贴包含标记的整行文本：
+AgentScope 使用实际配置的静态 Tool，而不是 Shell 命令：
+
+```text
+12 passing-test lines omitted. If needed, call tool tokenless_retrieve with hash_or_marker=0123456789abcdef01234567
+```
+
+历史 Marker 仍可读取，但不再生成：
 
 ```bash
-tokenless retrieve \
-  '<... 12 items truncated, retrieve with <<tokenless:0123456789abcdef01234567>>'
+tokenless retrieve '<<tokenless:0123456789abcdef01234567>>'
 ```
 
 覆盖数据库：

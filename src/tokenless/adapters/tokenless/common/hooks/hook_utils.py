@@ -37,16 +37,10 @@ def _user_path(*parts: str) -> str:
 
 
 _TOKENLESS_FALLBACK = "/usr/bin/tokenless"
-_TOKENLESS_LOCAL_SHARE = _user_path(
-    ".local", "share", "anolisa", "tokenless", "tokenless"
-)
-_TOKENLESS_LOCAL_LIB = _user_path(
-    ".local", "lib", "anolisa", "tokenless", "tokenless"
-)
+_TOKENLESS_LOCAL_SHARE = _user_path(".local", "share", "anolisa", "tokenless", "tokenless")
+_TOKENLESS_LOCAL_LIB = _user_path(".local", "lib", "anolisa", "tokenless", "tokenless")
 _RTK_FALLBACK = "/usr/libexec/anolisa/tokenless/rtk"
-_RTK_LOCAL_SHARE = _user_path(
-    ".local", "share", "anolisa", "tokenless", "rtk"
-)
+_RTK_LOCAL_SHARE = _user_path(".local", "share", "anolisa", "tokenless", "rtk")
 _RTK_LOCAL_LIB = _user_path(".local", "lib", "anolisa", "tokenless", "rtk")
 
 _TOKENLESS_HELPER_BINARIES = frozenset({"rtk"})
@@ -89,9 +83,7 @@ def _known_binary_paths(name: str, home: str | None = None) -> tuple[str, ...]:
     paths.append(os.path.join("/usr/local/bin", name))
     if name in _TOKENLESS_HELPER_BINARIES:
         # Anolisa CLI system mode.
-        paths.append(
-            os.path.join("/usr/local/libexec/anolisa/tokenless", name)
-        )
+        paths.append(os.path.join("/usr/local/libexec/anolisa/tokenless", name))
     paths.append(os.path.join("/usr/bin", name))
     if name in _TOKENLESS_HELPER_BINARIES:
         paths.extend(
@@ -105,15 +97,12 @@ def _known_binary_paths(name: str, home: str | None = None) -> tuple[str, ...]:
         if user_home:
             paths.extend(
                 [
-                    os.path.join(
-                        user_home, ".local", "share", "anolisa", "tokenless", name
-                    ),
-                    os.path.join(
-                        user_home, ".local", "lib", "anolisa", "tokenless", name
-                    ),
+                    os.path.join(user_home, ".local", "share", "anolisa", "tokenless", name),
+                    os.path.join(user_home, ".local", "lib", "anolisa", "tokenless", name),
                 ]
             )
     return tuple(paths)
+
 
 # -- Unified tool categorization ----------------------------------------------
 
@@ -128,16 +117,39 @@ _TOOL_CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "tool_categories
 # invalid. Matches the minimum safe classification from before the JSON was
 # introduced, ensuring content-retrieval tools are never accidentally compressed.
 _FALLBACK_SKIP_TOOLS = [
-    "Read", "read", "read_file", "read_many_files",
-    "Glob", "glob", "search_file", "list_directory", "list_dir",
-    "Grep", "grep", "grep_code", "grep_search", "search_files",
-    "Lsp", "lsp",
-    "NotebookRead", "notebook_read", "notebookread",
+    "Read",
+    "read",
+    "read_file",
+    "read_many_files",
+    "Glob",
+    "glob",
+    "search_file",
+    "list_directory",
+    "list_dir",
+    "Grep",
+    "grep",
+    "grep_code",
+    "grep_search",
+    "search_files",
+    "Lsp",
+    "lsp",
+    "NotebookRead",
+    "notebook_read",
+    "notebookread",
 ]
 _FALLBACK_SHELL_TOOLS = [
-    "Bash", "bash", "Shell", "shell", "exec", "terminal",
-    "run_shell_command", "run_in_terminal", "get_terminal_output",
-    "execute_command", "RunCommand", "process",
+    "Bash",
+    "bash",
+    "Shell",
+    "shell",
+    "exec",
+    "terminal",
+    "run_shell_command",
+    "run_in_terminal",
+    "get_terminal_output",
+    "execute_command",
+    "RunCommand",
+    "process",
 ]
 
 
@@ -189,6 +201,29 @@ SKIP_TOOLS: set[str] = set(_tool_categories.get("layer_1_skip", {}).get("tools",
 # These tools produce text output that can be safely truncated if too long.
 SHELL_TOOLS: set[str] = set(_tool_categories.get("layer_2_shell", {}).get("tools", []))
 
+_TOKENLESS_RETRIEVE_COMMAND_RE = re.compile(
+    r"^[ \t]*(?:\"tokenless\"|'tokenless'|tokenless)[ \t]+retrieve[ \t]+"
+    r"(?:\"(?:[0-9a-f]{24}|<<tokenless:[0-9a-f]{24}>>)\"|"
+    r"'(?:[0-9a-f]{24}|<<tokenless:[0-9a-f]{24}>>)'|[0-9a-f]{24})[ \t]*$",
+    re.IGNORECASE,
+)
+
+
+def tokenless_retrieve_command_available() -> bool:
+    """Return whether a Marker command can invoke bare ``tokenless``."""
+    return shutil.which("tokenless") is not None
+
+
+def is_tokenless_retrieve_command(tool_name: str, arguments: object) -> bool:
+    """Recognize the exact local recovery command emitted by Tokenless markers."""
+    if tool_name not in SHELL_TOOLS or not isinstance(arguments, dict):
+        return False
+    command = arguments.get("command")
+    if not isinstance(command, str):
+        return False
+    return _TOKENLESS_RETRIEVE_COMMAND_RE.fullmatch(command) is not None
+
+
 # Layer 3: API tools (zero-truncation).
 # These tools return structured data or API responses that should not be truncated.
 # No explicit set needed; tools not in SKIP_TOOLS or SHELL_TOOLS are Layer 3.
@@ -212,6 +247,7 @@ _layer3_thr = _tool_categories.get("layer_3_api", {}).get("thresholds", {})
 _TRUNCATE_STRINGS_AT = _layer3_thr.get("truncate_strings_at", 1_048_576)
 _TRUNCATE_ARRAYS_AT = _layer3_thr.get("truncate_arrays_at", 65_536)
 _MAX_DEPTH = _layer3_thr.get("max_depth", 32)
+
 
 def get_thresholds(tool_name: str) -> tuple[int, int, int]:
     """Return (truncate_strings_at, truncate_arrays_at, max_depth) for a tool.
@@ -411,9 +447,7 @@ def unwrap_string_json(raw: str) -> str | None:
             # characters (code points), not \uXXXX escape sequences, so
             # string-wrapped payloads are measured the same way as the
             # dict/list branch and the OpenClaw adapter.
-            return json.dumps(
-                inner_obj, separators=(",", ":"), ensure_ascii=False
-            )
+            return json.dumps(inner_obj, separators=(",", ":"), ensure_ascii=False)
         return None
     return raw
 
@@ -473,9 +507,7 @@ def write_context(agent_id: str, session_id: str, tool_use_id: str) -> None:
     secure_write_text(_CONTEXT_FILE, f"{agent_id}\n{session_id}\n{tool_use_id}\n")
 
 
-def _optimization_state_path(
-    agent_id: str, session_id: str, tool_use_id: str
-) -> str:
+def _optimization_state_path(agent_id: str, session_id: str, tool_use_id: str) -> str:
     identity = "\0".join((agent_id, session_id, tool_use_id)).encode()
     digest = hashlib.sha256(identity).hexdigest()
     return os.path.join(_OPTIMIZATION_STATE_DIR, digest)
@@ -517,14 +549,10 @@ def _prune_optimization_states() -> None:
 def mark_rtk_optimized(agent_id: str, session_id: str, tool_use_id: str) -> None:
     """Persist RTK ownership for one tool call before applying its rewrite."""
     _prune_optimization_states()
-    secure_write_text(
-        _optimization_state_path(agent_id, session_id, tool_use_id), "rtk\n"
-    )
+    secure_write_text(_optimization_state_path(agent_id, session_id, tool_use_id), "rtk\n")
 
 
-def consume_output_optimization(
-    agent_id: str, session_id: str, tool_use_id: str
-) -> str:
+def consume_output_optimization(agent_id: str, session_id: str, tool_use_id: str) -> str:
     """Consume one tool call's optimization state for its final result."""
     if not tool_use_id:
         return "none"
@@ -604,7 +632,7 @@ def build_before_model_request(
             "capabilities": {
                 "replace_tools": True,
                 # A local CLI is not marker-scoped Agent authorization.
-                "retrieval_available": False,
+                "recovery": {"kind": "none"},
             },
         },
     }
@@ -644,22 +672,21 @@ def build_post_tool_request(
     status: str,
     content_origin: str,
     output_optimization: str,
+    *,
+    result_kind: str,
+    recovery: dict[str, str],
     session_id: str = "",
     tool_use_id: str = "",
     replace_output: bool = False,
     replace_with_text: bool = False,
 ) -> dict:
-    """Build a Protocol v2 PostTool transport request.
-
-    Common Hooks cannot enforce marker-scoped authorization for a command
-    recovery path, so Core must reject lossy candidates.
-    """
+    """Build a Protocol v2 PostTool transport request."""
     return {
         "protocol_version": 2,
         "operation": "post_tool",
         "attribution": _attribution(agent_id, session_id, tool_use_id),
         "input": {
-            "result_kind": "tool",
+            "result_kind": result_kind,
             "tool_name": tool_name,
             "content": content,
             "status": status,
@@ -667,7 +694,7 @@ def build_post_tool_request(
             "output_optimization": output_optimization,
             "capabilities": {
                 "replace_output": replace_output,
-                "retrieval_available": False,
+                "recovery": recovery,
                 "replace_with_text": replace_with_text,
             },
         },
@@ -762,7 +789,7 @@ def _agent_id_from_argv(argv: list[str] | None) -> str | None:
             following = args[index + 1] if index + 1 < len(args) else ""
             return following or None
         if arg.startswith("--agent-id="):
-            return arg[len("--agent-id="):] or None
+            return arg[len("--agent-id=") :] or None
     return None
 
 
@@ -790,11 +817,7 @@ def resolve_agent_id(default: str = "unknown", argv: list[str] | None = None) ->
     """
     if detect_cosh_ng_runtime() is not None:
         return "cosh-ng"
-    return (
-        _agent_id_from_argv(argv)
-        or os.environ.get("TOKENLESS_AGENT_ID")
-        or default
-    )
+    return _agent_id_from_argv(argv) or os.environ.get("TOKENLESS_AGENT_ID") or default
 
 
 def parse_version(version_str: str) -> tuple | None:

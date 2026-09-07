@@ -18,7 +18,7 @@ fn requests() -> Vec<RequestEnvelope> {
                 visible_context: json!({"messages": []}),
                 capabilities: BeforeModelCapabilities {
                     replace_tools: true,
-                    retrieval_available: true,
+                    recovery: tokenless_protocol::RecoveryMethod::Shell,
                 },
             }),
         },
@@ -45,7 +45,7 @@ fn requests() -> Vec<RequestEnvelope> {
                 output_optimization: OutputOptimization::None,
                 capabilities: PostToolCapabilities {
                     replace_output: true,
-                    retrieval_available: false,
+                    recovery: tokenless_protocol::RecoveryMethod::None,
                     replace_with_text: true,
                 },
             }),
@@ -89,7 +89,14 @@ fn all_response_operations_round_trip_with_fixed_envelope() {
             output: "{}".into(),
             disposition: Disposition::Applied,
             content_type: Some(ContentType::Json),
-            applied_operations: vec![AppliedOperation::JsonCleanup],
+            applied_operations: vec![
+                AppliedOperation::TerminalCleanup,
+                AppliedOperation::BuildLogReduction,
+                AppliedOperation::JsonCleanup,
+                AppliedOperation::JsonRecordReduction,
+                AppliedOperation::JsonTruncation,
+                AppliedOperation::Toon,
+            ],
             recoverability: Recoverability::Lossless,
             before_tokens: 10,
             after_tokens: 4,
@@ -113,6 +120,26 @@ fn all_response_operations_round_trip_with_fixed_envelope() {
         assert!(value.get("input").is_none());
         assert_eq!(ResponseEnvelope::from_json(&json).unwrap(), envelope);
     }
+}
+
+#[test]
+fn record_reduction_has_a_stable_wire_name() {
+    assert_eq!(
+        serde_json::to_string(&AppliedOperation::JsonRecordReduction).unwrap(),
+        r#""json_record_reduction""#
+    );
+    assert_eq!(
+        serde_json::to_string(&AppliedOperation::TerminalCleanup).unwrap(),
+        r#""terminal_cleanup""#
+    );
+    assert_eq!(
+        serde_json::to_string(&AppliedOperation::BuildLogReduction).unwrap(),
+        r#""build_log_reduction""#
+    );
+    assert_eq!(
+        AppliedOperation::JsonRecordReduction.wire_str(),
+        "json_record_reduction"
+    );
 }
 
 #[test]
