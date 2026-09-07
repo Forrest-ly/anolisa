@@ -34,13 +34,14 @@ CPython 3.11 or later. Select the native `anolisa-tokenless` wheel for the targe
 | Linux aarch64 | `anolisa_tokenless-<version>-cp311-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl` |
 | macOS Apple silicon | `anolisa_tokenless-<version>-cp311-abi3-macosx_11_0_arm64.whl` |
 
-For example, install v0.7.14 on Linux x86_64 into a virtual environment:
+The lifecycle API examples below require Tokenless 0.8.0. Install v0.8.0 on Linux x86_64
+into a virtual environment:
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install \
-  "https://github.com/alibaba/anolisa/releases/download/tokenless/v0.7.14/anolisa_tokenless-0.7.14-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+  "https://github.com/alibaba/anolisa/releases/download/tokenless/v0.8.0/anolisa_tokenless-0.8.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
 ```
 
 The Linux assets target glibc-based distributions compatible with `manylinux_2_17`; they do not
@@ -103,6 +104,7 @@ from anolisa_tokenless import (
     OutputOptimization,
     PostToolCapabilities,
     PostToolRequest,
+    RecoveryMethod,
     ResultKind,
     RetrieveRequest,
     TokenlessConfig,
@@ -133,10 +135,9 @@ async def main() -> None:
             BeforeModelRequest(
                 tools=(tool,),
                 visible_context="",
-                retrieve_tool_name="tokenless_retrieve",
                 capabilities=BeforeModelCapabilities(
                     replace_tools=True,
-                    publish_retrieve_tool=True,
+                    recovery=RecoveryMethod.tool("tokenless_retrieve"),
                 ),
                 attribution=model_attribution,
             )
@@ -156,7 +157,7 @@ async def main() -> None:
                 output_optimization=OutputOptimization.NONE,
                 capabilities=PostToolCapabilities(
                     replace_output=True,
-                    publish_retrieve_tool=True,
+                    recovery=RecoveryMethod.tool("tokenless_retrieve"),
                     replace_with_text=True,
                 ),
                 attribution=Attribution("my-agent", "session-42", "tool-7"),
@@ -168,8 +169,7 @@ async def main() -> None:
             BeforeModelRequest(
                 tools=(),
                 visible_context=result.output,
-                retrieve_tool_name="tokenless_retrieve",
-                capabilities=BeforeModelCapabilities(True, True),
+                capabilities=BeforeModelCapabilities(True, RecoveryMethod.tool("tokenless_retrieve")),
                 attribution=model_attribution,
             )
         )
@@ -202,17 +202,19 @@ request = await sdk.before_model(
     BeforeModelRequest(
         tools=tuple(model_tools),
         visible_context=visible_context,
-        retrieve_tool_name="tokenless_retrieve",
-        capabilities=BeforeModelCapabilities(True, True),
+        capabilities=BeforeModelCapabilities(True, RecoveryMethod.tool("tokenless_retrieve")),
         attribution=attribution,
     )
 )
 ```
 
-`before_model()` compresses OpenAI Function Calling tools, scans the transformed tools and visible
-context for `<<tokenless:HASH>>` markers, and returns a separate Core-owned Retrieve declaration
-only when at least one marker is visible. The adapter adds that declaration to the host's model
-tools. It must not include a tool with the same name in `request.tools` while publication is enabled.
+`before_model()` permits recoverable schema truncation only with `RecoveryMethod.tool(name)`;
+the integration must already have registered that static Tool. `RecoveryMethod.shell()` permits
+PostTool command recovery but does not enable schema truncation. `RecoveryMethod()` means no
+recovery. Core scans transformed tools and visible context for complete shell instructions,
+instructions naming the declared Tool, and historical `<<tokenless:HASH>>` markers. It returns
+sorted, deduplicated lowercase hashes; an isolated hash does not authorize retrieval. Core never
+publishes an Agent tool. Tool names allow 1–64 ASCII letters, digits, underscores, or hyphens.
 
 #### Before a tool call
 
@@ -247,7 +249,7 @@ result = await sdk.post_tool(
         status=ToolResultStatus.SUCCESS,
         content_origin=ContentOrigin.API_RESPONSE,
         output_optimization=call.output_optimization,
-        capabilities=PostToolCapabilities(True, True, True),
+        capabilities=PostToolCapabilities(True, RecoveryMethod.tool("tokenless_retrieve"), True),
         attribution=attribution,
     )
 )
@@ -284,9 +286,13 @@ config = TokenlessConfig(
 
 `data_dir` must be absolute and writable. Use a different directory for every tenant or security
 boundary; `TOKENLESS_DATA_DIR` is only a process-wide fallback. `retrieve_tool_name` selects the
-Core-generated declaration name. `rtk_enabled` controls whether the SDK resolves packaged RTK for
-PreTool. Compression thresholds, content detection, TOON selection, diagnostics, authorization,
-and Stash policy are Core behavior and are not Python configuration.
+integration-owned tool name for framework layers such as AgentScope; they declare that name to
+Core through the recovery capability. Names must contain 1–64 ASCII letters, digits, underscores,
+or hyphens. This also tightens validation of existing `retrieve_tool_name` configurations: names
+containing dots, colons, or spaces must be renamed before upgrading.
+`rtk_enabled` controls whether the SDK resolves packaged RTK for PreTool. Compression thresholds,
+content detection, TOON selection, diagnostics, authorization, and Stash policy are Core behavior
+and are not Python configuration.
 
 ### Direct Runtime examples
 
@@ -360,16 +366,16 @@ model_visible_text = toon_result.output
 
 #### Retrieve stashed content
 
-Response or schema compression may place omitted content in Stash and leave a marker in the output:
+Low-level response or schema compression uses shell recovery instructions by default:
 
 ```python
-marker = re.search(r"<<tokenless:([0-9a-f]{24})>>", response_result.output)
-if marker is not None:
-    recovered_content = runtime.retrieve(marker.group(0))
+hash_match = re.search(r"If needed, run in shell: tokenless retrieve ([0-9A-Fa-f]{24})(?![\w-])", response_result.output)
+if hash_match is not None:
+    recovered_content = runtime.retrieve(hash_match.group(1))
     print(recovered_content)
 ```
 
-`retrieve()` accepts either the complete marker or its 24-character hash. Direct Runtime callers
+`retrieve()` accepts a 24-character hash or a historical marker. Direct Runtime callers
 must decide which markers are authorized for retrieval; `TokenlessSdk.retrieve()` sends the current
 BeforeModel marker set to Core for authorization.
 

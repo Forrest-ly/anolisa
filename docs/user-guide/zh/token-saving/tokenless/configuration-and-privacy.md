@@ -98,12 +98,19 @@ tokenless stats disable
 
 空值视为未设置。`TOKENLESS_DATA_DIR` 可以指向尚不存在的目录；Tokenless 会先规范化其最近的已存在父目录，再创建目标目录。文件级覆盖项只能位于规范化后的真实用户 home 或选定的数据目录下，且已存在的数据库软链接会被拒绝。该变量不会迁移 `~/.tokenless/config.json` 或 SLS JSONL 输出。
 
+DeepSeek Harness 是默认数据库位置的例外：它的沙箱会移除继承的 `TOKENLESS_*` 变量，并且
+可能无法访问 home 目录。未设置 `TOKENLESS_DATA_DIR` 时，Adapter 使用会话工作区下的
+`.tokenless`，并为该目录以及 `TOKENLESS_STATS_DB`、`TOKENLESS_STASH_DB` 发布受控 Shell
+别名。默认工作区目录包含内容为 `*` 的 `.gitignore`，因此完整工具文本、Stash Payload 和
+SQLite sidecar 不会被 `git add -A` 暂存。Adapter 不会修改自定义路径；应确保 DSH Shell
+沙箱可以访问它们，并按数据策略将其排除在源码管理或备份之外。
+
 ## 本地与外部数据
 
 | 数据 | 默认路径 | 默认内容 | 保留方式 | 如何停止新增 |
 |------|----------|----------|----------|--------------|
 | 本地统计 | `~/.tokenless/stats.db` | 压缩前后完整文本、标识和度量 | 无自动 TTL，直到清理 | `tokenless stats disable` |
-| Stash | `~/.tokenless/stash.db` | 截断时移除的原始字符串、截断数组中被丢弃的中间段、深层子树、Schema 描述和 build/log 间隙内容 | TTL 1 小时、最多 10,000 个有效条目，过期行延迟清理 | CLI 使用 `--no-stash`；Agent 场景禁用 Adapter |
+| Stash | `~/.tokenless/stash.db` | 截断时移除的原始字符串、截断数组中被丢弃的中间段、被缩减为采样集合的完整对象记录数组、深层子树、Schema 描述和 build/log 间隙内容 | TTL 1 小时、最多 10,000 个有效条目，过期行延迟清理 | CLI 使用 `--no-stash`；Agent 场景禁用 Adapter |
 | 配置 | `~/.tokenless/config.json` | 三个布尔开关 | 持续保留 | 不适用 |
 | SLS JSONL | `/var/log/anolisa/sls/ops/tokenless.jsonl` | 度量和标识，不含压缩原文 | 由 SLS/Logtail 设施管理 | `TOKENLESS_SLS_ENABLED=0` 或配置为 false |
 
@@ -124,7 +131,7 @@ ls -l ~/.tokenless/stats.db*
 
 ### Stash 的敏感性
 
-Stash 保存压缩时被截断的原始内容，而不是摘要。仅因字段在黑名单中、值为 `null` 或为空而被移除的内容不会写入 Stash。`tokenless` CLI 会把路径限制在真实用户 home 或选定的数据目录下，但仍应确认数据库及 SQLite sidecar 文件不会被其他本机用户读取：
+Stash 保存压缩时被截断的原始内容，而不是摘要。记录缩减写入的条目是缩减前的完整原始数组，而不仅是被省略的记录。仅因字段在黑名单中、值为 `null` 或为空而被移除的内容不会写入 Stash。`tokenless` CLI 会把路径限制在真实用户 home 或选定的数据目录下，但仍应确认数据库及 SQLite sidecar 文件不会被其他本机用户读取：
 
 ```bash
 ls -l ~/.tokenless/stash.db*
@@ -220,19 +227,22 @@ OpenClaw Plugin 还提供框架级选项：
 
 | 选项 | 作用 |
 |------|------|
-| `rtk_enabled` | 命令重写 |
+| `rtk_enabled` | 通过 RTK 改写支持的 Shell 命令 |
 | `tool_ready_enabled` | OpenClaw 侧的 Tool Ready 注册门槛 |
-| `response_compression_enabled` | 响应压缩 |
-| `toon_compression_enabled` | TOON 编码 |
-| `skip_tools` | 完全跳过压缩的工具名列表 |
-| `shell_tools` | 按 Shell/exec 策略处理中等截断的工具名 |
+| `post_tool_enabled` | 优化支持的持久化工具结果 |
 | `verbose` | Plugin 诊断日志 |
 
-OpenClaw Adapter 当前未实现 Schema 压缩；需要时可以直接调用 `tokenless compress-schema` CLI 命令。
+OpenClaw Plugin 不压缩工具 Schema，也不提供内容恢复。无法在不恢复内容的情况下安全优化的
+结果会原样透传。
 
-运行时代码默认开启 RTK、OpenClaw 侧的 Tool Ready 门槛和响应压缩，默认关闭 TOON。但由于 Tokenless 已硬关闭底层检查，Tool Ready 选项当前不会生效。当前运行时代码把未提供的 `verbose` 当作开启，但 Plugin Schema 声明的默认值是关闭；在二者统一前应显式设置 `verbose`。
+RTK、OpenClaw 侧的 Tool Ready 注册门槛和 PostTool 默认开启，verbose 日志默认关闭。由于
+Tokenless 已硬关闭底层检查，Tool Ready 选项当前没有实际效果。Tokenless 会自动判断 JSON
+清理或 TOON 是否有收益，以及哪些工具输出必须原样透传。已经删除的
+`response_compression_enabled`、`toon_compression_enabled`、`skip_tools` 和 `shell_tools` 不再
+控制 Adapter。
 
-这些值由 OpenClaw Plugin 配置管理，不属于 `~/.tokenless/config.json`。修改后按 OpenClaw 提示重启 gateway。
+这些值由 OpenClaw Plugin 配置管理，不属于 `~/.tokenless/config.json`。Adapter 要求
+OpenClaw Plugin API 2026.4.22 或更高版本。修改后按 OpenClaw 提示重启 gateway。
 
 ## 相关文档
 

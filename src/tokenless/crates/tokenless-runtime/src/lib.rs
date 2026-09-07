@@ -230,12 +230,6 @@ pub enum RuntimeError {
         /// Normalized hash rejected before the stash read.
         hash: String,
     },
-    /// The configured Retrieve tool name collides with a host declaration.
-    #[error("retrieve tool name conflicts with an existing tool: {name}")]
-    RetrieveToolConflict {
-        /// Conflicting tool name.
-        name: String,
-    },
     /// The PostTool domain compressor failed.
     #[error("{0}")]
     Pipeline(String),
@@ -446,7 +440,7 @@ impl TokenlessRuntime {
         pre_tool_with_rtk(request, attribution, rtk_path, &self.data_dir)
     }
 
-    /// Runs PostTool routing and the JSON-only content pipeline.
+    /// Runs PostTool routing and the content-domain pipeline.
     ///
     /// # Errors
     ///
@@ -775,9 +769,9 @@ const RESPONSE_PIPELINE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Compress a response using an optional caller-owned stash store.
 ///
-/// CLI and embedded frontends use the same Runtime-owned JSON PostTool
-/// pipeline. The explicit API validates JSON at its boundary; optional
-/// compression failures remain fail-open inside the pipeline.
+/// CLI and embedded frontends use the same Runtime-owned JSON domain path.
+/// The explicit API validates JSON at its boundary; optional compression
+/// failures remain fail-open inside the pipeline.
 ///
 /// # Errors
 ///
@@ -789,9 +783,8 @@ pub fn compress_response_with_store(
     stash_store: Option<&Arc<dyn StashStore>>,
 ) -> Result<CompressResult, RuntimeError> {
     validate_input_size(input)?;
-    // Boundary contract: response input must be JSON. The pipeline itself
-    // routes non-JSON content to passthrough, so this validation is what
-    // keeps invalid input a structured error for the CLI and bindings.
+    // This explicit API forces JSON domain dispatch, so validation here keeps
+    // invalid input a structured boundary error for the CLI and bindings.
     serde_json::from_str::<serde::de::IgnoredAny>(input)?;
 
     let request = PostToolRequest {
@@ -803,9 +796,11 @@ pub fn compress_response_with_store(
         output_optimization: OutputOptimization::None,
         capabilities: PostToolCapabilities {
             replace_output: true,
-            publish_retrieve_tool: options.stash_enabled
-                && compression_enabled
-                && stash_store.is_some(),
+            recovery: if options.stash_enabled && stash_store.is_some() {
+                tokenless_protocol::RecoveryMethod::Shell
+            } else {
+                tokenless_protocol::RecoveryMethod::None
+            },
             replace_with_text: false,
         },
     };
@@ -1039,6 +1034,11 @@ fn record_entry_stats(
             .contains(&tokenless_protocol::AppliedOperation::SchemaCompression)
         {
             "schema_compression"
+        } else if stats
+            .applied_operations
+            .contains(&tokenless_protocol::AppliedOperation::JsonRecordReduction)
+        {
+            "json_record_reduction"
         } else {
             "json_truncation"
         };
@@ -1111,7 +1111,7 @@ mod tests {
             .compress_response(
                 &input,
                 &CompressOptions {
-                    truncate_strings_at: Some(80),
+                    truncate_strings_at: Some(tokenless_ccr::truncation_suffix_char_len() + 16),
                     require_reversible: true,
                     ..CompressOptions::default()
                 },
@@ -1149,7 +1149,7 @@ mod tests {
         let result = compress_response_with_store(
             &input,
             &CompressOptions {
-                truncate_strings_at: Some(80),
+                truncate_strings_at: Some(tokenless_ccr::truncation_suffix_char_len() + 16),
                 require_reversible: true,
                 ..CompressOptions::default()
             },
@@ -1369,7 +1369,7 @@ mod tests {
         let result = compress_response_with_store(
             &input,
             &CompressOptions {
-                truncate_strings_at: Some(80),
+                truncate_strings_at: Some(tokenless_ccr::truncation_suffix_char_len() + 16),
                 ..CompressOptions::default()
             },
             true,
@@ -1477,7 +1477,7 @@ mod tests {
             .compress_response(
                 &input,
                 &CompressOptions {
-                    truncate_strings_at: Some(80),
+                    truncate_strings_at: Some(tokenless_ccr::truncation_suffix_char_len() + 16),
                     require_reversible: true,
                     ..CompressOptions::default()
                 },
@@ -1497,6 +1497,116 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].before_tokens, result.before_tokens);
         assert_eq!(records[0].after_tokens, result.after_tokens);
+    }
+
+    #[test]
+    fn runtime_records_json_record_reduction_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = TokenlessRuntime::new(RuntimeConfig {
+            data_dir: Some(directory.path().to_path_buf()),
+            stats_enabled: true,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let content = serde_json::to_string(
+            &(0..40)
+                .map(|index| {
+                    serde_json::json!({
+                        "id": index,
+                        "message": format!("record-{index}-{}", "x".repeat(80))
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let attribution = ProtocolAttribution {
+            agent_id: "agentscope".to_string(),
+            session_id: Some("record-session".to_string()),
+            tool_use_id: Some("record-call".to_string()),
+        };
+        let response = runtime
+            .post_tool(
+                &PostToolRequest {
+                    result_kind: ResultKind::Tool,
+                    tool_name: "api".to_string(),
+                    content,
+                    status: ToolResultStatus::Success,
+                    content_origin: ContentOrigin::ApiResponse,
+                    output_optimization: OutputOptimization::None,
+                    capabilities: PostToolCapabilities {
+                        replace_output: true,
+                        recovery: tokenless_protocol::RecoveryMethod::Shell,
+                        replace_with_text: false,
+                    },
+                },
+                &attribution,
+            )
+            .unwrap();
+        assert_eq!(
+            response.applied_operations,
+            [tokenless_protocol::AppliedOperation::JsonRecordReduction]
+        );
+
+        let recorder = StatsRecorder::new(directory.path().join("stats.db")).unwrap();
+        let records = recorder.records_by_session("record-session", None).unwrap();
+        assert_eq!(
+            records[0].applied_operations,
+            Some(vec!["json_record_reduction".to_string()])
+        );
+    }
+
+    #[test]
+    fn runtime_records_build_log_reduction_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = TokenlessRuntime::new(RuntimeConfig {
+            data_dir: Some(directory.path().to_path_buf()),
+            stats_enabled: true,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let mut content = "$ cargo build\n".to_owned();
+        for index in 0..30 {
+            content.push_str(&format!(
+                "Compiling package-{index:03} v0.1.{index} with extended progress output\n"
+            ));
+        }
+        content.push_str("Finished `dev` profile [unoptimized] target(s) in 1.2s\n");
+        let response = runtime
+            .post_tool(
+                &PostToolRequest {
+                    result_kind: ResultKind::Tool,
+                    tool_name: "Bash".to_owned(),
+                    content,
+                    status: ToolResultStatus::Success,
+                    content_origin: ContentOrigin::CommandOutput,
+                    output_optimization: OutputOptimization::None,
+                    capabilities: PostToolCapabilities {
+                        replace_output: true,
+                        recovery: tokenless_protocol::RecoveryMethod::Shell,
+                        replace_with_text: true,
+                    },
+                },
+                &ProtocolAttribution {
+                    agent_id: "agentscope".to_owned(),
+                    session_id: Some("build-log-session".to_owned()),
+                    tool_use_id: Some("build-log-call".to_owned()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            response.applied_operations,
+            [tokenless_protocol::AppliedOperation::BuildLogReduction]
+        );
+
+        let recorder = StatsRecorder::new(directory.path().join("stats.db")).unwrap();
+        let records = recorder
+            .records_by_session("build-log-session", None)
+            .unwrap();
+        assert_eq!(records[0].content_type.as_deref(), Some("build_log"));
+        assert_eq!(
+            records[0].applied_operations,
+            Some(vec!["build_log_reduction".to_owned()])
+        );
     }
 
     #[test]
