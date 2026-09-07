@@ -237,6 +237,7 @@ Default behavior:
 - Tokenless appends only when the target file already exists; otherwise it skips the write.
 - ANOLISA SLS/Logtail infrastructure creates, rotates, and removes the file.
 - SLS records contain metrics and identifiers, never the original before/after text.
+- When the agent host exports a W3C `traceparent`, records also carry `tokenless.trace_id` and `tokenless.span_id` so an observability backend such as AgentLoop can attribute the savings to the trace that produced them. Both keys are omitted when no context was propagated.
 - The bundled RTK statistics writer records `rewrite-command` rows only in local SQLite; it does not call the SLS writer.
 
 Use a custom test file:
@@ -248,6 +249,18 @@ TOKENLESS_SLS_PATH=/tmp/tokenless-sls.jsonl \
   tokenless compress-response -f response.json
 
 tail -n 1 /tmp/tokenless-sls.jsonl | jq .
+```
+
+Correlate one run with the trace the host is in:
+
+```bash
+touch /tmp/tokenless-sls.jsonl
+TRACEPARENT=00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 \
+TOKENLESS_SLS_ENABLED=1 \
+TOKENLESS_SLS_PATH=/tmp/tokenless-sls.jsonl \
+  tokenless compress-response -f response.json
+
+tail -n 1 /tmp/tokenless-sls.jsonl | jq '."tokenless.trace_id", ."tokenless.span_id"'
 ```
 
 `TOKENLESS_SLS_PATH` must be under `/var/log/` or `/tmp/`. Production SLS endpoint, authentication, and Logtail configuration belong to platform operations and are outside this guide.
