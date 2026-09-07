@@ -20,10 +20,17 @@
 # first `plugin list`. With settling retries, detect.sh must ride out the
 # race and report ready (exit 0); without retries (scenario 2) the same
 # first execution must fail with exit 2, proving the retries are what fix
-# it. Scenarios 3-4 pin the plugin probe's retry semantics: a successful
-# `plugin list` that omits the plugin is a definitive result and must not
-# consume the retry budget, while a failing `plugin list` is transient and
-# is retried.
+# it. Scenarios 3-6 pin the plugin probe's retry semantics. GH #3082 showed
+# that a successful `plugin list` omitting the plugin is not always
+# definitive: right after `claude plugin install` the CLI's plugin registry
+# index still lags the manifests on disk, so the first listing can omit a
+# plugin that is in fact installed. detect.sh now treats that omission as
+# retryable whenever the adapter's own marketplace.json + plugin.json payload
+# is fully staged (scenario 5) and as definitive only when nothing is staged
+# (scenario 3). A failing listing stays retryable (scenario 4), and a
+# genuinely absent plugin still terminates inside the bounded budget —
+# including the zero-retry opt-out `make claude-code-install` uses (scenario
+# 6).
 
 set -euo pipefail
 
@@ -38,7 +45,16 @@ PLUGIN_ID="tokenless@anolisa-tokenless"
 CALL_LOG="$TEST_DIR/claude-calls.log"
 STUB_MODE_FILE="$TEST_DIR/stub-mode"
 FLAKY_MARKER="$TEST_DIR/flaky-marker"
+LATE_MARKER="$TEST_DIR/late-list-marker"
 PROVISIONER_PID=""
+
+# detect.sh derives PLUGIN_SRC from ANOLISA_ADAPTER_DIR and its plugin probe
+# keys off the manifests staged there, so point it at a fixture adapter rather
+# than the real tree: a repo checkout has marketplace.json but no stamped
+# plugin.json, and `make stamp-adapter-templates` would silently change which
+# branch of the probe the scenarios exercise.
+FAKE_ADAPTER="$TEST_DIR/adapters/tokenless"
+FAKE_PLUGIN_SRC="$FAKE_ADAPTER/claude-code"
 
 cleanup() {
     if [ -n "$PROVISIONER_PID" ]; then
@@ -50,6 +66,37 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$FAKE_BIN" "$SHARED_HOOKS"
+
+# Fixture adapter payload. stage_plugin_payload reproduces a fully installed
+# adapter resource tree (both manifests present); unstage_plugin_manifest
+# reproduces the unstamped dev checkout (plugin.json missing). The hook
+# dispatcher is staged once — its absence would be an unrelated prerequisite
+# failure (exit 2) and would mask the plugin-probe assertions.
+stage_plugin_payload() {
+    mkdir -p "$FAKE_PLUGIN_SRC/.claude-plugin" "$FAKE_PLUGIN_SRC/hooks"
+    cat >"$FAKE_PLUGIN_SRC/.claude-plugin/marketplace.json" <<'JSON'
+{
+  "name": "anolisa-tokenless",
+  "plugins": [
+    { "name": "tokenless", "source": "./" }
+  ]
+}
+JSON
+    cat >"$FAKE_PLUGIN_SRC/.claude-plugin/plugin.json" <<'JSON'
+{
+  "name": "tokenless",
+  "version": "9.9.9-test"
+}
+JSON
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$FAKE_PLUGIN_SRC/hooks/run-hook.sh"
+    chmod +x "$FAKE_PLUGIN_SRC/hooks/run-hook.sh"
+}
+
+unstage_plugin_manifest() {
+    rm -f "$FAKE_PLUGIN_SRC/.claude-plugin/plugin.json"
+}
+
+stage_plugin_payload
 
 # detect.sh also requires `tokenless` and `rtk` on PATH (their absence is a
 # prerequisite failure). Provide isolated stubs so this test is
@@ -67,10 +114,13 @@ fail() {
 }
 
 # Stub claude CLI. `plugin list` behaviour is steered via $STUB_MODE_FILE:
-#   ready  — the list succeeds and contains the tokenless plugin (default)
-#   absent — the list succeeds but does not contain the plugin
-#   flaky  — the first `plugin list` call fails while the registry
-#            initializes; later calls succeed
+#   ready     — the list succeeds and contains the tokenless plugin (default)
+#   absent    — the list succeeds but never contains the plugin
+#   flaky     — the first `plugin list` call fails while the registry
+#               initializes; later calls succeed
+#   late-list — the first `plugin list` call succeeds but omits the plugin
+#               (registry index not rescanned since the install); later calls
+#               list it
 # Like the real CLI, `plugin list` creates $HOME/.claude when it first
 # runs; the config dir does not exist before that. Every invocation is
 # appended to $CALL_LOG so the tests can count CLI calls.
@@ -86,6 +136,12 @@ case "${1:-}" in
     ;;
 plugin)
     if [ "$mode" = "absent" ]; then
+        echo "NAME                          STATUS"
+        exit 0
+    fi
+    if [ "$mode" = "late-list" ] && [ ! -f "$LATE_MARKER" ]; then
+        : >"$LATE_MARKER"
+        mkdir -p "$HOME/.claude"
         echo "NAME                          STATUS"
         exit 0
     fi
@@ -128,21 +184,24 @@ cancel_provisioner() {
 
 reset_env() {
     rm -rf "$FAKE_HOME/.claude"
-    rm -f "$FAKE_BIN/claude" "$FLAKY_MARKER"
+    rm -f "$FAKE_BIN/claude" "$FLAKY_MARKER" "$LATE_MARKER"
+    stage_plugin_payload
     echo ready >"$STUB_MODE_FILE"
 }
 
 run_detect() { # run_detect <retries> <retry-delay>
     : >"$CALL_LOG"
-    rm -f "$FLAKY_MARKER"
+    rm -f "$FLAKY_MARKER" "$LATE_MARKER"
     # Inherit only /usr/local/bin:/usr/bin:/bin (detect.sh itself prepends
     # $HOME/.local/bin): a claude installed elsewhere in the CI PATH must
     # not leak into the window while the stub is not yet provisioned.
     HOME="$FAKE_HOME" \
     PATH="/usr/local/bin:/usr/bin:/bin" \
     CALL_LOG="$CALL_LOG" \
+    ANOLISA_ADAPTER_DIR="$FAKE_ADAPTER" \
     STUB_MODE_FILE="$STUB_MODE_FILE" \
     FLAKY_MARKER="$FLAKY_MARKER" \
+    LATE_MARKER="$LATE_MARKER" \
     TOKENLESS_DETECT_RETRIES="$1" \
     TOKENLESS_DETECT_RETRY_DELAY="$2" \
         bash "$DETECT" 2>&1
@@ -197,14 +256,15 @@ grep -qF "claude CLI" <<<"$out" \
 grep -qF "missing prerequisites" <<<"$out" \
     || fail "the first execution without retries should report missing prerequisites" "$out"
 
-# --- Scenario 3: definitive plugin-absent must not retry (PR review P2) ---
-# The CLI is installed and `plugin list` works, but the tokenless plugin is
-# not registered — the ordinary pre-install state. A successful list that
-# omits the plugin is definitive: detect.sh must report "not installed"
-# after exactly one `plugin list` invocation, without sleeping out the
-# retry budget.
+# --- Scenario 3: unstaged payload + omitted plugin must not retry ----------
+# The CLI is installed and `plugin list` works, the tokenless plugin is not
+# registered, and the adapter has no stamped plugin.json that a stale registry
+# index could be hiding — the pre-install state of an unstamped dev checkout.
+# Such an omission is definitive: detect.sh must report "not installed" after
+# exactly one `plugin list` invocation, without sleeping out the retry budget.
 reset_env
 install_claude_stub
+unstage_plugin_manifest
 echo absent >"$STUB_MODE_FILE"
 mkdir -p "$FAKE_HOME/.claude"
 set +e
@@ -218,6 +278,8 @@ grep -qF "not installed" <<<"$out" \
 calls="$(plugin_list_calls)"
 [ "$calls" -eq 1 ] \
     || fail "definitive plugin-absent must not retry: plugin list ran $calls times" "$out"
+grep -qF "missing (run: make stamp-adapter-templates)" <<<"$out" \
+    || fail "the unstamped manifest that makes the omission definitive should be reported" "$out"
 
 # --- Scenario 4: transient plugin-list failures are still retried ---------
 # A `plugin list` call that fails outright (as opposed to one that succeeds
@@ -234,5 +296,64 @@ grep -qF "installed ($PLUGIN_ID)" <<<"$out" \
 calls="$(plugin_list_calls)"
 [ "$calls" -eq 2 ] \
     || fail "the transient plugin-list failure should be retried once (saw $calls calls)" "$out"
+
+# --- Scenario 5: stale registry index after install is retried (GH #3082) --
+# The nightly failure path: the host has just installed the plugin, so the
+# adapter payload is fully staged on disk, but the CLI has not rescanned its
+# plugin registry yet — the first `plugin list` succeeds (exit 0) and omits
+# tokenless@anolisa-tokenless. detect.sh must ride out that window on its very
+# first execution and report ready (exit 0), instead of declaring the plugin
+# "not installed" and failing the framework-ready assertion.
+reset_env
+install_claude_stub
+echo late-list >"$STUB_MODE_FILE"
+mkdir -p "$FAKE_HOME/.claude"
+if ! out="$(run_detect 3 0)"; then
+    fail "detect.sh should exit 0 (ready) once the registry index catches up with the staged payload" "$out"
+fi
+grep -qF "installed ($PLUGIN_ID)" <<<"$out" \
+    || fail "plugin should be reported installed after the stale-index window" "$out"
+grep -qF "claude-code: ready" <<<"$out" \
+    || fail "claude-code should be reported ready after the stale-index window" "$out"
+calls="$(plugin_list_calls)"
+[ "$calls" -eq 2 ] \
+    || fail "the stale-index omission should be retried once (saw $calls plugin list calls)" "$out"
+
+# --- Scenario 6: a genuinely absent plugin stays bounded -------------------
+# Retrying the omission must not turn the pre-install probe into an unbounded
+# one: with the payload staged and the plugin never listed, detect.sh stops
+# after 1 + TOKENLESS_DETECT_RETRIES listings and still reports "not
+# installed" (exit 1). TOKENLESS_DETECT_RETRIES=0 — the opt-out
+# `make claude-code-install` uses for its informational pre-install probe —
+# keeps that path to a single listing.
+reset_env
+install_claude_stub
+echo absent >"$STUB_MODE_FILE"
+mkdir -p "$FAKE_HOME/.claude"
+set +e
+out="$(run_detect 2 0)"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] \
+    || fail "an absent plugin should still exit 1 (installable), got $rc" "$out"
+grep -qF "not installed" <<<"$out" \
+    || fail "plugin should be reported not installed once the bounded retries are spent" "$out"
+calls="$(plugin_list_calls)"
+[ "$calls" -eq 3 ] \
+    || fail "stale-index retries must stay bounded at 1 + TOKENLESS_DETECT_RETRIES listings (saw $calls)" "$out"
+
+reset_env
+install_claude_stub
+echo absent >"$STUB_MODE_FILE"
+mkdir -p "$FAKE_HOME/.claude"
+set +e
+out="$(run_detect 0 0)"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] \
+    || fail "the zero-retry opt-out should still exit 1 (installable), got $rc" "$out"
+calls="$(plugin_list_calls)"
+[ "$calls" -eq 1 ] \
+    || fail "TOKENLESS_DETECT_RETRIES=0 must skip the stale-index retries (saw $calls listings)" "$out"
 
 echo "claude-code detect retry test passed"

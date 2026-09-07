@@ -16,12 +16,12 @@ PLUGIN_SRC="$ADAPTER_DIR/claude-code"
 CLAUDE_BIN="${CLAUDE_BIN:-}"
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 
-# First-run settling retries: right after provisioning, the claude binary or
-# the plugin registry may be transiently invisible on the very first detect.sh
-# execution (filesystem/PATH init timing race). settle() only retries checks
-# that report a retryable failure (exit status 1); checks that succeed or
-# report a definitive result return immediately, so steady-state runs stay
-# fast.
+# First-run settling retries: right after provisioning, the claude binary, the
+# `plugin list` call, or the CLI's plugin registry index may be transiently
+# unavailable on the very first detect.sh execution (filesystem/PATH init and
+# marketplace-scan timing races). settle() only retries checks that report a
+# retryable failure (exit status 1); checks that succeed or report a definitive
+# result return immediately, so steady-state runs stay fast.
 DETECT_RETRIES="${TOKENLESS_DETECT_RETRIES:-3}"
 DETECT_RETRY_DELAY="${TOKENLESS_DETECT_RETRY_DELAY:-1}"
 
@@ -84,7 +84,14 @@ else
     field "claude config dir" "missing (created on first claude run)"
 fi
 
+# The two local manifests say what this adapter is able to install, and the
+# plugin probe below reuses them as its "plugin payload fully staged" signal,
+# so record both results here instead of stat'ing the files a second time.
+MARKETPLACE_STAGED=0
+PLUGIN_MANIFEST_STAGED=0
+
 if [ -f "$PLUGIN_SRC/.claude-plugin/marketplace.json" ]; then
+    MARKETPLACE_STAGED=1
     field "marketplace.json"  "present"
 else
     field "marketplace.json"  "missing"
@@ -92,18 +99,30 @@ else
 fi
 
 if [ -f "$PLUGIN_SRC/.claude-plugin/plugin.json" ]; then
+    PLUGIN_MANIFEST_STAGED=1
     field "plugin.json"       "present"
 else
     field "plugin.json"       "missing (run: make stamp-adapter-templates)"
 fi
 
 # claude_plugin_listed — probe the plugin registry, using the settle()
-# exit-status contract: 0 = plugin listed; 1 = `claude plugin list` itself
-# failed (the CLI may still be initializing ~/.claude on first run, so a
-# retry may still succeed); 2 = `plugin list` ran successfully but did not
-# list the plugin. That is a definitive absent result — no retry can change
-# it — so settle() must return immediately instead of sleeping out the
-# retry budget and invoking the CLI DETECT_RETRIES + 1 times.
+# exit-status contract:
+#   0 = the plugin is listed.
+#   1 = retryable. Either `claude plugin list` itself failed (the CLI may still
+#       be initializing ~/.claude on first run), or the list succeeded while
+#       omitting a plugin whose payload is fully staged on disk. The latter is
+#       the GH #3082 first-run race: marketplace.json / plugin.json are in
+#       place and `claude plugin install` has registered them, but the CLI
+#       refreshes its plugin registry index only on its next marketplace scan,
+#       so the very first `plugin list` after an install can succeed (exit 0)
+#       and still omit the plugin that is in fact installed. Reporting that
+#       omission as definitive made the first detect.sh run on a freshly
+#       provisioned host claim "not installed".
+#   2 = definitive absent: the list succeeded, the plugin is not in it, and the
+#       adapter has no staged payload for a stale index to be hiding either
+#       (e.g. an unstamped dev checkout). No retry can change that, so settle()
+#       must return immediately instead of sleeping out the retry budget and
+#       invoking the CLI DETECT_RETRIES + 1 times.
 claude_plugin_listed() {
     local listing
     if ! listing="$("$CLAUDE_BIN" plugin list 2>&1)"; then
@@ -112,14 +131,24 @@ claude_plugin_listed() {
     if printf '%s\n' "$listing" | grep -qF "$PLUGIN_ID"; then
         return 0
     fi
+    if [ "$MARKETPLACE_STAGED" -eq 1 ] && [ "$PLUGIN_MANIFEST_STAGED" -eq 1 ]; then
+        # Payload staged but not listed: ride out the registry-index refresh
+        # window instead of declaring the plugin absent.
+        return 1
+    fi
     return 2
 }
 
 if [ -n "$CLAUDE_BIN" ] && [ -x "$CLAUDE_BIN" ]; then
-    # First-run race: `claude plugin list` may transiently fail while the CLI
-    # initializes ~/.claude; settle() retries while that failure (status 1)
-    # persists. A successful list that simply omits the plugin is definitive
-    # (status 2) and is reported as "not installed" without further retries.
+    # First-run races: `claude plugin list` may transiently fail while the CLI
+    # initializes ~/.claude, and it may transiently omit an installed plugin
+    # while the registry index catches up with the on-disk manifests. settle()
+    # retries both (status 1) inside the bounded budget — a host whose plugin
+    # really is absent therefore reports "not installed" after at most
+    # DETECT_RETRIES extra listings (none at all with
+    # TOKENLESS_DETECT_RETRIES=0, which is what `make claude-code-install`
+    # uses for its informational pre-install probe). An omission with no staged
+    # payload stays definitive (status 2) and is reported without retries.
     if settle claude_plugin_listed; then
         field "plugin install"    "installed ($PLUGIN_ID)"
     else
