@@ -27,7 +27,10 @@ the unified-entry architecture (roadmap §5.4):
   successful command is not misclassified as an error.
 
 Uses subprocesses with mock ``tokenless`` binaries, following the pattern of
-test_compress_response_hook.py and test_rewrite_hook.py.
+test_compress_response_hook.py and test_rewrite_hook.py.  The three
+integration classes run through one shared harness
+(:class:`HookIntegrationTestCase`) so env scrubbing, PATH layout, timeouts
+and output parsing are defined exactly once.
 """
 
 from __future__ import annotations
@@ -200,6 +203,75 @@ class CoshNGEnvTestCase(unittest.TestCase):
         os.environ.update(self._saved_env)
 
 
+class HookIntegrationTestCase(CoshNGEnvTestCase):
+    """Shared harness for the hook subprocess integration tests.
+
+    Owns the temp sandbox, the scrubbed Cosh-NG environment (inherited from
+    :class:`CoshNGEnvTestCase`) and the one ``_run_hook`` implementation, so
+    env handling, timeouts and output parsing cannot drift between the
+    integration classes — the rewrite-marker leak caught in the first review
+    round was exactly such a drift.  Subclasses describe their sandbox with
+    ``_prepare_sandbox`` / ``_path_entries``, pick the hook under test via
+    ``hook_script`` and add class-wide env vars through ``extra_env``.
+    """
+
+    hook_script: Path = COMPRESS_HOOK
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.extra_env: dict[str, str] = {}
+        self._prepare_sandbox()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+        super().tearDown()
+
+    def _prepare_sandbox(self) -> None:
+        """Lay out the sandbox and set ``self.home`` (subclass hook)."""
+        raise NotImplementedError
+
+    def _path_entries(self, env: dict[str, str]) -> str:
+        """Return the ``PATH`` the hook subprocess runs with (subclass hook)."""
+        raise NotImplementedError
+
+    def _run_hook(self, stdin_data: dict, env_overrides: dict | None = None) -> dict:
+        env = os.environ.copy()
+        env.pop("COSH_NG_VERSION", None)
+        env.pop("COSH_RUNTIME", None)
+        env["HOME"] = str(self.home)
+        env["PATH"] = self._path_entries(env)
+        env["TOKENLESS_AGENT_ID"] = "copilot-shell"
+        env.update(self.extra_env)
+        if env_overrides:
+            env.update(env_overrides)
+        proc = subprocess.run(
+            [sys.executable, str(self.hook_script)],
+            input=json.dumps(stdin_data),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        stdout = proc.stdout.strip()
+        if not stdout or stdout == "{}":
+            return {}
+        return json.loads(stdout)
+
+
+class CompressHookTestCase(HookIntegrationTestCase):
+    """Sandbox for compress_response_hook.py: mock ``tokenless`` inside HOME."""
+
+    def _prepare_sandbox(self) -> None:
+        self.home = self.root
+        self.mock_tokenless = _create_mock_tokenless(self.home)
+
+    def _path_entries(self, env: dict[str, str]) -> str:
+        return str(self.mock_tokenless.parent) + ":" + env.get("PATH", "")
+
+
 class TestCoshNGRuntimeDetection(CoshNGEnvTestCase):
     """Cosh-NG detection from the host-injected environment variables."""
 
@@ -274,7 +346,7 @@ class TestCoshNGAgentAttribution(CoshNGEnvTestCase):
         self.assertEqual(hook_utils.resolve_agent_id(), "unknown")
 
 
-class TestCoshNGCompressResponseIntegration(unittest.TestCase):
+class TestCoshNGCompressResponseIntegration(CompressHookTestCase):
     """Integration tests for compress_response_hook.py under Cosh-NG.
 
     The unified-entry hook (roadmap §5.4) detects Cosh-NG from the
@@ -282,40 +354,6 @@ class TestCoshNGCompressResponseIntegration(unittest.TestCase):
     by the host, extracts only ``llmContent`` from the wrapped response,
     and emits the replacement through ``updatedToolResponse``.
     """
-
-    def setUp(self) -> None:
-        self._saved_env = os.environ.copy()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.home = Path(self.tmp.name)
-        self.mock_tokenless = _create_mock_tokenless(self.home)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-        os.environ.clear()
-        os.environ.update(self._saved_env)
-
-    def _run_hook(self, stdin_data: dict, env_overrides: dict | None = None) -> dict:
-        env = os.environ.copy()
-        env.pop("COSH_NG_VERSION", None)
-        env.pop("COSH_RUNTIME", None)
-        env["HOME"] = str(self.home)
-        env["PATH"] = str(self.mock_tokenless.parent) + ":" + env.get("PATH", "")
-        env["TOKENLESS_AGENT_ID"] = "copilot-shell"
-        if env_overrides:
-            env.update(env_overrides)
-        proc = subprocess.run(
-            [sys.executable, str(COMPRESS_HOOK)],
-            input=json.dumps(stdin_data),
-            capture_output=True,
-            text=True,
-            timeout=15,
-            env=env,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        stdout = proc.stdout.strip()
-        if not stdout or stdout == "{}":
-            return {}
-        return json.loads(stdout)
 
     def test_cosh_ng_replacement_field_emitted(self):
         """Cosh-NG path emits updatedToolResponse with compressed llmContent."""
@@ -481,7 +519,7 @@ class TestCoshNGCompressResponseIntegration(unittest.TestCase):
         self.assertEqual(out, {})
 
 
-class TestCopilotShellEnvelopeClassification(unittest.TestCase):
+class TestCopilotShellEnvelopeClassification(CompressHookTestCase):
     """Cross-host regression for string-envelope error classification.
 
     Protocol v2 moved environment diagnosis into Core, gated on the
@@ -492,40 +530,6 @@ class TestCopilotShellEnvelopeClassification(unittest.TestCase):
     must keep working through the same parse, and envelope-shaped text
     without error markers must not be misclassified.
     """
-
-    def setUp(self) -> None:
-        self._saved_env = os.environ.copy()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.home = Path(self.tmp.name)
-        self.mock_tokenless = _create_mock_tokenless(self.home)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-        os.environ.clear()
-        os.environ.update(self._saved_env)
-
-    def _run_hook(self, stdin_data: dict, env_overrides: dict | None = None) -> dict:
-        env = os.environ.copy()
-        env.pop("COSH_NG_VERSION", None)
-        env.pop("COSH_RUNTIME", None)
-        env["HOME"] = str(self.home)
-        env["PATH"] = str(self.mock_tokenless.parent) + ":" + env.get("PATH", "")
-        env["TOKENLESS_AGENT_ID"] = "copilot-shell"
-        if env_overrides:
-            env.update(env_overrides)
-        proc = subprocess.run(
-            [sys.executable, str(COMPRESS_HOOK)],
-            input=json.dumps(stdin_data),
-            capture_output=True,
-            text=True,
-            timeout=15,
-            env=env,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        stdout = proc.stdout.strip()
-        if not stdout or stdout == "{}":
-            return {}
-        return json.loads(stdout)
 
     def test_copilot_shell_string_envelope_error_keeps_attribution(self):
         """A failing copilot-shell string envelope is classified as error."""
@@ -556,15 +560,14 @@ class TestCopilotShellEnvelopeClassification(unittest.TestCase):
         self.assertEqual(self._run_hook(stdin_data), {})
 
 
-class TestCoshNGRewriteIntegration(unittest.TestCase):
+class TestCoshNGRewriteIntegration(HookIntegrationTestCase):
     """Integration tests for rewrite_hook.py under Cosh-NG."""
 
-    def setUp(self) -> None:
-        self._saved_env = os.environ.copy()
-        self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
-        self.home = root / "home"
-        self.bin_dir = root / "bin"
+    hook_script = REWRITE_HOOK
+
+    def _prepare_sandbox(self) -> None:
+        self.home = self.root / "home"
+        self.bin_dir = self.root / "bin"
         self.home.mkdir()
         self.bin_dir.mkdir()
         tokenless = self.bin_dir / "tokenless"
@@ -574,40 +577,19 @@ class TestCoshNGRewriteIntegration(unittest.TestCase):
         )
         # The mock's shebang resolves through PATH: pin it to this interpreter.
         (self.bin_dir / "python3").symlink_to(sys.executable)
-        self.request_log = root / "requests.jsonl"
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-        os.environ.clear()
-        os.environ.update(self._saved_env)
-
-    def _run_hook(self, stdin_data: dict, env_overrides: dict | None = None) -> dict:
-        env = os.environ.copy()
-        env.pop("COSH_NG_VERSION", None)
-        env.pop("COSH_RUNTIME", None)
-        env["HOME"] = str(self.home)
-        env["PATH"] = f"{self.bin_dir}:/usr/bin:/bin"
-        env["TOKENLESS_AGENT_ID"] = "copilot-shell"
+        self.request_log = self.root / "requests.jsonl"
         # Keep the run hermetic: no stats/SLS side channels.
-        env["TOKENLESS_STATS_ENABLED"] = "0"
-        env["TOKENLESS_SLS_ENABLED"] = "0"
-        env["TOKENLESS_MOCK_BEHAVIOR"] = "applied"
-        env["TOKENLESS_MOCK_REQUEST_LOG"] = str(self.request_log)
-        if env_overrides:
-            env.update(env_overrides)
-        proc = subprocess.run(
-            [sys.executable, str(REWRITE_HOOK)],
-            input=json.dumps(stdin_data),
-            capture_output=True,
-            text=True,
-            timeout=15,
-            env=env,
+        self.extra_env.update(
+            {
+                "TOKENLESS_STATS_ENABLED": "0",
+                "TOKENLESS_SLS_ENABLED": "0",
+                "TOKENLESS_MOCK_BEHAVIOR": "applied",
+                "TOKENLESS_MOCK_REQUEST_LOG": str(self.request_log),
+            }
         )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        stdout = proc.stdout.strip()
-        if not stdout or stdout == "{}":
-            return {}
-        return json.loads(stdout)
+
+    def _path_entries(self, env: dict[str, str]) -> str:
+        return f"{self.bin_dir}:/usr/bin:/bin"
 
     def _requests(self) -> list[dict]:
         with self.request_log.open(encoding="utf-8") as handle:
