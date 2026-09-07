@@ -252,6 +252,93 @@ tail -n 1 /tmp/tokenless-sls.jsonl | jq .
 
 `TOKENLESS_SLS_PATH` must be under `/var/log/` or `/tmp/`. Production SLS endpoint, authentication, and Logtail configuration belong to platform operations and are outside this guide.
 
+## AgentLoop observability
+
+AgentLoop is the agent observability and optimization platform that agent runtimes such as AgentCore report to. It correlates every tool call inside a conversation along a trajectory. Tokenless reports each compression's token savings on a separate AgentLoop channel and carries the trajectory correlation identity, so savings can be attributed to one conversation and one tool call instead of only a component-level aggregate.
+
+How this relates to the SLS channel:
+
+- The SLS channel targets operational collection and uses the `component.*` / `tokenless.compression.*` namespaces.
+- The AgentLoop channel targets trajectory correlation and uses the trajectory names `conversation_id`, `tool_call_id`, and `agent_name`.
+- The two channels are independent and can be toggled separately. Disabling one affects neither the other nor local `stats.db`.
+
+Default behavior:
+
+- `agentloop_enabled=true`.
+- The default target is `/var/log/anolisa/agentloop/ops/tokenless.jsonl`.
+- Tokenless appends only when the target file already exists; otherwise it skips the write.
+- ANOLISA collection infrastructure creates, rotates, and removes the file. Tokenless never creates or removes it.
+- Records contain metrics and correlation identifiers, never the original before/after text.
+- The bundled RTK statistics writer records to local SQLite only; it does not call the AgentLoop writer.
+
+### Correlation identity
+
+The AgentLoop correlation identity comes from Tokenless attribution fields that already exist, spelled with the trajectory names:
+
+| AgentLoop field | Tokenless source | Meaning |
+|-----------------|------------------|---------|
+| `conversation_id` | `--session-id` / `attribution.session_id` | One conversation |
+| `tool_call_id` | `--tool-use-id` / `attribution.tool_use_id` | One tool call in that conversation |
+| `agent_name` | `--agent-id` / `attribution.agent_id` | Agent or adapter identity |
+
+The `attribution` object of the unified entry point `tokenless compress` also accepts the trajectory spelling, so a host that already reports to AgentLoop needs no field-name translation layer:
+
+```json
+{
+  "protocol_version": 2,
+  "operation": "post_tool",
+  "attribution": {
+    "agent_id": "agentcore",
+    "conversation_id": "conv-1",
+    "tool_call_id": "call-1"
+  }
+}
+```
+
+Notes:
+
+- The alias is input-only. Tokenless always serializes `session_id` / `tool_use_id`, so existing adapters and response shapes are unaffected.
+- Sending both spellings of one identity is rejected as a duplicate field rather than silently resolved.
+- Absent identifiers are omitted from the record instead of being written as `null`.
+
+### Record content
+
+One JSON object per line. Main fields:
+
+| Field | Description |
+|-------|-------------|
+| `schema_version` | Record layout version, currently `1` |
+| `event_type` | Always `tokenless.token_savings` |
+| `timestamp` | RFC 3339 UTC timestamp |
+| `conversation_id` / `tool_call_id` / `agent_name` | Trajectory correlation identity |
+| `operation` | `compress-schema`, `compress-response`, `rewrite-command`, `compress-toon` |
+| `mode` | `active` means the savings were applied; `dry-run` means predicted only, and AgentLoop must not count dry-run savings as real |
+| `before_tokens` / `after_tokens` / `tokens_saved` / `tokens_saved_percent` | Token metrics |
+| `before_chars` / `after_chars` / `chars_saved` / `chars_saved_percent` | Character metrics |
+| `content_type` / `content_origin` / `applied_operations` | Content taxonomy and the operations that took effect |
+| `recoverability` / `unrecoverable_truncations` | Whether the original can be retrieved, separating lossless from lossy savings |
+| `tokenizer_id` | Token counter identity used for the estimates |
+
+Use a custom test file:
+
+```bash
+touch /tmp/tokenless-agentloop.jsonl
+TOKENLESS_AGENTLOOP_ENABLED=1 \
+TOKENLESS_AGENTLOOP_PATH=/tmp/tokenless-agentloop.jsonl \
+  tokenless compress-response -f response.json \
+  --agent-id agentcore --session-id conv-1 --tool-use-id call-1
+
+tail -n 1 /tmp/tokenless-agentloop.jsonl | jq .
+```
+
+`TOKENLESS_AGENTLOOP_PATH` must be under `/var/log/` or `/tmp/` and must not contain `..`. Production AgentLoop endpoints, authentication, and collection configuration belong to platform operations and are outside this guide.
+
+Check the current toggle state with:
+
+```bash
+tokenless stats status
+```
+
 ## Clear statistics
 
 First confirm that historical comparisons are no longer needed:
@@ -266,4 +353,4 @@ This clears records but does not disable future recording. Stop new local record
 tokenless stats disable
 ```
 
-`stats disable` turns off only local SQLite statistics, not SLS. See [Configuration and data privacy](configuration-and-privacy.md) for the complete toggle behavior.
+`stats disable` turns off only local SQLite statistics, not the SLS or AgentLoop feeds. See [Configuration and data privacy](configuration-and-privacy.md) for the complete toggle behavior.

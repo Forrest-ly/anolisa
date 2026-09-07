@@ -482,6 +482,7 @@ fn compress_response_cli_matches_runtime_library() {
         .env("TOKENLESS_COMPRESSION_ENABLED", "1")
         .env("TOKENLESS_STATS_ENABLED", "0")
         .env("TOKENLESS_SLS_ENABLED", "0")
+        .env("TOKENLESS_AGENTLOOP_ENABLED", "0")
         .args([
             "compress-response",
             "--truncate-arrays-at",
@@ -521,6 +522,7 @@ fn compress_response_stats_use_unicode_aware_estimates() {
         .env("TOKENLESS_COMPRESSION_ENABLED", "1")
         .env("TOKENLESS_STATS_ENABLED", "1")
         .env("TOKENLESS_SLS_ENABLED", "0")
+        .env("TOKENLESS_AGENTLOOP_ENABLED", "0")
         .args([
             "compress-response",
             "--truncate-strings-at",
@@ -572,6 +574,7 @@ fn dry_run_no_savings_keeps_the_no_savings_warning() {
         .env("TOKENLESS_COMPRESSION_ENABLED", "0")
         .env("TOKENLESS_STATS_ENABLED", "0")
         .env("TOKENLESS_SLS_ENABLED", "0")
+        .env("TOKENLESS_AGENTLOOP_ENABLED", "0")
         .args(["compress-response", "--no-stash"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -848,7 +851,8 @@ fn retrieve_records_events_and_summary_reports_attribution() {
             .command()
             .env("TOKENLESS_COMPRESSION_ENABLED", "1")
             .env("TOKENLESS_STATS_ENABLED", "1")
-            .env("TOKENLESS_SLS_ENABLED", "0"),
+            .env("TOKENLESS_SLS_ENABLED", "0")
+            .env("TOKENLESS_AGENTLOOP_ENABLED", "0"),
         &["compress"],
         &request.to_string(),
     );
@@ -1132,6 +1136,7 @@ fn run_compress_toon(
         .env("TOKENLESS_COMPRESSION_ENABLED", compression_enabled)
         .env("TOKENLESS_STATS_ENABLED", "1")
         .env("TOKENLESS_SLS_ENABLED", "0")
+        .env("TOKENLESS_AGENTLOOP_ENABLED", "0")
         .args([
             "compress-toon",
             "--agent-id",
@@ -1818,7 +1823,8 @@ fn compress_post_tool_uses_the_v2_result_envelope() {
             .command()
             .env("TOKENLESS_COMPRESSION_ENABLED", "1")
             .env("TOKENLESS_STATS_ENABLED", "0")
-            .env("TOKENLESS_SLS_ENABLED", "0"),
+            .env("TOKENLESS_SLS_ENABLED", "0")
+            .env("TOKENLESS_AGENTLOOP_ENABLED", "0"),
         &["compress"],
         &post_tool_request_json(&content, false, "v2-post-tool"),
     );
@@ -1859,7 +1865,8 @@ fn compress_post_tool_dry_run_previews_record_reduction_without_stash_writes() {
             .command()
             .env("TOKENLESS_COMPRESSION_ENABLED", "0")
             .env("TOKENLESS_STATS_ENABLED", "0")
-            .env("TOKENLESS_SLS_ENABLED", "0"),
+            .env("TOKENLESS_SLS_ENABLED", "0")
+            .env("TOKENLESS_AGENTLOOP_ENABLED", "0"),
         &["compress"],
         &post_tool_request_json(&content, true, "record-dry-run"),
     );
@@ -1925,7 +1932,8 @@ fn compress_post_tool_reduces_and_restores_build_logs() {
             .command()
             .env("TOKENLESS_COMPRESSION_ENABLED", "1")
             .env("TOKENLESS_STATS_ENABLED", "0")
-            .env("TOKENLESS_SLS_ENABLED", "0"),
+            .env("TOKENLESS_SLS_ENABLED", "0")
+            .env("TOKENLESS_AGENTLOOP_ENABLED", "0"),
         &["compress"],
         &build_log_request(&content, "success", "build-log"),
     );
@@ -1976,7 +1984,8 @@ fn compress_post_tool_error_build_log_stays_original_with_diagnosis() {
             .command()
             .env("TOKENLESS_COMPRESSION_ENABLED", "1")
             .env("TOKENLESS_STATS_ENABLED", "0")
-            .env("TOKENLESS_SLS_ENABLED", "0"),
+            .env("TOKENLESS_SLS_ENABLED", "0")
+            .env("TOKENLESS_AGENTLOOP_ENABLED", "0"),
         &["compress"],
         &build_log_request(&content, "error", "build-log-error"),
     );

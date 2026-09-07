@@ -134,6 +134,7 @@ class HookLifecycleStateTest(unittest.TestCase):
             "TOKENLESS_AGENT_ID": "qoder-cli",
             "TOKENLESS_STATS_ENABLED": "0",
             "TOKENLESS_SLS_ENABLED": "0",
+            "TOKENLESS_AGENTLOOP_ENABLED": "0",
             "TOKENLESS_MOCK_BEHAVIOR": "applied",
             "TOKENLESS_MOCK_REQUEST_LOG": str(self.request_log),
         }
@@ -268,6 +269,7 @@ class RealCorePreToolTest(unittest.TestCase):
                 "TOKENLESS_AGENT_ID": "qoder-cli",
                 "TOKENLESS_STATS_ENABLED": "0",
                 "TOKENLESS_SLS_ENABLED": "0",
+                "TOKENLESS_AGENTLOOP_ENABLED": "0",
             }
             proc = subprocess.run(
                 [sys.executable, corpus.PRE_TOOL_HOOK],

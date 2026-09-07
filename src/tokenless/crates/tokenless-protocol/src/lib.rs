@@ -117,16 +117,35 @@ impl Operation {
 }
 
 /// Attribution shared by lifecycle operations.
+///
+/// Hosts that report their trajectories to an agent observability backend
+/// (AgentLoop, via the ATIF trajectory vocabulary) name these identities
+/// `conversation_id` and `tool_call_id`. Both spellings are accepted on input
+/// so such a host can bind tokenless to the exact identity it already reports
+/// without a translation layer; tokenless always serializes its own names, so
+/// the emitted wire contract is unchanged. Supplying both spellings for the
+/// same identity is rejected as a duplicate field rather than silently
+/// picking one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Attribution {
     /// Stable agent or adapter identifier.
     pub agent_id: String,
     /// Conversation identifier when supplied by the host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Also accepted as `conversation_id` (trajectory vocabulary).
+    #[serde(
+        default,
+        alias = "conversation_id",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub session_id: Option<String>,
     /// Tool-call identifier when supplied by the host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Also accepted as `tool_call_id` (trajectory vocabulary).
+    #[serde(
+        default,
+        alias = "tool_call_id",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tool_use_id: Option<String>,
 }
 

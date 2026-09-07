@@ -14,7 +14,7 @@ Tokenless 默认启用压缩、本地统计和 SLS 度量。由于本地统计�
 
 空环境变量视为未设置。布尔环境变量中，`1`、`true`、`yes`（大小写不敏感）表示 true；其他非空值表示 false。为了可读性，建议明确使用 `true` 或 `false`。
 
-当前实现有一个例外：当 `TOKENLESS_STATS_ENABLED` 和 `TOKENLESS_SLS_ENABLED` 都是非空值时，代码会完全跳过配置文件。在这个分支中，压缩开关优先使用 `TOKENLESS_COMPRESSION_ENABLED`；未设置时直接默认为 `true`。如果同时导出两个记录开关，也应显式导出压缩开关。
+当前实现有一个例外：当 `TOKENLESS_STATS_ENABLED`、`TOKENLESS_SLS_ENABLED`、`TOKENLESS_AGENTLOOP_ENABLED` 和 `TOKENLESS_COMPRESSION_ENABLED` 全部是非空值时，代码会完全跳过配置文件，四个开关都直接取环境变量。只要有一个未设置，就会读取配置文件来补齐它。如果导出了其中任意几个记录开关，建议把四个都显式导出，避免配置文件在慢速或异常挂载上引入额外读取。
 
 ## 配置文件
 
@@ -30,6 +30,7 @@ Tokenless 默认启用压缩、本地统计和 SLS 度量。由于本地统计�
 {
   "stats_enabled": true,
   "sls_enabled": true,
+  "agentloop_enabled": true,
   "compression_enabled": true
 }
 ```
@@ -44,6 +45,7 @@ jq . ~/.tokenless/config.json
 |------|--------|----------|
 | `stats_enabled` | `true` | 把压缩前后文本和度量写入本地 SQLite |
 | `sls_enabled` | `true` | 目标 JSONL 文件已存在时追加仅包含度量的记录 |
+| `agentloop_enabled` | `true` | 目标 JSONL 文件已存在时追加仅包含度量与轨迹关联标识的 AgentLoop 记录 |
 | `compression_enabled` | `true` | 为 true 时返回压缩结果；false 时进入 dry-run 并返回原文 |
 
 Tokenless 写入配置文件时会把权限限制为 `0600`。手动创建文件后也应确认：
@@ -70,11 +72,13 @@ tokenless stats disable
 |------|------|------|
 | `TOKENLESS_STATS_ENABLED` | 覆盖本地统计开关 | 不影响 SLS 或 Stash |
 | `TOKENLESS_SLS_ENABLED` | 覆盖 SLS 度量开关 | 不影响本地统计 |
+| `TOKENLESS_AGENTLOOP_ENABLED` | 覆盖 AgentLoop 度量开关 | 不影响本地统计和 SLS |
 | `TOKENLESS_COMPRESSION_ENABLED` | 覆盖真实压缩开关 | false 是 dry-run，不是完全停用 |
 | `TOKENLESS_DATA_DIR` | 存放 `stats.db` 和 `stash.db` 的目录 | 可访问的任意绝对目录，但不能是文件系统根目录或包含父目录遍历 |
 | `TOKENLESS_STATS_DB` | 覆盖统计数据库路径 | 必须位于真实用户 home 或选定的数据目录下 |
 | `TOKENLESS_STASH_DB` | 覆盖 Stash 数据库路径 | 必须位于真实用户 home 或选定的数据目录下 |
 | `TOKENLESS_SLS_PATH` | 覆盖 SLS JSONL 路径 | 必须位于 `/var/log/` 或 `/tmp/` 下 |
+| `TOKENLESS_AGENTLOOP_PATH` | 覆盖 AgentLoop JSONL 路径 | 必须位于 `/var/log/` 或 `/tmp/` 下 |
 
 ### Adapter 和诊断变量
 
@@ -111,8 +115,9 @@ SQLite sidecar 不会被 `git add -A` 暂存。Adapter 不会修改自定义路�
 |------|----------|----------|----------|--------------|
 | 本地统计 | `~/.tokenless/stats.db` | 压缩前后完整文本、标识和度量 | 无自动 TTL，直到清理 | `tokenless stats disable` |
 | Stash | `~/.tokenless/stash.db` | 截断时移除的原始字符串、截断数组中被丢弃的中间段、被缩减为采样集合的完整对象记录数组、深层子树、Schema 描述和 build/log 间隙内容 | TTL 1 小时、最多 10,000 个有效条目，过期行延迟清理 | CLI 使用 `--no-stash`；Agent 场景禁用 Adapter |
-| 配置 | `~/.tokenless/config.json` | 三个布尔开关 | 持续保留 | 不适用 |
+| 配置 | `~/.tokenless/config.json` | 四个布尔开关 | 持续保留 | 不适用 |
 | SLS JSONL | `/var/log/anolisa/sls/ops/tokenless.jsonl` | 度量和标识，不含压缩原文 | 由 SLS/Logtail 设施管理 | `TOKENLESS_SLS_ENABLED=0` 或配置为 false |
+| AgentLoop JSONL | `/var/log/anolisa/agentloop/ops/tokenless.jsonl` | 度量、轨迹关联标识（`conversation_id`、`tool_call_id`、`agent_name`），不含压缩原文 | 由 ANOLISA 采集设施管理 | `TOKENLESS_AGENTLOOP_ENABLED=0` 或配置为 false |
 
 ### 本地统计的敏感性
 
@@ -139,9 +144,9 @@ ls -l ~/.tokenless/stash.db*
 
 TTL 表示条目超过一小时后不能再通过 `retrieve` 返回。过期行会在后续取回时延迟删除；TTL 不应被理解为立即安全擦除磁盘数据。当有效条目超过 10,000 个时，存储会优先淘汰到期时间最早的条目，因此高负载下可能不到一小时就无法取回。
 
-### SLS 不包含原文
+### SLS 与 AgentLoop 通道都不包含原文
 
-Tokenless 的 SLS JSONL 只写入组件、Operation、Session/Tool Use 标识和字符/Token 度量，不写 `before_text` 或 `after_text`。但标识字段本身仍可能属于组织的运行元数据，应按照平台日志策略管理。
+Tokenless 的 SLS JSONL 和 AgentLoop JSONL 都只写入组件、Operation、关联标识和字符/Token 度量，不写 `before_text` 或 `after_text`。AgentLoop 记录额外带上 `conversation_id` 与 `tool_call_id`，用于把节省归因到具体会话和工具调用。但标识字段本身仍可能属于组织的运行元数据，应按照平台日志策略管理。
 
 ## 敏感工作负载建议
 
@@ -150,6 +155,7 @@ Tokenless 的 SLS JSONL 只写入组件、Operation、Session/Tool Use 标识和
 ```bash
 TOKENLESS_STATS_ENABLED=0 \
 TOKENLESS_SLS_ENABLED=0 \
+TOKENLESS_AGENTLOOP_ENABLED=0 \
   tokenless compress-response --no-stash -f response.json
 ```
 
@@ -168,6 +174,7 @@ export TOKENLESS_COMPRESSION_ENABLED=0
 ```bash
 export TOKENLESS_STATS_ENABLED=0
 export TOKENLESS_SLS_ENABLED=0
+export TOKENLESS_AGENTLOOP_ENABLED=0
 ```
 
 Dry-run 不会创建 Stash 条目，但也不会关闭 RTK 重写。Tool Ready 已独立硬关闭。需要停止全部 Hook 行为时应禁用 Adapter。

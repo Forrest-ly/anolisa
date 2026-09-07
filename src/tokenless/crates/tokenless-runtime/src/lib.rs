@@ -18,8 +18,9 @@ use tokenless_protocol::{
 };
 use tokenless_schema::SchemaCompressor;
 use tokenless_stats::{
-    CompressionMode, OperationType, SlsWriter, StatsRecord, StatsRecorder, ensure_state_dir,
-    estimate_tokens, get_home_dir, resolve_data_dir, validate_data_dir, validate_database_path,
+    AgentLoopWriter, CompressionMode, OperationType, SlsWriter, StatsRecord, StatsRecorder,
+    ensure_state_dir, estimate_tokens, get_home_dir, resolve_data_dir, validate_data_dir,
+    validate_database_path,
 };
 
 mod entry;
@@ -61,6 +62,10 @@ pub struct RuntimeConfig {
     pub stats_enabled: bool,
     /// Whether successful compression savings are emitted to the SLS writer.
     pub sls_enabled: bool,
+    /// Whether successful compression savings are emitted to the AgentLoop
+    /// observability writer, keyed by the trajectory correlation identity
+    /// (`conversation_id`, `tool_call_id`, agent name).
+    pub agentloop_enabled: bool,
     /// Whether compressed output is returned. Disabled mode calculates and
     /// records predicted savings but returns the original input.
     pub compression_enabled: bool,
@@ -72,6 +77,7 @@ impl Default for RuntimeConfig {
             data_dir: None,
             stats_enabled: true,
             sls_enabled: false,
+            agentloop_enabled: false,
             compression_enabled: true,
         }
     }
@@ -421,6 +427,7 @@ impl TokenlessRuntime {
             &outcome.artifact_keys,
             self.stats_recorder.as_ref(),
             self.config.sls_enabled,
+            self.config.agentloop_enabled,
         );
         Ok(outcome.response)
     }
@@ -466,6 +473,7 @@ impl TokenlessRuntime {
             &outcome.response.stash_keys,
             self.stats_recorder.as_ref(),
             self.config.sls_enabled,
+            self.config.agentloop_enabled,
         );
         Ok(outcome.response)
     }
@@ -544,7 +552,8 @@ impl TokenlessRuntime {
         result: &CompressResult,
         attribution: &Attribution,
     ) {
-        if !self.config.stats_enabled && !self.config.sls_enabled {
+        if !self.config.stats_enabled && !self.config.sls_enabled && !self.config.agentloop_enabled
+        {
             return;
         }
         let (after, after_tokens) = match result.disposition {
@@ -588,6 +597,9 @@ impl TokenlessRuntime {
         }
         if self.config.sls_enabled {
             SlsWriter::new().write(&record);
+        }
+        if self.config.agentloop_enabled {
+            AgentLoopWriter::new().write(&record);
         }
     }
 }
@@ -944,6 +956,7 @@ pub fn record_compression(
     outcome: &EntryOutcome,
     recorder: Option<&StatsRecorder>,
     sls_enabled: bool,
+    agentloop_enabled: bool,
 ) {
     let Some(stats) = outcome.stats.as_ref() else {
         return;
@@ -957,6 +970,7 @@ pub fn record_compression(
         &outcome.artifact_keys,
         recorder,
         sls_enabled,
+        agentloop_enabled,
     );
 }
 
@@ -972,8 +986,9 @@ fn record_entry_stats(
     stash_keys: &[String],
     recorder: Option<&StatsRecorder>,
     sls_enabled: bool,
+    agentloop_enabled: bool,
 ) {
-    if recorder.is_none() && !sls_enabled {
+    if recorder.is_none() && !sls_enabled && !agentloop_enabled {
         return;
     }
     let before_tokens = estimate_tokens(&stats.input);
@@ -1046,6 +1061,9 @@ fn record_entry_stats(
     }
     if sls_enabled {
         SlsWriter::new().write(&record);
+    }
+    if agentloop_enabled {
+        AgentLoopWriter::new().write(&record);
     }
 }
 

@@ -116,9 +116,10 @@ def run_hook(
             "PATH": bindir,
             "LC_ALL": "C.UTF-8",
             "TOKENLESS_DATA_DIR": os.path.join(home, ".tokenless"),
-            # Keep runs hermetic: no stats/SLS side channels; compression on.
+            # Keep runs hermetic: no stats/SLS/AgentLoop side channels; compression on.
             "TOKENLESS_STATS_ENABLED": "0",
             "TOKENLESS_SLS_ENABLED": "0",
+            "TOKENLESS_AGENTLOOP_ENABLED": "0",
         }
         env.update(agent_env)
         if extra_env:

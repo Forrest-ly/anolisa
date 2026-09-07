@@ -50,6 +50,7 @@ def state_env(directory: Path) -> dict:
         "TOKENLESS_DATA_DIR": str(directory),
         "TOKENLESS_STATS_ENABLED": "1",
         "TOKENLESS_SLS_ENABLED": "0",
+        "TOKENLESS_AGENTLOOP_ENABLED": "0",
         "TOKENLESS_COMPRESSION_ENABLED": "1",
     }
 

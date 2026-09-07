@@ -50,7 +50,7 @@ cat response.json | tokenless compress-response
 估算值严格小于原文（`after < before`）时才会输出候选结果；否则 stdout 输出原文，stderr
 报告 `did not reduce size`，且不写入统计记录。在 Dry-run 模式
 （`TOKENLESS_COMPRESSION_ENABLED=0` 或 `compression_enabled=false`）下，stdout 始终输出
-原文；候选结果更小时，如果已启用 Stats 或 SLS 记录，则把它记为预测节省。
+原文；候选结果更小时，如果已启用 Stats、SLS 或 AgentLoop 记录，则把它记为预测节省。
 
 因此，盈亏平衡点取决于内容和 JSON 结构，而不只取决于字节数或字符数。包含可移除字段
 的小 Payload 仍可能被压缩，而已经紧凑的较大 Payload 也可能原样透传。下文的描述、
@@ -393,7 +393,7 @@ tokenless stats diff --session <session-id> \
 
 任一端内容不可用或超过 1 MiB 时不生成内容差异，渲染的 hunk 最多 500 行。单记录和 tool-use 差异可能包含存储的源文本，使用共享终端或收集输出时注意敏感信息。完整说明见[效果度量](measuring-savings.md)和[配置与数据隐私](configuration-and-privacy.md)。
 
-`stats status` 只报告本地统计和 SLS 开关及其来源，因为当前状态读取路径没有读取 compression 开关，所以不显示 `compression_enabled`。该设置应检查 `TOKENLESS_COMPRESSION_ENABLED` 和 `~/.tokenless/config.json`。
+`stats status` 只报告本地统计、SLS 和 AgentLoop 开关及其来源，因为当前状态读取路径没有读取 compression 开关，所以不显示 `compression_enabled`。该设置应检查 `TOKENLESS_COMPRESSION_ENABLED` 和 `~/.tokenless/config.json`。
 
 ## 错误与降级
 

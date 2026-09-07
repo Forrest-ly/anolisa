@@ -281,18 +281,21 @@ impl PyTokenlessRuntime {
         *,
         compression_enabled=true,
         stats_enabled=true,
-        sls_enabled=false
+        sls_enabled=false,
+        agentloop_enabled=false
     ))]
     fn new(
         data_dir: Option<PathBuf>,
         compression_enabled: bool,
         stats_enabled: bool,
         sls_enabled: bool,
+        agentloop_enabled: bool,
     ) -> PyResult<Self> {
         let inner = NativeRuntime::new(RuntimeConfig {
             data_dir,
             stats_enabled,
             sls_enabled,
+            agentloop_enabled,
             compression_enabled,
         })
         .map_err(to_python_error)?;

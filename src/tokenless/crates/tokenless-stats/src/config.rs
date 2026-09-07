@@ -2,7 +2,8 @@
 //!
 //! Stored at `~/.tokenless/config.json`. Controls global feature flags.
 //! Environment variables `TOKENLESS_STATS_ENABLED`, `TOKENLESS_SLS_ENABLED`,
-//! and `TOKENLESS_COMPRESSION_ENABLED` override file config at runtime.
+//! `TOKENLESS_AGENTLOOP_ENABLED`, and `TOKENLESS_COMPRESSION_ENABLED` override
+//! file config at runtime.
 //! `tokenless stats enable` / `disable` persist from the file snapshot so
 //! those session overrides are not written back.
 
@@ -28,6 +29,13 @@ pub struct TokenlessConfig {
     /// each compression is also appended as a JSONL record for SLS ingestion.
     #[serde(default = "default_true")]
     pub sls_enabled: bool,
+    /// Whether the AgentLoop observability feed is enabled (default: true).
+    /// When enabled, each compression is also appended as a JSONL record
+    /// carrying the trajectory correlation identity AgentLoop joins on
+    /// (`conversation_id`, `tool_call_id`, agent name). Like the SLS feed the
+    /// file is collector-owned: records are appended only when it exists.
+    #[serde(default = "default_true")]
+    pub agentloop_enabled: bool,
     /// Whether compression is actually applied (default: true).
     /// When false, tokenless runs in dry-run mode: it computes and records
     /// the predicted savings but emits the original (uncompressed) text,
@@ -45,6 +53,7 @@ impl Default for TokenlessConfig {
         Self {
             stats_enabled: true,
             sls_enabled: true,
+            agentloop_enabled: true,
             compression_enabled: true,
         }
     }
@@ -114,9 +123,32 @@ impl TokenlessConfig {
         compression_env: Option<&str>,
         path: Option<&PathBuf>,
     ) -> Self {
-        Self::load_with_envs_and_file_reader(stats_env, sls_env, compression_env, path, |p| {
-            std::fs::read_to_string(p)
-        })
+        Self::load_with_all_envs_and_path(stats_env, sls_env, compression_env, None, path)
+    }
+
+    /// Load config with explicit env overrides for every toggle and an
+    /// optional custom path.
+    ///
+    /// Same priority as [`Self::load_with_envs_and_path`] — env > config.json
+    /// file > default, per toggle — extended with the AgentLoop feed toggle.
+    /// The file read is skipped only when *all four* env vars are present;
+    /// with fewer than four, the file is read so the remaining toggle can take
+    /// its stored value instead of silently falling back to the default.
+    pub fn load_with_all_envs_and_path(
+        stats_env: Option<&str>,
+        sls_env: Option<&str>,
+        compression_env: Option<&str>,
+        agentloop_env: Option<&str>,
+        path: Option<&PathBuf>,
+    ) -> Self {
+        Self::load_with_all_envs_and_file_reader(
+            stats_env,
+            sls_env,
+            compression_env,
+            agentloop_env,
+            path,
+            |p| std::fs::read_to_string(p),
+        )
     }
 
     /// Core logic of [`TokenlessConfig::load_with_envs_and_path`] with an
@@ -125,10 +157,11 @@ impl TokenlessConfig {
     /// assert whether the config file read was attempted at all — the returned
     /// config alone cannot distinguish the fast path from a failed read when
     /// every toggle is already determined by env.
-    fn load_with_envs_and_file_reader(
+    fn load_with_all_envs_and_file_reader(
         stats_env: Option<&str>,
         sls_env: Option<&str>,
         compression_env: Option<&str>,
+        agentloop_env: Option<&str>,
         path: Option<&PathBuf>,
         read_file: impl FnOnce(&std::path::Path) -> std::io::Result<String>,
     ) -> Self {
@@ -136,12 +169,16 @@ impl TokenlessConfig {
         let stats_env = stats_env.filter(|v| !v.is_empty());
         let sls_env = sls_env.filter(|v| !v.is_empty());
         let compression_env = compression_env.filter(|v| !v.is_empty());
+        let agentloop_env = agentloop_env.filter(|v| !v.is_empty());
 
-        // Fast path: all three toggles are determined by env — no file read needed.
-        if let (Some(s), Some(sl), Some(c)) = (stats_env, sls_env, compression_env) {
+        // Fast path: every toggle is determined by env — no file read needed.
+        if let (Some(s), Some(sl), Some(c), Some(al)) =
+            (stats_env, sls_env, compression_env, agentloop_env)
+        {
             return Self {
                 stats_enabled: parse_env_bool(s),
                 sls_enabled: parse_env_bool(sl),
+                agentloop_enabled: parse_env_bool(al),
                 compression_enabled: parse_env_bool(c),
             };
         }
@@ -165,6 +202,12 @@ impl TokenlessConfig {
             base.sls_enabled
         };
 
+        let agentloop_enabled = if let Some(val) = agentloop_env {
+            parse_env_bool(val)
+        } else {
+            base.agentloop_enabled
+        };
+
         let compression_enabled = if let Some(val) = compression_env {
             parse_env_bool(val)
         } else {
@@ -174,6 +217,7 @@ impl TokenlessConfig {
         Self {
             stats_enabled,
             sls_enabled,
+            agentloop_enabled,
             compression_enabled,
         }
     }
@@ -208,10 +252,14 @@ impl TokenlessConfig {
         let compression_env = std::env::var("TOKENLESS_COMPRESSION_ENABLED")
             .ok()
             .filter(|v| !v.is_empty());
-        Self::load_with_envs_and_path(
+        let agentloop_env = std::env::var("TOKENLESS_AGENTLOOP_ENABLED")
+            .ok()
+            .filter(|v| !v.is_empty());
+        Self::load_with_all_envs_and_path(
             stats_env.as_deref(),
             sls_env.as_deref(),
             compression_env.as_deref(),
+            agentloop_env.as_deref(),
             None,
         )
     }
@@ -223,7 +271,7 @@ impl TokenlessConfig {
     /// `TOKENLESS_COMPRESSION_ENABLED` into `config.json`, turning a
     /// temporary A/B dry-run into a durable setting.
     pub fn load_from_file() -> Self {
-        Self::load_with_envs_and_path(None, None, None, None)
+        Self::load_with_all_envs_and_path(None, None, None, None, None)
     }
 
     /// Save config to disk.
@@ -252,6 +300,12 @@ impl TokenlessConfig {
     /// Returns true if SLS integration is enabled (env override or file config).
     pub fn is_sls_enabled(&self) -> bool {
         self.sls_enabled
+    }
+
+    /// Returns true if the AgentLoop observability feed is enabled
+    /// (env override or file config).
+    pub fn is_agentloop_enabled(&self) -> bool {
+        self.agentloop_enabled
     }
 
     /// Returns true if compression is applied (env override or file config).

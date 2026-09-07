@@ -13,10 +13,13 @@ struct TempDbGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     test_dir: String,
     sls_dir: String,
+    agentloop_dir: String,
     stash_db_path: String,
+    agentloop_path: String,
     prev_stats_db: Option<std::ffi::OsString>,
     prev_stash_db: Option<std::ffi::OsString>,
     prev_sls_path: Option<std::ffi::OsString>,
+    prev_agentloop_path: Option<std::ffi::OsString>,
 }
 
 impl TempDbGuard {
@@ -37,24 +40,39 @@ impl TempDbGuard {
         let sls_path = format!("{sls_dir}/tokenless.jsonl");
         // Pre-create the JSONL file so SlsWriter::write can open it.
         std::fs::write(&sls_path, "").unwrap();
+        let agentloop_dir = format!("/tmp/tokenless-agentloop-test-{nanos}");
+        std::fs::create_dir_all(&agentloop_dir).unwrap();
+        let agentloop_path = format!("{agentloop_dir}/tokenless.jsonl");
+        // Pre-create the JSONL file so AgentLoopWriter::write can open it.
+        std::fs::write(&agentloop_path, "").unwrap();
         let prev_stats_db = std::env::var_os("TOKENLESS_STATS_DB");
         let prev_stash_db = std::env::var_os("TOKENLESS_STASH_DB");
         let prev_sls_path = std::env::var_os("TOKENLESS_SLS_PATH");
+        let prev_agentloop_path = std::env::var_os("TOKENLESS_AGENTLOOP_PATH");
         unsafe {
             std::env::set_var("TOKENLESS_STATS_DB", format!("{test_dir}/stats.db"));
             std::env::set_var("TOKENLESS_STASH_DB", format!("{test_dir}/stash.db"));
             std::env::set_var("TOKENLESS_SLS_PATH", &sls_path);
+            std::env::set_var("TOKENLESS_AGENTLOOP_PATH", &agentloop_path);
         }
         let stash_db_path = format!("{test_dir}/stash.db");
         Some(TempDbGuard {
             _lock: lock,
             test_dir,
             sls_dir,
+            agentloop_dir,
             stash_db_path,
+            agentloop_path,
             prev_stats_db,
             prev_stash_db,
             prev_sls_path,
+            prev_agentloop_path,
         })
+    }
+
+    /// Returns the temp AgentLoop JSONL path, useful for feed assertions.
+    fn agentloop_path(&self) -> &str {
+        &self.agentloop_path
     }
 
     /// Returns the temp stash DB path, useful for override-path tests.
@@ -70,6 +88,7 @@ struct PersistConfigGuard {
     prev_stats: Option<std::ffi::OsString>,
     prev_sls: Option<std::ffi::OsString>,
     prev_compression: Option<std::ffi::OsString>,
+    prev_agentloop: Option<std::ffi::OsString>,
 }
 
 impl PersistConfigGuard {
@@ -87,10 +106,14 @@ impl PersistConfigGuard {
         let prev_stats = std::env::var_os("TOKENLESS_STATS_ENABLED");
         let prev_sls = std::env::var_os("TOKENLESS_SLS_ENABLED");
         let prev_compression = std::env::var_os("TOKENLESS_COMPRESSION_ENABLED");
+        let prev_agentloop = std::env::var_os("TOKENLESS_AGENTLOOP_ENABLED");
         unsafe {
             std::env::set_var("TOKENLESS_STATS_ENABLED", stats_env);
             std::env::set_var("TOKENLESS_SLS_ENABLED", sls_env);
             std::env::set_var("TOKENLESS_COMPRESSION_ENABLED", compression_env);
+            // These cases assert on stats/sls/compression only; an ambient
+            // AgentLoop override must not leak in through `TokenlessConfig::load`.
+            std::env::remove_var("TOKENLESS_AGENTLOOP_ENABLED");
         }
         Self {
             _lock: lock,
@@ -99,6 +122,7 @@ impl PersistConfigGuard {
             prev_stats,
             prev_sls,
             prev_compression,
+            prev_agentloop,
         }
     }
 
@@ -123,6 +147,10 @@ impl Drop for PersistConfigGuard {
                 Some(v) => std::env::set_var("TOKENLESS_COMPRESSION_ENABLED", v),
                 None => std::env::remove_var("TOKENLESS_COMPRESSION_ENABLED"),
             }
+            match &self.prev_agentloop {
+                Some(v) => std::env::set_var("TOKENLESS_AGENTLOOP_ENABLED", v),
+                None => std::env::remove_var("TOKENLESS_AGENTLOOP_ENABLED"),
+            }
         }
     }
 }
@@ -142,9 +170,14 @@ impl Drop for TempDbGuard {
                 Some(v) => std::env::set_var("TOKENLESS_SLS_PATH", v),
                 None => std::env::remove_var("TOKENLESS_SLS_PATH"),
             }
+            match &self.prev_agentloop_path {
+                Some(v) => std::env::set_var("TOKENLESS_AGENTLOOP_PATH", v),
+                None => std::env::remove_var("TOKENLESS_AGENTLOOP_PATH"),
+            }
         }
         std::fs::remove_dir_all(&self.test_dir).ok();
         std::fs::remove_dir_all(&self.sls_dir).ok();
+        std::fs::remove_dir_all(&self.agentloop_dir).ok();
     }
 }
 
@@ -556,6 +589,7 @@ fn record_compression_stats_skips_when_both_disabled() {
     let config = TokenlessConfig {
         stats_enabled: false,
         sls_enabled: false,
+        agentloop_enabled: false,
         ..TokenlessConfig::default()
     };
     // Should return immediately without touching DB
@@ -1263,11 +1297,13 @@ fn stats_persist_snapshot_enable_keeps_file_compression_and_sls() {
     let file = TokenlessConfig {
         stats_enabled: false,
         sls_enabled: true,
+        agentloop_enabled: true,
         compression_enabled: true,
     };
     let persisted = stats_persist_snapshot(file, true);
     assert!(persisted.stats_enabled);
     assert!(persisted.sls_enabled);
+    assert!(persisted.agentloop_enabled);
     assert!(persisted.compression_enabled);
 }
 
@@ -1276,11 +1312,13 @@ fn stats_persist_snapshot_disable_keeps_file_compression_and_sls() {
     let file = TokenlessConfig {
         stats_enabled: true,
         sls_enabled: false,
+        agentloop_enabled: false,
         compression_enabled: false,
     };
     let persisted = stats_persist_snapshot(file, false);
     assert!(!persisted.stats_enabled);
     assert!(!persisted.sls_enabled);
+    assert!(!persisted.agentloop_enabled);
     assert!(!persisted.compression_enabled);
 }
 
@@ -1577,7 +1615,12 @@ fn open_stash_store_or_err_none_returns_ok() {
 #[test]
 fn record_compression_stats_sls_only_path() {
     let _guard = match TempDbGuard::new() { Some(g) => g, None => return };
-    let config = TokenlessConfig { stats_enabled: false, sls_enabled: true, ..Default::default() };
+    let config = TokenlessConfig {
+        stats_enabled: false,
+        sls_enabled: true,
+        agentloop_enabled: false,
+        ..Default::default()
+    };
     let long_before = "x".repeat(500);
     let short_after = "y".repeat(50);
     record_compression_stats(
@@ -1599,7 +1642,12 @@ fn record_compression_stats_sls_only_path() {
 #[test]
 fn record_compression_stats_full_path() {
     let _guard = match TempDbGuard::new() { Some(g) => g, None => return };
-    let config = TokenlessConfig { stats_enabled: true, sls_enabled: true, ..Default::default() };
+    let config = TokenlessConfig {
+        stats_enabled: true,
+        sls_enabled: true,
+        agentloop_enabled: false,
+        ..Default::default()
+    };
     let long_before = "z".repeat(1000);
     let short_after = "w".repeat(100);
     record_compression_stats(
@@ -1616,6 +1664,128 @@ fn record_compression_stats_full_path() {
         Some(1),
         Some(200),
     );
+}
+
+#[test]
+fn record_compression_stats_writes_agentloop_feed_only() {
+    // AgentLoop-only: SQLite and SLS off, so the single appended line proves
+    // the feed is wired independently of the other two sinks.
+    let guard = match TempDbGuard::new() {
+        Some(g) => g,
+        None => return,
+    };
+    let config = TokenlessConfig {
+        stats_enabled: false,
+        sls_enabled: false,
+        agentloop_enabled: true,
+        ..Default::default()
+    };
+    record_compression_stats(
+        &config,
+        &DatabasePathResolver::default(),
+        OperationType::CompressResponse,
+        Some("agentcore".to_string()),
+        Some("conv-1".to_string()),
+        Some("call-1".to_string()),
+        "x".repeat(500),
+        "y".repeat(50),
+        CompressionMode::Active,
+        None,
+        None,
+        None,
+    );
+
+    let lines: Vec<String> = std::fs::read_to_string(guard.agentloop_path())
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one AgentLoop record expected");
+
+    let record: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    // Trajectory correlation identity AgentLoop joins on.
+    assert_eq!(record["conversation_id"], "conv-1");
+    assert_eq!(record["tool_call_id"], "call-1");
+    assert_eq!(record["agent_name"], "agentcore");
+    assert_eq!(record["event_type"], "tokenless.token_savings");
+    assert_eq!(record["operation"], "compress-response");
+    assert_eq!(record["mode"], "active");
+    assert!(record["tokens_saved"].as_u64().unwrap() > 0);
+    // Metrics only — the payload text must never reach the feed.
+    assert!(record.get("before_text").is_none());
+    assert!(record.get("after_text").is_none());
+}
+
+#[test]
+fn record_compression_stats_skips_agentloop_feed_when_disabled() {
+    let guard = match TempDbGuard::new() {
+        Some(g) => g,
+        None => return,
+    };
+    let config = TokenlessConfig {
+        stats_enabled: false,
+        sls_enabled: true,
+        agentloop_enabled: false,
+        ..Default::default()
+    };
+    record_compression_stats(
+        &config,
+        &DatabasePathResolver::default(),
+        OperationType::CompressResponse,
+        Some("agentcore".to_string()),
+        Some("conv-1".to_string()),
+        Some("call-1".to_string()),
+        "x".repeat(500),
+        "y".repeat(50),
+        CompressionMode::Active,
+        None,
+        None,
+        None,
+    );
+
+    assert!(
+        std::fs::read_to_string(guard.agentloop_path())
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "disabled AgentLoop feed must not be written"
+    );
+}
+
+#[test]
+fn record_compression_stats_labels_dryrun_in_agentloop_feed() {
+    // AgentLoop must be able to tell predicted savings from billed ones.
+    let guard = match TempDbGuard::new() {
+        Some(g) => g,
+        None => return,
+    };
+    let config = TokenlessConfig {
+        stats_enabled: false,
+        sls_enabled: false,
+        agentloop_enabled: true,
+        ..Default::default()
+    };
+    record_compression_stats(
+        &config,
+        &DatabasePathResolver::default(),
+        OperationType::CompressSchema,
+        Some("agentcore".to_string()),
+        None,
+        None,
+        "x".repeat(500),
+        "y".repeat(50),
+        CompressionMode::DryRun,
+        None,
+        None,
+        None,
+    );
+
+    let content = std::fs::read_to_string(guard.agentloop_path()).unwrap();
+    let record: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert_eq!(record["mode"], "dry-run");
+    // Absent identities stay absent instead of serializing as null.
+    assert!(record.get("conversation_id").is_none());
+    assert!(record.get("tool_call_id").is_none());
 }
 
 #[test]

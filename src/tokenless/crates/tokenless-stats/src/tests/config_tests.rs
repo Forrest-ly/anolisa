@@ -208,22 +208,25 @@ fn test_compression_config_honored_with_stats_sls_envs_unreadable_file() {
 
 #[test]
 fn test_all_envs_set_skips_file_read() {
-    // Fast path: when all three envs are present, the config file must not be
-    // read at all. Observe the read itself via an injected reader that records
-    // invocations and returns values opposite to the envs — asserting only the
-    // returned config is blind here, because env overrides every toggle even
-    // when the slow path falls back to defaults after a failed read.
+    // Fast path: when every toggle's env is present, the config file must not
+    // be read at all. Observe the read itself via an injected reader that
+    // records invocations and returns values opposite to the envs — asserting
+    // only the returned config is blind here, because env overrides every
+    // toggle even when the slow path falls back to defaults after a failed
+    // read.
     let path = std::path::PathBuf::from("/nonexistent/path/config.json");
     let read_attempted = std::cell::Cell::new(false);
-    let config = TokenlessConfig::load_with_envs_and_file_reader(
+    let config = TokenlessConfig::load_with_all_envs_and_file_reader(
         Some("true"),
+        Some("false"),
         Some("false"),
         Some("false"),
         Some(&path),
         |_p| {
             read_attempted.set(true);
             Ok(
-                "{\"stats_enabled\":false,\"sls_enabled\":true,\"compression_enabled\":true}"
+                "{\"stats_enabled\":false,\"sls_enabled\":true,\
+                 \"agentloop_enabled\":true,\"compression_enabled\":true}"
                     .to_string(),
             )
         },
@@ -234,6 +237,7 @@ fn test_all_envs_set_skips_file_read() {
     );
     assert!(config.is_stats_enabled());
     assert!(!config.is_sls_enabled());
+    assert!(!config.is_agentloop_enabled());
     assert!(!config.is_compression_enabled());
 }
 
@@ -245,9 +249,10 @@ fn test_partial_envs_attempt_file_read() {
     // test's !read_attempted assertion cannot pass vacuously.
     let path = std::path::PathBuf::from("/nonexistent/path/config.json");
     let read_attempted = std::cell::Cell::new(false);
-    let config = TokenlessConfig::load_with_envs_and_file_reader(
+    let config = TokenlessConfig::load_with_all_envs_and_file_reader(
         Some("true"),
         Some("true"),
+        None,
         None,
         Some(&path),
         |_p| {
@@ -265,6 +270,7 @@ fn test_partial_envs_attempt_file_read() {
     // Read failed → built-in default fills the gap: env > default preserved.
     assert!(config.is_stats_enabled());
     assert!(config.is_sls_enabled());
+    assert!(config.is_agentloop_enabled());
     assert!(config.is_compression_enabled());
 }
 
@@ -303,6 +309,7 @@ fn test_save_and_reload_roundtrip() {
     let config = TokenlessConfig {
         stats_enabled: false,
         sls_enabled: true,
+        agentloop_enabled: false,
         compression_enabled: false,
     };
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -312,6 +319,7 @@ fn test_save_and_reload_roundtrip() {
     let reloaded = TokenlessConfig::load_with_envs_and_path(None, None, None, Some(&path));
     assert!(!reloaded.stats_enabled);
     assert!(reloaded.sls_enabled);
+    assert!(!reloaded.agentloop_enabled);
     assert!(!reloaded.compression_enabled);
 }
 
@@ -320,6 +328,7 @@ fn test_default_all_enabled() {
     let config = TokenlessConfig::default();
     assert!(config.is_stats_enabled());
     assert!(config.is_sls_enabled());
+    assert!(config.is_agentloop_enabled());
     assert!(config.is_compression_enabled());
 }
 
@@ -328,13 +337,75 @@ fn test_serde_round_trip() {
     let config = TokenlessConfig {
         stats_enabled: false,
         sls_enabled: false,
+        agentloop_enabled: false,
         compression_enabled: true,
     };
     let json = serde_json::to_string(&config).unwrap();
     let deserialized: TokenlessConfig = serde_json::from_str(&json).unwrap();
     assert!(!deserialized.stats_enabled);
     assert!(!deserialized.sls_enabled);
+    assert!(!deserialized.agentloop_enabled);
     assert!(deserialized.compression_enabled);
+}
+
+#[test]
+fn test_agentloop_env_overrides_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let _ = std::fs::write(&path, "{\"agentloop_enabled\":false}");
+    let config =
+        TokenlessConfig::load_with_all_envs_and_path(None, None, None, Some("1"), Some(&path));
+    assert!(config.is_agentloop_enabled());
+}
+
+#[test]
+fn test_agentloop_file_config_honored() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let _ = std::fs::write(&path, "{\"agentloop_enabled\":false}");
+    let config =
+        TokenlessConfig::load_with_all_envs_and_path(None, None, None, None, Some(&path));
+    assert!(!config.is_agentloop_enabled());
+}
+
+#[test]
+fn test_agentloop_empty_env_treated_as_unset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let _ = std::fs::write(&path, "{\"agentloop_enabled\":false}");
+    let config =
+        TokenlessConfig::load_with_all_envs_and_path(None, None, None, Some(""), Some(&path));
+    assert!(!config.is_agentloop_enabled());
+}
+
+#[test]
+fn test_legacy_config_without_agentloop_field_defaults_enabled() {
+    // Configs written before the AgentLoop feed existed have no
+    // `agentloop_enabled` key. The serde default must turn the feed on rather
+    // than silently disabling observability for upgraded installs.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let _ = std::fs::write(
+        &path,
+        "{\"stats_enabled\":true,\"sls_enabled\":true,\"compression_enabled\":true}",
+    );
+    let config =
+        TokenlessConfig::load_with_all_envs_and_path(None, None, None, None, Some(&path));
+    assert!(config.is_agentloop_enabled());
+}
+
+#[test]
+fn test_three_env_shim_leaves_agentloop_to_file() {
+    // The pre-AgentLoop 3-env entry point must stay source-compatible and
+    // still resolve the new toggle from the file instead of forcing a default.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let _ = std::fs::write(&path, "{\"agentloop_enabled\":false}");
+    let config = TokenlessConfig::load_with_envs_and_path(Some("1"), Some("1"), Some("1"), Some(&path));
+    assert!(config.is_stats_enabled());
+    assert!(config.is_sls_enabled());
+    assert!(config.is_compression_enabled());
+    assert!(!config.is_agentloop_enabled());
 }
 
 static CONFIG_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -344,6 +415,7 @@ struct ConfigPathEnvGuard {
     prev_stats: Option<std::ffi::OsString>,
     prev_sls: Option<std::ffi::OsString>,
     prev_compression: Option<std::ffi::OsString>,
+    prev_agentloop: Option<std::ffi::OsString>,
 }
 
 impl ConfigPathEnvGuard {
@@ -358,16 +430,22 @@ impl ConfigPathEnvGuard {
         let prev_stats = std::env::var_os("TOKENLESS_STATS_ENABLED");
         let prev_sls = std::env::var_os("TOKENLESS_SLS_ENABLED");
         let prev_compression = std::env::var_os("TOKENLESS_COMPRESSION_ENABLED");
+        let prev_agentloop = std::env::var_os("TOKENLESS_AGENTLOOP_ENABLED");
         unsafe {
             std::env::set_var("TOKENLESS_STATS_ENABLED", stats_env);
             std::env::set_var("TOKENLESS_SLS_ENABLED", sls_env);
             std::env::set_var("TOKENLESS_COMPRESSION_ENABLED", compression_env);
+            // Keep the AgentLoop toggle hermetic: these cases assert on
+            // stats/sls/compression only, so an ambient override must not
+            // leak in through `TokenlessConfig::load`.
+            std::env::remove_var("TOKENLESS_AGENTLOOP_ENABLED");
         }
         Self {
             _lock: lock,
             prev_stats,
             prev_sls,
             prev_compression,
+            prev_agentloop,
         }
     }
 }
@@ -387,6 +465,10 @@ impl Drop for ConfigPathEnvGuard {
             match &self.prev_compression {
                 Some(v) => std::env::set_var("TOKENLESS_COMPRESSION_ENABLED", v),
                 None => std::env::remove_var("TOKENLESS_COMPRESSION_ENABLED"),
+            }
+            match &self.prev_agentloop {
+                Some(v) => std::env::set_var("TOKENLESS_AGENTLOOP_ENABLED", v),
+                None => std::env::remove_var("TOKENLESS_AGENTLOOP_ENABLED"),
             }
         }
     }

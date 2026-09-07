@@ -9,10 +9,9 @@
 //! only if the file already exists, and silently skips when it does not
 //! (treated as "SLS collection not active").
 
+use crate::collector_sink::{append_json_line, resolve_collector_path};
 use crate::{StatsRecord, VERSION};
 use serde::Serialize;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -23,111 +22,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// (must be under /var/log/ or /tmp/, no `..`).
 pub const DEFAULT_SLS_PATH: &str = "/var/log/anolisa/sls/ops/tokenless.jsonl";
 
-/// Allowed path prefixes for TOKENLESS_SLS_PATH env var override.
-/// NOTE: /tmp/ is world-writable on most Unix systems — other local users
-/// can read the JSONL file if placed there. Prefer /var/log/ for production.
-const ALLOWED_SLS_PREFIXES: &[&str] = &["/var/log/", "/tmp/"];
-
-/// Root-owned prefixes where creating a symlink requires privilege. For
-/// these, the original (pre-canonicalize) path can be trusted even when
-/// canonicalization resolves it elsewhere (e.g. `/var/log` symlinked to
-/// another filesystem). World-writable prefixes like `/tmp/` are excluded
-/// because an unprivileged user can place a symlink there to escape.
-const TRUSTED_SLS_PREFIXES: &[&str] = &["/var/log/"];
-
-/// Canonicalize a path, walking up the parent chain to resolve symlinks
-/// when the path or its ancestors don't exist yet. Returns the best-effort
-/// canonicalized path (falls back to the original if the entire chain is
-/// unresolvable).
-fn canonicalize_or_reconstruct(path: &std::path::Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| {
-        let mut cursor = path.to_path_buf();
-        let mut suffix: Vec<std::ffi::OsString> = Vec::new();
-        loop {
-            match cursor.canonicalize() {
-                Ok(canon) => {
-                    let mut result = canon;
-                    for name in suffix.iter().rev() {
-                        result.push(name);
-                    }
-                    return result;
-                }
-                Err(_) => {
-                    if let Some(name) = cursor.file_name() {
-                        suffix.push(name.to_os_string());
-                    }
-                    match cursor.parent() {
-                        Some(p) => cursor = p.to_path_buf(),
-                        None => return path.to_path_buf(),
-                    }
-                }
-            }
-        }
-    })
-}
-
-/// Validate an SLS output path: reject `..` traversal and paths outside
-/// allowed prefixes. Returns the canonicalized path if acceptable, or `None`.
-///
-/// Canonicalizes the path to resolve symlinks before the prefix check,
-/// so a symlinked `/var/log` → `/` cannot be used to escape the allowed
-/// directories. A path is accepted when the resolved path matches an
-/// allowed prefix, OR the original (pre-canonicalize) path matches a
-/// root-owned trusted prefix (see `TRUSTED_SLS_PREFIXES`).
-///
-/// The trusted-prefix fallback covers systems where `/var/log` is itself
-/// symlinked to another filesystem: canonicalization resolves it to the
-/// real target (no longer starting with `/var/log/`), but since creating
-/// that symlink requires root, trusting the original path is safe. The
-/// world-writable `/tmp/` prefix is excluded from the fallback, so a
-/// user-placed symlink in `/tmp/` cannot escape to an arbitrary location.
-///
-/// NOTE: `SlsWriter` stores the canonicalized path at construction time
-/// to narrow the TOCTOU window between validation and write.
-fn validate_sls_path(path: &std::path::Path) -> Option<PathBuf> {
-    if path
-        .components()
-        .any(|c| c == std::path::Component::ParentDir)
-    {
-        return None;
-    }
-
-    let resolved = canonicalize_or_reconstruct(path);
-    let resolved_str = resolved.to_str().unwrap_or("");
-    let original_str = path.to_str().unwrap_or("");
-    let resolved_ok = ALLOWED_SLS_PREFIXES
-        .iter()
-        .any(|prefix| resolved_str.starts_with(prefix));
-    let original_ok = TRUSTED_SLS_PREFIXES
-        .iter()
-        .any(|prefix| original_str.starts_with(prefix));
-    if resolved_ok || original_ok {
-        Some(resolved)
-    } else {
-        None
-    }
-}
+/// Environment variable that overrides [`DEFAULT_SLS_PATH`].
+pub const SLS_PATH_ENV: &str = "TOKENLESS_SLS_PATH";
 
 /// Resolve the SLS output path from an optional env var value.
 /// Falls back to DEFAULT_SLS_PATH when the env var is unset, empty,
 /// or contains an invalid path. Returns the canonicalized path
 /// to narrow the TOCTOU window between validation and write.
 fn resolve_sls_path(env_val: Option<&str>) -> PathBuf {
-    env_val
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .and_then(|p| match validate_sls_path(&p) {
-            Some(resolved) => Some(resolved),
-            None => {
-                eprintln!(
-                    "tokenless-sls: TOKENLESS_SLS_PATH rejected (must be under \
-                     /var/log/ or /tmp/, and must not contain '..'), \
-                     falling back to default: {DEFAULT_SLS_PATH}"
-                );
-                None
-            }
-        })
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SLS_PATH))
+    resolve_collector_path("sls", SLS_PATH_ENV, env_val, DEFAULT_SLS_PATH)
 }
 
 /// SLS-specific data model with namespace-style field names.
@@ -238,7 +141,7 @@ impl SlsWriter {
     /// falling back to DEFAULT_SLS_PATH if the env var is not set,
     /// empty, or contains an invalid path.
     pub fn new() -> Self {
-        let env_val = std::env::var("TOKENLESS_SLS_PATH").ok();
+        let env_val = std::env::var(SLS_PATH_ENV).ok();
         Self {
             path: resolve_sls_path(env_val.as_deref()),
         }
@@ -274,22 +177,7 @@ impl SlsWriter {
             }
         };
 
-        let mut opts = OpenOptions::new();
-        opts.append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Refuse to open if the final path component is a symlink. The
-            // file is owned by the anolisa SLS component and tokenless never
-            // creates one, so a legit target is never a symlink here;
-            // O_NOFOLLOW blocks a swap-to-symlink between the existence
-            // check and the open (narrowing the TOCTOU window on /tmp/).
-            opts.custom_flags(libc::O_NOFOLLOW);
-        }
-        if let Err(e) = opts.open(&self.path).and_then(|mut f| {
-            f.write_all(line.as_bytes())?;
-            f.write_all(b"\n")
-        }) {
+        if let Err(e) = append_json_line(&self.path, &line) {
             static WRITE_ERROR_WARNED: AtomicBool = AtomicBool::new(false);
             if !WRITE_ERROR_WARNED.swap(true, Ordering::Relaxed) {
                 eprintln!(
@@ -626,36 +514,5 @@ mod tests {
             resolve_sls_path(Some("/tmp/tokenless-test.jsonl")),
             PathBuf::from("/tmp/tokenless-test.jsonl")
         );
-    }
-
-    #[test]
-    fn test_validate_sls_path_symlinked_prefix() {
-        // When /var/log is symlinked to another filesystem, canonicalization
-        // resolves it to the real target which no longer starts with
-        // /var/log/. Since /var/log is root-owned (creating the symlink needs
-        // privilege), the original path is trusted and the path is still
-        // accepted. Here /var/log is a real directory (no symlink), so both
-        // the original and reconstructed paths match the /var/log/ prefix.
-        let result = validate_sls_path(std::path::Path::new(
-            "/var/log/anolisa/sls/ops/tokenless.jsonl",
-        ));
-        assert!(result.is_some());
-        let resolved = result.unwrap();
-        assert!(resolved.to_str().unwrap().starts_with("/var/log/"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_validate_sls_path_rejects_tmp_symlink_escape() {
-        // /tmp/ is world-writable, so an unprivileged user can place a
-        // symlink there that escapes the allowed prefixes (e.g. -> /etc).
-        // The path must be REJECTED: the resolved path no longer matches an
-        // allowed prefix, and /tmp/ is not a trusted prefix, so the original
-        // path must not be used as a fallback.
-        let dir = tempfile::tempdir().unwrap();
-        let link = dir.path().join("escape");
-        std::os::unix::fs::symlink("/etc", &link).unwrap();
-        let escaped = link.join("cron.d/evil.jsonl");
-        assert!(validate_sls_path(&escaped).is_none());
     }
 }

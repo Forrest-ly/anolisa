@@ -458,6 +458,8 @@ tokenless stats summary
 统计启用条件：`TOKENLESS_STATS_ENABLED` 环境变量未设为 `0`/`false`，或通过 `tokenless stats enable` 启用。
 
 > **SLS 日志记录（JSONL）**：除 SQLite 统计外，tokenless 默认还会将每次压缩以 SLS JSONL 记录写入 `/var/log/anolisa/sls/ops/tokenless.jsonl`（默认开启）。该文件由 **anolisa SLS 组件统一管理**，tokenless 不创建/删除，仅在文件存在时追加，不存在则跳过。开关字段 `~/.tokenless/config.json` 的 `sls_enabled`（默认 `true`），环境变量 `TOKENLESS_SLS_ENABLED` 优先；输出路径可用 `TOKENLESS_SLS_PATH` 覆盖（须位于 `/var/log/` 或 `/tmp/` 下）。仅记录度量，不含原文/敏感数据。详见 [Tokenless 效果度量 · SLS JSONL](../../../docs/user-guide/zh/token-saving/tokenless/measuring-savings.md#sls-jsonl)。
+>
+> **AgentLoop 可观测（JSONL）**：tokenless 还会把每次压缩以 AgentLoop JSONL 记录写入 `/var/log/anolisa/agentloop/ops/tokenless.jsonl`（默认开启），并携带轨迹关联标识 `conversation_id`、`tool_call_id`、`agent_name`，便于把节省归因到具体会话与工具调用。该文件同样由采集设施统一管理，tokenless 只在文件存在时追加。开关字段 `~/.tokenless/config.json` 的 `agentloop_enabled`（默认 `true`），环境变量 `TOKENLESS_AGENTLOOP_ENABLED` 优先；输出路径可用 `TOKENLESS_AGENTLOOP_PATH` 覆盖（须位于 `/var/log/` 或 `/tmp/` 下）。仅记录度量与标识，不含原文/敏感数据。详见 [Tokenless 效果度量 · AgentLoop 可观测](../../../docs/user-guide/zh/token-saving/tokenless/measuring-savings.md#agentloop-可观测)。
 
 ### 9.3 压缩效果说明
 

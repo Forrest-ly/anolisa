@@ -218,3 +218,100 @@ fn response_operation_must_match_request() {
         Err(ProtocolError::OperationMismatch { .. })
     ));
 }
+
+#[test]
+fn attribution_accepts_trajectory_identity_names() {
+    // A host that reports trajectories to an agent observability backend
+    // names these identities conversation_id / tool_call_id. It must be able
+    // to bind tokenless to the exact identity it already reports.
+    let attribution: Attribution = serde_json::from_str(
+        r#"{"agent_id":"agentcore","conversation_id":"conv-1","tool_call_id":"call-1"}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        attribution,
+        Attribution {
+            agent_id: "agentcore".into(),
+            session_id: Some("conv-1".into()),
+            tool_use_id: Some("call-1".into()),
+        }
+    );
+}
+
+#[test]
+fn attribution_serializes_its_own_identity_names() {
+    // The alias is input-only: the emitted wire contract stays session_id /
+    // tool_use_id so existing adapters and stored requests are unaffected.
+    let json = serde_json::to_value(attribution()).unwrap();
+
+    assert_eq!(json["session_id"], "session-1");
+    assert_eq!(json["tool_use_id"], "call-1");
+    assert!(json.get("conversation_id").is_none());
+    assert!(json.get("tool_call_id").is_none());
+}
+
+#[test]
+fn attribution_rejects_both_spellings_of_one_identity() {
+    // Ambiguous input must fail loudly rather than silently pick a side.
+    let error = serde_json::from_str::<Attribution>(
+        r#"{"agent_id":"agentcore","session_id":"s-1","conversation_id":"c-1"}"#,
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("duplicate field"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn attribution_still_rejects_unknown_fields() {
+    let error =
+        serde_json::from_str::<Attribution>(r#"{"agent_id":"agentcore","trajectory_id":"t-1"}"#)
+            .unwrap_err();
+
+    assert!(
+        error.to_string().contains("unknown field"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn request_envelope_accepts_trajectory_spelled_attribution() {
+    // End-to-end shape a host that reports trajectories to an agent
+    // observability backend sends: the envelope carries conversation_id /
+    // tool_call_id instead of session_id / tool_use_id. The operation payload
+    // is taken from a real round-trip so this case stays focused on
+    // attribution naming.
+    let native = RequestEnvelope {
+        attribution: Attribution {
+            agent_id: "agentcore".into(),
+            session_id: Some("conv-1".into()),
+            tool_use_id: Some("call-1".into()),
+        },
+        request: Request::PreTool(PreToolRequest {
+            tool_name: "Bash".into(),
+            arguments: json!({"command": "git status"}),
+            command_field: "command".into(),
+            capabilities: PreToolCapabilities {
+                replace_arguments: true,
+                block_and_suggest: false,
+            },
+        }),
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&native.to_json().unwrap()).unwrap();
+    value["attribution"] = json!({
+        "agent_id": "agentcore",
+        "conversation_id": "conv-1",
+        "tool_call_id": "call-1",
+    });
+
+    let envelope = RequestEnvelope::from_json(&value.to_string()).unwrap();
+
+    assert_eq!(envelope.attribution.session_id.as_deref(), Some("conv-1"));
+    assert_eq!(envelope.attribution.tool_use_id.as_deref(), Some("call-1"));
+    assert_eq!(envelope.attribution.agent_id, "agentcore");
+    // The operation payload is untouched by the attribution spelling.
+    assert_eq!(envelope.request, native.request);
+}

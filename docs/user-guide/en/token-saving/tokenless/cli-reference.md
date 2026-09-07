@@ -52,7 +52,7 @@ lower than the original (`after < before`). Otherwise stdout receives the origin
 input, stderr reports `did not reduce size`, and no statistics record is written.
 In dry-run mode (`TOKENLESS_COMPRESSION_ENABLED=0` or
 `compression_enabled=false`), stdout always receives the original input; a smaller
-candidate is recorded as a predicted saving when statistics or SLS recording is enabled.
+candidate is recorded as a predicted saving when statistics, SLS, or AgentLoop recording is enabled.
 
 The break-even point therefore depends on content and JSON shape, not only on
 bytes or characters. A small payload with a removable field can compress, while
@@ -403,7 +403,7 @@ tokenless stats diff --session <session-id> \
 
 Content diffing is omitted when either endpoint is unavailable or exceeds 1 MiB, and rendered hunks stop after 500 lines. Take care when using a shared terminal or collecting output because record and tool-use diffs can contain stored source text. See [Measuring savings](measuring-savings.md) and [Configuration and data privacy](configuration-and-privacy.md).
 
-`stats status` reports the local-statistics and SLS switches and their source. The current status path does not read the compression switch, so it does not display `compression_enabled`; inspect `TOKENLESS_COMPRESSION_ENABLED` and `~/.tokenless/config.json` for that setting.
+`stats status` reports the local-statistics, SLS, and AgentLoop switches and their source. The current status path does not read the compression switch, so it does not display `compression_enabled`; inspect `TOKENLESS_COMPRESSION_ENABLED` and `~/.tokenless/config.json` for that setting.
 
 ## Errors and degradation
 

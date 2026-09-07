@@ -55,6 +55,7 @@ class TokenlessRuntime:
         compression_enabled: bool = True,
         stats_enabled: bool = True,
         sls_enabled: bool = False,
+        agentloop_enabled: bool = False,
     ) -> None: ...
     def _before_model_json(
         self,

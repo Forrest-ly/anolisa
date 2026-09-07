@@ -248,7 +248,13 @@ def main() -> None:
     if MANIFEST["live_requested"]:
         SECRET = Path("/run/tokenplan-key").read_text().strip()
         assert SECRET, "API key file is empty"
-    os.environ.update({"TOKENLESS_STATS_ENABLED": "1", "TOKENLESS_SLS_ENABLED": "0"})
+    os.environ.update(
+        {
+            "TOKENLESS_STATS_ENABLED": "1",
+            "TOKENLESS_SLS_ENABLED": "0",
+            "TOKENLESS_AGENTLOOP_ENABLED": "0",
+        }
+    )
     asyncio.run(exercise())
 
 

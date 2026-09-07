@@ -584,6 +584,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                 &outcome,
                 recorder.as_ref(),
                 config.is_sls_enabled(),
+                config.is_agentloop_enabled(),
             );
         }
         Commands::CompressSchema {
@@ -951,6 +952,9 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     let sls_env_set = std::env::var("TOKENLESS_SLS_ENABLED")
                         .ok()
                         .filter(|v| !v.is_empty());
+                    let agentloop_env_set = std::env::var("TOKENLESS_AGENTLOOP_ENABLED")
+                        .ok()
+                        .filter(|v| !v.is_empty());
                     let config = TokenlessConfig::load();
                     let file_exists = TokenlessConfig::config_file_exists();
 
@@ -981,6 +985,20 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                         "default"
                     };
                     println!("SLS recording:   {sls_state} (via {sls_source})");
+
+                    let agentloop_state = if config.is_agentloop_enabled() {
+                        "ENABLED"
+                    } else {
+                        "DISABLED"
+                    };
+                    let agentloop_source = if agentloop_env_set.is_some() {
+                        "env override"
+                    } else if file_exists {
+                        "config file"
+                    } else {
+                        "default"
+                    };
+                    println!("AgentLoop feed:  {agentloop_state} (via {agentloop_source})");
                 }
                 StatsCommands::Enable => {
                     persist_stats_enabled(true)?;
@@ -1216,8 +1234,8 @@ fn record_compression_stats(
     stash_errors: Option<usize>,
     stash_size: Option<usize>,
 ) {
-    // Short-circuit only if both stats and SLS are disabled.
-    if !config.is_stats_enabled() && !config.is_sls_enabled() {
+    // Short-circuit only if stats and every external feed are disabled.
+    if !config.is_stats_enabled() && !config.is_sls_enabled() && !config.is_agentloop_enabled() {
         return;
     }
 
@@ -1267,6 +1285,15 @@ fn record_compression_stats(
     // SLS recording — fail-silent, independent of SQLite
     if config.is_sls_enabled() {
         let writer = tokenless_stats::SlsWriter::new();
+        writer.write(&record);
+    }
+
+    // AgentLoop recording — fail-silent, independent of SQLite and SLS. The
+    // record carries the trajectory correlation identity (conversation_id,
+    // tool_call_id, agent name) so AgentLoop can attach the savings to the
+    // step that produced them.
+    if config.is_agentloop_enabled() {
+        let writer = tokenless_stats::AgentLoopWriter::new();
         writer.write(&record);
     }
 }

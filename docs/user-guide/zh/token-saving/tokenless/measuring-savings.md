@@ -246,6 +246,93 @@ tail -n 1 /tmp/tokenless-sls.jsonl | jq .
 
 `TOKENLESS_SLS_PATH` 必须位于 `/var/log/` 或 `/tmp/` 下。生产 SLS endpoint、认证和 Logtail 配置属于平台运维配置，不在 Tokenless 用户指南中展开。
 
+## AgentLoop 可观测
+
+AgentLoop 是 AgentCore 等 Agent 运行时接入的 Agent 可观测与优化平台，按轨迹（Trajectory）把一次会话中的每个工具调用关联起来。Tokenless 通过独立的 AgentLoop 通道上报每次压缩的 Token 节省，并携带轨迹侧的关联标识，使节省可以归因到具体的 Conversation 和 Tool Call，而不是只有一份组件级汇总。
+
+与 SLS 通道的关系：
+
+- SLS 通道面向运维采集，字段使用 `component.*` / `tokenless.compression.*` 命名空间。
+- AgentLoop 通道面向轨迹关联，字段使用轨迹侧的 `conversation_id`、`tool_call_id`、`agent_name`。
+- 两条通道互不依赖，可以独立开关；关闭其中一条不影响另一条，也不影响本地 `stats.db`。
+
+默认行为：
+
+- `agentloop_enabled=true`。
+- 默认目标为 `/var/log/anolisa/agentloop/ops/tokenless.jsonl`。
+- Tokenless 只在目标文件已经存在时追加；不存在时静默跳过。
+- 文件由 ANOLISA 采集设施创建、轮转和删除，Tokenless 不创建也不删除。
+- 记录只包含度量与关联标识，不包含压缩前后的原文。
+- 随包提供的 RTK 统计写入器只写本地 SQLite，不会调用 AgentLoop Writer。
+
+### 关联标识
+
+AgentLoop 记录的关联标识来自 Tokenless 已有的归因字段，只是改用轨迹侧的字段名：
+
+| AgentLoop 字段 | Tokenless 来源 | 含义 |
+|----------------|----------------|------|
+| `conversation_id` | `--session-id` / `attribution.session_id` | 一次会话 |
+| `tool_call_id` | `--tool-use-id` / `attribution.tool_use_id` | 会话中的一次工具调用 |
+| `agent_name` | `--agent-id` / `attribution.agent_id` | Agent 或 Adapter 标识 |
+
+统一入口 `tokenless compress` 的 `attribution` 同时接受轨迹侧写法，因此直接上报 AgentLoop 的宿主无需再做字段名翻译：
+
+```json
+{
+  "protocol_version": 2,
+  "operation": "post_tool",
+  "attribution": {
+    "agent_id": "agentcore",
+    "conversation_id": "conv-1",
+    "tool_call_id": "call-1"
+  }
+}
+```
+
+注意：
+
+- 别名只作用于输入。Tokenless 自身序列化时始终输出 `session_id` / `tool_use_id`，既有 Adapter 与响应格式不受影响。
+- 同一标识的两种写法同时出现会被拒绝（duplicate field），而不是静默择一。
+- 缺失的标识不会写成 `null`，而是不出现在记录中。
+
+### 记录内容
+
+每行一个 JSON 对象，主要字段：
+
+| 字段 | 说明 |
+|------|------|
+| `schema_version` | 记录结构版本，当前为 `1` |
+| `event_type` | 固定为 `tokenless.token_savings` |
+| `timestamp` | RFC 3339 UTC 时间戳 |
+| `conversation_id` / `tool_call_id` / `agent_name` | 轨迹关联标识 |
+| `operation` | `compress-schema`、`compress-response`、`rewrite-command`、`compress-toon` |
+| `mode` | `active` 表示真实压缩，`dry-run` 表示只预测未生效，AgentLoop 侧不应把 dry-run 计入实际节省 |
+| `before_tokens` / `after_tokens` / `tokens_saved` / `tokens_saved_percent` | Token 度量 |
+| `before_chars` / `after_chars` / `chars_saved` / `chars_saved_percent` | 字符度量 |
+| `content_type` / `content_origin` / `applied_operations` | 内容分类与生效的操作 |
+| `recoverability` / `unrecoverable_truncations` | 原文是否可恢复，用于区分无损与有损节省 |
+| `tokenizer_id` | 估算所用 Token 计数器标识 |
+
+自定义测试文件：
+
+```bash
+touch /tmp/tokenless-agentloop.jsonl
+TOKENLESS_AGENTLOOP_ENABLED=1 \
+TOKENLESS_AGENTLOOP_PATH=/tmp/tokenless-agentloop.jsonl \
+  tokenless compress-response -f response.json \
+  --agent-id agentcore --session-id conv-1 --tool-use-id call-1
+
+tail -n 1 /tmp/tokenless-agentloop.jsonl | jq .
+```
+
+`TOKENLESS_AGENTLOOP_PATH` 必须位于 `/var/log/` 或 `/tmp/` 下，且不能包含 `..`。生产 AgentLoop 接入点、鉴权与采集配置属于平台运维配置，不在 Tokenless 用户指南中展开。
+
+当前开关状态可以用：
+
+```bash
+tokenless stats status
+```
+
 ## 清理统计
 
 先确认不再需要历史对比：
@@ -260,4 +347,4 @@ tokenless stats clear --yes
 tokenless stats disable
 ```
 
-`stats disable` 只关闭本地 SQLite 统计，不会关闭 SLS。完整开关关系见[配置与数据隐私](configuration-and-privacy.md)。
+`stats disable` 只关闭本地 SQLite 统计，不会关闭 SLS 或 AgentLoop 通道。完整开关关系见[配置与数据隐私](configuration-and-privacy.md)。

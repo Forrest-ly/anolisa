@@ -14,7 +14,7 @@ Environment variable > ~/.tokenless/config.json > default
 
 An empty environment variable is treated as unset. For Boolean environment variables, `1`, `true`, and `yes` are true, case-insensitively; any other non-empty value is false. Prefer explicit `true` or `false` values for readability.
 
-There is one current implementation exception: when both `TOKENLESS_STATS_ENABLED` and `TOKENLESS_SLS_ENABLED` are non-empty, the config file is skipped completely. In that branch, compression uses `TOKENLESS_COMPRESSION_ENABLED` when set and otherwise defaults to `true`. If you export both recording variables, export the compression variable explicitly as well.
+There is one current implementation exception: when `TOKENLESS_STATS_ENABLED`, `TOKENLESS_SLS_ENABLED`, `TOKENLESS_AGENTLOOP_ENABLED`, and `TOKENLESS_COMPRESSION_ENABLED` are all non-empty, the config file is skipped completely and all four toggles come straight from the environment. When any one of them is unset, the file is read to fill that gap. If you export some of the recording variables, export all four so a slow or broken mount never adds a config read.
 
 ## Configuration file
 
@@ -30,6 +30,7 @@ Complete example:
 {
   "stats_enabled": true,
   "sls_enabled": true,
+  "agentloop_enabled": true,
   "compression_enabled": true
 }
 ```
@@ -44,6 +45,7 @@ jq . ~/.tokenless/config.json
 |-------|---------|-----------------|
 | `stats_enabled` | `true` | Writes complete before/after text and metrics to local SQLite |
 | `sls_enabled` | `true` | Appends a metrics-only record when the target JSONL file exists |
+| `agentloop_enabled` | `true` | Appends a metrics-only AgentLoop record with trajectory correlation identity when the target JSONL file exists |
 | `compression_enabled` | `true` | Returns compressed output when true; false runs dry-run and returns the original |
 
 When Tokenless writes the configuration, it restricts the mode to `0600`. Confirm the mode after creating it manually:
@@ -70,11 +72,13 @@ An environment override still wins after these commands. For example, `TOKENLESS
 |----------|---------|------------|
 | `TOKENLESS_STATS_ENABLED` | Override local statistics | Does not affect SLS or Stash |
 | `TOKENLESS_SLS_ENABLED` | Override SLS metrics | Does not affect local statistics |
+| `TOKENLESS_AGENTLOOP_ENABLED` | Override AgentLoop metrics | Does not affect local statistics or SLS |
 | `TOKENLESS_COMPRESSION_ENABLED` | Override active compression | False is dry-run, not a full stop |
 | `TOKENLESS_DATA_DIR` | Directory containing `stats.db` and `stash.db` | Any accessible absolute directory except filesystem root; no parent traversal |
 | `TOKENLESS_STATS_DB` | Override the statistics database | Must be under the real user home or selected data directory |
 | `TOKENLESS_STASH_DB` | Override the Stash database | Must be under the real user home or selected data directory |
 | `TOKENLESS_SLS_PATH` | Override the SLS JSONL path | Must be under `/var/log/` or `/tmp/` |
+| `TOKENLESS_AGENTLOOP_PATH` | Override the AgentLoop JSONL path | Must be under `/var/log/` or `/tmp/` |
 
 ### Adapter and diagnostic variables
 
@@ -114,8 +118,9 @@ them from source control or backups as required by your data policy.
 |------|--------------|-----------------|-----------|---------------|
 | Local statistics | `~/.tokenless/stats.db` | Complete before/after text, identifiers, and metrics | No automatic TTL; retained until cleared | `tokenless stats disable` |
 | Stash | `~/.tokenless/stash.db` | Original strings, dropped middle segments of truncated arrays, complete object record arrays reduced to a sampled subset, deep subtrees, schema descriptions removed by truncation, and build/log gaps | One-hour TTL and 10,000 live entries; expired rows are purged lazily | CLI: `--no-stash`; agent: disable the adapter |
-| Configuration | `~/.tokenless/config.json` | Three Boolean toggles | Persistent | Not applicable |
+| Configuration | `~/.tokenless/config.json` | Four Boolean toggles | Persistent | Not applicable |
 | SLS JSONL | `/var/log/anolisa/sls/ops/tokenless.jsonl` | Metrics and identifiers, no compressed source text | Managed by SLS/Logtail infrastructure | `TOKENLESS_SLS_ENABLED=0` or config false |
+| AgentLoop JSONL | `/var/log/anolisa/agentloop/ops/tokenless.jsonl` | Metrics and trajectory correlation identity (`conversation_id`, `tool_call_id`, `agent_name`), no compressed source text | Managed by ANOLISA collection infrastructure | `TOKENLESS_AGENTLOOP_ENABLED=0` or config false |
 
 ### Sensitivity of local statistics
 
@@ -142,9 +147,9 @@ ls -l ~/.tokenless/stash.db*
 
 TTL means that `retrieve` no longer returns an entry after one hour. Expired rows are deleted lazily during a later retrieval; TTL is not an immediate secure-erasure guarantee for disk data. When more than 10,000 live entries exist, the store evicts entries with the earliest expiry first, so retrieval can fail before one hour under heavy use.
 
-### SLS excludes original text
+### SLS and AgentLoop feeds exclude original text
 
-Tokenless SLS JSONL includes the component, operation, session/tool-use identifiers, and character/token metrics. It does not include `before_text` or `after_text`. Identifiers can still be organizational runtime metadata and should follow the platform's log policy.
+Both the Tokenless SLS JSONL and the AgentLoop JSONL include the component, operation, correlation identifiers, and character/token metrics. Neither includes `before_text` or `after_text`. The AgentLoop record additionally carries `conversation_id` and `tool_call_id` so savings can be attributed to one conversation and tool call. Identifiers can still be organizational runtime metadata and should follow the platform's log policy.
 
 ## Guidance for sensitive workloads
 
@@ -153,6 +158,7 @@ Tokenless SLS JSONL includes the component, operation, session/tool-use identifi
 ```bash
 TOKENLESS_STATS_ENABLED=0 \
 TOKENLESS_SLS_ENABLED=0 \
+TOKENLESS_AGENTLOOP_ENABLED=0 \
   tokenless compress-response --no-stash -f response.json
 ```
 
@@ -171,6 +177,7 @@ This is a dry-run and may still write local statistics or SLS. To avoid persiste
 ```bash
 export TOKENLESS_STATS_ENABLED=0
 export TOKENLESS_SLS_ENABLED=0
+export TOKENLESS_AGENTLOOP_ENABLED=0
 ```
 
 Dry-run does not create Stash entries, but it also does not disable RTK rewriting. Tool Ready is independently hard-disabled. Disable the adapter when all hook behavior must stop.

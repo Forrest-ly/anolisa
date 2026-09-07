@@ -4,6 +4,8 @@
 //! for Agent hook integrations. Records before/after data for
 //! schema compression, response compression, and command rewriting.
 
+pub mod agentloop;
+mod collector_sink;
 pub mod config;
 pub mod diff;
 pub mod home;
@@ -39,6 +41,8 @@ pub use path_policy::{
 };
 
 pub use sls::{SlsRecord, SlsWriter};
+
+pub use agentloop::{AgentLoopRecord, AgentLoopWriter};
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
