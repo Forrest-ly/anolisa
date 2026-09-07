@@ -325,13 +325,20 @@ def main() -> None:
         and tool_name in SHELL_TOOLS
         and isinstance(model_visible_before, str)
     ):
-        # Cosh-NG hands shell output over as text: cosh-core's
-        # wrap_tool_response always wraps the raw output into a string
-        # llmContent, and the PostToolUse payload carries no is_error or
-        # status marker. A JSON shell envelope inside that text keeps its
+        # Some hosts hand shell output over as text instead of a dict:
+        # cosh-core's wrap_tool_response always wraps the raw output into a
+        # string llmContent, and copilot-shell delivers a plain string
+        # envelope. Either way the PostToolUse payload carries no is_error
+        # or status marker. A JSON shell envelope inside that text keeps its
         # exit_code / stderr / error fields, so parse it for error
         # detection — v1 classified these hook-side; under Protocol v2
         # the hook must supply the status and Core owns the diagnosis.
+        # Deliberately NOT gated on cosh_ng_detected: the classification is
+        # host-agnostic by design (restoring it for every host is the point
+        # of this change), so do not add a Cosh-NG condition here.
+        # TestCopilotShellEnvelopeClassification in
+        # tests/test_cosh_ng_compat.py pins the contract for a host running
+        # without any Cosh-NG marker.
         parsed_envelope = try_parse_json(model_visible_before)
         if isinstance(parsed_envelope, str):
             parsed_envelope = try_parse_json(parsed_envelope)
