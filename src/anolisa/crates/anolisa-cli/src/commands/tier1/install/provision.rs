@@ -45,11 +45,11 @@ pub(crate) fn run_runtime_preflight(
     run_runtime_preflight_with(manifest, env, command, &resolver)
 }
 
-fn run_runtime_preflight_with<R: CommandRunner>(
+fn run_runtime_preflight_with<R: CommandRunner, P: Fn() -> std::io::Result<String>>(
     manifest: &ComponentManifest,
     env: &anolisa_env::EnvFacts,
     command: &str,
-    resolver: &DependencyResolver<R>,
+    resolver: &DependencyResolver<R, P>,
 ) -> Result<Vec<String>, CliError> {
     if manifest.runtime_deps.is_empty() {
         return Ok(Vec::new());
@@ -118,7 +118,7 @@ pub(crate) fn run_provision(
 // injected, so introducing a second request object would obscure the existing
 // production signature without reducing call-site complexity.
 #[allow(clippy::too_many_arguments)]
-fn run_provision_with<R, F>(
+fn run_provision_with<R, P, F>(
     manifest: &ComponentManifest,
     env: &anolisa_env::EnvFacts,
     ctx: &CliContext,
@@ -126,11 +126,12 @@ fn run_provision_with<R, F>(
     warnings: &mut Vec<String>,
     journals: &JournalInventory,
     layout: &FsLayout,
-    resolver: &DependencyResolver<R>,
+    resolver: &DependencyResolver<R, P>,
     detect_manager: F,
 ) -> Result<Vec<String>, CliError>
 where
     R: CommandRunner,
+    P: Fn() -> std::io::Result<String>,
     F: FnOnce(Option<&str>) -> Result<Box<dyn PackageManager>, PkgError>,
 {
     if manifest.runtime_deps.is_empty() {
@@ -579,6 +580,169 @@ mod tests {
                 vec!["-q".to_string(), "libfoo".to_string()]
             )]
         );
+    }
+
+    #[test]
+    fn injected_btrfs_reader_controls_preflight_and_provisioning() {
+        for supported in [true, false] {
+            let sandbox = TestSandbox::new();
+            let ctx = sandbox.context(InstallMode::System);
+            let layout = ctx.layout();
+            let inventory = inventory_for(layout, &[]);
+            let manifest = manifest_with_deps(vec![platform_dep("btrfs", "btrfs")]);
+            let env = rpm_host_env();
+            let reads = Cell::new(0);
+            let runner = ScriptedRunner::with_codes([]);
+            let resolver = DependencyResolver::with_probes(runner.clone(), || {
+                reads.set(reads.get() + 1);
+                Ok(if supported {
+                    "nodev\tbtrfs\n"
+                } else {
+                    "ext4\n"
+                }
+                .to_string())
+            });
+
+            let preflight = run_runtime_preflight_with(&manifest, &env, "update", &resolver);
+            assert_eq!(reads.get(), 1);
+            let mut warnings = Vec::new();
+            let provision = run_provision_with(
+                &manifest,
+                &env,
+                &ctx,
+                "install component-a",
+                &mut warnings,
+                &inventory,
+                layout,
+                &resolver,
+                |_| panic!("platform capabilities must not invoke a package manager"),
+            );
+            if supported {
+                assert!(preflight.unwrap().is_empty());
+                assert!(provision.unwrap().is_empty());
+            } else {
+                let preflight = preflight.unwrap_err().reason();
+                assert!(preflight.contains("missing runtime dependencies; no files were changed"));
+                let provision = provision.unwrap_err().reason();
+                assert!(
+                    provision
+                        .contains("unsatisfiable platform requirements; no files were changed")
+                );
+                for reason in [preflight, provision] {
+                    assert!(
+                        reason.contains(
+                            "btrfs is not supported by the running kernel (absent from /proc/filesystems)"
+                        )
+                    );
+                }
+            }
+            assert_eq!(reads.get(), 2);
+            assert!(runner.calls().is_empty());
+            assert!(warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn injected_btrfs_read_failure_blocks_before_manager_detection() {
+        let sandbox = TestSandbox::new();
+        let ctx = sandbox.context(InstallMode::System);
+        let layout = ctx.layout();
+        let inventory = inventory_for(layout, &[]);
+        let manifest = manifest_with_deps(vec![platform_dep("btrfs", "btrfs")]);
+        let reads = Cell::new(0);
+        let resolver = DependencyResolver::with_probes(ScriptedRunner::with_codes([]), || {
+            reads.set(reads.get() + 1);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "scripted denial",
+            ))
+        });
+        let err = run_provision_with(
+            &manifest,
+            &rpm_host_env(),
+            &ctx,
+            "install component-a",
+            &mut Vec::new(),
+            &inventory,
+            layout,
+            &resolver,
+            |_| panic!("an unreadable capability probe must block before manager detection"),
+        )
+        .unwrap_err();
+        assert!(
+            err.reason()
+                .contains("could not read /proc/filesystems to verify btrfs support")
+        );
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn provisioning_reuses_btrfs_reader_after_install() {
+        for recheck_code in [Some(0), Some(1)] {
+            let sandbox = TestSandbox::new();
+            let ctx = sandbox.context(InstallMode::System);
+            let layout = ctx.layout();
+            let inventory = inventory_for(layout, &[]);
+            let manifest = manifest_with_deps(vec![
+                system_dep("foo", "libfoo"),
+                platform_dep("btrfs", "btrfs"),
+            ]);
+            let runner = ScriptedRunner::with_codes([Some(1), recheck_code]);
+            let manager = FakePackageManager::default();
+            let reads = Cell::new(0);
+            let detections = Cell::new(0);
+            let resolver = DependencyResolver::with_probes(runner.clone(), || {
+                reads.set(reads.get() + 1);
+                assert_eq!(runner.calls().len(), reads.get());
+                if reads.get() == 1 {
+                    assert_eq!(detections.get(), 0);
+                    assert!(manager.install_calls().is_empty());
+                } else {
+                    assert_eq!(detections.get(), 1);
+                    assert_eq!(manager.install_calls(), vec![vec!["libfoo".to_string()]]);
+                }
+                Ok("btrfs\n".to_string())
+            });
+            let result = run_provision_with(
+                &manifest,
+                &rpm_host_env(),
+                &ctx,
+                "install component-a",
+                &mut Vec::new(),
+                &inventory,
+                layout,
+                &resolver,
+                |pkg_base| {
+                    assert_eq!(reads.get(), 1);
+                    assert_eq!(pkg_base, Some("rpm"));
+                    detections.set(detections.get() + 1);
+                    Ok(Box::new(manager.clone()))
+                },
+            );
+            if recheck_code == Some(0) {
+                assert_eq!(result.unwrap(), vec!["libfoo".to_string()]);
+            } else {
+                let reason = result.unwrap_err().reason();
+                assert!(reason.contains("dependencies still unsatisfied after install"));
+                assert!(reason.contains("system packages were installed and retained: libfoo"));
+            }
+            assert_eq!(reads.get(), 2);
+            assert_eq!(detections.get(), 1);
+            assert_eq!(manager.install_calls(), vec![vec!["libfoo".to_string()]]);
+            assert_eq!(
+                runner.calls(),
+                vec![
+                    (
+                        "rpm".to_string(),
+                        vec!["-q".to_string(), "libfoo".to_string()]
+                    ),
+                    (
+                        "rpm".to_string(),
+                        vec!["-q".to_string(), "libfoo".to_string()]
+                    ),
+                ]
+            );
+        }
     }
 
     #[test]
