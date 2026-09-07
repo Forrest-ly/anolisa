@@ -397,6 +397,25 @@ duplicate intermediate token counts. See
 [Measuring Tokenless Savings](../../docs/user-guide/en/token-saving/tokenless/measuring-savings.md)
 for options and measurement limits.
 
+### Trace correlation
+
+Exported SLS records carry the trace identity of the host span they were
+produced under, so an observability backend such as AgentLoop can attribute
+token savings to a trace. Two optional environment variables supply it:
+
+- `TOKENLESS_TRACEPARENT` — adapter-facing override, read first.
+- `TRACEPARENT` — standard W3C variable, used when the override is absent,
+  empty, or unparsable.
+
+Injecting one is the launcher's responsibility: OpenTelemetry keeps the active
+span in an in-process carrier and does not export it to child processes, so a
+host or adapter that wants correlation must set one of them before spawning
+Tokenless. Without a usable context the record shape is unchanged, and the
+identity is written only to the SLS JSONL — never to the local `stats.db`. See
+[Measuring Tokenless Savings](../../docs/user-guide/en/token-saving/tokenless/measuring-savings.md)
+and
+[Configuration and Data Privacy](../../docs/user-guide/en/token-saving/tokenless/configuration-and-privacy.md).
+
 ### Database location
 
 Tokenless stores statistics and reversible-compression data in

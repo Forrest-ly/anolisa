@@ -3,10 +3,14 @@
 //! An agent observability backend such as AgentLoop joins component telemetry
 //! by trace identity, but tokenless emits no spans of its own: it runs as a
 //! short-lived hook process spawned by the agent host. The environment is the
-//! propagation channel that needs no host-side protocol change — an
-//! OpenTelemetry-instrumented host exports the `traceparent` of the span it is
-//! currently in, and tokenless stamps that identity onto the observability
-//! records it writes.
+//! propagation channel that needs no host-side protocol change, but it is a
+//! contract the launcher has to fulfil: OpenTelemetry propagates W3C context
+//! through in-process carriers and does not export the active span into a
+//! child environment, so a host or adapter that wants correlation must inject
+//! the `traceparent` of the span it is currently in before spawning tokenless.
+//! tokenless is the receiving end — it stamps the identity it was given onto
+//! the observability records it writes, and writes them uncorrelated when it
+//! was given none.
 //!
 //! Only the exported (SLS) records carry the identity. The local `stats.db`
 //! deliberately does not: nothing reads trace columns back there, and a
@@ -26,7 +30,12 @@ use serde::{Deserialize, Serialize};
 /// the DeepSeek Harness adapter already works around for `TOKENLESS_*`.
 pub const TOKENLESS_TRACEPARENT_ENV: &str = "TOKENLESS_TRACEPARENT";
 
-/// W3C Trace Context environment propagation variable (OpenTelemetry convention).
+/// W3C Trace Context environment propagation variable.
+///
+/// The name follows the W3C/OpenTelemetry convention, but nothing populates it
+/// automatically: an OpenTelemetry SDK keeps the active span in an in-process
+/// carrier, so the launching host or adapter has to inject the current
+/// `traceparent` into the environment it spawns tokenless with.
 pub const STANDARD_TRACEPARENT_ENV: &str = "TRACEPARENT";
 
 /// Length of the `trace-id` field: 16 bytes as lowercase hex.

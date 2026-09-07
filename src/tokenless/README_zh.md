@@ -484,6 +484,23 @@ active 阶段的输出与输入内容完全一致时才会串成一条链，从�
 阶段的 Token。完整选项和度量限制见
 [Tokenless 效果度量](../../docs/user-guide/zh/token-saving/tokenless/measuring-savings.md)。
 
+## Trace 关联
+
+导出的 SLS 记录会带上产生它的宿主 span 的 trace 标识，AgentLoop
+这类可观测后端因此可以把 Token 节省量归因到具体 trace。两个可选
+环境变量负责传入该标识：
+
+- `TOKENLESS_TRACEPARENT` —— 面向 Adapter 的覆盖项，优先读取。
+- `TRACEPARENT` —— 标准 W3C 变量，覆盖项缺失、为空或无法解析时使用。
+
+注入是启动方的责任：OpenTelemetry 只在进程内 carrier 中保存 active
+span，不会导出到子进程，因此需要关联能力的宿主或 Adapter 必须
+在启动 Tokenless 前写入其中一个。没有可用上下文时记录结构不变，
+且该标识只写入 SLS JSONL，不会写入本地 `stats.db`。详见
+[Tokenless 效果度量](../../docs/user-guide/zh/token-saving/tokenless/measuring-savings.md)
+与
+[配置与数据隐私](../../docs/user-guide/zh/token-saving/tokenless/configuration-and-privacy.md)。
+
 ## 数据库位置
 
 Tokenless 默认将统计数据和可逆压缩数据分别存储在

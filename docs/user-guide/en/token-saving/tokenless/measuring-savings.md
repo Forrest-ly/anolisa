@@ -237,7 +237,7 @@ Default behavior:
 - Tokenless appends only when the target file already exists; otherwise it skips the write.
 - ANOLISA SLS/Logtail infrastructure creates, rotates, and removes the file.
 - SLS records contain metrics and identifiers, never the original before/after text.
-- When the agent host exports a W3C `traceparent`, records also carry `tokenless.trace_id` and `tokenless.span_id` so an observability backend such as AgentLoop can attribute the savings to the trace that produced them. Both keys are omitted when no context was propagated.
+- When the agent host or adapter injects a W3C `traceparent` into the environment Tokenless runs in, records also carry `tokenless.trace_id` and `tokenless.span_id` so an observability backend such as AgentLoop can attribute the savings to the trace that produced them. Nothing sets that variable automatically — OpenTelemetry keeps the active span in an in-process carrier — so both keys are omitted unless the launcher injected a usable context.
 - The bundled RTK statistics writer records `rewrite-command` rows only in local SQLite; it does not call the SLS writer.
 
 Use a custom test file:
@@ -251,7 +251,7 @@ TOKENLESS_SLS_PATH=/tmp/tokenless-sls.jsonl \
 tail -n 1 /tmp/tokenless-sls.jsonl | jq .
 ```
 
-Correlate one run with the trace the host is in:
+Correlate one run with the trace the launcher is in. The example sets the variable inline, which is exactly what a host or adapter has to do before spawning Tokenless:
 
 ```bash
 touch /tmp/tokenless-sls.jsonl

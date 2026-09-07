@@ -231,7 +231,7 @@ SLS 是独立的外部采集通道，不是 AgentSight 读取本地统计的前�
 - Tokenless 只在目标文件已经存在时追加；不存在时静默跳过。
 - 文件由 ANOLISA SLS/Logtail 设施创建、轮转和删除。
 - SLS 记录只包含度量与标识，不包含压缩前后的原文。
-- 当 Agent 宿主导出 W3C `traceparent` 时，记录还会带上 `tokenless.trace_id` 和 `tokenless.span_id`，AgentLoop 这类可观测后端因此可以把节省量归因到产生它的 trace；没有传入 trace context 时这两个字段不会出现。
+- 当 Agent 宿主或 Adapter 向 Tokenless 的运行环境注入 W3C `traceparent` 时，记录还会带上 `tokenless.trace_id` 和 `tokenless.span_id`，AgentLoop 这类可观测后端因此可以把节省量归因到产生它的 trace。该变量不会被自动写入 —— OpenTelemetry 只在进程内 carrier 中保存 active span —— 因此启动方没有注入可用 trace context 时这两个字段不会出现。
 - 随包提供的 RTK 统计写入器只把 `rewrite-command` 记录写入本地 SQLite，不会调用 SLS Writer。
 
 自定义测试文件：
@@ -245,7 +245,7 @@ TOKENLESS_SLS_PATH=/tmp/tokenless-sls.jsonl \
 tail -n 1 /tmp/tokenless-sls.jsonl | jq .
 ```
 
-把一次运行与宿主当前所在的 trace 关联起来：
+把一次运行与启动方所在的 trace 关联起来。示例直接在命令行写入该变量，宿主或 Adapter 在启动 Tokenless 前需要做的正是这件事：
 
 ```bash
 touch /tmp/tokenless-sls.jsonl
