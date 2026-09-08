@@ -52,6 +52,10 @@ anolisa update all
 | `env` | Show environment detection results |
 | `bug` | Generate a bug report |
 
+Running `anolisa adapter enable <component> openclaw` accepts the plugin's
+declared capabilities when the host supports capability consent. This does
+not authorize an unsafe-install bypass.
+
 ## Install Modes
 
 | Mode | Prefix | When |
@@ -96,6 +100,11 @@ Supports dual backends: **raw** (OSS tar.gz) and **RPM** (dnf repository).
 The lifecycle planner separates ANOLISA-owned files from native-package
 authority and records crash-recovery intent before side effects. Component
 metadata is declared through `component.toml`.
+
+The raw backend re-fetches the distribution index on every resolve and fails
+when the repository is unreachable. Legacy `cache_ttl_secs` and
+`offline_fallback` keys in `repo.toml` are still accepted for compatibility,
+but the current raw backend ignores their values.
 
 ## Requirements
 

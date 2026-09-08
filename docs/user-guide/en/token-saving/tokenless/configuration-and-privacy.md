@@ -83,11 +83,15 @@ An environment override still wins after these commands. For example, `TOKENLESS
 | `TOKENLESS_AGENT_ID` | Agent identifier injected by an adapter |
 | `TOKENLESS_SESSION_ID` | Session identifier injected by an adapter |
 | `TOKENLESS_TOOL_USE_ID` | Tool-call identifier injected by an adapter |
+| `TOKENLESS_TRACEPARENT` | W3C trace context override stamped onto SLS records |
+| `TRACEPARENT` | Standard W3C trace context variable, injected by the launching host or adapter |
 | `TOKENLESS_TOOL_READY_SPEC` | Override the Tool Ready dependency specification |
 | `TOKENLESS_ENV_FIX_SCRIPT` | Override the environment repair script |
 | `TOKENLESS_PACKAGE_MANAGER` | Override package-manager detection, mainly for tests |
 
 Tool Ready is hard-disabled in this build. Its specification and repair-script overrides are retained for the dormant legacy implementation but have no runtime effect. They are subject to trusted-path validation and are not recommended for normal users.
+
+`TOKENLESS_TRACEPARENT` and the standard `TRACEPARENT` carry a W3C trace context for SLS records. Injecting one is the launcher's job: OpenTelemetry propagates W3C context through in-process carriers and does not export the active span as a process variable, so a host or adapter that wants correlation has to set one of these two variables in the environment it spawns Tokenless with. Tokenless only reads them. The override is read first, and an empty or unparsable override falls back to the standard variable so one typo cannot drop correlation for a whole session. Both are optional: when neither carries a usable context, records keep the previous shape and are written uncorrelated. The identity is stamped only onto the SLS JSONL — the local statistics database does not store it.
 
 Database path priority is:
 
@@ -98,12 +102,22 @@ Database path priority is:
 
 An empty value is treated as unset. `TOKENLESS_DATA_DIR` may name a directory that does not exist yet; Tokenless canonicalizes its nearest existing ancestor before creating it. File-level overrides are accepted only beneath the canonical real home or selected data directory, and existing database symlinks are rejected. `TOKENLESS_DATA_DIR` does not relocate `~/.tokenless/config.json` or the SLS JSONL output.
 
+DeepSeek Harness is an exception to the default database location because its
+sandbox removes inherited `TOKENLESS_*` variables and may not expose the home
+directory. Its adapter uses `.tokenless` in the session workspace unless
+`TOKENLESS_DATA_DIR` is set, and publishes managed shell aliases for that
+directory plus `TOKENLESS_STATS_DB` and `TOKENLESS_STASH_DB`. The default
+workspace directory contains a `.gitignore` with `*`, so complete tool text,
+Stash payloads, and SQLite sidecars are not staged by `git add -A`. Custom paths
+are not modified; make them accessible to the DSH shell sandbox and exclude
+them from source control or backups as required by your data policy.
+
 ## Local and external data
 
 | Data | Default path | Default content | Retention | Stop new data |
 |------|--------------|-----------------|-----------|---------------|
 | Local statistics | `~/.tokenless/stats.db` | Complete before/after text, identifiers, and metrics | No automatic TTL; retained until cleared | `tokenless stats disable` |
-| Stash | `~/.tokenless/stash.db` | Original strings, dropped middle segments of truncated arrays, deep subtrees, schema descriptions removed by truncation, and build/log gaps | One-hour TTL and 10,000 live entries; expired rows are purged lazily | CLI: `--no-stash`; agent: disable the adapter |
+| Stash | `~/.tokenless/stash.db` | Original strings, dropped middle segments of truncated arrays, complete object record arrays reduced to a sampled subset, deep subtrees, schema descriptions removed by truncation, and build/log gaps | One-hour TTL and 10,000 live entries; expired rows are purged lazily | CLI: `--no-stash`; agent: disable the adapter |
 | Configuration | `~/.tokenless/config.json` | Three Boolean toggles | Persistent | Not applicable |
 | SLS JSONL | `/var/log/anolisa/sls/ops/tokenless.jsonl` | Metrics and identifiers, no compressed source text | Managed by SLS/Logtail infrastructure | `TOKENLESS_SLS_ENABLED=0` or config false |
 
@@ -124,7 +138,7 @@ ls -l ~/.tokenless/stats.db*
 
 ### Sensitivity of Stash
 
-Stash saves the original content removed by truncation, not a summary. It does not save fields removed solely because they are blacklisted, `null`, or empty. The `tokenless` CLI restricts its path to the real user home or selected data directory, but also verify that the database and SQLite sidecar files are not readable by other local users:
+Stash saves the original content removed by truncation, not a summary. For record reduction, the stashed entry is the complete original array before reduction, not only the omitted records. It does not save fields removed solely because they are blacklisted, `null`, or empty. The `tokenless` CLI restricts its path to the real user home or selected data directory, but also verify that the database and SQLite sidecar files are not readable by other local users:
 
 ```bash
 ls -l ~/.tokenless/stash.db*
@@ -134,7 +148,7 @@ TTL means that `retrieve` no longer returns an entry after one hour. Expired row
 
 ### SLS excludes original text
 
-Tokenless SLS JSONL includes the component, operation, session/tool-use identifiers, and character/token metrics. It does not include `before_text` or `after_text`. Identifiers can still be organizational runtime metadata and should follow the platform's log policy.
+Tokenless SLS JSONL includes the component, operation, session/tool-use identifiers, the host trace identity when one was propagated, and character/token metrics. It does not include `before_text` or `after_text`. Identifiers can still be organizational runtime metadata and should follow the platform's log policy.
 
 ## Guidance for sensitive workloads
 
@@ -220,19 +234,24 @@ The OpenClaw plugin also provides framework-level options:
 
 | Option | Purpose |
 |--------|---------|
-| `rtk_enabled` | Command rewriting |
+| `rtk_enabled` | Rewrite supported shell commands through RTK |
 | `tool_ready_enabled` | OpenClaw-side Tool Ready registration gate |
-| `response_compression_enabled` | Response compression |
-| `toon_compression_enabled` | TOON encoding |
-| `skip_tools` | Tool names that bypass all compression |
-| `shell_tools` | Tool names handled as shell/exec with moderate truncation |
+| `post_tool_enabled` | Optimize supported persisted tool results |
 | `verbose` | Plugin diagnostic logging |
 
-The OpenClaw adapter does not currently implement Schema compression; invoke the `tokenless compress-schema` CLI command directly when needed.
+The OpenClaw plugin does not compress tool schemas or provide content retrieval. Results that cannot
+be safely optimized without retrieval pass through unchanged.
 
-The runtime defaults RTK, its OpenClaw-side Tool Ready gate, and response compression to on, and TOON to off. The Tool Ready option currently has no effect because Tokenless hard-disables the underlying check. The current runtime code treats an omitted `verbose` as on, while the plugin schema declares its default as off; set `verbose` explicitly until those definitions are aligned.
+RTK, the OpenClaw-side Tool Ready registration gate, and PostTool default to on; verbose logging
+defaults to off. The Tool Ready option currently has no operational effect because Tokenless
+hard-disables the underlying check. Tokenless automatically decides whether JSON cleanup or TOON is
+useful and which tool outputs must pass through unchanged. The removed
+`response_compression_enabled`, `toon_compression_enabled`, `skip_tools`, and `shell_tools` keys no
+longer control the adapter.
 
-These values are managed by OpenClaw plugin configuration, not `~/.tokenless/config.json`. Restart the gateway as instructed after changing them.
+These values are managed by OpenClaw plugin configuration, not `~/.tokenless/config.json`. The
+adapter requires OpenClaw Plugin API 2026.4.22 or later. Restart the gateway as instructed after
+changing them.
 
 ## Related documents
 

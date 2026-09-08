@@ -21,6 +21,7 @@ GOLDENS_DIR = os.path.join(CONTRACT_DIR, "goldens")
 
 RESPONSE_HOOK = os.path.join(HOOKS_DIR, "compress_response_hook.py")
 SCHEMA_HOOK = os.path.join(HOOKS_DIR, "compress_schema_hook.py")
+PRE_TOOL_HOOK = os.path.join(HOOKS_DIR, "rewrite_hook.py")
 
 DEBUG_TOKENLESS_BIN = os.path.join(REPO_ROOT, "target", "debug", "tokenless")
 
@@ -82,6 +83,7 @@ def run_hook(
     tokenless_bin: str | None = DEBUG_TOKENLESS_BIN,
     extra_env: dict | None = None,
     timeout: int = 60,
+    tokenless_on_path: bool = True,
 ) -> subprocess.CompletedProcess:
     """Run one hook hermetically and return the completed process.
 
@@ -95,16 +97,25 @@ def run_hook(
         os.makedirs(home)
         os.makedirs(bindir)
         if tokenless_bin:
-            os.symlink(tokenless_bin, os.path.join(bindir, "tokenless"))
+            if tokenless_on_path:
+                os.symlink(tokenless_bin, os.path.join(bindir, "tokenless"))
+            else:
+                # The first supported off-PATH layout must win before any
+                # host-level FHS installation can influence this fixture.
+                fallback_dir = os.path.join(home, ".local", "bin")
+                os.makedirs(fallback_dir)
+                os.symlink(tokenless_bin, os.path.join(fallback_dir, "tokenless"))
         claude = os.path.join(bindir, "claude")
         with open(claude, "w") as f:
             f.write(f'#!/bin/sh\necho "{FAKE_CLAUDE_VERSION} (Claude Code)"\n')
         os.chmod(claude, 0o755)
+        os.symlink(sys.executable, os.path.join(bindir, "python3"))
 
         env = {
             "HOME": home,
-            "PATH": f"{bindir}:/usr/bin:/bin",
+            "PATH": bindir,
             "LC_ALL": "C.UTF-8",
+            "TOKENLESS_DATA_DIR": os.path.join(home, ".tokenless"),
             # Keep runs hermetic: no stats/SLS side channels; compression on.
             "TOKENLESS_STATS_ENABLED": "0",
             "TOKENLESS_SLS_ENABLED": "0",

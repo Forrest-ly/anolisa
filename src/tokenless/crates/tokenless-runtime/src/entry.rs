@@ -8,15 +8,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
-use tokenless_ccr::{MARKER_PREFIX, MARKER_SUFFIX, StashStore, extract_hash, is_valid_hash};
-use tokenless_compressors::{JsonCompressionConfig, JsonOperation};
+use serde_json::Value;
+use tokenless_ccr::{RecoveryMethod, StashStore, extract_hash, is_valid_hash, recovery_hashes};
+use tokenless_compressors::JsonCompressionConfig;
 use tokenless_protocol::{
     AppliedOperation, Attribution, BeforeModelRequest, BeforeModelResponse, Disposition, Operation,
     OutputOptimization, PostToolRequest, PostToolResponse, PreToolAction, PreToolRequest,
     PreToolResponse, Recoverability, Request, RequestEnvelope, Response, ResponseEnvelope,
-    ResultKind, RetrieveRequest, RetrieveResponse, RetrieveToolDeclaration, TOKENIZER_ID,
-    ToolResultStatus, estimate_tokens,
+    ResultKind, RetrieveRequest, RetrieveResponse, TOKENIZER_ID, ToolResultStatus, estimate_tokens,
 };
 use tokenless_schema::SchemaCompressor;
 use tokenless_stats::{OperationType, StatsRecorder};
@@ -39,6 +38,8 @@ pub struct EntryOptions {
     pub stash_enabled: bool,
     /// Resolved RTK executable for PreTool.
     pub rtk_path: Option<PathBuf>,
+    /// Resolved state directory propagated to RTK commands.
+    pub rtk_data_dir: Option<PathBuf>,
 }
 
 /// Runtime-only facts used for statistics recording.
@@ -99,6 +100,7 @@ pub fn dispatch_with_store(
                     request,
                     &envelope.attribution,
                     options.rtk_path.as_deref(),
+                    options.rtk_data_dir.as_deref(),
                     RTK_TIMEOUT,
                 )?),
                 None,
@@ -161,17 +163,6 @@ pub(crate) fn before_model_with_store(
     options: &EntryOptions,
     stash_store: Option<&Arc<dyn StashStore>>,
 ) -> Result<BeforeModelOutcome, RuntimeError> {
-    if request.capabilities.publish_retrieve_tool
-        && request
-            .tools
-            .iter()
-            .any(|tool| tool_name(tool).is_some_and(|name| name == request.retrieve_tool_name))
-    {
-        return Err(RuntimeError::RetrieveToolConflict {
-            name: request.retrieve_tool_name.clone(),
-        });
-    }
-
     let input = serde_json::to_string(&request.tools).map_err(RuntimeError::Serialize)?;
     if input.len() > MAX_INPUT_BYTES {
         return Err(RuntimeError::InputTooLarge {
@@ -181,13 +172,14 @@ pub(crate) fn before_model_with_store(
     let attached_store = if request.capabilities.replace_tools
         && options.compression_enabled
         && options.stash_enabled
-        && request.capabilities.publish_retrieve_tool
+        && matches!(request.capabilities.recovery, RecoveryMethod::Tool { .. })
     {
         stash_store
     } else {
         None
     };
-    let mut compressor = SchemaCompressor::new();
+    let mut compressor =
+        SchemaCompressor::new().with_recovery(request.capabilities.recovery.clone());
     if let Some(store) = attached_store {
         compressor = compressor.with_stash_store(Arc::clone(store));
     }
@@ -228,15 +220,17 @@ pub(crate) fn before_model_with_store(
     let tools = serde_json::from_str::<Vec<Value>>(&compression.output)?;
 
     let mut markers = BTreeSet::new();
-    collect_markers(&request.visible_context, &mut markers);
-    collect_markers(&Value::Array(tools.clone()), &mut markers);
+    collect_markers(
+        &request.visible_context,
+        &request.capabilities.recovery,
+        &mut markers,
+    );
+    collect_markers(
+        &Value::Array(tools.clone()),
+        &request.capabilities.recovery,
+        &mut markers,
+    );
     let visible_markers = markers.into_iter().collect::<Vec<_>>();
-    let retrieve_tool = if request.capabilities.publish_retrieve_tool && !visible_markers.is_empty()
-    {
-        Some(retrieve_tool_declaration(&request.retrieve_tool_name))
-    } else {
-        None
-    };
     let measured = matches!(
         compression.disposition,
         Disposition::Applied | Disposition::DryRun
@@ -255,7 +249,6 @@ pub(crate) fn before_model_with_store(
         response: BeforeModelResponse {
             tools,
             visible_markers,
-            retrieve_tool,
         },
         stats: EntryStats {
             operation: OperationType::CompressSchema,
@@ -281,46 +274,29 @@ pub(crate) fn before_model_with_store(
     })
 }
 
-fn tool_name(tool: &Value) -> Option<&str> {
-    tool.get("name")
-        .and_then(Value::as_str)
-        .or_else(|| tool.get("function")?.get("name")?.as_str())
-}
-
-fn collect_markers(value: &Value, markers: &mut BTreeSet<String>) {
-    let Ok(text) = serde_json::to_string(value) else {
-        return;
-    };
-    let mut rest = text.as_str();
-    while let Some(start) = rest.find(MARKER_PREFIX) {
-        let after_prefix = &rest[start + MARKER_PREFIX.len()..];
-        if let Some(hash) = after_prefix.get(..24)
-            && is_valid_hash(hash)
-            && after_prefix[24..].starts_with(MARKER_SUFFIX)
-        {
-            markers.insert(hash.to_ascii_lowercase());
-            rest = &after_prefix[24 + MARKER_SUFFIX.len()..];
-        } else {
-            rest = after_prefix;
+fn collect_markers(value: &Value, recovery: &RecoveryMethod, markers: &mut BTreeSet<String>) {
+    match value {
+        Value::String(text) => markers.extend(
+            recovery_hashes(text, recovery)
+                .into_iter()
+                .map(str::to_ascii_lowercase),
+        ),
+        Value::Array(items) => {
+            for item in items {
+                collect_markers(item, recovery, markers);
+            }
         }
-    }
-}
-
-fn retrieve_tool_declaration(name: &str) -> RetrieveToolDeclaration {
-    RetrieveToolDeclaration {
-        name: name.to_owned(),
-        description: "Restore content referenced by a visible Tokenless marker.".into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "hash_or_marker": {
-                    "type": "string",
-                    "description": "A visible <<tokenless:HASH>> marker or its hash"
-                }
-            },
-            "required": ["hash_or_marker"],
-            "additionalProperties": false
-        }),
+        Value::Object(fields) => {
+            for (name, item) in fields {
+                markers.extend(
+                    recovery_hashes(name, recovery)
+                        .into_iter()
+                        .map(str::to_ascii_lowercase),
+                );
+                collect_markers(item, recovery, markers);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -328,14 +304,22 @@ pub(crate) fn pre_tool_with_rtk(
     request: &PreToolRequest,
     attribution: &Attribution,
     rtk_path: &Path,
+    data_dir: &Path,
 ) -> Result<PreToolResponse, RuntimeError> {
-    pre_tool_with_optional_rtk(request, attribution, Some(rtk_path), RTK_TIMEOUT)
+    pre_tool_with_optional_rtk(
+        request,
+        attribution,
+        Some(rtk_path),
+        Some(data_dir),
+        RTK_TIMEOUT,
+    )
 }
 
 fn pre_tool_with_optional_rtk(
     request: &PreToolRequest,
     attribution: &Attribution,
     rtk_path: Option<&Path>,
+    data_dir: Option<&Path>,
     timeout: Duration,
 ) -> Result<PreToolResponse, RuntimeError> {
     let Some(arguments) = request.arguments.as_object() else {
@@ -350,13 +334,20 @@ fn pre_tool_with_optional_rtk(
     if !request.capabilities.replace_arguments && !request.capabilities.block_and_suggest {
         return Ok(pre_tool_passthrough(request));
     }
+    // RTK ownership would bypass the PostTool domain selected for native
+    // build/test output, so the two optimizers remain mutually exclusive.
+    if is_build_log_owned_command(command) {
+        return Ok(pre_tool_passthrough(request));
+    }
     let rtk_path = rtk_path.ok_or(RuntimeError::RtkUnavailable)?;
+    let data_dir = data_dir.ok_or(RuntimeError::RtkDataDirectoryUnavailable)?;
 
     let mut child = Command::new(rtk_path);
     child
         .arg("rewrite")
         .arg(command)
         .env("TOKENLESS_AGENT_ID", &attribution.agent_id)
+        .env("TOKENLESS_DATA_DIR", data_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     if let Some(session_id) = &attribution.session_id {
@@ -407,7 +398,7 @@ fn pre_tool_with_optional_rtk(
     if rewritten.is_empty() || rewritten == command {
         return Ok(pre_tool_passthrough(request));
     }
-    let anchored = anchor_rtk_prefix(rewritten, rtk_path);
+    let anchored = anchor_rtk_prefix(command, rewritten, rtk_path, attribution, data_dir);
     let mut rewritten_arguments = arguments.clone();
     rewritten_arguments.insert(request.command_field.clone(), Value::String(anchored));
     let action = if request.capabilities.replace_arguments {
@@ -430,40 +421,257 @@ fn pre_tool_passthrough(request: &PreToolRequest) -> PreToolResponse {
     }
 }
 
-fn anchor_rtk_prefix(rewritten: &str, rtk_path: &Path) -> String {
+fn is_build_log_owned_command(command: &str) -> bool {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for character in command.chars() {
+        if escaped {
+            word.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            } else {
+                word.push(character);
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character.is_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            if character == '\n' && segment_is_build_log_owned(&words) {
+                return true;
+            }
+            if character == '\n' {
+                words.clear();
+            }
+        } else if matches!(character, '&' | '|' | ';' | '(' | ')') {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            if segment_is_build_log_owned(&words) {
+                return true;
+            }
+            words.clear();
+        } else {
+            word.push(character);
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    segment_is_build_log_owned(&words)
+}
+
+fn segment_is_build_log_owned(words: &[String]) -> bool {
+    let mut index = words
+        .iter()
+        .position(|word| !is_environment_assignment(word))
+        .unwrap_or(words.len());
+    if words.get(index).is_some_and(|word| word == "env") {
+        index += 1;
+        while words
+            .get(index)
+            .is_some_and(|word| is_environment_assignment(word))
+        {
+            index += 1;
+        }
+    }
+    if matches!(
+        words.get(index).map(|word| command_basename(word)),
+        Some("command" | "exec")
+    ) {
+        index += 1;
+    }
+
+    let executable = words
+        .get(index)
+        .map(|word| command_basename(word))
+        .unwrap_or_default();
+    let arguments = &words[index.saturating_add(1).min(words.len())..];
+    match executable {
+        "cargo" => matches!(
+            arguments.first().map(String::as_str),
+            Some("build" | "check" | "clippy" | "install" | "test")
+        ),
+        "pytest" => true,
+        executable if is_python_executable(executable) => {
+            matches!(
+                arguments,
+                [module, runner, ..] if module == "-m" && runner == "pytest"
+            )
+        }
+        "uv" => matches!(
+            arguments,
+            [run, runner, ..] if run == "run" && (runner == "pytest" || is_python_pytest(arguments, 1))
+        ),
+        "npm" | "pnpm" => package_command_is_build_log_owned(arguments),
+        "npx" | "pnpx" => arguments.first().is_some_and(|runner| runner == "jest"),
+        "jest" => true,
+        "go" => matches!(
+            arguments.first().map(String::as_str),
+            Some("build" | "test" | "vet")
+        ),
+        "make" | "gmake" => true,
+        _ => false,
+    }
+}
+
+fn package_command_is_build_log_owned(arguments: &[String]) -> bool {
+    let Some(action) = arguments.first().map(String::as_str) else {
+        return false;
+    };
+    if action == "test" {
+        return true;
+    }
+    if matches!(action, "exec" | "x" | "dlx") {
+        return arguments.get(1).is_some_and(|runner| runner == "jest");
+    }
+    if !matches!(action, "run" | "run-script") {
+        return false;
+    }
+    arguments
+        .iter()
+        .skip(1)
+        .find(|word| !word.starts_with('-'))
+        .is_some_and(|script| {
+            matches!(script.as_str(), "build" | "jest" | "test")
+                || script.starts_with("build:")
+                || script.starts_with("test:")
+        })
+}
+
+fn is_environment_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    })
+}
+
+fn command_basename(command: &str) -> &str {
+    command.rsplit('/').next().unwrap_or(command)
+}
+
+fn is_python_executable(executable: &str) -> bool {
+    executable.strip_prefix("python").is_some_and(|suffix| {
+        suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    })
+}
+
+fn is_python_pytest(arguments: &[String], start: usize) -> bool {
+    matches!(
+        arguments.get(start..),
+        Some([python, module, runner, ..])
+            if is_python_executable(command_basename(python))
+                && module == "-m"
+                && runner == "pytest"
+    )
+}
+
+fn anchor_rtk_prefix(
+    original: &str,
+    rewritten: &str,
+    rtk_path: &Path,
+    attribution: &Attribution,
+    data_dir: &Path,
+) -> String {
     let quoted_path = shell_quote(&rtk_path.to_string_lossy());
-    let mut anchored = String::with_capacity(rewritten.len() + quoted_path.len());
+    let prefix = format!(
+        "env TOKENLESS_AGENT_ID={} TOKENLESS_SESSION_ID={} TOKENLESS_TOOL_USE_ID={} TOKENLESS_DATA_DIR={} {}",
+        shell_quote(&attribution.agent_id),
+        shell_quote(attribution.session_id.as_deref().unwrap_or_default()),
+        shell_quote(attribution.tool_use_id.as_deref().unwrap_or_default()),
+        shell_quote(&data_dir.to_string_lossy()),
+        quoted_path,
+    );
+    // RTK can preserve arbitrary configured transparent prefixes before its
+    // wrapper. The first divergence in each rewritten segment locates the
+    // inserted wrapper without replacing `rtk` arguments in that prefix.
+    // Backtick and double-quoted command substitutions are left untouched
+    // because they require the host parser.
+    let original_segments = bare_rtk_offsets_by_segment(original);
+    let rewritten_segments = bare_rtk_offsets_by_segment(rewritten);
+    let mut replacements = Vec::new();
+    for (segment_index, (rewritten_start, tokens)) in rewritten_segments.iter().enumerate() {
+        let original_segment = original_segments.get(segment_index);
+        let original_count = original_segment.map_or(0, |(_, tokens)| tokens.len());
+        if tokens.len() > original_count {
+            let original_start = original_segment.map_or(original.len(), |(start, _)| *start);
+            let original_suffix = &original[original_start..];
+            let rewritten_suffix = &rewritten[*rewritten_start..];
+            let original_trimmed = original_suffix.trim_start();
+            let rewritten_trimmed = rewritten_suffix.trim_start();
+            let common_prefix_len = original_trimmed
+                .bytes()
+                .zip(rewritten_trimmed.bytes())
+                .take_while(|(original, rewritten)| original == rewritten)
+                .count();
+            let insertion_floor = rewritten_start
+                + (rewritten_suffix.len() - rewritten_trimmed.len())
+                + common_prefix_len;
+            replacements.extend(
+                tokens
+                    .iter()
+                    .copied()
+                    .find(|offset| *offset + 3 > insertion_floor),
+            );
+        }
+    }
+
+    let mut anchored = String::with_capacity(rewritten.len() + replacements.len() * prefix.len());
+    let mut copied_until = 0;
+    for offset in replacements {
+        anchored.push_str(&rewritten[copied_until..offset]);
+        anchored.push_str(&prefix);
+        copied_until = offset + 3;
+    }
+    anchored.push_str(&rewritten[copied_until..]);
+    anchored
+}
+
+fn bare_rtk_offsets_by_segment(command: &str) -> Vec<(usize, Vec<usize>)> {
+    let mut segments = Vec::new();
+    let mut segment_start = 0;
+    let mut current_offsets = Vec::new();
     let mut index = 0;
     let mut quote = None;
     let mut escaped = false;
     let mut word_start = true;
-    let mut anchored_in_segment = false;
 
-    // RTK can preserve arbitrary configured transparent prefixes before its
-    // wrapper, so anchor the first bare `rtk` token in each command segment
-    // without interpreting those prefixes. Backtick and double-quoted command
-    // substitutions are left untouched because they require the host parser.
-    while index < rewritten.len() {
-        let Some(ch) = rewritten[index..].chars().next() else {
+    while index < command.len() {
+        let Some(ch) = command[index..].chars().next() else {
             break;
         };
         let width = ch.len_utf8();
 
         if escaped {
-            anchored.push(ch);
             escaped = false;
             index += width;
             continue;
         }
         if ch == '\\' && quote != Some('\'') {
-            anchored.push(ch);
             escaped = true;
             word_start = false;
             index += width;
             continue;
         }
         if let Some(delimiter) = quote {
-            anchored.push(ch);
             if ch == delimiter {
                 quote = None;
             }
@@ -473,43 +681,43 @@ fn anchor_rtk_prefix(rewritten: &str, rtk_path: &Path) -> String {
         if matches!(ch, '\'' | '"' | '`') {
             quote = Some(ch);
             word_start = false;
-            anchored.push(ch);
             index += width;
             continue;
         }
         if ch.is_whitespace() {
             word_start = true;
             if ch == '\n' {
-                anchored_in_segment = false;
+                segments.push((segment_start, current_offsets));
+                segment_start = index + width;
+                current_offsets = Vec::new();
             }
-            anchored.push(ch);
             index += width;
             continue;
         }
         if matches!(ch, '&' | '|' | ';' | '(') {
+            segments.push((segment_start, current_offsets));
+            segment_start = index + width;
+            current_offsets = Vec::new();
             word_start = true;
-            anchored_in_segment = false;
-            anchored.push(ch);
             index += width;
             continue;
         }
-        if word_start && !anchored_in_segment && rewritten[index..].starts_with("rtk") {
-            let next = rewritten[index + 3..].chars().next();
+        if word_start && command[index..].starts_with("rtk") {
+            let next = command[index + 3..].chars().next();
             if next.is_none_or(|value| {
                 value.is_whitespace() || matches!(value, '&' | '|' | ';' | '(' | ')')
             }) {
-                anchored.push_str(&quoted_path);
+                current_offsets.push(index);
                 index += 3;
                 word_start = false;
-                anchored_in_segment = true;
                 continue;
             }
         }
         word_start = false;
-        anchored.push(ch);
         index += width;
     }
-    anchored
+    segments.push((segment_start, current_offsets));
+    segments
 }
 
 fn shell_quote(value: &str) -> String {
@@ -545,61 +753,75 @@ pub(crate) fn post_tool_with_store(
         || request.output_optimization == OutputOptimization::Rtk
     {
         Some(PostToolResponse::passthrough(request, before_tokens))
-    } else if request.status == ToolResultStatus::Error {
-        let mut response = PostToolResponse::passthrough(request, before_tokens);
-        response.disposition = Disposition::ToolError;
-        response.additional_context = diagnose_tool_error(&request.tool_name, &request.content);
-        Some(response)
     } else {
         None
     };
     let attached_store = request
         .capabilities
-        .publish_retrieve_tool
+        .recovery
+        .is_available()
         .then_some(stash_store)
         .flatten();
 
-    let (response, candidate, operations, stash_writes, stash_errors, stash_size, unrecoverable) =
-        if let Some(response) = routed {
-            (response, None, Vec::new(), None, None, None, None)
-        } else {
-            let thresholds = taxonomy::thresholds_for(request.content_origin);
-            let run = PostToolPipeline::run(
-                request,
-                &PostToolPipelineConfig {
-                    timeout: RESPONSE_PIPELINE_TIMEOUT,
-                    max_input_bytes: MAX_INPUT_BYTES,
-                    min_input_chars: MIN_RESPONSE_CHARS,
-                    compression_enabled: options.compression_enabled,
-                    stash_enabled: options.stash_enabled,
-                    require_reversibility: true,
-                    force_json: false,
-                    preserve_top_level_shape: !request.capabilities.replace_with_text,
-                    allow_toon: true,
-                    min_toon_chars: MIN_TOON_CHARS,
-                    json: JsonCompressionConfig {
-                        truncate_strings_at: thresholds.truncate_strings_at,
-                        truncate_arrays_at: thresholds.truncate_arrays_at,
-                        max_depth: thresholds.max_depth,
-                        ..JsonCompressionConfig::default()
-                    },
+    let (
+        mut response,
+        candidate,
+        operations,
+        stash_writes,
+        stash_errors,
+        stash_size,
+        unrecoverable,
+    ) = if let Some(response) = routed {
+        (response, None, Vec::new(), None, None, None, None)
+    } else {
+        let thresholds = taxonomy::thresholds_for(request.content_origin);
+        let run = PostToolPipeline::run(
+            request,
+            &PostToolPipelineConfig {
+                timeout: RESPONSE_PIPELINE_TIMEOUT,
+                max_input_bytes: MAX_INPUT_BYTES,
+                min_input_chars: MIN_RESPONSE_CHARS,
+                compression_enabled: options.compression_enabled,
+                stash_enabled: options.stash_enabled,
+                require_reversibility: true,
+                force_json: false,
+                preserve_top_level_shape: !request.capabilities.replace_with_text,
+                allow_toon: true,
+                min_toon_chars: MIN_TOON_CHARS,
+                json: JsonCompressionConfig {
+                    truncate_strings_at: thresholds.truncate_strings_at,
+                    truncate_arrays_at: thresholds.truncate_arrays_at,
+                    max_depth: thresholds.max_depth,
+                    ..JsonCompressionConfig::default()
                 },
-                attached_store,
-            )
-            .map_err(|error| RuntimeError::Pipeline(error.to_string()))?;
-            if let Some(count) = run.stash_errors.filter(|count| *count > 0) {
-                return Err(RuntimeError::StashWrite { count });
-            }
-            (
-                run.response,
-                run.candidate,
-                run.operations,
-                run.stash_writes,
-                run.stash_errors,
-                run.stash_size,
-                run.unrecoverable_truncations,
-            )
-        };
+            },
+            attached_store,
+        )
+        .map_err(|error| RuntimeError::Pipeline(error.to_string()))?;
+        if let Some(count) = run.stash_errors.filter(|count| *count > 0) {
+            return Err(RuntimeError::StashWrite { count });
+        }
+        (
+            run.response,
+            run.candidate,
+            run.operations,
+            run.stash_writes,
+            run.stash_errors,
+            run.stash_size,
+            run.unrecoverable_truncations,
+        )
+    };
+    if request.status == ToolResultStatus::Error {
+        response.additional_context = diagnose_tool_error(&request.tool_name, &request.content);
+        if matches!(
+            response.disposition,
+            Disposition::Passthrough
+                | Disposition::NoSavings
+                | Disposition::RecoverabilityUnavailable
+        ) {
+            response.disposition = Disposition::ToolError;
+        }
+    }
     let measured = matches!(
         response.disposition,
         Disposition::Applied | Disposition::DryRun
@@ -609,7 +831,7 @@ pub(crate) fn post_tool_with_store(
     } else {
         request.content.clone()
     };
-    let operation = if operations.contains(&JsonOperation::Toon) {
+    let operation = if operations.contains(&AppliedOperation::Toon) {
         OperationType::CompressToon
     } else {
         OperationType::CompressResponse
@@ -748,10 +970,12 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use serde_json::json;
     use tempfile::tempdir;
     use tokenless_ccr::{InMemoryStore, StashError, StashStore, StashWrite};
     use tokenless_protocol::{
-        BeforeModelCapabilities, ContentOrigin, PostToolCapabilities, PreToolCapabilities,
+        BeforeModelCapabilities, ContentOrigin, ContentType, PostToolCapabilities,
+        PreToolCapabilities,
     };
 
     use super::*;
@@ -761,6 +985,7 @@ mod tests {
             compression_enabled: true,
             stash_enabled: true,
             rtk_path: None,
+            rtk_data_dir: Some(PathBuf::from("/tmp/tokenless-test")),
         }
     }
 
@@ -862,6 +1087,85 @@ mod tests {
     }
 
     #[test]
+    fn new_visible_references_authorize_only_the_current_static_tool() {
+        let concrete = Arc::new(ReadCountingStore::default());
+        let write = concrete.stash("恢复\n").unwrap();
+        let store: Arc<dyn StashStore> = concrete.clone();
+        let recovery = RecoveryMethod::tool("tenant_retrieve").unwrap();
+        for (context, authorized) in [
+            (write.key.clone(), false),
+            (
+                tokenless_ccr::recovery_instruction(
+                    &write.key,
+                    &RecoveryMethod::tool("other").unwrap(),
+                ),
+                false,
+            ),
+            (
+                tokenless_ccr::recovery_instruction(&write.key, &recovery),
+                true,
+            ),
+            (
+                tokenless_ccr::recovery_instruction(&write.key, &RecoveryMethod::Shell),
+                true,
+            ),
+            (tokenless_ccr::marker_for(&write.key), true),
+        ] {
+            let before = before_model_with_store(
+                &BeforeModelRequest {
+                    tools: vec![],
+                    visible_context: json!({"messages": [context]}),
+                    capabilities: BeforeModelCapabilities {
+                        replace_tools: false,
+                        recovery: recovery.clone(),
+                    },
+                },
+                &options(),
+                Some(&store),
+            )
+            .unwrap();
+            let reads = concrete.reads.load(Ordering::Relaxed);
+            let restored = retrieve_authorized_with_store(
+                &RetrieveRequest {
+                    hash_or_marker: write.key.clone(),
+                    visible_markers: before.response.visible_markers,
+                },
+                Some(&store),
+                None,
+                &Attribution::new("test"),
+                "test",
+            );
+            if authorized {
+                assert_eq!(restored.unwrap().payload, "恢复\n");
+                assert_eq!(concrete.reads.load(Ordering::Relaxed), reads + 1);
+            } else {
+                assert!(matches!(
+                    restored,
+                    Err(RuntimeError::RetrieveUnauthorized { .. })
+                ));
+                assert_eq!(concrete.reads.load(Ordering::Relaxed), reads);
+            }
+        }
+    }
+
+    #[test]
+    fn shell_recovery_does_not_enable_schema_stash() {
+        let store: Arc<dyn StashStore> = Arc::new(InMemoryStore::new());
+        let request = BeforeModelRequest {
+            tools: vec![json!({"name":"read", "description":"long description ".repeat(200)})],
+            visible_context: json!([]),
+            capabilities: BeforeModelCapabilities {
+                replace_tools: true,
+                recovery: RecoveryMethod::Shell,
+            },
+        };
+        let result = before_model_with_store(&request, &options(), Some(&store)).unwrap();
+        assert_eq!(result.response.tools, request.tools);
+        assert!(result.response.visible_markers.is_empty());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
     fn retrieve_records_attribution_only_after_authorization() {
         let directory = tempdir().unwrap();
         let database = directory.path().join("stats.db");
@@ -950,6 +1254,7 @@ mod tests {
             },
             &Attribution::new("test"),
             &rtk,
+            directory.path(),
         )
         .unwrap();
         assert_eq!(response.action, PreToolAction::ReplaceArguments);
@@ -963,35 +1268,170 @@ mod tests {
     }
 
     #[test]
+    fn pre_tool_reserves_supported_build_and_test_commands_for_post_tool() {
+        let commands = [
+            "cargo test --workspace",
+            "RUST_BACKTRACE=1 /usr/bin/cargo check",
+            "cd crate && cargo clippy",
+            "python3.12 -m pytest tests/",
+            "uv run python -m pytest -q",
+            "npm test",
+            "npm run --silent test:unit",
+            "pnpm exec jest --runInBand",
+            "npx jest",
+            "go test ./... 2>&1 | tail -40",
+            "make -j8",
+        ];
+        for command in commands {
+            assert!(
+                is_build_log_owned_command(command),
+                "expected BuildLog ownership for {command:?}"
+            );
+        }
+
+        for command in [
+            "cargo metadata",
+            "cargo fmt --all",
+            "go env",
+            "npm run lint",
+            "cat build.log",
+            "echo 'cargo test'",
+            "rg pytest README.md",
+        ] {
+            assert!(
+                !is_build_log_owned_command(command),
+                "unexpected BuildLog ownership for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_tool_build_log_owner_does_not_require_rtk() {
+        let request = PreToolRequest {
+            tool_name: "Bash".into(),
+            arguments: json!({"command": "cargo test --workspace"}),
+            command_field: "command".into(),
+            capabilities: PreToolCapabilities {
+                replace_arguments: true,
+                block_and_suggest: false,
+            },
+        };
+        let response = pre_tool_with_optional_rtk(
+            &request,
+            &Attribution::new("test"),
+            None,
+            None,
+            RTK_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(response.action, PreToolAction::Passthrough);
+        assert_eq!(response.output_optimization, OutputOptimization::None);
+        assert_eq!(response.arguments, request.arguments);
+    }
+
+    #[test]
     fn pre_tool_anchor_preserves_quoted_arguments_and_handles_subshells() {
         let path = Path::new("/opt/tokenless/rtk");
+        let data_dir = Path::new("/tenant/tokenless");
+        let attribution = Attribution {
+            agent_id: "agent".into(),
+            session_id: Some("session".into()),
+            tool_use_id: Some("call".into()),
+        };
+        let prefix = "env TOKENLESS_AGENT_ID=agent TOKENLESS_SESSION_ID=session TOKENLESS_TOOL_USE_ID=call TOKENLESS_DATA_DIR=/tenant/tokenless /opt/tokenless/rtk";
         assert_eq!(
-            anchor_rtk_prefix("rtk grep -E 'foo | rtk bar' src && rtk git status", path),
-            "/opt/tokenless/rtk grep -E 'foo | rtk bar' src && /opt/tokenless/rtk git status"
+            anchor_rtk_prefix(
+                "grep -E 'foo | rtk bar' src && git status",
+                "rtk grep -E 'foo | rtk bar' src && rtk git status",
+                path,
+                &attribution,
+                data_dir,
+            ),
+            format!("{prefix} grep -E 'foo | rtk bar' src && {prefix} git status")
         );
         assert_eq!(
-            anchor_rtk_prefix("echo $(rtk git status)", path),
-            "echo $(/opt/tokenless/rtk git status)"
+            anchor_rtk_prefix(
+                "echo $(git status)",
+                "echo $(rtk git status)",
+                path,
+                &attribution,
+                data_dir,
+            ),
+            format!("echo $({prefix} git status)")
         );
         assert_eq!(
-            anchor_rtk_prefix("echo `rtk git status`", path),
+            anchor_rtk_prefix(
+                "echo `git status`",
+                "echo `rtk git status`",
+                path,
+                &attribution,
+                data_dir,
+            ),
             "echo `rtk git status`"
         );
         assert_eq!(
-            anchor_rtk_prefix("sudo rtk git status", path),
-            "sudo /opt/tokenless/rtk git status"
+            anchor_rtk_prefix(
+                "sudo git status",
+                "sudo rtk git status",
+                path,
+                &attribution,
+                data_dir,
+            ),
+            format!("sudo {prefix} git status")
         );
         assert_eq!(
-            anchor_rtk_prefix("RUST_BACKTRACE=1 rtk cargo test", path),
-            "RUST_BACKTRACE=1 /opt/tokenless/rtk cargo test"
+            anchor_rtk_prefix(
+                "RUST_BACKTRACE=1 cargo test",
+                "RUST_BACKTRACE=1 rtk cargo test",
+                path,
+                &attribution,
+                data_dir,
+            ),
+            format!("RUST_BACKTRACE=1 {prefix} cargo test")
         );
         assert_eq!(
-            anchor_rtk_prefix("sudo noglob rtk git status", path),
-            "sudo noglob /opt/tokenless/rtk git status"
+            anchor_rtk_prefix(
+                "sudo noglob git status",
+                "sudo noglob rtk git status",
+                path,
+                &attribution,
+                data_dir,
+            ),
+            format!("sudo noglob {prefix} git status")
         );
         assert_eq!(
-            anchor_rtk_prefix("shadowenv exec -- rtk git status", path),
-            "shadowenv exec -- /opt/tokenless/rtk git status"
+            anchor_rtk_prefix(
+                "shadowenv exec -- git status",
+                "shadowenv exec -- rtk git status",
+                path,
+                &attribution,
+                data_dir,
+            ),
+            format!("shadowenv exec -- {prefix} git status")
+        );
+        assert_eq!(
+            anchor_rtk_prefix(
+                "git status | grep rtk",
+                "rtk git status | grep rtk",
+                path,
+                &attribution,
+                data_dir,
+            ),
+            format!("{prefix} git status | grep rtk")
+        );
+        assert_eq!(
+            anchor_rtk_prefix(
+                "docker exec rtk git status",
+                "docker exec rtk rtk git status",
+                path,
+                &attribution,
+                data_dir,
+            ),
+            format!("docker exec rtk {prefix} git status")
+        );
+        assert_eq!(
+            anchor_rtk_prefix("rg error", "rtk rg error", path, &attribution, data_dir),
+            format!("{prefix} rg error")
         );
     }
 
@@ -1054,7 +1494,13 @@ mod tests {
             },
         };
         assert!(matches!(
-            pre_tool_with_optional_rtk(&applicable, &Attribution::new("test"), None, RTK_TIMEOUT),
+            pre_tool_with_optional_rtk(
+                &applicable,
+                &Attribution::new("test"),
+                None,
+                None,
+                RTK_TIMEOUT
+            ),
             Err(RuntimeError::RtkUnavailable)
         ));
     }
@@ -1074,21 +1520,26 @@ mod tests {
         for code in [1, 2] {
             let rtk = directory.path().join(format!("rtk-{code}"));
             write_executable(&rtk, &format!("#!/bin/sh\nprintf 'changed'\nexit {code}\n"));
-            let response = pre_tool_with_rtk(&request, &Attribution::new("test"), &rtk).unwrap();
+            let response =
+                pre_tool_with_rtk(&request, &Attribution::new("test"), &rtk, directory.path())
+                    .unwrap();
             assert_eq!(response.action, PreToolAction::Passthrough);
             assert_eq!(response.arguments, request.arguments);
         }
         for (name, output) in [("empty", ""), ("unchanged", "grep error log")] {
             let rtk = directory.path().join(format!("rtk-{name}"));
             write_executable(&rtk, &format!("#!/bin/sh\nprintf '%s' '{output}'\n"));
-            let response = pre_tool_with_rtk(&request, &Attribution::new("test"), &rtk).unwrap();
+            let response =
+                pre_tool_with_rtk(&request, &Attribution::new("test"), &rtk, directory.path())
+                    .unwrap();
             assert_eq!(response.action, PreToolAction::Passthrough);
             assert_eq!(response.arguments, request.arguments);
         }
 
         let rtk = directory.path().join("rtk-3");
         write_executable(&rtk, "#!/bin/sh\nprintf 'optimized command'\nexit 3\n");
-        let response = pre_tool_with_rtk(&request, &Attribution::new("test"), &rtk).unwrap();
+        let response =
+            pre_tool_with_rtk(&request, &Attribution::new("test"), &rtk, directory.path()).unwrap();
         assert_eq!(response.action, PreToolAction::ReplaceArguments);
         assert_eq!(response.output_optimization, OutputOptimization::Rtk);
         assert_eq!(response.arguments["command"], "optimized command");
@@ -1110,28 +1561,32 @@ mod tests {
         let rtk = directory.path().join("rtk-env");
         write_executable(
             &rtk,
-            "#!/bin/sh\nprintf '%s:%s:%s' \"$TOKENLESS_AGENT_ID\" \"$TOKENLESS_SESSION_ID\" \"$TOKENLESS_TOOL_USE_ID\"\n",
+            "#!/bin/sh\nprintf '%s:%s:%s:%s' \"$TOKENLESS_AGENT_ID\" \"$TOKENLESS_SESSION_ID\" \"$TOKENLESS_TOOL_USE_ID\" \"$TOKENLESS_DATA_DIR\"\n",
         );
         let attribution = Attribution {
             agent_id: "agent".into(),
             session_id: Some("session".into()),
             tool_use_id: Some("call".into()),
         };
-        let response = pre_tool_with_rtk(&request, &attribution, &rtk).unwrap();
+        let response = pre_tool_with_rtk(&request, &attribution, &rtk, directory.path()).unwrap();
         assert_eq!(response.action, PreToolAction::BlockAndSuggest);
-        assert_eq!(response.arguments["command"], "agent:session:call");
+        assert_eq!(
+            response.arguments["command"],
+            format!("agent:session:call:{}", directory.path().display())
+        );
 
         let unexpected = directory.path().join("rtk-9");
         write_executable(&unexpected, "#!/bin/sh\nexit 9\n");
         assert!(matches!(
-            pre_tool_with_rtk(&request, &attribution, &unexpected),
+            pre_tool_with_rtk(&request, &attribution, &unexpected, directory.path()),
             Err(RuntimeError::RtkUnexpectedExit { code: 9 })
         ));
         assert!(matches!(
             pre_tool_with_rtk(
                 &request,
                 &attribution,
-                &directory.path().join("missing-rtk")
+                &directory.path().join("missing-rtk"),
+                directory.path(),
             ),
             Err(RuntimeError::RtkSpawn { .. })
         ));
@@ -1156,6 +1611,7 @@ mod tests {
                 &request,
                 &Attribution::new("test"),
                 Some(&rtk),
+                Some(directory.path()),
                 Duration::from_millis(20)
             ),
             Err(RuntimeError::RtkTimeout)
@@ -1183,6 +1639,7 @@ mod tests {
             &request,
             &Attribution::new("test"),
             Some(&rtk),
+            Some(directory.path()),
             Duration::from_secs(1),
         )
         .unwrap();
@@ -1202,16 +1659,14 @@ mod tests {
                 }
             })],
             visible_context: json!({"messages": []}),
-            retrieve_tool_name: "tokenless_retrieve".into(),
             capabilities: BeforeModelCapabilities {
                 replace_tools: true,
-                publish_retrieve_tool: false,
+                recovery: tokenless_protocol::RecoveryMethod::None,
             },
         };
         let outcome = before_model_with_store(&request, &options(), None).unwrap();
         assert_eq!(outcome.response.tools, request.tools);
         assert!(outcome.response.visible_markers.is_empty());
-        assert!(outcome.response.retrieve_tool.is_none());
         assert_eq!(
             outcome.stats.disposition,
             Disposition::RecoverabilityUnavailable
@@ -1220,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn before_model_publishes_sorted_markers_only_with_capability() {
+    fn before_model_returns_sorted_markers_with_recovery_available() {
         let store: Arc<dyn StashStore> = Arc::new(InMemoryStore::new());
         let request = BeforeModelRequest {
             tools: vec![json!({
@@ -1237,17 +1692,12 @@ mod tests {
                     "<<tokenless:abcdef0123456789abcdef01>>"
                 ]
             }),
-            retrieve_tool_name: "tokenless_retrieve".into(),
             capabilities: BeforeModelCapabilities {
                 replace_tools: true,
-                publish_retrieve_tool: true,
+                recovery: RecoveryMethod::tool("tokenless_retrieve").unwrap(),
             },
         };
         let outcome = before_model_with_store(&request, &options(), Some(&store)).unwrap();
-        assert_eq!(
-            outcome.response.retrieve_tool.unwrap().name,
-            "tokenless_retrieve"
-        );
         assert!(
             outcome
                 .response
@@ -1268,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn before_model_obeys_replace_capability_and_checks_publish_conflicts() {
+    fn before_model_obeys_replace_capability_without_owning_tool_names() {
         let tool = json!({
             "type": "function",
             "function": {
@@ -1280,21 +1730,18 @@ mod tests {
         let mut request = BeforeModelRequest {
             tools: vec![tool.clone()],
             visible_context: json!({}),
-            retrieve_tool_name: "tokenless_retrieve".into(),
             capabilities: BeforeModelCapabilities {
                 replace_tools: false,
-                publish_retrieve_tool: false,
+                recovery: tokenless_protocol::RecoveryMethod::None,
             },
         };
         let outcome = before_model_with_store(&request, &options(), None).unwrap();
         assert_eq!(outcome.response.tools, vec![tool]);
         assert_eq!(outcome.stats.disposition, Disposition::Passthrough);
 
-        request.capabilities.publish_retrieve_tool = true;
-        assert!(matches!(
-            before_model_with_store(&request, &options(), None),
-            Err(RuntimeError::RetrieveToolConflict { .. })
-        ));
+        request.capabilities.recovery = RecoveryMethod::tool("tokenless_retrieve").unwrap();
+        let outcome = before_model_with_store(&request, &options(), None).unwrap();
+        assert_eq!(outcome.response.tools, request.tools);
     }
 
     #[test]
@@ -1312,7 +1759,7 @@ mod tests {
                 output_optimization: optimization,
                 capabilities: PostToolCapabilities {
                     replace_output: true,
-                    publish_retrieve_tool: false,
+                    recovery: tokenless_protocol::RecoveryMethod::None,
                     replace_with_text: true,
                 },
             };
@@ -1349,6 +1796,61 @@ mod tests {
         );
     }
 
+    fn failing_build_log() -> String {
+        let mut output = "$ cargo build\n".to_owned();
+        for index in 0..30 {
+            output.push_str(&format!(
+                "Compiling package-{index:03} v0.1.{index} with extended progress output\n"
+            ));
+        }
+        output.push_str("error: linker command not found\n");
+        output
+    }
+
+    #[test]
+    fn tool_error_build_log_stays_original_even_when_recovery_is_available() {
+        let store: Arc<dyn StashStore> = Arc::new(InMemoryStore::new());
+        let request = PostToolRequest {
+            status: ToolResultStatus::Error,
+            content: failing_build_log(),
+            capabilities: PostToolCapabilities {
+                replace_output: true,
+                recovery: tokenless_protocol::RecoveryMethod::Shell,
+                replace_with_text: true,
+            },
+            ..post_tool_request("unused")
+        };
+
+        let outcome = post_tool_with_store(&request, &options(), Some(&store)).unwrap();
+
+        assert_eq!(outcome.response.disposition, Disposition::ToolError);
+        assert_eq!(outcome.response.content_type, Some(ContentType::BuildLog));
+        assert_eq!(outcome.response.output, request.content);
+        assert!(outcome.response.applied_operations.is_empty());
+        assert_eq!(outcome.response.recoverability, Recoverability::Lossless);
+        assert!(
+            outcome
+                .response
+                .additional_context
+                .as_deref()
+                .unwrap()
+                .contains("ENV_DEPENDENCY_MISSING")
+        );
+    }
+
+    #[test]
+    fn tool_error_without_recovery_keeps_the_original_build_log() {
+        let request = PostToolRequest {
+            status: ToolResultStatus::Error,
+            content: failing_build_log(),
+            ..post_tool_request("unused")
+        };
+        let outcome = post_tool_with_store(&request, &options(), None).unwrap();
+        assert_eq!(outcome.response.disposition, Disposition::ToolError);
+        assert_eq!(outcome.response.output, request.content);
+        assert!(outcome.response.applied_operations.is_empty());
+    }
+
     #[test]
     fn post_tool_accepts_lossless_json_and_requires_retrieve_for_truncation() {
         let cleanup = post_tool_request(&format!(
@@ -1377,7 +1879,7 @@ mod tests {
         let failing: Arc<dyn StashStore> = Arc::new(FailingStore);
         let failing_request = PostToolRequest {
             capabilities: PostToolCapabilities {
-                publish_retrieve_tool: true,
+                recovery: tokenless_protocol::RecoveryMethod::Shell,
                 ..lossy.capabilities
             },
             ..lossy.clone()
@@ -1390,7 +1892,7 @@ mod tests {
         let store: Arc<dyn StashStore> = Arc::new(InMemoryStore::new());
         let recoverable = PostToolRequest {
             capabilities: PostToolCapabilities {
-                publish_retrieve_tool: true,
+                recovery: tokenless_protocol::RecoveryMethod::Shell,
                 ..lossy.capabilities
             },
             ..lossy
@@ -1411,7 +1913,7 @@ mod tests {
             output_optimization: OutputOptimization::None,
             capabilities: PostToolCapabilities {
                 replace_output: true,
-                publish_retrieve_tool: false,
+                recovery: tokenless_protocol::RecoveryMethod::None,
                 replace_with_text: true,
             },
         }

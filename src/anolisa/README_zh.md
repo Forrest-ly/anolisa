@@ -52,6 +52,10 @@ anolisa update all
 | `env` | 显示环境检测结果 |
 | `bug` | 生成 bug 报告 |
 
+执行 `anolisa adapter enable <component> openclaw` 即同意插件声明的能力，
+CLI 会在宿主支持 capability consent 时传递对应参数。此操作不授予
+unsafe-install 覆盖权限。
+
 ## 安装模式
 
 | 模式 | 前缀 | 使用场景 |
@@ -94,6 +98,10 @@ scope。因此，即使 system scope 已安装同名组件，
 支持双后端：**raw**（OSS tar.gz）和 **RPM**（dnf 仓库）。生命周期
 planner 区分 ANOLISA 自有文件与 native package authority，并在副作用前
 记录崩溃恢复意图。组件元数据通过 `component.toml` 声明。
+
+raw backend 每次解析都会重新拉取 distribution index，仓库不可达时命令直接
+失败。`repo.toml` 中旧的 `cache_ttl_secs` 和 `offline_fallback` 字段仍可正常
+解析以保持向后兼容，但当前 raw backend 不会使用这些值。
 
 ## 环境要求
 

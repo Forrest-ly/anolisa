@@ -167,6 +167,11 @@ anolisa adapter disable <component> [framework]
 anolisa adapter status [component]
 ```
 
+对于 OpenClaw 插件，执行 `adapter enable` 即同意插件声明的能力。ANOLISA
+仅在安装器 help 列出 `--accept-capabilities` 时添加该参数，dry-run 计划也
+遵循相同规则。Capability consent 不授予 `--allow-unsafe-plugin-install`
+权限；同意被拒绝时会单独诊断，不归为插件安全扫描拒绝。
+
 ### logs 与 bug report
 
 查看组件日志或生成诊断包：
@@ -234,20 +239,21 @@ anolisa status
 
 ## 配置
 
-system mode 从 `/etc/anolisa/config.toml` 读取 registry 设置，user mode 从
-`~/.config/anolisa/config.toml` 读取。registry resolution 只使用
-`[registry]` 表：
+system mode 从 `/etc/anolisa/repo.toml` 读取 backend 选择和 endpoint，
+user mode 从 `~/.config/anolisa/repo.toml` 读取：
 
 ```toml
-[registry]
-url = "https://registry.example.com/index.toml"
-cache_ttl_secs = 3600
-offline_fallback = true
+schema_version = 1
+default_backend = "raw"
+
+[backends.raw]
+base_url = "https://repo.example.com/anolisa/v1/"
 ```
 
-backend 选择和 endpoint 位于对应的 `repo.toml`（`/etc/anolisa/repo.toml`
-或 `~/.config/anolisa/repo.toml`）。CLI 参数覆盖当前执行的操作；不存在
-`[install] mode` 配置。
+raw backend 每次执行都会重新拉取 distribution index。当前不会使用缓存的 index 作为回退，因此仓库不可达时命令会直接失败。
+旧的 `cache_ttl_secs` 和 `offline_fallback` 字段仍可正常解析以保持向后兼容，但当前 raw backend 不会使用这些值。
+
+CLI 参数只影响当前执行的操作，不存在 `[install] mode` 配置。
 
 ---
 

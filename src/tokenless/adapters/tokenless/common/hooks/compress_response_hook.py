@@ -36,10 +36,10 @@ Output contract per agent:
     replacement remain passthrough (roadmap §7). Environment attribution is
     still injected: it is additive by design.
 
-The agent ID is read from the TOKENLESS_AGENT_ID environment variable
-(set by the install action script).  When running under Cosh-NG, the
-agent ID is overridden to ``cosh-ng`` for correct stats attribution.
-Fallback paths follow the ANOLISA FHS spec: /usr/bin/tokenless.
+The agent ID is resolved from the host runtime, ``--agent-id`` argument, or
+TOKENLESS_AGENT_ID environment variable. When running under Cosh-NG, runtime
+detection overrides the declared ID for correct stats attribution. Fallback
+paths follow the ANOLISA FHS spec: /usr/bin/tokenless.
 """
 
 from __future__ import annotations
@@ -58,8 +58,10 @@ from hook_utils import (
     SHELL_TOOLS,
     SKIP_TOOLS,
     build_post_tool_request,
+    consume_output_optimization,
     detect_cosh_ng_runtime,
     is_skill_file,
+    is_tokenless_retrieve_command,
     parse_version,
     resolve_agent_id,
     resolve_binary,
@@ -67,6 +69,7 @@ from hook_utils import (
     run_compress,
     secure_write_text,
     skip,
+    tokenless_retrieve_command_available,
     try_parse_json,
     warn,
 )
@@ -96,9 +99,7 @@ _OPENCODE_AGENT_ID = "opencode"
 # Cache for `claude --version`, keyed on binary path+mtime+size so upgrades
 # invalidate it. Hooks run as a fresh process per tool call and spawning the
 # node CLI every time would add noticeable latency.
-_CLAUDE_VERSION_CACHE = os.path.join(
-    os.path.expanduser("~"), ".tokenless", ".claude-version"
-)
+_CLAUDE_VERSION_CACHE = os.path.join(os.path.expanduser("~"), ".tokenless", ".claude-version")
 
 
 # -- helpers -------------------------------------------------------------------
@@ -115,13 +116,15 @@ def _emit_attribution_or_skip(env_attribution: str) -> None:
     additive and safe on every agent), otherwise a plain skip. Never returns.
     """
     if env_attribution:
-        _emit({
-            "suppressOutput": True,
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": env_attribution,
-            },
-        })
+        _emit(
+            {
+                "suppressOutput": True,
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": env_attribution,
+                },
+            }
+        )
         sys.exit(0)
     skip()
 
@@ -170,7 +173,9 @@ def _cached_claude_version(claude_bin: str) -> tuple | None:
     try:
         proc = subprocess.run(
             [claude_bin, "--version"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
     except Exception as e:
         warn(f"claude --version failed: {e}")
@@ -182,9 +187,7 @@ def _cached_claude_version(claude_bin: str) -> tuple | None:
         try:
             # Same hardened write as other ~/.tokenless state files (0o600,
             # symlink-safe) so the cache stays private on shared HOMEs.
-            secure_write_text(
-                _CLAUDE_VERSION_CACHE, f"{cache_key}\n{proc.stdout.strip()}"
-            )
+            secure_write_text(_CLAUDE_VERSION_CACHE, f"{cache_key}\n{proc.stdout.strip()}")
         except OSError:
             pass
     return ver
@@ -212,27 +215,34 @@ def main() -> None:
     cosh_ng_version = detect_cosh_ng_runtime()
     cosh_ng_detected = cosh_ng_version is not None
 
-    # If Cosh-NG is detected but unsupported version, fail open
+    # 2. Resolve agent ID based on runtime
+    agent_id = resolve_agent_id()
+
+    # 3. Read stdin JSON and consume any matching PreTool state.
+    try:
+        input_data = json.load(sys.stdin)
+    except (json.JSONDecodeError, EOFError, ValueError):
+        warn("failed to read PostToolUse payload. Passing through unchanged.")
+        skip()
+
+    session_id = input_data.get("session_id", "")
+    tool_use_id = resolve_tool_call_id(agent_id, input_data)
+    try:
+        output_optimization = consume_output_optimization(agent_id, session_id, tool_use_id)
+    except OSError as error:
+        warn(f"failed to consume PreTool optimization state: {error}")
+        output_optimization = "none"
+
     if cosh_ng_detected and cosh_ng_version == (0, 0, 0):
         warn("Unsupported Cosh-NG version. Response compression disabled (fail open).")
         skip()
 
-    # 2. Resolve agent ID based on runtime
-    agent_id = resolve_agent_id()
-
-    # 3. Resolve binaries
+    # 4. Resolve the single Core entry point after consuming per-call state.
     tokenless_bin = resolve_binary(
         "tokenless", _TOKENLESS_FALLBACK, _TOKENLESS_LOCAL_SHARE, _TOKENLESS_LOCAL_LIB
     )
     if not tokenless_bin:
         warn("tokenless is not installed. Response compression hook disabled.")
-        skip()
-
-    # 4. Read stdin JSON
-    try:
-        input_data = json.load(sys.stdin)
-    except (json.JSONDecodeError, EOFError, ValueError):
-        warn("failed to read PostToolUse payload. Passing through unchanged.")
         skip()
 
     tool_name = input_data.get("tool_name", "unknown")
@@ -271,17 +281,11 @@ def main() -> None:
     elif isinstance(model_visible_before, str):
         content = model_visible_before
     elif isinstance(model_visible_before, (dict, list)):
-        content = json.dumps(
-            model_visible_before, separators=(",", ":"), ensure_ascii=False
-        )
+        content = json.dumps(model_visible_before, separators=(",", ":"), ensure_ascii=False)
     else:
         skip()
 
-    # 8. Extract caller context
-    session_id = input_data.get("session_id", "")
-    tool_use_id = resolve_tool_call_id(agent_id, input_data)
-
-    # 9. Capability declaration: what can this host actually do?
+    # 8. Capability declaration: what can this host actually do?
     if cosh_ng_detected:
         can_replace = True
         replace_with_text = True  # updatedToolResponse accepts any text
@@ -307,7 +311,7 @@ def main() -> None:
         can_replace = False
         replace_with_text = True
 
-    # 10. Map host facts into the required lifecycle fields.
+    # 9. Map host facts into the required lifecycle fields.
     if tool_name in SKIP_TOOLS:
         content_origin = "file_content"
     elif tool_name in SHELL_TOOLS:
@@ -315,9 +319,7 @@ def main() -> None:
     else:
         content_origin = "api_response"
     raw_status = str(input_data.get("status", "")).lower()
-    shell_process_result = (
-        model_visible_before if isinstance(model_visible_before, dict) else None
-    )
+    shell_process_result = model_visible_before if isinstance(model_visible_before, dict) else None
     shell_process_error = (
         tool_name in SHELL_TOOLS
         and shell_process_result is not None
@@ -336,8 +338,7 @@ def main() -> None:
     if raw_status in {"interrupted", "denied"}:
         status = raw_status
     elif input_data.get("is_error") is True or (
-        isinstance(tool_response_raw, dict)
-        and tool_response_raw.get("isError") is True
+        isinstance(tool_response_raw, dict) and tool_response_raw.get("isError") is True
     ):
         status = "error"
     elif shell_process_error:
@@ -348,9 +349,7 @@ def main() -> None:
     # Shell envelopes often carry a large stdout alongside the actual failure
     # in a short stderr. Error results are never replaced, so send the error
     # stream to Core for diagnosis while the host keeps the original envelope.
-    if status == "error" and tool_name in SHELL_TOOLS and isinstance(
-        model_visible_before, dict
-    ):
+    if status == "error" and tool_name in SHELL_TOOLS and isinstance(model_visible_before, dict):
         error_parts = []
         for field in ("stderr", "error"):
             value = model_visible_before.get(field)
@@ -359,24 +358,34 @@ def main() -> None:
         if error_parts:
             content = "\n".join(error_parts)
 
-    # 11. The one Tokenless subprocess: Core owns all PostTool policy.
+    retrieve_result = status == "success" and is_tokenless_retrieve_command(
+        tool_name, input_data.get("tool_input")
+    )
+    retrieval_available = (
+        can_replace
+        and status == "success"
+        and output_optimization == "none"
+        and not retrieve_result
+        and tokenless_retrieve_command_available()
+    )
+
+    # 10. The one Tokenless subprocess: Core owns all PostTool policy.
     request = build_post_tool_request(
         content,
         agent_id,
         tool_name,
         status,
         content_origin,
+        output_optimization,
+        result_kind="retrieve" if retrieve_result else "tool",
+        recovery={"kind": "shell" if retrieval_available else "none"},
         session_id=session_id,
         tool_use_id=tool_use_id,
         replace_output=can_replace,
         replace_with_text=replace_with_text,
     )
-    response = run_compress(
-        tokenless_bin, request, _COMPRESS_TIMEOUT, "post_tool"
-    )
-    env_attribution = (
-        response.get("additional_context", "") if response is not None else ""
-    )
+    response = run_compress(tokenless_bin, request, _COMPRESS_TIMEOUT, "post_tool")
+    env_attribution = response.get("additional_context", "") if response is not None else ""
     if response is None or response.get("disposition") != "applied":
         _emit_attribution_or_skip(env_attribution)
 
@@ -385,7 +394,7 @@ def main() -> None:
         warn("tokenless compress returned no output. Passing through unchanged.")
         _emit_attribution_or_skip(env_attribution)
 
-    # 13. Envelope construction — dispatch by agent runtime. An unwrapped
+    # 11. Envelope construction — dispatch by agent runtime. An unwrapped
     # shell field is re-injected into a same-shaped envelope: the compressed
     # text replaces exactly the field that was sent, every other field stays
     # byte-identical.
@@ -422,9 +431,7 @@ def main() -> None:
     # is exactly that string; a rewrapped shell envelope serializes here.
     if agent_id == _QODER_AGENT_ID and not isinstance(updated_output, str):
         if rewrapped is not None:
-            updated_output = json.dumps(
-                rewrapped, separators=(",", ":"), ensure_ascii=False
-            )
+            updated_output = json.dumps(rewrapped, separators=(",", ":"), ensure_ascii=False)
         else:
             updated_output = output_text
 

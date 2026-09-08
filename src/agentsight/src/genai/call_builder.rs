@@ -67,11 +67,12 @@ impl GenAIBuilder {
 
         // Build token usage from TokenRecord
         let token_usage = token_record.as_ref().map(|t| {
-            let cache = t.cache_creation_tokens.unwrap_or(0) + t.cache_read_tokens.unwrap_or(0);
             TokenUsage {
                 input_tokens: t.input_tokens as u32,
                 output_tokens: t.output_tokens as u32,
-                total_tokens: (t.input_tokens + t.output_tokens + cache) as u32,
+                // Whether the cache counters belong in the total depends on the
+                // provider, so let TokenRecord own that rule.
+                total_tokens: t.total_tokens() as u32,
                 cache_creation_input_tokens: t.cache_creation_tokens.map(|v| v as u32),
                 cache_read_input_tokens: t.cache_read_tokens.map(|v| v as u32),
             }
@@ -259,10 +260,10 @@ impl GenAIBuilder {
             token_usage,
             error,
             pid: pid_i32,
-            // Process name = the *process* comm (/proc/<pid>/comm), not the SSL
-            // event's per-event thread comm (which may be a library worker-thread
-            // name such as "HTTP client"). Falls back to the event comm only when
-            // /proc is unreadable (process already gone).
+            // Process name = the *process* comm (`<procfs root>/<pid>/comm`), not
+            // the SSL event's per-event thread comm (which may be a library
+            // worker-thread name such as "HTTP client"). Falls back to the event
+            // comm only when the entry is unreadable (process already gone).
             process_name: crate::discovery::scanner::read_comm(http.pid)
                 .unwrap_or_else(|| http.comm.clone()),
             agent_name: Some(agent_name.clone()),
@@ -623,11 +624,19 @@ impl GenAIBuilder {
                                 crate::analyzer::message::AnthropicContentBlock::ToolResult {
                                     tool_use_id,
                                     content,
-                                    ..
+                                    is_error,
                                 } => {
-                                    // Anthropic tool_result: convert to MessagePart::ToolCallResponse
-                                    let response_val =
-                                        content.clone().unwrap_or(serde_json::Value::Null);
+                                    // Anthropic tool_result: convert to MessagePart::ToolCallResponse.
+                                    // `is_error` must ride along inside the wrapper so the ATIF
+                                    // converter can preserve it as a structured failure signal.
+                                    let response_val = match (content.clone(), *is_error) {
+                                        (Some(value), Some(flag)) => {
+                                            serde_json::json!({"content": value, "is_error": flag})
+                                        }
+                                        (Some(value), None) => value,
+                                        (None, Some(flag)) => serde_json::json!({"is_error": flag}),
+                                        (None, None) => serde_json::Value::Null,
+                                    };
                                     parts.push(MessagePart::ToolCallResponse {
                                         id: Some(tool_use_id.clone()),
                                         response: response_val,
@@ -1158,7 +1167,9 @@ mod tests {
         let tu = call.token_usage.unwrap();
         assert_eq!(tu.input_tokens, 10);
         assert_eq!(tu.output_tokens, 20);
-        assert_eq!(tu.total_tokens, 38);
+        // "token-provider" is not Anthropic, so the cache counters are assumed
+        // to sit inside the reported input already.
+        assert_eq!(tu.total_tokens, 30);
         assert_eq!(tu.cache_creation_input_tokens, Some(5));
         assert_eq!(tu.cache_read_input_tokens, Some(3));
     }

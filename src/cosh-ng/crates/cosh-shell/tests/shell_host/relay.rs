@@ -1195,6 +1195,124 @@ fn raw_relay_bash_intercepts_history_recalled_slash_with_enter_and_ctrl_o() {
 }
 
 #[test]
+fn raw_relay_bash_routes_recalled_and_indented_natural_language() {
+    if !bash_supports_command_not_found_handler() {
+        return;
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "cosh-shell-bash-history-recall-2951-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let home = root.join("home");
+    let work_dir = root.join("work");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(
+        home.join(".bashrc"),
+        "export HISTFILE=\"$HOME/.bash_history\"\n\
+         export HISTSIZE=1000\n\
+         export HISTFILESIZE=1000\n\
+         shopt -s histappend\n",
+    )
+    .expect("bashrc");
+
+    let prompt = "你好你是谁";
+    let secret = "TEST_ONLY_SECRET_2951";
+    let control = home.join(".history-recall-control");
+    let indented_control = home.join(".history-recall-indented-control");
+    let config = ShellHostConfig::new("bash-history-recall-2951", &work_dir)
+        .with_env("HOME", home.display().to_string());
+    let mut rendered = Vec::new();
+    let output = run_raw_relay_bash_with_actions(
+        &config,
+        vec![
+            RawRelayAction::wait(Duration::from_millis(200)),
+            RawRelayAction::line(prompt),
+            RawRelayAction::wait(Duration::from_millis(300)),
+            RawRelayAction::write(b"\x1b[A".to_vec()),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::write(b"\n".to_vec()),
+            RawRelayAction::wait(Duration::from_millis(300)),
+            RawRelayAction::write(b"\x1b[A".to_vec()),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::write(b"?\n".to_vec()),
+            RawRelayAction::wait(Duration::from_millis(300)),
+            RawRelayAction::line(" 你好"),
+            RawRelayAction::wait(Duration::from_millis(300)),
+            RawRelayAction::line("   你好"),
+            RawRelayAction::wait(Duration::from_millis(300)),
+            RawRelayAction::write("\t你好\n".as_bytes().to_vec()),
+            RawRelayAction::wait(Duration::from_millis(300)),
+            RawRelayAction::line(format!("printf ignored > /dev/null # token={secret}")),
+            RawRelayAction::wait(Duration::from_millis(200)),
+            RawRelayAction::line("printf x > \"$HOME/.history-recall-control\""),
+            RawRelayAction::wait(Duration::from_millis(200)),
+            RawRelayAction::line("  printf y > \"$HOME/.history-recall-indented-control\""),
+            RawRelayAction::wait(Duration::from_millis(200)),
+            RawRelayAction::line("exit"),
+        ],
+        &mut rendered,
+    )
+    .expect("history recall relay");
+
+    let routed = output
+        .events
+        .iter()
+        .filter(|event| {
+            event.kind == ShellEventKind::UserInputIntercepted
+                && event.component.as_deref() == Some("natural_language")
+        })
+        .map(|event| event.input.as_deref().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        routed,
+        [prompt, prompt, "你好你是谁?", " 你好", "   你好", "你好"],
+        "events: {:#?}\nrendered: {}",
+        output.events,
+        String::from_utf8_lossy(&rendered)
+    );
+
+    let rendered_text = String::from_utf8_lossy(&rendered);
+    assert!(
+        !rendered_text.contains("command not found"),
+        "{rendered_text}"
+    );
+    for internal in ["__cosh_slash_guard__", "_COSH_HANDOFF", "1337;COSH;"] {
+        assert!(
+            !rendered_text.contains(internal),
+            "{internal}: {rendered_text}"
+        );
+    }
+    assert_eq!(std::fs::read(&control).expect("shell control"), b"x");
+    assert_eq!(
+        std::fs::read(&indented_control).expect("indented shell control"),
+        b"y"
+    );
+
+    let history = std::fs::read_to_string(home.join(".bash_history")).expect("history");
+    assert_eq!(
+        history.lines().filter(|line| *line == prompt).count(),
+        1,
+        "{history}"
+    );
+    assert_eq!(
+        history
+            .lines()
+            .filter(|line| *line == "printf x > \"$HOME/.history-recall-control\"")
+            .count(),
+        1,
+        "{history}"
+    );
+    assert!(!history.contains(secret), "{history}");
+    let journal = std::fs::read_to_string(&output.journal_path).expect("journal");
+    assert!(!journal.contains(secret), "{journal}");
+    assert!(!ledger_output_refs_text(&ledger_from_output(&output)).contains(secret));
+
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
 fn raw_relay_zsh_preserves_session_history() {
     if Command::new("zsh").arg("--version").output().is_err() {
         return;
@@ -1252,6 +1370,9 @@ fn raw_relay_bash_excludes_secrets_from_history_and_journal() {
     let edited_secret = "history-edited-secret-value";
     let access_key = "LTAI5tExampleAccessKey";
     let url_password = "history-url-password";
+    let empty_user_url_password = "history-empty-user-url-password";
+    let dynamic_option_secret = "history-dynamic-option-secret";
+    let nested_dynamic_option_secret = "history-nested-dynamic-option-secret";
     let mut config = ShellHostConfig::new("bash-secret-history-test", &work_dir);
     config.native_mode = false;
     let output = run_raw_relay_bash_with_actions(
@@ -1267,6 +1388,26 @@ fn raw_relay_bash_excludes_secrets_from_history_and_journal() {
             RawRelayAction::wait(Duration::from_millis(100)),
             RawRelayAction::line(format!(": https://user:{url_password}@example.test")),
             RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::line(format!(": http://:{empty_user_url_password}@example.test")),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::line("HEADER_OPTION=-H"),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::line(format!(
+                ": ${{HEADER_OPTION}}\"Cookie: session={dynamic_option_secret}\""
+            )),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::line(format!(
+                ": $(true; printf -- -H)\"Cookie: session={nested_dynamic_option_secret}\""
+            )),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::line(format!(
+                ": $(true && printf -- -H)\"Cookie: session={nested_dynamic_option_secret}\""
+            )),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::line(format!(
+                ": $(printf -- -H | cat)\"Cookie: session={nested_dynamic_option_secret}\""
+            )),
+            RawRelayAction::wait(Duration::from_millis(100)),
             RawRelayAction::line(format!("history > {}", shell_arg(&history_snapshot))),
             RawRelayAction::wait(Duration::from_millis(100)),
             RawRelayAction::line("exit"),
@@ -1281,17 +1422,26 @@ fn raw_relay_bash_excludes_secrets_from_history_and_journal() {
     assert!(!history.contains(edited_secret), "{history}");
     assert!(!history.contains(access_key), "{history}");
     assert!(!history.contains(url_password), "{history}");
+    assert!(!history.contains(empty_user_url_password), "{history}");
+    assert!(!history.contains(dynamic_option_secret), "{history}");
+    assert!(!history.contains(nested_dynamic_option_secret), "{history}");
     assert!(!journal.contains(secret), "{journal}");
     assert!(!journal.contains(edited_secret), "{journal}");
     assert!(!journal.contains(access_key), "{journal}");
     assert!(!journal.contains(url_password), "{journal}");
+    assert!(!journal.contains(empty_user_url_password), "{journal}");
+    assert!(!journal.contains(dynamic_option_secret), "{journal}");
+    assert!(!journal.contains(nested_dynamic_option_secret), "{journal}");
     assert!(ledger_from_output(&output)
         .blocks
         .iter()
         .all(|block| !block.command.contains(secret)
             && !block.command.contains(edited_secret)
             && !block.command.contains(access_key)
-            && !block.command.contains(url_password)));
+            && !block.command.contains(url_password)
+            && !block.command.contains(empty_user_url_password)
+            && !block.command.contains(dynamic_option_secret)
+            && !block.command.contains(nested_dynamic_option_secret)));
 }
 
 #[test]
@@ -1310,6 +1460,9 @@ fn raw_relay_zsh_excludes_secrets_from_history_and_journal() {
     let secret = "history-secret-value";
     let access_key = "LTAI5tExampleAccessKey";
     let url_password = "history-url-password";
+    let empty_user_url_password = "history-empty-user-url-password";
+    let dynamic_option_secret = "history-dynamic-option-secret";
+    let nested_dynamic_option_secret = "history-nested-dynamic-option-secret";
     let mut config = ShellHostConfig::new("zsh-secret-history-test", &work_dir);
     config.native_mode = false;
     let output = run_raw_relay_zsh_with_actions(
@@ -1320,6 +1473,26 @@ fn raw_relay_zsh_excludes_secrets_from_history_and_journal() {
             RawRelayAction::line(format!(": {access_key}")),
             RawRelayAction::wait(Duration::from_millis(100)),
             RawRelayAction::line(format!(": https://user:{url_password}@example.test")),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::line(format!(": http://:{empty_user_url_password}@example.test")),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::line("HEADER_OPTION=-H"),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::line(format!(
+                ": ${{HEADER_OPTION}}\"Cookie: session={dynamic_option_secret}\""
+            )),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::line(format!(
+                ": $(true; printf -- -H)\"Cookie: session={nested_dynamic_option_secret}\""
+            )),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::line(format!(
+                ": $(true && printf -- -H)\"Cookie: session={nested_dynamic_option_secret}\""
+            )),
+            RawRelayAction::wait(Duration::from_millis(100)),
+            RawRelayAction::line(format!(
+                ": $(printf -- -H | cat)\"Cookie: session={nested_dynamic_option_secret}\""
+            )),
             RawRelayAction::wait(Duration::from_millis(100)),
             RawRelayAction::line(format!("fc -l -100 > {}", shell_arg(&history_snapshot))),
             RawRelayAction::wait(Duration::from_millis(100)),
@@ -1334,15 +1507,24 @@ fn raw_relay_zsh_excludes_secrets_from_history_and_journal() {
     assert!(!history.contains(secret), "{history}");
     assert!(!history.contains(access_key), "{history}");
     assert!(!history.contains(url_password), "{history}");
+    assert!(!history.contains(empty_user_url_password), "{history}");
+    assert!(!history.contains(dynamic_option_secret), "{history}");
+    assert!(!history.contains(nested_dynamic_option_secret), "{history}");
     assert!(!journal.contains(secret), "{journal}");
     assert!(!journal.contains(access_key), "{journal}");
     assert!(!journal.contains(url_password), "{journal}");
+    assert!(!journal.contains(empty_user_url_password), "{journal}");
+    assert!(!journal.contains(dynamic_option_secret), "{journal}");
+    assert!(!journal.contains(nested_dynamic_option_secret), "{journal}");
     assert!(ledger_from_output(&output)
         .blocks
         .iter()
         .all(|block| !block.command.contains(secret)
             && !block.command.contains(access_key)
-            && !block.command.contains(url_password)));
+            && !block.command.contains(url_password)
+            && !block.command.contains(empty_user_url_password)
+            && !block.command.contains(dynamic_option_secret)
+            && !block.command.contains(nested_dynamic_option_secret)));
 }
 
 #[test]

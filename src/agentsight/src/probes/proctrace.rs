@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-use super::pidns::observer_in_init_pidns;
+use super::pidns::proc_root_is_init_pidns;
 
 // ─── Generated skeleton ───────────────────────────────────────────────────────
 #[allow(
@@ -82,7 +82,9 @@ impl VariableEvent {
 
         // Convert ktime to Unix timestamp
         let mut header = *raw_header;
-        header.timestamp_ns = config::ktime_to_unix_ns(raw_header.timestamp_ns);
+        header.timestamp_ns = config::ktime_to_unix_ns(raw_header.timestamp_ns)
+            .inspect_err(|error| config::report_clock_error("proctrace", error))
+            .ok()?;
 
         match header.event_type {
             PROCTRACE_EVENT_EXEC => Self::parse_exec(&header, data),
@@ -412,7 +414,7 @@ impl ProcTrace {
 
         // Tell BPF which namespace to report event pids in. proctrace itself
         // reports host pids, but it shares common.h's is_pid_traced() gate.
-        open_skel.rodata_mut().observer_pidns_is_init = observer_in_init_pidns();
+        open_skel.rodata_mut().observer_pidns_is_init = proc_root_is_init_pidns();
 
         // Detect cgroup v2 unified hierarchy and pass to BPF via rodata.
         // When true, get_cgroup_id_compat() uses bpf_get_current_cgroup_id() directly.
@@ -659,6 +661,7 @@ impl ProcTrace {
     /// Spawn a background thread that polls the BPF ring buffer
     /// Uses variable-length event parsing for efficiency
     pub fn run(&self) -> Result<ProcPoller> {
+        config::initialize_event_clock().context("failed to initialize event clock")?;
         let min_sz = std::mem::size_of::<ProcEventHeader>();
         let tx = self.tx.clone();
         let stop_flag = Arc::new(AtomicBool::new(false));

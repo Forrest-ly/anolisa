@@ -31,7 +31,9 @@ ADAPTER_TEMPLATES := \
     $(ADAPTER_SRC_DIR)/qoder/.qoder-plugin/plugin.json \
     $(ADAPTER_SRC_DIR)/claude-code/.claude-plugin/plugin.json \
     $(ADAPTER_SRC_DIR)/codex/.codex-plugin/plugin.json \
-    $(ADAPTER_SRC_DIR)/qwencode/qwen-extension.json
+    $(ADAPTER_SRC_DIR)/qwencode/qwen-extension.json \
+    $(ADAPTER_SRC_DIR)/qwenpaw/plugin.json \
+    $(ADAPTER_SRC_DIR)/qwenpaw/requirements.txt
 # Canonical RPM/raw component contract — kept separate from the adapter
 # payload tree and stamped from the workspace version before packaging.
 # Shipped to %{_datadir}/anolisa/components/tokenless/component.toml and
@@ -62,6 +64,7 @@ PYPROJECT_BUILD ?= uvx --from 'build>=1,<2' pyproject-build
         codex-install codex-uninstall \
         opencode-install opencode-uninstall \
         qwencode-install qwencode-uninstall \
+        qwenpaw-install qwenpaw-uninstall \
         setup help \
         npm-package npm-package-all npm-publish prepare-npm-native-binaries \
         python-wheel test-python-runtime agentscope-wheel \
@@ -128,6 +131,14 @@ $(ADAPTER_SRC_DIR)/codex/.codex-plugin/plugin.json: $(ADAPTER_SRC_DIR)/codex/.co
 $(ADAPTER_SRC_DIR)/qwencode/qwen-extension.json: \
     $(ADAPTER_SRC_DIR)/qwencode/qwen-extension.json.in Cargo.toml
 	@echo "==> Generating qwencode/qwen-extension.json (version=$(VERSION))..."
+	sed 's/@VERSION@/$(VERSION)/g' $< > $@
+
+$(ADAPTER_SRC_DIR)/qwenpaw/plugin.json: $(ADAPTER_SRC_DIR)/qwenpaw/plugin.json.in Cargo.toml
+	@echo "==> Generating qwenpaw/plugin.json (version=$(VERSION))..."
+	sed 's/@VERSION@/$(VERSION)/g' $< > $@
+
+$(ADAPTER_SRC_DIR)/qwenpaw/requirements.txt: $(ADAPTER_SRC_DIR)/qwenpaw/requirements.txt.in Cargo.toml
+	@echo "==> Generating qwenpaw/requirements.txt (version=$(VERSION))..."
 	sed 's/@VERSION@/$(VERSION)/g' $< > $@
 
 $(AGENTSCOPE_PACKAGE_DIR)/pyproject.toml: \
@@ -249,9 +260,8 @@ test-claude-code-detect:
 test-integration:
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_compress_response_hook.py
-	python3 tests/test_compress_toon_hook.py
 	python3 tests/test_codex_response_diagnostics.py
-	python3 tests/test_hermes_toon_threshold.py
+	python3 tests/test_hermes_lifecycle.py
 	python3 tests/test_compress_schema_hook.py
 	python3 tests/test_hook_contract.py
 	python3 tests/test_hermes_plugin_import.py
@@ -260,6 +270,8 @@ test-integration:
 	python3 tests/test_rewrite_hook.py
 	python3 tests/test_cosh_extension_matcher.py
 	python3 tests/test_resolve_agent_id.py
+	python3 tests/test_release_regression_probe.py
+	python3 tests/test_qwenpaw_plugin.py
 
 # Protocol v2 Common Hook parity: replay the contract corpus through the
 # current hooks and real debug binary, then compare with the v2 goldens.
@@ -269,10 +281,10 @@ test-hook-parity:
 	python3 tests/test_hook_parity.py
 
 test-adapters: build-openclaw-plugin build-dsh-plugin
-	@echo "==> Testing openclaw RTK context propagation..."
-	node --test tests/test-openclaw-rtk-context.mjs
-	@echo "==> Testing openclaw TOON minimum payload threshold..."
-	node --test tests/test-openclaw-toon-threshold.mjs
+	@echo "==> Testing OpenClaw adapter installer..."
+	bash tests/test-openclaw-adapter-install.sh
+	@echo "==> Testing openclaw Protocol v2 lifecycle..."
+	node --test tests/test-openclaw-lifecycle-v2.mjs
 	@echo "==> Testing native dsh adapter bundle..."
 	bash tests/test-dsh-adapter.sh
 	@echo "==> Testing qoder adapter installer..."
@@ -280,6 +292,8 @@ test-adapters: build-openclaw-plugin build-dsh-plugin
 	@echo "==> Testing OpenCode adapter..."
 	bash tests/test-opencode-adapter-install.sh
 	node tests/test-opencode-plugin.mjs
+	@echo "==> Testing QwenPaw adapter installer..."
+	bash tests/test-qwenpaw-adapter-install.sh
 
 # Build the abi3 extension with unwind semantics so a Rust panic cannot abort
 # the embedding Python interpreter. The wheel remains platform-specific, but
@@ -391,9 +405,9 @@ ADAPTER_ENV = ANOLISA_PREFIX=$(HOME)/.local \
               ANOLISA_COMPONENT=tokenless \
               ANOLISA_VERSION=$(VERSION)
 
-adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install opencode-install qwencode-install
+adapter-install: cosh-extension-install openclaw-install hermes-install qoder-install claude-code-install codex-install opencode-install qwencode-install qwenpaw-install
 
-adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall opencode-uninstall qwencode-uninstall
+adapter-uninstall: cosh-extension-uninstall openclaw-uninstall hermes-uninstall qoder-uninstall claude-code-uninstall codex-uninstall opencode-uninstall qwencode-uninstall qwenpaw-uninstall
 
 adapter-scan:
 	@echo "=== Tokenless Adapter Manifest ==="
@@ -464,8 +478,9 @@ claude-code-install:
 	@# detect.sh exits 1 (installable) or 2 (missing prereq); we tolerate both
 	@# and let install.sh make the final call (it gracefully no-ops without claude CLI).
 	@# This pre-install probe runs on a steady-state machine and its output is
-	@# informational only, so skip detect.sh's first-run settling retries.
-	@$(ADAPTER_ENV) ANOLISA_TARGET=claude-code TOKENLESS_DETECT_RETRIES=0 bash $(CLAUDE_CODE_ADAPTER_DIR)/scripts/detect.sh || true
+	@# informational only, so skip detect.sh's first-run settling retries and
+	@# the plugin registry re-lists that ride out the GH #3082 index lag.
+	@$(ADAPTER_ENV) ANOLISA_TARGET=claude-code TOKENLESS_DETECT_RETRIES=0 TOKENLESS_DETECT_PLUGIN_RELISTS=0 bash $(CLAUDE_CODE_ADAPTER_DIR)/scripts/detect.sh || true
 	@$(ADAPTER_ENV) ANOLISA_TARGET=claude-code bash $(CLAUDE_CODE_ADAPTER_DIR)/scripts/install.sh
 
 claude-code-uninstall:
@@ -508,6 +523,18 @@ qwencode-uninstall:
 	@echo "==> Uninstalling Qwen Code plugin..."
 	@$(ADAPTER_ENV) ANOLISA_TARGET=qwencode bash $(QWENCODE_ADAPTER_DIR)/scripts/uninstall.sh
 
+# --- QwenPaw ---
+QWENPAW_ADAPTER_DIR = $(SHARE_DIR)/qwenpaw
+
+qwenpaw-install:
+	@echo "==> Installing QwenPaw plugin..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=qwenpaw bash $(QWENPAW_ADAPTER_DIR)/scripts/detect.sh || true
+	@$(ADAPTER_ENV) ANOLISA_TARGET=qwenpaw bash $(QWENPAW_ADAPTER_DIR)/scripts/install.sh
+
+qwenpaw-uninstall:
+	@echo "==> Uninstalling QwenPaw plugin..."
+	@$(ADAPTER_ENV) ANOLISA_TARGET=qwenpaw bash $(QWENPAW_ADAPTER_DIR)/scripts/uninstall.sh
+
 # One-step setup: build + install + all adapters
 setup: install adapter-install
 	@echo ""
@@ -522,7 +549,7 @@ setup: install adapter-install
 	@echo "  Adapter (FHS):"
 	@echo "    $(SHARE_DIR)/"
 	@echo "  Registered:"
-	@echo "    cosh, openclaw, hermes, qoder, claude-code, codex, opencode, qwencode"
+	@echo "    cosh, openclaw, hermes, qoder, claude-code, codex, opencode, qwencode, qwenpaw"
 	@echo ""
 	@echo "Verify:"
 	@echo "  tokenless --version"
@@ -595,7 +622,7 @@ help:
 	@echo "  agentscope-wheel  Build the AgentScope integration wheel"
 	@echo "  test-agentscope-integration  Test the integration with supported AgentScope versions"
 	@echo "  adapter-scan      List registered adapter capabilities"
-	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+qoder+claude-code+codex+opencode+qwencode)"
+	@echo "  adapter-install   Register all adapters (cosh+openclaw+hermes+qoder+claude-code+codex+opencode+qwencode+qwenpaw)"
 	@echo "  adapter-uninstall Unregister all adapters"
 	@echo "  cosh-extension-install  Install cosh extension"
 	@echo "  cosh-extension-uninstall Uninstall cosh extension"
@@ -613,6 +640,8 @@ help:
 	@echo "  opencode-uninstall Unregister OpenCode local plugin"
 	@echo "  qwencode-install  Register Qwen Code plugin via qwen CLI"
 	@echo "  qwencode-uninstall Unregister Qwen Code plugin"
+	@echo "  qwenpaw-install   Install QwenPaw plugin via qwenpaw CLI"
+	@echo "  qwenpaw-uninstall Uninstall QwenPaw plugin"
 	@echo "  setup             Full setup: build + install + register adapters"
 	@echo "  npm-package       Build and package the current host"
 	@echo "  npm-package-all   Package target/npm-prebuilt target directories"

@@ -11,7 +11,7 @@ use libbpf_rs::{
 };
 use std::mem::MaybeUninit;
 
-use super::pidns::observer_in_init_pidns;
+use super::pidns::proc_root_is_init_pidns;
 use super::shared_maps::{MapKind, SharedMaps};
 
 // ─── Generated skeleton ───────────────────────────────────────────────────────
@@ -82,7 +82,9 @@ impl FileWriteEvent {
             pid: raw.pid,
             tid: raw.tid,
             uid: raw.uid,
-            timestamp_ns: config::ktime_to_unix_ns(raw.timestamp_ns),
+            timestamp_ns: config::ktime_to_unix_ns(raw.timestamp_ns)
+                .inspect_err(|error| config::report_clock_error("filewrite", error))
+                .ok()?,
             write_size: raw.write_size,
             comm,
             filename,
@@ -121,7 +123,7 @@ impl FileWrite {
         open_skel.rodata_mut().filter_cgroup_enabled = shared.cgroup_filter_enabled();
 
         // Tell BPF which namespace to report event pids in.
-        open_skel.rodata_mut().observer_pidns_is_init = observer_in_init_pidns();
+        open_skel.rodata_mut().observer_pidns_is_init = proc_root_is_init_pidns();
 
         // Detect cgroup v2 and pass to BPF via rodata.
         open_skel.rodata_mut().cgroup_v2_mode =

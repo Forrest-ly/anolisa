@@ -177,6 +177,12 @@ anolisa adapter disable <component> [framework]
 anolisa adapter status [component]
 ```
 
+For OpenClaw plugins, executing `adapter enable` accepts the plugin's declared
+capabilities. ANOLISA adds `--accept-capabilities` only when the installer's
+help advertises it, including in the dry-run plan. Capability consent does
+not authorize `--allow-unsafe-plugin-install`; a consent rejection is reported
+separately from a plugin-safety rejection.
+
 ### logs and bug reports
 
 Inspect component logs or generate a diagnostic bundle:
@@ -247,20 +253,25 @@ anolisa status
 
 ## Configuration
 
-Registry settings are read from `/etc/anolisa/config.toml` in system mode or
-`~/.config/anolisa/config.toml` in user mode. Only the `[registry]` table is
-used for registry resolution:
+Backend selection and endpoints are read from `/etc/anolisa/repo.toml` in
+system mode or `~/.config/anolisa/repo.toml` in user mode:
 
 ```toml
-[registry]
-url = "https://registry.example.com/index.toml"
-cache_ttl_secs = 3600
-offline_fallback = true
+schema_version = 1
+default_backend = "raw"
+
+[backends.raw]
+base_url = "https://repo.example.com/anolisa/v1/"
 ```
 
-Backend selection and endpoints live in the corresponding `repo.toml`
-(`/etc/anolisa/repo.toml` or `~/.config/anolisa/repo.toml`). CLI flags override
-the operation being run; there is no `[install] mode` setting.
+The raw backend re-fetches the distribution index on every run: there is no
+index cache and no stale-index fallback, so an unreachable repository fails the
+command instead of resolving against older data. `cache_ttl_secs` and
+`offline_fallback` were never wired up; configs that still set them keep
+parsing, but the values are ignored.
+
+CLI flags override the operation being run; there is no `[install] mode`
+setting.
 
 ---
 
