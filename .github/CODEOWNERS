@@ -35,7 +35,7 @@
 /src/tokenless/                         @Forrest-ly @ikunkun-sys    # auto-label: component:tokenless
 /src/agent-memory/                      @ikunkun-sys                # auto-label: component:memory
 /src/anolisa/                           @kongche-jbw @ikunkun-sys   # auto-label: component:anolisa
-/src/cosh-ng/                           @KaiLongZhou                # auto-label: component:cosh-ng
+/src/cosh-ng/                           @zkl123                     # auto-label: component:cosh-ng
 /src/cosh-ng/crates/cosh-shell/         @SunnyQjm                   # auto-label: component:cosh-ng
 
 # ---------------------------------------------------------------------------
