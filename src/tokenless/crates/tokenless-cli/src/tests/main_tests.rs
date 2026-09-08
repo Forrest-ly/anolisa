@@ -406,6 +406,106 @@ fn get_stash_db_path_default() {
 }
 
 #[test]
+fn get_data_dir_uses_managed_dsh_override_only_in_dsh_shell() {
+    let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let managed = tempfile::tempdir().unwrap();
+    let explicit = tempfile::tempdir().unwrap();
+    let previous_data_dir = std::env::var_os("TOKENLESS_DATA_DIR");
+    let previous_stats_db = std::env::var_os("TOKENLESS_STATS_DB");
+    let previous_stash_db = std::env::var_os("TOKENLESS_STASH_DB");
+    let previous_dsh_shell = std::env::var_os("DSH_SHELL");
+    let previous_dsh_data_dir = std::env::var_os("DSH_TOKENLESS_DATA_DIR");
+    let previous_dsh_stats_db = std::env::var_os("DSH_TOKENLESS_STATS_DB");
+    let previous_dsh_stash_db = std::env::var_os("DSH_TOKENLESS_STASH_DB");
+    let managed_stats = managed.path().join("managed-stats.db");
+    let managed_stash = managed.path().join("managed-stash.db");
+    let explicit_stats = explicit.path().join("explicit-stats.db");
+    let explicit_stash = explicit.path().join("explicit-stash.db");
+
+    unsafe {
+        std::env::remove_var("TOKENLESS_DATA_DIR");
+        std::env::remove_var("TOKENLESS_STATS_DB");
+        std::env::remove_var("TOKENLESS_STASH_DB");
+        std::env::set_var("DSH_SHELL", "1");
+        std::env::set_var("DSH_TOKENLESS_DATA_DIR", managed.path());
+        std::env::set_var("DSH_TOKENLESS_STATS_DB", &managed_stats);
+        std::env::set_var("DSH_TOKENLESS_STASH_DB", &managed_stash);
+    }
+    let managed_result = get_data_dir(home.path().to_str().unwrap());
+    let managed_paths = DatabasePathResolver {
+        home: std::sync::OnceLock::from(home.path().to_string_lossy().into_owned()),
+        data_dir: std::sync::OnceLock::new(),
+    };
+    let managed_stats_result = get_db_path_with(&managed_paths);
+    let managed_stash_result = get_stash_db_path_with(&managed_paths, None);
+
+    unsafe {
+        std::env::remove_var("DSH_SHELL");
+    }
+    let ignored_result = get_data_dir(home.path().to_str().unwrap());
+
+    unsafe {
+        std::env::set_var("DSH_SHELL", "1");
+        std::env::set_var("TOKENLESS_DATA_DIR", explicit.path());
+        std::env::set_var("TOKENLESS_STATS_DB", &explicit_stats);
+        std::env::set_var("TOKENLESS_STASH_DB", &explicit_stash);
+    }
+    let explicit_result = get_data_dir(home.path().to_str().unwrap());
+    let explicit_paths = DatabasePathResolver {
+        home: std::sync::OnceLock::from(home.path().to_string_lossy().into_owned()),
+        data_dir: std::sync::OnceLock::new(),
+    };
+    let explicit_stats_result = get_db_path_with(&explicit_paths);
+    let explicit_stash_result = get_stash_db_path_with(&explicit_paths, None);
+
+    unsafe {
+        match previous_data_dir {
+            Some(value) => std::env::set_var("TOKENLESS_DATA_DIR", value),
+            None => std::env::remove_var("TOKENLESS_DATA_DIR"),
+        }
+        match previous_stats_db {
+            Some(value) => std::env::set_var("TOKENLESS_STATS_DB", value),
+            None => std::env::remove_var("TOKENLESS_STATS_DB"),
+        }
+        match previous_stash_db {
+            Some(value) => std::env::set_var("TOKENLESS_STASH_DB", value),
+            None => std::env::remove_var("TOKENLESS_STASH_DB"),
+        }
+        match previous_dsh_shell {
+            Some(value) => std::env::set_var("DSH_SHELL", value),
+            None => std::env::remove_var("DSH_SHELL"),
+        }
+        match previous_dsh_data_dir {
+            Some(value) => std::env::set_var("DSH_TOKENLESS_DATA_DIR", value),
+            None => std::env::remove_var("DSH_TOKENLESS_DATA_DIR"),
+        }
+        match previous_dsh_stats_db {
+            Some(value) => std::env::set_var("DSH_TOKENLESS_STATS_DB", value),
+            None => std::env::remove_var("DSH_TOKENLESS_STATS_DB"),
+        }
+        match previous_dsh_stash_db {
+            Some(value) => std::env::set_var("DSH_TOKENLESS_STASH_DB", value),
+            None => std::env::remove_var("DSH_TOKENLESS_STASH_DB"),
+        }
+    }
+
+    assert_eq!(managed_result.unwrap(), managed.path().canonicalize().unwrap());
+    assert_eq!(managed_stats_result.unwrap(), managed_stats);
+    assert_eq!(managed_stash_result.unwrap(), managed_stash);
+    assert_eq!(
+        ignored_result.unwrap(),
+        home.path().canonicalize().unwrap().join(".tokenless")
+    );
+    assert_eq!(
+        explicit_result.unwrap(),
+        explicit.path().canonicalize().unwrap()
+    );
+    assert_eq!(explicit_stats_result.unwrap(), explicit_stats);
+    assert_eq!(explicit_stash_result.unwrap(), explicit_stash);
+}
+
+#[test]
 fn get_stash_db_path_with_valid_override() {
     let guard = match TempDbGuard::new() { Some(g) => g, None => return };
     // Use the temp stash path as an explicit override; get_stash_db_path
@@ -1494,6 +1594,157 @@ fn record_compression_stats_sls_only_path() {
         Some(0),
         Some(15),
     );
+}
+
+/// Sets or clears the trace-context variables for one test and restores the
+/// previous values on drop, so a panic cannot leak them into other tests.
+///
+/// Constructed after [`TempDbGuard`], which serializes environment mutation
+/// through `ENV_MUTEX`.
+struct TraceEnvGuard {
+    prev_traceparent: Option<std::ffi::OsString>,
+    prev_override: Option<std::ffi::OsString>,
+}
+
+impl TraceEnvGuard {
+    fn new(traceparent: Option<&str>) -> Self {
+        let prev_traceparent = std::env::var_os("TRACEPARENT");
+        let prev_override = std::env::var_os("TOKENLESS_TRACEPARENT");
+        unsafe {
+            std::env::remove_var("TOKENLESS_TRACEPARENT");
+            match traceparent {
+                Some(value) => std::env::set_var("TRACEPARENT", value),
+                None => std::env::remove_var("TRACEPARENT"),
+            }
+        }
+        Self {
+            prev_traceparent,
+            prev_override,
+        }
+    }
+}
+
+impl Drop for TraceEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.prev_traceparent {
+                Some(v) => std::env::set_var("TRACEPARENT", v),
+                None => std::env::remove_var("TRACEPARENT"),
+            }
+            match &self.prev_override {
+                Some(v) => std::env::set_var("TOKENLESS_TRACEPARENT", v),
+                None => std::env::remove_var("TOKENLESS_TRACEPARENT"),
+            }
+        }
+    }
+}
+
+/// Reads the single JSONL line the SLS writer appended under `TempDbGuard`.
+fn read_sls_line(sls_dir: &str) -> serde_json::Value {
+    let path = PathBuf::from(sls_dir).join("tokenless.jsonl");
+    let content = std::fs::read_to_string(&path).unwrap();
+    let line = content.lines().next_back().expect("the SLS writer must append one line");
+    serde_json::from_str(line).unwrap()
+}
+
+#[test]
+fn record_compression_stats_stamps_host_trace_context() {
+    let guard = match TempDbGuard::new() { Some(g) => g, None => return };
+    let _trace = TraceEnvGuard::new(Some(
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    ));
+    let config = TokenlessConfig { stats_enabled: false, sls_enabled: true, ..Default::default() };
+
+    record_compression_stats(
+        &config,
+        &DatabasePathResolver::default(),
+        OperationType::CompressResponse,
+        Some("trace-agent".to_string()),
+        Some("trace-session".to_string()),
+        Some("trace-tool".to_string()),
+        "t".repeat(600),
+        "u".repeat(60),
+        CompressionMode::Active,
+        None,
+        None,
+        None,
+    );
+
+    let obj = read_sls_line(&guard.sls_dir);
+    assert_eq!(
+        obj["tokenless.trace_id"],
+        "4bf92f3577b34da6a3ce929d0e0e4736",
+        "the exported record must carry the host trace identity"
+    );
+    assert_eq!(obj["tokenless.span_id"], "00f067aa0ba902b7");
+    // Existing attribution is unchanged by trace stamping.
+    assert_eq!(obj["tokenless.session_id"], "trace-session");
+    assert_eq!(obj["tokenless.tool_use_id"], "trace-tool");
+}
+
+#[test]
+fn record_compression_stats_prefers_traceparent_override() {
+    let guard = match TempDbGuard::new() { Some(g) => g, None => return };
+    let _trace = TraceEnvGuard::new(Some(
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    ));
+    unsafe {
+        std::env::set_var(
+            "TOKENLESS_TRACEPARENT",
+            "00-11111111111111111111111111111111-2222222222222222-01",
+        );
+    }
+    let config = TokenlessConfig { stats_enabled: false, sls_enabled: true, ..Default::default() };
+
+    record_compression_stats(
+        &config,
+        &DatabasePathResolver::default(),
+        OperationType::CompressResponse,
+        Some("trace-agent".to_string()),
+        None,
+        None,
+        "t".repeat(600),
+        "u".repeat(60),
+        CompressionMode::Active,
+        None,
+        None,
+        None,
+    );
+
+    let obj = read_sls_line(&guard.sls_dir);
+    assert_eq!(
+        obj["tokenless.trace_id"],
+        "11111111111111111111111111111111",
+        "the adapter override must win over the standard host variable"
+    );
+    assert_eq!(obj["tokenless.span_id"], "2222222222222222");
+}
+
+#[test]
+fn record_compression_stats_omits_trace_without_host_context() {
+    let guard = match TempDbGuard::new() { Some(g) => g, None => return };
+    let _trace = TraceEnvGuard::new(None);
+    let config = TokenlessConfig { stats_enabled: false, sls_enabled: true, ..Default::default() };
+
+    record_compression_stats(
+        &config,
+        &DatabasePathResolver::default(),
+        OperationType::CompressResponse,
+        Some("trace-agent".to_string()),
+        None,
+        None,
+        "t".repeat(600),
+        "u".repeat(60),
+        CompressionMode::Active,
+        None,
+        None,
+        None,
+    );
+
+    let obj = read_sls_line(&guard.sls_dir);
+    let keys = obj.as_object().unwrap();
+    assert!(!keys.contains_key("tokenless.trace_id"));
+    assert!(!keys.contains_key("tokenless.span_id"));
 }
 
 #[test]

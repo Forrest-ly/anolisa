@@ -7,6 +7,11 @@
 入口。实现、评审和验收只能依赖仓库内可访问的规范；新的架构决策必须直接更新本文及受
 影响的契约，不能依赖未随仓库发布的材料。
 
+**[TARGET V2] CLI 命名：** Rust CLI 的 Cargo package/crate 与源码目录继续使用
+`asc-cli` / `asc_cli` / `v2/apps/asc-cli`，对外编译产物和命令名统一为 `agent-sec-cli`。
+本文其余 `asc-cli` 表示内部组件，不表示另一份可执行文件；当前 PAP slice 与 V1 同名
+不代表已完成 V1 全量命令迁移。
+
 此前文档中的“长期保留 Python CLI、PyO3 NativeExecutor、daemon 不可用时自动本地
 fallback、backend-first/daemon-last、per-user daemon”路线已经被当前 V2 架构取代，不再
 是候选实现或兼容路线。旧路线只保留在 Git 历史中用于审计。
@@ -101,6 +106,10 @@ revision、搜索路径、已有测试和未自动验证项；不使用构建产
 
 - asc-daemon 是进程入口和 composition root，只负责 bootstrap、配置、runtime、RPC、
   signals、具体 adapter 装配和进程级 observability。
+- asc-daemon-service 负责协议无关的 UDS admission、framing、peer credentials、timeout、
+  drain 和 socket 生命周期，并通过 `RequestDispatcher` port 调用上层。
+- asc-daemon-handler 负责 daemon wire 解码、method allowlist、server-owned authorization、
+  application use case 路由以及 response/error projection；不拥有进程或 transport runtime。
 - asc-daemon-core 负责编排 identity、authorization、action、policy、observability、
   management、jobs 和 lifecycle 用例，不复制领域业务语义。
 - asc-action-runtime 负责 action validation、admission、execution supervision、timeout、
@@ -164,7 +173,7 @@ daemon protocol adapter
 - 升级、状态 owner、回滚和混合版本读取。
 
 兼容不要求保留 Python 内部调用路径。若 agent-sec-cli 是 supported command，V2 可以由
-Rust asc-cli binary、兼容命令名或受控 wrapper 提供同一外部接口，但不能以 Python/PyO3
+Rust agent-sec-cli binary、兼容命令名或受控 wrapper 提供同一外部接口，但不能以 Python/PyO3
 作为 V2 依赖。任何删除、重命名或语义变化都必须先有 versioned replacement、兼容期和批准
 的 change record。
 
@@ -229,8 +238,8 @@ asc-state-migrator 必须定义并验证：
 
 工作包采用本文定义的目标 workspace，至少包括：
 
-- 产品入口：asc-daemon、asc-cli、asc-state-migrator；
-- daemon：asc-daemon-protocol、asc-daemon-core；
+- 产品入口：asc-daemon、agent-sec-cli、asc-state-migrator；
+- daemon：asc-daemon-protocol、asc-daemon-service、asc-daemon-handler、asc-daemon-core；
 - action：asc-action-types、asc-evidence-types、asc-action-runtime 和各 asc-capability-*；
 - policy：asc-policy-types、asc-policy-engine、asc-policy-runtime、asc-pap、asc-pcp；
 - data：asc-security-events、asc-observability、asc-session、asc-state、
@@ -247,7 +256,7 @@ composition root 负责注入。
 - **Action Slice**：daemon-core + action-runtime + 一个 capability + security-events；
 - **Policy Slice**：PAP + policy-engine + PCP + AgentSight adapter + persistence；
 - **Query Slice**：security-events + session + observability + persistence + authorization；
-- **Product Slice**：asc-daemon + asc-cli + state-migrator + packaging。
+- **Product Slice**：asc-daemon + agent-sec-cli + state-migrator + packaging。
 
 slice 是集成验收单元，不是让所有 crate 串行等待的开发阶段。
 

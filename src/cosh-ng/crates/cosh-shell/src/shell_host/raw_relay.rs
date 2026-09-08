@@ -36,7 +36,7 @@ use activity::{
 };
 pub(super) use activity::{DriverCompletion, RawActionWatchdog};
 use eof_shutdown::{advance_eof_shutdown, request_eof_shutdown};
-use input_events::{candidate_display_columns, drain_raw_input_events};
+use input_events::{candidate_display_columns, drain_raw_input_events, write_no_wrap_overlay};
 use input_readiness::RawInputReadinessProbe;
 use interactive_sentinel::{
     emit_interactive_hint_if_waiting, InputWaitStatus, InteractiveHintKind, SentinelThrottle,
@@ -52,6 +52,12 @@ use terminal_size::sync_outer_terminal_winsize;
 const SAVE_CURSOR: &str = "\x1b7";
 const RESTORE_CURSOR: &str = "\x1b8";
 const PTY_READ_BATCH_BYTES: usize = 256 * 1024;
+
+fn publish_prompt_snapshot_if_drained(parser: &OscParser, pty_drained: bool) {
+    if pty_drained {
+        parser.publish_quiescent_prompt_snapshot();
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn read_raw_until_exit<W: Write, F>(
@@ -169,6 +175,7 @@ where
             output.flush()?;
         }
         let mut batch_bytes = 0usize;
+        let mut pty_drained = false;
         loop {
             match master.read(&mut buffer) {
                 Ok(0) => break,
@@ -289,7 +296,10 @@ where
                         break;
                     }
                 }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    pty_drained = true;
+                    break;
+                }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) if child.try_wait()?.is_some() => {
                     if !advance_eof_shutdown(&mut eof_shutdown)? {
@@ -416,6 +426,7 @@ where
             output.flush()?;
         }
         input_readiness.acknowledge_if_ready(output, input_mode)?;
+        publish_prompt_snapshot_if_drained(parser, pty_drained);
         // The PTY is drained (WouldBlock) at this point: write off
         // submissions a foreground program consumed once the shell has
         // painted a prompt after the last boundary and idles at it. A bare
@@ -560,10 +571,7 @@ fn write_pending_display_preserving_prompt_ghost<W: Write>(
 
 fn write_prompt_ghost<W: Write>(output: &mut W, text: &str, selection: bool) -> io::Result<()> {
     let marker = if selection { " ›" } else { "" };
-    write!(
-        output,
-        "{SAVE_CURSOR}\x1b[2m{marker} {text}\x1b[0m{RESTORE_CURSOR}"
-    )
+    write_no_wrap_overlay(output, |output| write!(output, "\x1b[2m{marker} {text}"))
 }
 
 fn drain_observer_until_released<W: Write, F>(

@@ -15,7 +15,7 @@ use libbpf_rs::{
 };
 use std::mem::MaybeUninit;
 
-use super::pidns::observer_in_init_pidns;
+use super::pidns::proc_root_is_init_pidns;
 use super::shared_maps::{MapKind, SharedMaps};
 
 // --- Generated skeleton ---
@@ -151,7 +151,9 @@ impl UdpDnsEvent {
             pid: raw.pid,
             tid: raw.tid,
             uid: raw.uid,
-            timestamp_ns: config::ktime_to_unix_ns(raw.timestamp_ns),
+            timestamp_ns: config::ktime_to_unix_ns(raw.timestamp_ns)
+                .inspect_err(|error| config::report_clock_error("udpdns", error))
+                .ok()?,
             comm,
             domain,
         })
@@ -182,7 +184,7 @@ impl UdpDns {
         let mut open_skel = builder.open().context("failed to open udpdns BPF object")?;
 
         // Tell BPF which namespace to report event pids in.
-        open_skel.rodata_mut().observer_pidns_is_init = observer_in_init_pidns();
+        open_skel.rodata_mut().observer_pidns_is_init = proc_root_is_init_pidns();
 
         // Reuse shared ring buffer + process filter.
         shared

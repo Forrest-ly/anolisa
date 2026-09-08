@@ -338,10 +338,11 @@ impl Probes {
 
     pub fn attach_process(&mut self, pid: i32) -> Result<()> {
         if let Err(e) = self.attach_ssl_to_process(pid) {
-            // SSL attach may fail when the process exits before /proc/<pid>/maps is
-            // readable, but a previously-attached global uprobe (pid=-1) is still
-            // valid.  Register the pid in the traced map so BPF events from the
-            // global uprobe are not silently dropped.
+            // SSL attach may fail when the process exits before
+            // `<procfs root>/<pid>/maps` is readable, but a previously-attached
+            // global uprobe (pid=-1) is still valid.  Register the pid in the
+            // traced map so BPF events from the global uprobe are not silently
+            // dropped.
             log::warn!(
                 "[attach_process] pid={pid}: SSL attach failed ({e:#}); registering pid anyway for global uprobe coverage"
             );
@@ -362,6 +363,7 @@ impl Probes {
     /// A single background thread polls the shared ring buffer and dispatches
     /// events as unified Event type to the channel.
     pub fn run(&self) -> Result<ProbesPoller> {
+        crate::config::initialize_event_clock().context("failed to initialize event clock")?;
         let proc_min_sz = mem::size_of::<ProcEventHeader>();
         let procmon_event_size = mem::size_of::<ProcMonEvent>();
         let filewatch_event_size = mem::size_of::<RawFileWatchEvent>();

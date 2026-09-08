@@ -41,6 +41,14 @@ fn detects_make_style_build_log() {
 }
 
 #[test]
+fn go_test_rows_are_build_logs_before_generic_tabular_data() {
+    let go = (0..30)
+        .map(|index| format!("ok  \tgithub.com/acme/pkg{index:02}\t0.{index:03}s\n"))
+        .collect::<String>();
+    assert_eq!(detect(&go), ContentType::BuildLog);
+}
+
+#[test]
 fn log_containing_a_traceback_stays_build_log() {
     let pytest = "$ pytest -q\n\
                   ...F\n\
@@ -97,14 +105,19 @@ fn detects_html_documents_but_not_fragments() {
 
 #[test]
 fn detects_tabular_content() {
+    for input in [
+        "name,value\nalice,1\nbob,2",
+        "name,value\ralice,1\rbob,2",
+        "name,value\n\"alice, a\",1\n\"bob\nb\",2",
+        "name\tvalue\nalice\t001\nbob\t002",
+    ] {
+        assert_eq!(detect(input), ContentType::Tabular);
+    }
     assert_eq!(
         detect("name,age,city\nalice,30,berlin\nbob,25,tokyo"),
         ContentType::Tabular
     );
-    assert_eq!(
-        detect("a\tb\nc\td\ne\tf"),
-        ContentType::Tabular
-    );
+    assert_eq!(detect("a\tb\nc\td\ne\tf"), ContentType::Tabular);
     assert_eq!(
         detect("| col | n |\n|---|---:|\n| x | 1 |"),
         ContentType::Tabular
@@ -113,7 +126,10 @@ fn detects_tabular_content() {
 
 #[test]
 fn detects_source_code_on_strong_signals_only() {
-    assert_eq!(detect("#!/usr/bin/env bash\necho hi"), ContentType::SourceCode);
+    assert_eq!(
+        detect("#!/usr/bin/env bash\necho hi"),
+        ContentType::SourceCode
+    );
     let rust = "use std::fs;\n\
                 pub struct Config;\n\
                 impl Config {\n\
@@ -129,6 +145,14 @@ fn detects_source_code_on_strong_signals_only() {
 }
 
 #[test]
+fn source_declarations_take_precedence_over_rectangular_commas() {
+    let input = (0..100)
+        .map(|i| format!("def function_{i:03}(a, b): return a + b\n"))
+        .collect::<String>();
+    assert_eq!(detect(&input), ContentType::SourceCode);
+}
+
+#[test]
 fn readable_prose_is_plain_text() {
     assert_eq!(
         detect("压缩按无损、可取回有损、截断三级阶梯递进。检测器必须廉价且确定。"),
@@ -138,24 +162,18 @@ fn readable_prose_is_plain_text() {
 }
 
 #[test]
-fn prose_carrying_two_generic_markers_is_a_known_detection_boundary() {
-    // `is_build_log` needs two distinct markers and counts several short,
-    // word-like ones (`gcc `, `make: `, `cc -`, `ld: `). Ordinary prose that
-    // happens to mention two of them therefore scores as BuildLog. This test
-    // pins that tolerance rather than endorsing it: raising the score
-    // threshold or adding word-boundary conditions should update it
-    // deliberately, not discover it through a golden diff elsewhere.
+fn prose_carrying_build_words_is_not_a_build_log() {
     let mut doc = String::new();
     doc.push_str("Toolchain notes for new contributors.\n\n");
     doc.push_str("We build with gcc on every supported platform. The make: prefix in\n");
     doc.push_str("the transcript below is the recursive build announcing itself.\n\n");
     for i in 0..36 {
-        doc.push_str(&format!("Paragraph {i} explains one configuration knob in prose.\n"));
+        doc.push_str(&format!(
+            "Paragraph {i} explains one configuration knob in prose.\n"
+        ));
     }
-    assert_eq!(detect(&doc), ContentType::BuildLog);
+    assert_eq!(detect(&doc), ContentType::PlainText);
 
-    // One marker alone is not enough, which is what keeps the tolerance
-    // bounded: the misdetection needs two distinct mentions.
     let single = doc.replace("make: ", "recursive ");
     assert_eq!(detect(&single), ContentType::PlainText);
 }

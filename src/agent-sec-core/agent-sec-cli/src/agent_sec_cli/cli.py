@@ -36,7 +36,7 @@ try:
 
     __version__ = get_version("agent-sec-cli")
 except Exception:
-    __version__ = "0.11.0"  # pragma: no cover
+    __version__ = "0.12.0"  # pragma: no cover
 
 app = typer.Typer(
     name="agent-sec-cli",
@@ -284,7 +284,7 @@ def verify(
     """Skill integrity verification."""
     result = invoke("verify", skill=skill)
     if result.stdout:
-        typer.echo(result.stdout)
+        typer.echo(result.stdout, nl=False)
     if result.error:
         typer.echo(result.error, err=True)
     raise typer.Exit(code=result.exit_code)

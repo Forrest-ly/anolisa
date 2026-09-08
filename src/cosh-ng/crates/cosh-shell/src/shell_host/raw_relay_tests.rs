@@ -110,6 +110,82 @@ fn feed_shell_ready(parser: &mut OscParser) {
     parser.feed(&marker).expect("feed precmd");
 }
 
+fn feed_enhanced_prompt_ready(parser: &mut OscParser) {
+    parser
+        .feed(
+            b"\x1b]1337;COSH;{\"event\":\"precmd\",\"token\":\"test-marker-token\",\"status\":0,\"cwd\":\"/tmp\",\"prompt_ready\":true}\x07",
+        )
+        .expect("feed enhanced prompt ready");
+}
+
+#[test]
+fn prompt_snapshot_publishes_only_after_pty_is_drained() {
+    for (name, drained, expected) in [
+        ("not-drained", false, b"".as_slice()),
+        ("drained", true, b"prompt> ".as_slice()),
+    ] {
+        let mut parser = parser_for_test(name);
+        let generation = UserPtyInputGeneration::default();
+        parser.set_prompt_epoch_exchange(generation.prompt_epoch_exchange());
+        feed_enhanced_prompt_ready(&mut parser);
+        parser.feed(b"prompt> ").expect("feed prompt");
+
+        publish_prompt_snapshot_if_drained(&parser, drained);
+        generation.bump();
+        parser
+            .feed(b"\x1b]1337;COSH;{\"e\":\"slash_guard\",\"t\":\"test-marker-token\"}\x07")
+            .expect("arm slash guard");
+
+        assert_eq!(
+            parser
+                .pending_slash_guard_prompt_for_test()
+                .expect("pending slash guard"),
+            expected
+        );
+    }
+}
+
+#[test]
+fn buffered_pty_output_stays_before_queued_candidate_redraw() {
+    let mut parser = parser_for_test("buffered-output-before-redraw");
+    let (_generation, mut prompt_replay) = tracker_for_test();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut output = Vec::new();
+    let mut display_start = 0usize;
+    let mut echoed = 0usize;
+    let mut prompt_presentation = PromptPresentation::new(false);
+
+    parser
+        .feed(b"BACKGROUND\r\n")
+        .expect("feed buffered PTY output");
+    sender
+        .send(crate::raw_input::RawInputEvent::CandidateRedraw {
+            input: b"/cancel".to_vec(),
+            hint: None,
+        })
+        .expect("queue candidate redraw");
+    write_pending_display(
+        &parser,
+        &mut output,
+        &mut display_start,
+        &mut prompt_replay,
+        &mut prompt_presentation,
+    )
+    .expect("write older PTY output");
+    drain_raw_input_events(
+        &receiver,
+        &mut parser,
+        &mut output,
+        "prompt> ",
+        &mut echoed,
+        &mut prompt_replay,
+        &prompt_presentation,
+    )
+    .expect("draw queued candidate");
+
+    assert_eq!(output, b"BACKGROUND\r\n\r\x1b[2Kprompt> /cancel");
+}
+
 #[test]
 fn capture_ack_generation_expires_at_terminal_event() {
     let mut parser = parser_for_test("capture-ack-lifecycle");
@@ -345,6 +421,47 @@ fn candidate_hint_uses_terminfo_cursor_save_restore() {
     assert!(!output.windows(3).any(|window| window == b"\x1b[u"));
 }
 
+#[test]
+fn isolated_candidate_repaints_keep_prompt_presentation_owner() {
+    let mut parser = parser_for_test("candidate-prompt-owner");
+    let (_generation, mut prompt_replay) = tracker_for_test();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut output = Vec::new();
+    let mut echoed = 0usize;
+    let prompt_presentation = PromptPresentation::new(true);
+
+    sender
+        .send(crate::raw_input::RawInputEvent::CandidateRedraw {
+            input: "你好".as_bytes().to_vec(),
+            hint: None,
+        })
+        .expect("queue candidate redraw");
+    sender
+        .send(crate::raw_input::RawInputEvent::CandidateCommit(
+            "你好".as_bytes().to_vec(),
+        ))
+        .expect("queue candidate commit");
+    sender
+        .send(crate::raw_input::RawInputEvent::CandidateClearLine)
+        .expect("queue candidate clear");
+
+    drain_raw_input_events(
+        &receiver,
+        &mut parser,
+        &mut output,
+        "prompt> ",
+        &mut echoed,
+        &mut prompt_replay,
+        &prompt_presentation,
+    )
+    .expect("draw isolated candidate states");
+
+    assert_eq!(
+        String::from_utf8(output).expect("utf8 output"),
+        "\r\x1b[2K◇ prompt> 你好\r\x1b[2K◇ prompt> 你好\n\r\x1b[2K◇ prompt> "
+    );
+}
+
 // A wrapped hint tail would land below the erase-to-EOL reach of the next
 // redraw/commit, so the hint write must keep auto-wrap disabled in both
 // the native and the prompt-owned branches.
@@ -384,6 +501,123 @@ fn candidate_hint_disables_autowrap_in_both_branches() {
             "hint must render inside the no-wrap window: {rendered:?}"
         );
     }
+}
+
+// A prompt ghost can be longer than the remaining terminal row. Its clear
+// restores the saved prompt cursor and erases that physical line, so a wrapped
+// tail would survive below the next draft as stale screen content.
+#[test]
+fn prompt_ghost_disables_autowrap_before_restoring_the_cursor() {
+    let mut output = Vec::new();
+
+    write_prompt_ghost(
+        &mut output,
+        "Analyze and handle the previous input that did not run successfully",
+        false,
+    )
+    .expect("render prompt ghost");
+
+    let rendered = String::from_utf8(output).expect("utf8 output");
+    let disable = rendered.find("\x1b[?7l").expect("auto-wrap disabled");
+    let ghost = rendered.find("Analyze and handle").expect("ghost rendered");
+    let enable = rendered.find("\x1b[?7h").expect("auto-wrap restored");
+    let restore = rendered.find(RESTORE_CURSOR).expect("cursor restored");
+    assert!(
+        disable < ghost && ghost < enable && enable < restore,
+        "ghost must render inside the no-wrap window: {rendered:?}"
+    );
+}
+
+struct OneShotFailingWriter {
+    output: Vec<u8>,
+    fail_after: usize,
+    failed: bool,
+}
+
+impl Write for OneShotFailingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if !self.failed && self.output.len() >= self.fail_after {
+            self.failed = true;
+            return Err(io::Error::other("injected prompt ghost failure"));
+        }
+        if !self.failed && self.output.len() + bytes.len() > self.fail_after {
+            let accepted = self.fail_after - self.output.len();
+            self.output.extend_from_slice(&bytes[..accepted]);
+            return Ok(accepted);
+        }
+        self.output.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn prompt_ghost_restores_terminal_after_a_recoverable_partial_write() {
+    let fail_after = b"\x1b7\x1b[?7l\x1b[2mAnalyze".len();
+    let mut output = OneShotFailingWriter {
+        output: Vec::new(),
+        fail_after,
+        failed: false,
+    };
+
+    let error = write_prompt_ghost(
+        &mut output,
+        "Analyze and handle the previous input that did not run successfully",
+        false,
+    )
+    .expect_err("body write must preserve the injected error");
+
+    assert_eq!(error.to_string(), "injected prompt ghost failure");
+    assert!(output.failed, "writer must exercise its one-shot failure");
+    assert!(
+        output.output.ends_with(b"\x1b[0m\x1b[?7h\x1b8"),
+        "recoverable error must restore SGR, autowrap, and cursor: {:?}",
+        String::from_utf8_lossy(&output.output)
+    );
+}
+
+#[test]
+fn overlay_does_not_restore_an_unpaired_cursor_after_save_failure() {
+    let mut output = OneShotFailingWriter {
+        output: Vec::new(),
+        fail_after: 0,
+        failed: false,
+    };
+
+    let error = write_no_wrap_overlay(&mut output, |output| output.write_all(b"body"))
+        .expect_err("cursor save must preserve the injected error");
+
+    assert_eq!(error.to_string(), "injected prompt ghost failure");
+    assert_eq!(output.output, b"\x1b[0m\x1b[?7h");
+    assert!(
+        !output.output.windows(2).any(|bytes| bytes == b"\x1b8"),
+        "a failed DECSC must not consume an older cursor save"
+    );
+}
+
+#[test]
+fn overlay_returns_first_cleanup_error_after_restoring_later_state() {
+    let body = b"\x1b[2m cleanup";
+    let fail_after = SAVE_CURSOR.len() + b"\x1b[?7l".len() + body.len();
+    let mut output = OneShotFailingWriter {
+        output: Vec::new(),
+        fail_after,
+        failed: false,
+    };
+
+    let error = write_no_wrap_overlay(&mut output, |output| output.write_all(body))
+        .expect_err("first cleanup write must preserve the injected error");
+
+    assert_eq!(error.to_string(), "injected prompt ghost failure");
+    assert!(output.failed, "writer must exercise its cleanup failure");
+    assert!(
+        output.output.ends_with(b"\x1b[?7h\x1b8"),
+        "later cleanup must restore autowrap and cursor: {:?}",
+        String::from_utf8_lossy(&output.output)
+    );
 }
 
 #[test]
@@ -746,7 +980,7 @@ fn prompt_fragment_after_restore_keeps_ghost_last_on_screen() {
     .expect("write prompt fragment");
 
     assert!(
-        output.ends_with(b"\x1b7\x1b[2m objdump\x1b[0m\x1b8"),
+        output.ends_with(b"\x1b7\x1b[?7l\x1b[2m objdump\x1b[0m\x1b[?7h\x1b8"),
         "{}",
         String::from_utf8_lossy(&output)
     );

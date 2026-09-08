@@ -16,9 +16,10 @@ from agentscope.memory import InMemoryMemory
 from agentscope.message import Msg, TextBlock, ToolResultBlock, ToolUseBlock
 from agentscope.model import ChatModelBase, ChatResponse
 from agentscope.tool import ToolResponse
-from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig
+from anolisa_tokenless import ContentOrigin
+from tokenless_agentscope import TokenlessAgentScope, TokenlessConfig, ToolContract
 
-_RECOVERY_PAYLOAD = "RECOVERY_SENTINEL=世界\n" + ("内容" * 3_000) + "TRAILING_NEWLINE\n"
+_RECOVERY_PAYLOAD = "RECOVERY_SENTINEL=世界\n" + ("内容" * 525_000) + "TRAILING_NEWLINE\n"
 _SCHEMA_DESCRIPTION = "SCHEMA_SENTINEL " + ("details " * 200)
 _SHELL_COMMANDS: list[str] = []
 
@@ -29,8 +30,7 @@ class CaptureFormatter(FormatterBase):
     async def format(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         del args
         return [
-            {"role": message.role, "content": str(message.content)}
-            for message in kwargs["msgs"]
+            {"role": message.role, "content": str(message.content)} for message in kwargs["msgs"]
         ]
 
 
@@ -73,15 +73,12 @@ async def main() -> None:
     """Run one real AgentScope 1.x postprocessor and retrieval cycle."""
     version = tuple(int(part) for part in agentscope.__version__.split(".")[:3])
     assert (1, 0, 11) <= version < (1, 1, 0)
-    with tempfile.TemporaryDirectory(
-        prefix="tokenless-agentscope-v1-smoke-"
-    ) as directory:
+    with tempfile.TemporaryDirectory(prefix="tokenless-agentscope-v1-smoke-") as directory:
         integration = TokenlessAgentScope(
             TokenlessConfig(
-                mode="aggressive",
                 data_dir=Path(directory),
-                min_chars=0,
             ),
+            tool_contracts={"large_result": ToolContract(ContentOrigin.API_RESPONSE)},
         )
         toolkit = integration.create_toolkit()
         for options in ({}, {"namesake_strategy": "override"}):
@@ -123,10 +120,11 @@ async def main() -> None:
         await agent._reasoning()
         serialized_tools = json.dumps(model.tools, ensure_ascii=False)
         assert _SCHEMA_DESCRIPTION not in serialized_tools, serialized_tools
-        assert re.search(r"<<tokenless:[0-9a-f]{24}>>", serialized_tools)
-        assert any(
-            tool["function"]["name"] == "tokenless_retrieve" for tool in model.tools
+        assert re.search(
+            r"If needed, call tool tokenless_retrieve with hash_or_marker=[0-9a-f]{24}",
+            serialized_tools,
         )
+        assert any(tool["function"]["name"] == "tokenless_retrieve" for tool in model.tools)
 
         _SHELL_COMMANDS.clear()
         await agent._acting(
@@ -139,8 +137,10 @@ async def main() -> None:
         )
         assert len(_SHELL_COMMANDS) == 1
         assert str(integration.sdk._rtk_path) in _SHELL_COMMANDS[0]
+        assert "TOKENLESS_AGENT_ID=smoke" in _SHELL_COMMANDS[0]
         assert "TOKENLESS_SESSION_ID=smoke-session" in _SHELL_COMMANDS[0]
         assert "TOKENLESS_TOOL_USE_ID=call-shell" in _SHELL_COMMANDS[0]
+        assert f"TOKENLESS_DATA_DIR={directory}" in _SHELL_COMMANDS[0]
 
         tool_call = ToolUseBlock(
             type="tool_use",
@@ -148,13 +148,14 @@ async def main() -> None:
             name="large_result",
             input={},
         )
-        responses = [
-            chunk async for chunk in await toolkit.call_tool_function(tool_call)
-        ]
+        responses = [chunk async for chunk in await toolkit.call_tool_function(tool_call)]
         assert len(responses) == 1
         response = responses[0]
         assert "TRAILING_NEWLINE" not in response.content[0]["text"]
-        marker = re.search(r"<<tokenless:([0-9a-f]{24})>>", response.content[0]["text"])
+        marker = re.search(
+            r"If needed, call tool tokenless_retrieve with hash_or_marker=([0-9a-f]{24})",
+            response.content[0]["text"],
+        )
         assert marker is not None
 
         await memory.add(
@@ -177,11 +178,9 @@ async def main() -> None:
             type="tool_use",
             id="call-retrieve",
             name="tokenless_retrieve",
-            input={"hash": marker.group(1).upper()},
+            input={"hash_or_marker": marker.group(1).upper()},
         )
-        retrieved = [
-            chunk async for chunk in await toolkit.call_tool_function(retrieve_call)
-        ]
+        retrieved = [chunk async for chunk in await toolkit.call_tool_function(retrieve_call)]
         assert len(retrieved) == 1
         assert retrieved[0].content[0]["text"] == _RECOVERY_PAYLOAD
 

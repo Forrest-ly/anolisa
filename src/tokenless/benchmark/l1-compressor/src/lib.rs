@@ -39,7 +39,7 @@ use serde_json::{Map, Value, json};
 use std::sync::OnceLock;
 use tokenless_ccr::StashStore;
 use tokenless_compressors::{
-    JsonCompressionConfig, JsonCompressionContext, JsonCompressor, JsonOutcome,
+    JsonCompressionConfig, JsonCompressionContext, JsonCompressor, JsonOutcome, RecoveryMethod,
 };
 
 /// Runs the default JSON compressor and parses its JSON representation.
@@ -48,6 +48,11 @@ pub fn compress_json(value: &Value) -> Value {
 }
 
 /// Runs the JSON compressor with explicit limits and an optional Stash store.
+///
+/// [`RecoveryMethod::Shell`] matches the default CLI recovery entry point so
+/// Stash-backed tests exercise its instruction format and truncation budget.
+/// Without a Stash (including the current latency benches), the recovery method
+/// does not affect output or compression metrics.
 pub fn compress_json_with(
     value: &Value,
     config: JsonCompressionConfig,
@@ -58,10 +63,12 @@ pub fn compress_json_with(
         .compress(
             &input,
             &JsonCompressionContext {
+                recovery: &RecoveryMethod::Shell,
                 stash,
                 allow_toon: false,
                 preserve_top_level_shape: false,
                 min_toon_chars: usize::MAX,
+                allow_unrecoverable: true,
             },
         )
         .expect("serialized JSON value parses");
@@ -77,6 +84,7 @@ pub fn compress_json_with(
 // fixture; a failure here means the fixture file was hand-edited into invalid
 // JSON, which should surface loudly.
 const RECORDS_JSON: &str = include_str!("../fixtures/records.json");
+const RECORD_REDUCTION_JSON: &str = include_str!("../fixtures/record_reduction.json");
 const TOOL_RESPONSE_JSON: &str = include_str!("../fixtures/tool_response.json");
 const SCHEMA_SEARCH_JSON: &str = include_str!("../fixtures/schema_search.json");
 
@@ -249,6 +257,12 @@ pub fn response_items(n: usize) -> Value {
     Value::Array(records().iter().take(n).cloned().collect())
 }
 
+/// Focused record collection with a critical anomaly at index 31.
+pub fn response_record_reduction() -> Value {
+    serde_json::from_str(RECORD_REDUCTION_JSON)
+        .expect("fixtures/record_reduction.json is valid JSON")
+}
+
 /// A ~1MB response — the canonical records cycled to fill approximately one
 /// megabyte of serialized JSON. The 1000-record fixture (~326KB) is repeated
 /// ~3.2× to reach the target size.
@@ -262,8 +276,8 @@ pub fn response_huge() -> Value {
 /// The canonical tool response (`fixtures/tool_response.json`): a synthetic
 /// compression-friendly fixture (an envelope wrapping 60 records plus
 /// trace/log noise). Designed to exercise field deletion (debug/trace/logs)
-/// and array 32-item truncation — does NOT represent typical tool-response
-/// compression rates.
+/// without changing its record count — does NOT represent typical
+/// tool-response compression rates.
 ///
 /// Measured for BOTH latency (here) and compression rate (Rust in-process),
 /// so the two numbers describe the same bytes.

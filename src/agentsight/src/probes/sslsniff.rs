@@ -5,18 +5,19 @@
 // Exposes a `SslSniff` struct with a builder-style API.
 
 use crate::config;
+use crate::utils::procfs::{proc_pid_entry, proc_pid_rooted};
 use anyhow::{Context, Result};
 use libbpf_rs::{
     Link, RingBufferBuilder, UprobeOpts,
     skel::{OpenSkel, SkelBuilder},
 };
-use procfs::process::Process;
 
-use super::pidns::observer_in_init_pidns;
+use super::pidns::proc_root_is_init_pidns;
 use super::shared_maps::{MapKind, SharedMaps};
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::Read,
     mem::{self, MaybeUninit},
     path::Path,
     slice,
@@ -168,7 +169,9 @@ impl SslEvent {
 
         Some(Self {
             source: u32_at(mem::offset_of!(R, source)),
-            timestamp_ns: config::ktime_to_unix_ns(u64_at(mem::offset_of!(R, timestamp_ns))),
+            timestamp_ns: config::ktime_to_unix_ns(u64_at(mem::offset_of!(R, timestamp_ns)))
+                .inspect_err(|error| config::report_clock_error("sslsniff", error))
+                .ok()?,
             delta_ns: u64_at(mem::offset_of!(R, delta_ns)),
             pid: u32_at(mem::offset_of!(R, pid)),
             tid: u32_at(mem::offset_of!(R, tid)),
@@ -312,7 +315,7 @@ impl SslSniff {
         let mut open_skel = builder.open().context("failed to open BPF object")?;
 
         // Tell BPF which namespace to report event pids in.
-        open_skel.rodata_mut().observer_pidns_is_init = observer_in_init_pidns();
+        open_skel.rodata_mut().observer_pidns_is_init = proc_root_is_init_pidns();
 
         // Reuse shared maps when running under the unified manager.
         if let Some(shared) = shared {
@@ -346,8 +349,9 @@ impl SslSniff {
     /// Attach SSL probes to a running process by reading its `/proc/<pid>/maps`.
     ///
     /// Detects which SSL libraries the process has mapped (OpenSSL, GnuTLS, NSS,
-    /// or statically-linked SSL — BoringSSL/OpenSSL), attaches uprobes, and skips any
-    /// library whose inode has already been traced (dedup via `traced_files`) —
+    /// statically-linked SSL — BoringSSL/OpenSSL — or rustls), attaches uprobes,
+    /// and skips any library whose inode has already been traced (dedup via
+    /// `traced_files`) —
     /// unless that attachment is stale (older than the re-attach TTL), in
     /// which case the probes are re-attached and the old links are dropped
     /// only after the replacement succeeds.
@@ -454,6 +458,15 @@ impl SslSniff {
         self.stale_reattachs
     }
 
+    /// How many rustls gather writes (`OutboundChunks::Multiple`) were observed
+    /// and skipped because chunk reassembly is not implemented yet.
+    ///
+    /// A non-zero value means part of the request side of a rustls process was
+    /// not captured, so this is a coverage gap indicator rather than an error.
+    pub fn rustls_gather_skips(&self) -> u64 {
+        self.skel.bss().rustls_gather_skips
+    }
+
     /// Record a successful attach for `inode`, replacing any prior entry
     /// (whose links are dropped, detaching the old probes).
     fn record_attach(&mut self, inode: u64, links: Vec<Link>) {
@@ -478,49 +491,74 @@ impl SslSniff {
             SslLibKind::OpenSsl => attach_openssl(&mut self.skel, path, -1),
             SslLibKind::GnuTls => attach_gnutls(&mut self.skel, path, -1),
             SslLibKind::Nss => attach_nss(&mut self.skel, path, -1),
+            SslLibKind::Rustls => match find_rustls_offsets(path) {
+                Some(off) => {
+                    log::info!(
+                        "[attach_process] pid={pid}: rustls plaintext probes on {path} \
+                         (write={:x?}, read={:x?})",
+                        off.write,
+                        off.read
+                    );
+                    attach_rustls(&mut self.skel, path, &off, -1)
+                }
+                None => {
+                    log::warn!(
+                        "[attach_process] pid={pid}: rustls detection failed for {path} \
+                         (neither plaintext prologue matched -- rustls or the toolchain likely moved), skipping"
+                    );
+                    return AttachOutcome::Untraceable;
+                }
+            },
             SslLibKind::Static => {
                 match attach_static_ssl_by_symbol(&mut self.skel, path, -1) {
                     Ok(ls) => Ok(ls),
                     Err(sym_err) => {
                         log::debug!(
-                            "[attach_process] pid={pid}: Static SSL symbol attach failed for {path} ({sym_err:#}), falling back to byte-pattern"
+                            "[attach_process] pid={pid}: Static SSL symbol attach failed for {path} ({sym_err:#}), falling back to the offset table"
                         );
+                        // Consult the offset table before the byte-pattern scan.
+                        // A lookup costs a stat() plus, only when the size already
+                        // matches a known build, a 64 KiB head read; the scan reads
+                        // the whole binary. Probing in the opposite order charged
+                        // every unsupported agent binary its own size in resident
+                        // memory before the table could answer, which exhausted the
+                        // service memory cap during startup attach on hosts running
+                        // several large harnesses (#2981).
+                        if let Some(off) = CODEX_OFFSET_TABLE
+                            .as_ref()
+                            .and_then(|table| table.lookup(path))
+                        {
+                            log::info!(
+                                "[attach_process] pid={pid}: codex offset table matched for {path} \
+                                 (write=0x{:x}, read=0x{:x}, handshake=0x{:x})",
+                                off.ssl_write,
+                                off.ssl_read,
+                                off.ssl_do_handshake
+                            );
+                            return match attach_static_ssl_by_offset(
+                                &mut self.skel,
+                                path,
+                                &off,
+                                true,
+                                -1,
+                            ) {
+                                Ok(links) => AttachOutcome::Attached(links),
+                                Err(e) => {
+                                    log::warn!(
+                                        "[attach_process] pid={pid}: attach failed for {path}: {e:#}"
+                                    );
+                                    AttachOutcome::Failed
+                                }
+                            };
+                        }
                         match find_static_ssl_offsets(path) {
                             Some(off) => {
                                 attach_static_ssl_by_offset(&mut self.skel, path, &off, false, -1)
                             }
                             None => {
-                                // Tier 3: codex offset table lookup (for static-pie binaries
-                                // like Codex CLI that statically link OpenSSL/BoringSSL without symbols)
-                                if let Some(ref table) = *CODEX_OFFSET_TABLE {
-                                    if let Some(off) = table.lookup(path) {
-                                        log::info!(
-                                            "[attach_process] pid={pid}: codex offset table matched for {path} \
-                                         (write=0x{:x}, read=0x{:x}, handshake=0x{:x})",
-                                            off.ssl_write,
-                                            off.ssl_read,
-                                            off.ssl_do_handshake
-                                        );
-                                        return match attach_static_ssl_by_offset(
-                                            &mut self.skel,
-                                            path,
-                                            &off,
-                                            true,
-                                            -1,
-                                        ) {
-                                            Ok(links) => AttachOutcome::Attached(links),
-                                            Err(e) => {
-                                                log::warn!(
-                                                    "[attach_process] pid={pid}: attach failed for {path}: {e:#}"
-                                                );
-                                                AttachOutcome::Failed
-                                            }
-                                        };
-                                    }
-                                }
                                 log::warn!(
                                     "[attach_process] pid={pid}: SSL detection failed for {path} \
-                                 (no SSL_* in .dynsym, no byte-pattern match, and not in codex offset table), skipping"
+                                 (no SSL_* in .dynsym, not in the codex offset table, and no byte-pattern match), skipping"
                                 );
                                 return AttachOutcome::Untraceable;
                             }
@@ -582,6 +620,7 @@ impl SslSniff {
     /// Returns a [`SslPoller`] handle.  Drop it (or call [`SslPoller::stop`])
     /// to signal the poll thread to exit.
     pub fn run(&self) -> Result<SslPoller> {
+        config::initialize_event_clock().context("failed to initialize event clock")?;
         let tx = self.tx.clone();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_inner = Arc::clone(&stop_flag);
@@ -687,29 +726,103 @@ pub(super) struct StaticSslOffsets {
     pub read_is_ex: bool,
 }
 
-fn find_pattern(haystack: &[u8], pattern: &[u8]) -> Option<usize> {
-    if pattern.is_empty() || pattern.len() > haystack.len() {
-        return None;
-    }
-    haystack.windows(pattern.len()).position(|w| w == pattern)
-}
-
-/// Find all occurrences of `pattern` in `haystack`.
-fn find_all_patterns(haystack: &[u8], pattern: &[u8]) -> Vec<usize> {
-    if pattern.is_empty() || pattern.len() > haystack.len() {
-        return Vec::new();
-    }
-    let mut results = Vec::new();
-    let mut pos = 0;
-    while pos + pattern.len() <= haystack.len() {
-        if let Some(off) = find_pattern(&haystack[pos..], pattern) {
-            results.push(pos + off);
-            pos += off + 1;
-        } else {
-            break;
+/// Appends the absolute offset of every pattern match starting in `window`
+/// below `limit`, one vector per entry of `patterns`, in ascending order.
+///
+/// Walks the window once and tests every pattern at each position, rather than
+/// walking it once per pattern. The signatures are all function prologues that
+/// share a leading byte run, so each comparison rejects a position on its first
+/// byte and the extra signatures cost close to nothing. Walking per pattern
+/// instead means a binary matching none of them is scanned once for every
+/// signature before it can be rejected, on the synchronous attach path.
+fn collect_pattern_hits(
+    window: &[u8],
+    patterns: &[&[u8]],
+    base: usize,
+    limit: usize,
+    hits: &mut [Vec<usize>],
+) {
+    for pos in 0..limit.min(window.len()) {
+        let tail = &window[pos..];
+        for (slot, pattern) in hits.iter_mut().zip(patterns) {
+            if tail.len() >= pattern.len() && &tail[..pattern.len()] == *pattern {
+                slot.push(base + pos);
+            }
         }
     }
-    results
+}
+
+/// Bytes read per window by [`scan_file_patterns`].
+///
+/// Caps the scan's peak memory. Agent binaries reach hundreds of megabytes (a
+/// Codex build is ~264 MiB, node ~120 MiB), more than the whole budget the
+/// service runs under, so the image must never be held in one piece (#2981).
+const SCAN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Absolute offsets of every occurrence of each pattern in the file at `path`.
+///
+/// Returns one vector per entry of `patterns`, in the same order and each
+/// ascending. The file is streamed in [`SCAN_CHUNK_BYTES`] windows overlapping
+/// by `max_pattern_len - 1` bytes, so a match straddling a window boundary is
+/// still reported, and reported only once.
+///
+/// # Errors
+///
+/// Returns `None` when `patterns` is empty, or the file cannot be opened or read.
+fn scan_file_patterns(path: &str, patterns: &[&[u8]]) -> Option<Vec<Vec<usize>>> {
+    let overlap = patterns.iter().map(|p| p.len()).max()?.checked_sub(1)?;
+    let mut file = fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; overlap + SCAN_CHUNK_BYTES];
+    let mut hits = vec![Vec::new(); patterns.len()];
+    // Absolute offset that `buf[0]` maps to, and how many leading bytes of `buf`
+    // are the previous window's carried-over tail.
+    let mut base = 0usize;
+    let mut carry = 0usize;
+    loop {
+        let read = fill_buf(&mut file, &mut buf[carry..])?;
+        let filled = carry + read;
+        if filled == 0 {
+            break;
+        }
+        // A match beginning inside the trailing `overlap` bytes may run past this
+        // window, so defer it to the next round; on the final window nothing is
+        // left to wait for, so every start counts.
+        let last = filled < buf.len();
+        let start_limit = if last { filled } else { filled - overlap };
+        collect_pattern_hits(&buf[..filled], patterns, base, start_limit, &mut hits);
+        if last {
+            break;
+        }
+        buf.copy_within(filled - overlap..filled, 0);
+        base += filled - overlap;
+        carry = overlap;
+    }
+    Some(hits)
+}
+
+/// Reads until `dst` is full or the file ends, returning the byte count.
+///
+/// `Read::read` is free to return short of the request before EOF, and a short
+/// window would split a pattern that is actually present, so the fill has to be
+/// driven to completion rather than trusted to one call.
+///
+/// # Errors
+///
+/// Returns `None` on any I/O error other than an interrupted call.
+fn fill_buf(file: &mut fs::File, mut dst: &mut [u8]) -> Option<usize> {
+    let mut total = 0;
+    while !dst.is_empty() {
+        match file.read(dst) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                dst = &mut dst[n..];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(total)
 }
 
 fn find_static_ssl_offsets(path: &str) -> Option<StaticSslOffsets> {
@@ -742,10 +855,19 @@ fn find_static_ssl_offsets(path: &str) -> Option<StaticSslOffsets> {
     const ADJACENCY_THRESHOLD: usize = 0x1000; // 4KB
     let verbose = config::verbose();
 
-    let data = fs::read(path).ok()?;
+    // One streaming pass collects every pattern at once: the file is read in
+    // bounded windows, so a hundreds-of-megabytes binary costs a few MiB here
+    // instead of its own size.
+    let mut patterns: Vec<&[u8]> = vec![READ_PAT, WRITE_PAT];
+    patterns.extend_from_slice(HANDSHAKE_PATS);
+    let mut hits = scan_file_patterns(path, &patterns)?;
+    // Drain the fixed slots high-index-first so the remaining vectors are
+    // exactly the handshake variants.
+    let write_matches = hits.remove(1);
+    let read_matches = hits.remove(0);
+    let handshake_hits = hits;
 
     // --- SSL_read: expect unique match ---
-    let read_matches = find_all_patterns(&data, READ_PAT);
     if read_matches.is_empty() {
         if verbose {
             eprintln!("Static SSL: SSL_read pattern not found in {path}");
@@ -765,10 +887,7 @@ fn find_static_ssl_offsets(path: &str) -> Option<StaticSslOffsets> {
     };
 
     // --- SSL_do_handshake: collect matches across all known variants ---
-    let mut hs_matches: Vec<usize> = HANDSHAKE_PATS
-        .iter()
-        .flat_map(|pat| find_all_patterns(&data, pat))
-        .collect();
+    let mut hs_matches: Vec<usize> = handshake_hits.into_iter().flatten().collect();
     if hs_matches.is_empty() {
         if verbose {
             eprintln!("Static SSL: SSL_do_handshake pattern not found in {path}");
@@ -797,7 +916,6 @@ fn find_static_ssl_offsets(path: &str) -> Option<StaticSslOffsets> {
     };
 
     // --- SSL_write: adjacency verification ---
-    let write_matches = find_all_patterns(&data, WRITE_PAT);
     if write_matches.is_empty() {
         if verbose {
             eprintln!("Static SSL: SSL_write pattern not found in {path}");
@@ -836,6 +954,93 @@ fn find_static_ssl_offsets(path: &str) -> Option<StaticSslOffsets> {
     })
 }
 
+/// Offsets of rustls' two plaintext chokepoints inside a stripped binary.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RustlsOffsets {
+    /// `CommonState::buffer_plaintext` — outbound application data.
+    write: Option<usize>,
+    /// `CommonState::take_received_plaintext` — inbound application data.
+    read: Option<usize>,
+}
+
+impl RustlsOffsets {
+    /// Whether anything worth attaching was found.
+    ///
+    /// One direction alone is still attached, but it degrades HTTP/2: the
+    /// aggregator pairs a request with its response inside one connection, so a
+    /// half-captured connection never completes. `attach_rustls` warns about it.
+    fn is_usable(&self) -> bool {
+        self.write.is_some() || self.read.is_some()
+    }
+}
+
+/// Locate rustls' plaintext chokepoints in `path` by function-prologue matching.
+///
+/// `CommonState::buffer_plaintext` and `CommonState::take_received_plaintext` are
+/// the narrowest pair of functions that (a) survive cosh-ng's `lto = true` build
+/// and (b) share one `&mut CommonState`, which is what keeps both directions of a
+/// connection under a single `ssl_ptr`. The obvious `Writer::write` /
+/// `Reader::read` plaintext API is inlined away and leaves no symbol, and release
+/// binaries are fully stripped, so a prologue scan is the only handle left.
+///
+/// Each pattern is the first 24 bytes of the function: the callee-saved register
+/// block, the frame setup, and the argument shuffle. The length is not arbitrary
+/// — the register-save prefix these functions share also matches dozens of
+/// unrelated Rust functions (40 hits for one of them in a real binary), while 24
+/// bytes was verified to match exactly once. A pattern hitting more than once is
+/// discarded rather than guessed at, because attaching a uprobe to the wrong
+/// function would sample unrelated memory.
+///
+/// Because these bytes encode rustc's register allocation and frame sizes, they
+/// are tied to a given rustls + toolchain combination and must be re-verified
+/// when either moves. A miss is safe: the caller reports the binary as
+/// untraceable, which is exactly the behaviour before rustls was supported.
+fn find_rustls_offsets(path: &str) -> Option<RustlsOffsets> {
+    /// `CommonState::buffer_plaintext`: push block, `sub $0x78,%rsp`, then
+    /// `mov %rdx,%r15; mov %rsi,%r14; mov 0x308(%rdi),%rbp` — the tail also
+    /// pins rdi as the `&mut CommonState` this probe reports as the connection.
+    const WRITE_PAT: &[u8] = &[
+        0x55, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x78, 0x49,
+        0x89, 0xd7, 0x49, 0x89, 0xf6, 0x48, 0x8b, 0xaf, 0x08,
+    ];
+    /// `CommonState::take_received_plaintext`: push block, `mov %rdi,%r14`, the
+    /// inlined `temper_counters.received_app_data()` store `movb $0x20,0x32e(%rdi)`,
+    /// then `mov (%rsi),%r12` loading the first eightbyte of the `Payload`.
+    const READ_PAT: &[u8] = &[
+        0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x50, 0x49, 0x89, 0xfe, 0xc6, 0x87, 0x2e, 0x03,
+        0x00, 0x00, 0x20, 0x4c, 0x8b, 0x26, 0x48, 0x8b, 0x5e,
+    ];
+
+    let mut hits = scan_file_patterns(path, &[WRITE_PAT, READ_PAT])?;
+    // scan_file_patterns returns one Vec<usize> per pattern, in order.
+    let read_hits = hits.pop().unwrap_or_default();
+    let write_hits = hits.pop().unwrap_or_default();
+    let mut found = RustlsOffsets::default();
+
+    for (label, offsets, is_write) in [
+        ("CommonState::buffer_plaintext", &write_hits, true),
+        ("CommonState::take_received_plaintext", &read_hits, false),
+    ] {
+        match offsets.len() {
+            0 => log::debug!("rustls: {label} pattern not found in {path}"),
+            1 => {
+                log::debug!("rustls: {label} at {:#x} in {path}", offsets[0]);
+                if is_write {
+                    found.write = Some(offsets[0]);
+                } else {
+                    found.read = Some(offsets[0]);
+                }
+            }
+            n => log::debug!("rustls: {label} pattern has {n} matches in {path}, skipping"),
+        }
+    }
+
+    if !found.is_usable() {
+        return None;
+    }
+    Some(found)
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// SSL library kind detected from `/proc/<pid>/maps`.
@@ -849,6 +1054,10 @@ enum SslLibKind {
     Nss,
     /// Statically-linked SSL (BoringSSL or OpenSSL, e.g. Node.js, Chrome, Codex CLI)
     Static,
+    /// Statically-linked rustls (pure Rust TLS, e.g. cosh-ng). Distinct from
+    /// `Static` because there is no SSL_* API to hook at all: the probes go on
+    /// rustls' AEAD layer instead, with a different calling convention.
+    Rustls,
 }
 
 /// Classify a mapped file path into an `SslLibKind`, if it is an SSL library.
@@ -887,6 +1096,14 @@ fn classify_ssl_lib(path: &str) -> Option<SslLibKind> {
     if name.starts_with("codex") && !name.contains('.') {
         return Some(SslLibKind::Static);
     }
+    // cosh-ng links rustls, so nothing SSL-shaped appears in its maps at all
+    // and there is no library name to key off -- only the binary itself (#3042).
+    if matches!(
+        name.as_ref(),
+        "cosh-core" | "cosh-shell" | "cosh-cli" | "cosh-gateway"
+    ) {
+        return Some(SslLibKind::Rustls);
+    }
     // uv Python statically links OpenSSL into the binary. The ELF .symtab contains
     // SSL_write/SSL_read/SSL_do_handshake as LOCAL symbols, so attach_openssl()
     // (symbol-name uprobe) works directly. Only match python3.<ver> (with version
@@ -897,57 +1114,86 @@ fn classify_ssl_lib(path: &str) -> Option<SslLibKind> {
     None
 }
 
-/// Parse `/proc/<pid>/maps` via `procfs` and return `(absolute_path, inode, SslLibKind)`
+/// Split one `maps` line into `(inode, pathname)`.
+///
+/// The line is `start-end perms offset dev inode pathname`, and the pathname is
+/// taken as the verbatim remainder rather than another whitespace token: it can
+/// contain spaces and carries a literal `" (deleted)"` suffix for unlinked files,
+/// which the caller keys off. Anonymous and pseudo mappings (`[heap]`, `[stack]`)
+/// return an empty pathname and are filtered by the caller.
+fn parse_maps_line(line: &str) -> Option<(u64, &str)> {
+    let mut rest = line;
+    let mut inode = None;
+    for field in 0..5 {
+        rest = rest.trim_start();
+        match rest.find(char::is_whitespace) {
+            Some(end) => {
+                if field == 4 {
+                    inode = rest[..end].parse::<u64>().ok();
+                }
+                rest = &rest[end..];
+            }
+            // Anonymous mappings end at the inode with neither a pathname nor
+            // trailing whitespace; surface them with an empty path instead of
+            // dropping the line.
+            None if field == 4 => return Some((rest.parse::<u64>().ok()?, "")),
+            None => return None,
+        }
+    }
+    Some((inode?, rest.trim_start()))
+}
+
+/// Parse `<procfs root>/<pid>/maps` and return `(attach_path, inode, SslLibKind)`
 /// for every SSL-related library found.
 ///
-/// Each unique inode is returned at most once.
+/// Each unique inode is returned at most once. Parsed by hand rather than via the
+/// `procfs` crate so the read honours the configured procfs root -- that crate
+/// hardcodes `/proc`, which an observer reading a bind-mounted host procfs cannot
+/// use.
 fn ssl_libs_from_maps(pid: i32) -> Result<Vec<(String, u64, SslLibKind)>> {
-    let proc = Process::new(pid).with_context(|| format!("failed to open /proc/{pid}"))?;
-    let maps = proc
-        .maps()
-        .with_context(|| format!("failed to read /proc/{pid}/maps"))?;
+    let maps_path = proc_pid_entry(pid, "maps");
+    let maps = fs::read_to_string(&maps_path)
+        .with_context(|| format!("failed to read {}", maps_path.display()))?;
 
     let mut seen_inodes: HashSet<u64> = HashSet::new();
     let mut results: Vec<(String, u64, SslLibKind)> = Vec::new();
 
-    for entry in maps.iter() {
-        // Only care about file-backed mappings.
-        let path_str = match &entry.pathname {
-            procfs::process::MMapPath::Path(p) => p.to_string_lossy().into_owned(),
-            _ => continue,
+    for line in maps.lines() {
+        let Some((inode, path_str)) = parse_maps_line(line) else {
+            continue;
         };
-        // inode comes from the memory map entry's inode field.
-        let inode = entry.inode;
-        if inode == 0 || seen_inodes.contains(&inode) {
+        // Only care about file-backed mappings.
+        if inode == 0 || !path_str.starts_with('/') || seen_inodes.contains(&inode) {
             continue;
         }
-        if let Some(kind) = classify_ssl_lib(&path_str) {
+        if let Some(kind) = classify_ssl_lib(path_str) {
             seen_inodes.insert(inode);
             // When the backing file has been unlinked (" (deleted)" in maps),
-            // the filesystem path no longer exists.  Fall back to /proc/<pid>/exe
+            // the filesystem path no longer exists.  Fall back to <pid>/exe
             // which the kernel keeps accessible as long as the process is alive.
             //
-            // For normal paths we prefix with `/proc/<pid>/root` so that the
-            // uprobe target resolves through the process's own mount namespace.
+            // For normal paths we prefix with `<pid>/root` so that the uprobe
+            // target resolves through the process's own mount namespace.
             // This is intentional: `canonicalize()` would resolve overlayfs
             // paths to the host's lower/upper dirs, which libbpf cannot always
             // map back to an inode for uprobe attachment.  The kernel's uprobe
-            // mechanism natively understands `/proc/<pid>/root/<path>` because
-            // it follows the process's mount namespace, making this safe for
-            // both host and container processes.
-            let path_str = if path_str.ends_with(" (deleted)") {
-                format!("/proc/{pid}/exe")
-            } else if matches!(kind, SslLibKind::Static) {
-                // Statically-linked SSL binary (codex, node, etc).
-                // /proc/<pid>/exe is a kernel-maintained symlink that stays
-                // valid even when the backing file has been replaced or
-                // unlinked, which is common for npm-installed binaries that
-                // get updated while old processes are still running.
-                format!("/proc/{pid}/exe")
+            // mechanism natively understands `<pid>/root/<path>` because it
+            // follows the process's mount namespace, making this safe for both
+            // host and container processes -- and it keeps working when the
+            // `<pid>` entry itself comes from a bind-mounted host procfs.
+            let attach_path = if path_str.ends_with(" (deleted)") {
+                proc_pid_entry(pid, "exe")
+            } else if matches!(kind, SslLibKind::Static | SslLibKind::Rustls) {
+                // Statically-linked SSL binary (codex, node, cosh-core, etc).
+                // <pid>/exe is a kernel-maintained symlink that stays valid
+                // even when the backing file has been replaced or unlinked,
+                // which is common for npm-installed binaries that get updated
+                // while old processes are still running.
+                proc_pid_entry(pid, "exe")
             } else {
-                format!("/proc/{pid}/root{path_str}")
+                proc_pid_rooted(pid, path_str)
             };
-            results.push((path_str, inode, kind));
+            results.push((attach_path.to_string_lossy().into_owned(), inode, kind));
         }
     }
 
@@ -1199,6 +1445,48 @@ fn attach_static_ssl_by_offset(
             pid,
             lib,
             off.ssl_do_handshake
+        )?);
+    }
+    Ok(links)
+}
+
+/// Attach the rustls plaintext probes at the offsets found by
+/// `find_rustls_offsets`.
+///
+/// Both probes fire at function entry, where the plaintext is an argument, so
+/// neither direction needs a uretprobe. There is no handshake probe either:
+/// these hooks sit above the record layer and only ever see application data,
+/// so a rustls process reports no handshake timings.
+fn attach_rustls(
+    skel: &mut SslsniffSkel<'_>,
+    lib: &str,
+    off: &RustlsOffsets,
+    pid: i32,
+) -> Result<Vec<Link>> {
+    // A one-sided attach still yields data, but HTTP/2 request/response
+    // correlation needs both halves of the connection, so say so loudly.
+    if off.write.is_none() || off.read.is_none() {
+        log::warn!(
+            "rustls: only the {} direction was located in {lib}; HTTP/2 streams will not complete",
+            if off.write.is_some() { "write" } else { "read" }
+        );
+    }
+
+    let mut links = Vec::new();
+    if let Some(w) = off.write {
+        links.push(up_off!(
+            skel.progs_mut().probe_rustls_write_plaintext(),
+            pid,
+            lib,
+            w
+        )?);
+    }
+    if let Some(r) = off.read {
+        links.push(up_off!(
+            skel.progs_mut().probe_rustls_read_plaintext(),
+            pid,
+            lib,
+            r
         )?);
     }
     Ok(links)
@@ -1477,6 +1765,262 @@ mod tests {
         );
         with_static_ssl_fixture("write-far", &img, |path| {
             assert!(find_static_ssl_offsets(path).is_none());
+        });
+    }
+
+    #[test]
+    fn static_ssl_offsets_still_resolves_past_one_scan_window() {
+        // Guards Claude Code: its Bun single-file executable is the case the
+        // byte-pattern path exists for, and it is far larger than one window.
+        // The patterns sit in the final window, so a resolution here proves the
+        // scan neither stops early nor loses the absolute offset.
+        let img = build_static_ssl_image(Some((0x100, HS_BUN_PAT)), Some(0x2000), Some(0x2100));
+        let pad = SCAN_CHUNK_BYTES + 0x3000;
+        let mut padded = vec![0u8; pad];
+        padded.extend_from_slice(&img);
+        with_static_ssl_fixture("past-window", &padded, |path| {
+            let off = find_static_ssl_offsets(path).expect("large image must still resolve");
+            assert_eq!(off.ssl_do_handshake, pad + 0x100);
+            assert_eq!(off.ssl_read, pad + 0x2000);
+            assert_eq!(off.ssl_write, pad + 0x2100);
+        });
+    }
+
+    #[test]
+    fn scan_file_patterns_finds_match_straddling_window_boundary() {
+        // A pattern laid across the window edge is only found if the windows
+        // overlap; without the carry it would be split and silently missed.
+        let start = SCAN_CHUNK_BYTES - READ_PAT_T.len() / 2;
+        let mut img = vec![0u8; SCAN_CHUNK_BYTES + 0x1000];
+        img[start..start + READ_PAT_T.len()].copy_from_slice(READ_PAT_T);
+        with_static_ssl_fixture("straddle", &img, |path| {
+            let hits = scan_file_patterns(path, &[READ_PAT_T]).expect("scan must succeed");
+            assert_eq!(hits[0], vec![start]);
+        });
+    }
+
+    #[test]
+    fn collect_pattern_hits_finds_every_signature_in_one_walk() {
+        // Distinct signatures at distinct positions must all be reported from a
+        // single walk, and a window matching none of them must yield nothing —
+        // the rejection case that used to cost one walk per signature.
+        let mut window = vec![0u8; 0x400];
+        window[0x10..0x10 + READ_PAT_T.len()].copy_from_slice(READ_PAT_T);
+        window[0x200..0x200 + WRITE_PAT_T.len()].copy_from_slice(WRITE_PAT_T);
+        let patterns: [&[u8]; 2] = [READ_PAT_T, WRITE_PAT_T];
+        let mut hits = vec![Vec::new(); patterns.len()];
+        collect_pattern_hits(&window, &patterns, 0x1000, window.len(), &mut hits);
+        assert_eq!(hits[0], vec![0x1000 + 0x10]);
+        assert_eq!(hits[1], vec![0x1000 + 0x200]);
+
+        let mut empty = vec![Vec::new(); patterns.len()];
+        collect_pattern_hits(&vec![0u8; 0x400], &patterns, 0, 0x400, &mut empty);
+        assert!(empty.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn scan_file_patterns_reports_each_match_once() {
+        // Overlapping windows must not double-count a match that lands inside
+        // the carried-over tail.
+        let offsets = [
+            0usize,
+            SCAN_CHUNK_BYTES - READ_PAT_T.len(),
+            SCAN_CHUNK_BYTES,
+            SCAN_CHUNK_BYTES + 0x800,
+        ];
+        let mut img = vec![0u8; SCAN_CHUNK_BYTES * 2];
+        for &off in &offsets {
+            img[off..off + READ_PAT_T.len()].copy_from_slice(READ_PAT_T);
+        }
+        with_static_ssl_fixture("once", &img, |path| {
+            let hits = scan_file_patterns(path, &[READ_PAT_T]).expect("scan must succeed");
+            assert_eq!(hits[0], offsets.to_vec());
+        });
+    }
+
+    // ── parse_maps_line ─────────────────────────────────────────────────────
+    //
+    // Replaces the procfs crate's maps parsing, so it carries the coverage the
+    // crate used to provide. Fixtures match the kernel's show_map_vma output:
+    // five whitespace-separated fields (addr, perms, offset, dev, inode), then
+    // an optional pathname that is the *entire remainder* of the line and may
+    // itself contain spaces.
+
+    #[test]
+    fn maps_line_file_backed_mapping() {
+        let line = "7f2f0a000000-7f2f0a028000 r--p 00000000 fd:01 2621443 \
+                    /usr/lib64/libssl.so.1.1.1k";
+        assert_eq!(
+            parse_maps_line(line),
+            Some((2621443, "/usr/lib64/libssl.so.1.1.1k"))
+        );
+    }
+
+    #[test]
+    fn maps_line_anonymous_mapping_ends_at_inode() {
+        // Anonymous vmas print neither a pathname nor trailing whitespace.
+        let line = "7f2f09e00000-7f2f09e21000 rw-p 00000000 00:00 0";
+        assert_eq!(parse_maps_line(line), Some((0, "")));
+        // Trailing whitespace without a pathname behaves the same.
+        let padded = "7f2f09e00000-7f2f09e21000 rw-p 00000000 00:00 0   ";
+        assert_eq!(parse_maps_line(padded), Some((0, "")));
+    }
+
+    #[test]
+    fn maps_line_deleted_suffix_is_part_of_the_path() {
+        // The suffix belongs to the pathname verbatim; the caller strips it
+        // when choosing the attach target.
+        let line = "7f2f09c00000-7f2f09c28000 r-xp 00028000 fd:01 2621443 \
+                    /usr/lib64/libssl.so.1.1.1k (deleted)";
+        assert_eq!(
+            parse_maps_line(line),
+            Some((2621443, "/usr/lib64/libssl.so.1.1.1k (deleted)"))
+        );
+    }
+
+    #[test]
+    fn maps_line_pseudo_path_survives_untouched() {
+        // [stack]/[heap]-style entries parse with a non-slash path; the caller
+        // filters them out, the parser must not mangle them.
+        let line = "7fffb6c40000-7fffb6c61000 rw-p 00000000 00:00 0   [stack]";
+        assert_eq!(parse_maps_line(line), Some((0, "[stack]")));
+    }
+
+    #[test]
+    fn maps_line_path_with_spaces_kept_whole() {
+        let line = "7f2f09a00000-7f2f09a10000 r--p 00000000 fd:01 1048577 \
+                    /opt/my app (copy)/libssl.so";
+        assert_eq!(
+            parse_maps_line(line),
+            Some((1048577, "/opt/my app (copy)/libssl.so"))
+        );
+    }
+
+    #[test]
+    fn maps_line_malformed_input_yields_none() {
+        // Fewer than five fields.
+        assert_eq!(
+            parse_maps_line("7f2f0a000000-7f2f0a028000 r--p 00000000"),
+            None
+        );
+        // Garbage in the inode field.
+        let bad_inode = "7f2f0a000000-7f2f0a028000 r--p 00000000 fd:01 xx /usr/lib/libssl.so";
+        assert_eq!(parse_maps_line(bad_inode), None);
+        // Not a maps line at all.
+        assert_eq!(parse_maps_line("rubbish"), None);
+        assert_eq!(parse_maps_line(""), None);
+    }
+
+    // ─── rustls detection tests (#3042) ─────────────────────────────────────
+    // Prologue literals mirror the ones inside find_rustls_offsets, for the same
+    // reason as the static-SSL fixtures above: editing a production pattern
+    // without updating these makes detection on the synthetic image fail.
+    const RUSTLS_WRITE_PAT: &[u8] = &[
+        0x55, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x78, 0x49,
+        0x89, 0xd7, 0x49, 0x89, 0xf6, 0x48, 0x8b, 0xaf, 0x08,
+    ];
+    const RUSTLS_READ_PAT: &[u8] = &[
+        0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x50, 0x49, 0x89, 0xfe, 0xc6, 0x87, 0x2e, 0x03,
+        0x00, 0x00, 0x20, 0x4c, 0x8b, 0x26, 0x48, 0x8b, 0x5e,
+    ];
+
+    /// Zero-filled synthetic binary with rustls prologues planted at the given
+    /// file offsets; zeros cannot match a pattern, so matches are unambiguous.
+    fn build_rustls_image(planted: &[(usize, &[u8])]) -> Vec<u8> {
+        let mut img = vec![0u8; 0x5000];
+        for (off, pat) in planted {
+            img[*off..*off + pat.len()].copy_from_slice(pat);
+        }
+        img
+    }
+
+    #[test]
+    fn classify_recognises_cosh_binaries_as_rustls() {
+        for path in [
+            "/usr/libexec/anolisa/cosh-ng/cosh-core",
+            "/usr/libexec/anolisa/cosh-ng/cosh-shell",
+            "/usr/bin/cosh-cli",
+            "/usr/libexec/anolisa/cosh-ng/cosh-gateway",
+        ] {
+            assert_eq!(
+                classify_ssl_lib(path),
+                Some(SslLibKind::Rustls),
+                "{path} must be probed through rustls' plaintext chokepoints"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_keeps_existing_kinds_unchanged() {
+        // Guards against the rustls arm shadowing an established classification.
+        assert_eq!(
+            classify_ssl_lib("/usr/lib64/libssl.so.3"),
+            Some(SslLibKind::OpenSsl)
+        );
+        assert_eq!(
+            classify_ssl_lib("/usr/lib64/libgnutls.so.30"),
+            Some(SslLibKind::GnuTls)
+        );
+        assert_eq!(classify_ssl_lib("/usr/bin/node"), Some(SslLibKind::Static));
+        assert_eq!(classify_ssl_lib("/usr/bin/codex"), Some(SslLibKind::Static));
+        // `/usr/bin/cosh` is a symlink; maps always reports the resolved target,
+        // so the bare name is deliberately NOT matched.
+        assert_eq!(classify_ssl_lib("/usr/bin/cosh"), None);
+        assert_eq!(classify_ssl_lib("/usr/lib64/libc.so.6"), None);
+    }
+
+    #[test]
+    fn rustls_offsets_locates_both_directions() {
+        let img = build_rustls_image(&[(0x400, RUSTLS_WRITE_PAT), (0x1200, RUSTLS_READ_PAT)]);
+        with_static_ssl_fixture("rustls-both", &img, |path| {
+            let off = find_rustls_offsets(path).expect("planted prologues must be detected");
+            assert_eq!(off.write, Some(0x400));
+            assert_eq!(off.read, Some(0x1200));
+        });
+    }
+
+    #[test]
+    fn rustls_offsets_usable_with_one_direction() {
+        // Half a connection is still attached (and warned about): losing it
+        // outright would mean capturing nothing at all from the process.
+        let img = build_rustls_image(&[(0x800, RUSTLS_READ_PAT)]);
+        with_static_ssl_fixture("rustls-read-only", &img, |path| {
+            let off = find_rustls_offsets(path).expect("read-only image must be usable");
+            assert_eq!(off.read, Some(0x800));
+            assert!(off.write.is_none());
+            assert!(off.is_usable());
+        });
+    }
+
+    #[test]
+    fn rustls_offsets_discards_ambiguous_pattern() {
+        // Two hits for one function means the prologue is no longer unique after
+        // a toolchain change. Guessing could point a uprobe at unrelated code and
+        // sample arbitrary memory as if it were plaintext, so the pattern is
+        // dropped instead of resolved by heuristic.
+        let img = build_rustls_image(&[
+            (0x400, RUSTLS_READ_PAT),
+            (0x2400, RUSTLS_READ_PAT),
+            (0x3000, RUSTLS_WRITE_PAT),
+        ]);
+        with_static_ssl_fixture("rustls-ambiguous", &img, |path| {
+            let off = find_rustls_offsets(path).expect("the unique write match still stands");
+            assert!(
+                off.read.is_none(),
+                "ambiguous read pattern must be discarded, got {:x?}",
+                off.read
+            );
+            assert_eq!(off.write, Some(0x3000));
+        });
+    }
+
+    #[test]
+    fn rustls_offsets_absent_yields_none() {
+        // A non-rustls binary must report nothing so the caller marks it
+        // untraceable instead of attaching probes to arbitrary offsets.
+        let img = vec![0u8; 0x5000];
+        with_static_ssl_fixture("rustls-absent", &img, |path| {
+            assert!(find_rustls_offsets(path).is_none());
         });
     }
 }

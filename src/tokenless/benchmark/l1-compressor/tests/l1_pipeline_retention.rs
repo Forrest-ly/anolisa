@@ -34,8 +34,8 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use tokenless_bench::{compress_json, compress_json_with, response_canonical, schema_canonical};
-use tokenless_ccr::{InMemoryStore, StashStore};
-use tokenless_compressors::JsonCompressionConfig;
+use tokenless_ccr::{InMemoryStore, StashStore, extract_hash, recovery_instruction};
+use tokenless_compressors::{JsonCompressionConfig, RecoveryMethod};
 use tokenless_schema::SchemaCompressor;
 
 /// Compress a response value (stage 1 of the pipeline).
@@ -68,6 +68,16 @@ fn schema_pipeline(value: &Value) -> Value {
     toon_format::decode_default::<Value>(&encoded).expect("TOON decode")
 }
 
+fn non_record_array_response() -> Value {
+    json!({
+        "tool": "search_code",
+        "status": "ok",
+        "results": (0..60)
+            .map(|index| format!("result-{index}-{}", "x".repeat(80)))
+            .collect::<Vec<_>>()
+    })
+}
+
 #[test]
 fn response_pipeline_preserves_tool_and_status() {
     // Tool and status are top-level scalar keys appearing after the large
@@ -89,9 +99,8 @@ fn response_pipeline_preserves_tool_and_status() {
 
 #[test]
 fn response_pipeline_preserves_result_item_fields() {
-    // Default configuration: the plain marker sits BETWEEN the head and tail
-    // items of `results`. The marker's `, not stashed` clause forces the TOON
-    // encoder to quote it, so the strict round-trip keeps it intact.
+    // Lossless cleanup exceeds the selection threshold for the canonical
+    // response, so all records survive rather than entering bounded reduction.
     let decoded = response_pipeline(
         &response_canonical(),
         JsonCompressionConfig::default(),
@@ -101,31 +110,20 @@ fn response_pipeline_preserves_result_item_fields() {
     let results = decoded["results"]
         .as_array()
         .expect("results array exists after pipeline");
-    // The canonical response has 60 items; the compressor keeps 32 head +
-    // 1 marker + 8 tail = 41 items.
-    assert_eq!(results.len(), 41, "32 head + marker + 8 tail");
+    assert_eq!(results.len(), 60, "lossless cleanup keeps every record");
     let first = &results[0];
     assert!(first["id"].is_number(), "id preserved");
     assert!(first["name"].is_string(), "name preserved");
     assert!(first["path"].is_string(), "path preserved");
     assert!(first["status"].is_string(), "status preserved");
     assert!(first["score"].is_number(), "score preserved");
-    // The marker survives the round-trip intact, including the clause that
-    // makes it TOON-safe. If this assertion ever fails, the marker text lost
-    // its quoting trigger and the combined pipeline is broken again.
-    let marker = results[32]
-        .as_str()
-        .expect("plain marker sits between head and tail");
-    assert!(
-        marker.contains("more items truncated, not stashed"),
-        "plain marker round-trips intact: {marker}"
-    );
+    assert!(results.iter().all(Value::is_object));
 }
 
 #[test]
 fn response_pipeline_drops_noise_fields() {
     let decoded = response_pipeline(
-        &response_canonical(),
+        &non_record_array_response(),
         JsonCompressionConfig::default(),
         None,
     )
@@ -157,7 +155,7 @@ fn response_pipeline_head_only_marker_roundtrips() {
     // marker after the last kept item; the quoted marker round-trips and
     // the root-level keys after the array are recovered as well.
     let decoded = response_pipeline(
-        &response_canonical(),
+        &non_record_array_response(),
         JsonCompressionConfig {
             array_tail_preserve: 0,
             ..JsonCompressionConfig::default()
@@ -190,7 +188,7 @@ fn response_pipeline_stash_marker_roundtrips_intact() {
     // This is the reversible-production shape; pin it end to end.
     let store = Arc::new(InMemoryStore::new());
     let decoded = response_pipeline(
-        &response_canonical(),
+        &non_record_array_response(),
         JsonCompressionConfig::default(),
         Some(store.as_ref()),
     )
@@ -203,9 +201,15 @@ fn response_pipeline_stash_marker_roundtrips_intact() {
     let marker = results[32]
         .as_str()
         .expect("marker sits between head and tail");
+    let hash = extract_hash(marker)
+        .unwrap_or_else(|| panic!("stash key survives the round-trip intact: {marker}"));
     assert!(
-        marker.contains("tokenless:"),
-        "stash key survives the round-trip intact: {marker}"
+        marker.ends_with(&recovery_instruction(hash, &RecoveryMethod::Shell)),
+        "new instruction form, not a legacy marker: {marker}"
+    );
+    assert!(
+        store.retrieve(hash).expect("stash readable").is_some(),
+        "recovered key resolves to the stashed payload"
     );
     assert_eq!(store.len(), 1, "one stash entry for the dropped middle");
     assert_eq!(decoded["tool"], "search_code", "root keys recovered");

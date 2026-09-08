@@ -7,6 +7,7 @@ mod event_store;
 mod handoff_claim;
 mod handoff_echo;
 mod marker_sequence;
+mod prompt_epoch;
 mod routing;
 mod slash_guard_echo;
 mod transcript_store;
@@ -88,7 +89,9 @@ pub(super) struct OscParser {
     last_prompt_display: Vec<u8>,
     capture_prompt_display: bool,
     prompt_ready_display_start: Option<usize>,
-    prompt_ready_display_starts: Vec<usize>,
+    prompt_presentation_display_starts: Vec<usize>,
+    prompt_epoch_exchange: Option<crate::raw_input::PromptEpochExchange>,
+    prompt_epoch: Option<u64>,
     /// #1932: the soft-newline upgrade submitted a synthetic empty line so
     /// bash repaints PS1; its visually blank accept echo is dropped at the
     /// matching prompt boundary instead of surfacing as a blank line.
@@ -116,6 +119,8 @@ pub(super) struct OscParser {
     assistance_control: Option<crate::input::AssistanceControl>,
     /// Trusted primary-prompt cwd shared with the submit-time input router.
     shell_prompt_cwd: crate::input::ShellPromptCwd,
+    /// Zsh-proven slash names shared with the submit-time input router.
+    shell_path_command_names: crate::input::ShellPathCommandNames,
     /// Collapses consecutive PTY input writes into one prompt-cwd
     /// invalidation barrier; a fresh command-less prompt report
     /// (`ShellReady`) re-arms it.
@@ -139,6 +144,13 @@ impl OscParser {
 
     pub(crate) fn set_prompt_cwd(&mut self, cwd: crate::input::ShellPromptCwd) {
         self.shell_prompt_cwd = cwd;
+    }
+
+    pub(crate) fn set_shell_path_command_names(
+        &mut self,
+        names: crate::input::ShellPathCommandNames,
+    ) {
+        self.shell_path_command_names = names;
     }
 
     pub(super) fn with_environment_observer(mut self, observer: ShellEnvironmentObserver) -> Self {
@@ -326,6 +338,8 @@ impl OscParser {
             .unwrap_or_else(|| self.session_id.clone());
         let timestamp = marker.timestamp_ms.unwrap_or_else(now_ms);
         let prompt_ready_with_precmd = marker.prompt_ready.unwrap_or(false);
+        let shell_path_names = marker.shell_path_names.clone();
+        let shell_path_suffixes = marker.shell_path_suffixes.clone();
 
         if matches!(marker.event.as_str(), "intercept" | "top_level_missing") {
             self.submission_boundary_observed = true;
@@ -335,7 +349,7 @@ impl OscParser {
 
         match marker.event.as_str() {
             "prompt_ready" => {
-                self.mark_prompt_ready(marker.physical_cwd);
+                self.mark_prompt_ready(marker.physical_cwd, shell_path_names, shell_path_suffixes);
             }
             "preexec" => {
                 self.submission_boundary_observed = true;
@@ -428,7 +442,7 @@ impl OscParser {
                         capture: None,
                     });
                     if prompt_ready_with_precmd {
-                        self.mark_prompt_ready(prompt_cwd);
+                        self.mark_prompt_ready(prompt_cwd, shell_path_names, shell_path_suffixes);
                     }
                     return Ok(());
                 };
@@ -472,7 +486,7 @@ impl OscParser {
                 event.shell_environment_generation = current.shell_environment_generation;
                 self.events.push(event);
                 if prompt_ready_with_precmd {
-                    self.mark_prompt_ready(prompt_cwd);
+                    self.mark_prompt_ready(prompt_cwd, shell_path_names, shell_path_suffixes);
                 }
             }
             _ => {}
@@ -481,13 +495,21 @@ impl OscParser {
         Ok(())
     }
 
-    fn mark_prompt_ready(&mut self, prompt_cwd: Option<String>) {
+    fn mark_prompt_ready(
+        &mut self,
+        prompt_cwd: Option<String>,
+        shell_path_names: Option<Vec<String>>,
+        shell_path_suffixes: Option<Vec<String>>,
+    ) {
         self.shell_prompt_cwd.set(prompt_cwd.clone());
+        self.shell_path_command_names
+            .set(shell_path_names, shell_path_suffixes);
+        self.open_prompt_epoch();
         if !self.display.is_full() {
             self.start_prompt_display_capture();
         }
         self.prompt_ready_display_start = Some(self.display.position());
-        self.prompt_ready_display_starts
+        self.prompt_presentation_display_starts
             .push(self.display.position());
         self.main_prompt_gate.set_at_prompt(true);
         if let Some(control) = &self.assistance_control {
@@ -687,8 +709,8 @@ impl OscParser {
         std::mem::take(&mut self.intervention_display_cuts)
     }
 
-    pub(super) fn drain_prompt_ready_display_starts(&mut self) -> Vec<usize> {
-        std::mem::take(&mut self.prompt_ready_display_starts)
+    pub(super) fn drain_prompt_presentation_display_starts(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.prompt_presentation_display_starts)
     }
 
     /// Arms the one-shot blank-echo drop for the synthetic PS1 repaint

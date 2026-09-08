@@ -29,6 +29,7 @@
         "flush_ms": 100
       }
     },
+    "resource_sampling": false,
     "interruption_detection": {
       "enabled": true,
       "retention_days": 30,
@@ -81,6 +82,7 @@
       {"rule": ["*openclaw-gatewa*"], "agent_name": "OpenClaw"},
       {"rule": ["node*", "*openclaw*"], "agent_name": "OpenClaw"},
       {"rule": ["*node*", "*openclaw*", "gatewa*"], "agent_name": "OpenClaw"},
+      {"rule": ["*node*", "*", "*openclaw*", "gatewa*"], "agent_name": "OpenClaw"},
       {"rule": ["openclaw"], "agent_name": "OpenClaw"},
       {"rule": ["claude*"], "agent_name": "Claude"},
       {"rule": ["*/claude*"], "agent_name": "Claude"},
