@@ -422,22 +422,41 @@ fn systemd_cli_error(cmd: &str, args: &[&str], error: SystemdError) -> CliError 
 }
 
 fn verify_socket(cmd: &str) -> Result<(), CliError> {
-    // Wait briefly for the socket to appear (daemon may take a moment to start).
     let socket_path = Path::new(SYSTEM_HELPER_SOCKET);
+    verify_socket_with(
+        cmd,
+        || socket_path.exists(),
+        thread::sleep,
+        || HelperClient::connect(socket_path),
+    )
+}
+
+fn verify_socket_with<P, S, C>(
+    cmd: &str,
+    mut socket_exists: P,
+    mut sleep: S,
+    connect: C,
+) -> Result<(), CliError>
+where
+    P: FnMut() -> bool,
+    S: FnMut(Duration),
+    C: FnOnce() -> Result<HelperClient, HelperClientError>,
+{
+    // Wait briefly for the socket to appear (daemon may take a moment to start).
     let mut attempts = 0;
-    while !socket_path.exists() && attempts < 10 {
-        thread::sleep(Duration::from_millis(300));
+    while !socket_exists() && attempts < 10 {
+        sleep(Duration::from_millis(300));
         attempts += 1;
     }
 
-    if !socket_path.exists() {
+    if !socket_exists() {
         return Err(CliError::Runtime {
             command: cmd.to_string(),
             reason: format!("socket {SYSTEM_HELPER_SOCKET} did not appear within 3 seconds"),
         });
     }
 
-    verify_helper_connection(cmd, || HelperClient::connect(socket_path))
+    verify_helper_connection(cmd, connect)
 }
 
 fn verify_helper_connection<F>(cmd: &str, connect: F) -> Result<(), CliError>
@@ -636,23 +655,41 @@ struct StatusReport {
     last_operation_time: Option<String>,
 }
 
+struct SystemStatusObservation {
+    service_state: StatusServiceState,
+    report: StatusReport,
+}
+
 fn handle_status(json: bool, ctx: &CliContext) -> Result<(), CliError> {
-    let cli_version = env!("CARGO_PKG_VERSION").to_string();
+    let observation = collect_status_with(
+        env!("CARGO_PKG_VERSION"),
+        &Systemd::system(),
+        || Path::new(SYSTEM_HELPER_SOCKET).exists(),
+        || HelperClient::connect(Path::new(SYSTEM_HELPER_SOCKET)),
+    );
+    render_status(json, ctx, observation)
+}
 
-    // 1. Check systemd service state.
-    let service_state = check_service_state();
+fn collect_status_with<R, F, C>(
+    cli_version: &str,
+    systemd: &Systemd<R>,
+    socket_exists: F,
+    connect: C,
+) -> SystemStatusObservation
+where
+    R: CommandRunner,
+    F: FnOnce() -> bool,
+    C: FnOnce() -> Result<HelperClient, HelperClientError>,
+{
+    let service_state = check_service_state(systemd);
+    let socket_exists = socket_exists();
 
-    // 2. Check socket file existence.
-    let socket_exists = Path::new(SYSTEM_HELPER_SOCKET).exists();
-
-    // 3. Try connect + handshake + SystemStatus.
     let connection = if socket_exists {
-        try_status_connection(&cli_version)
+        try_status_connection_with(cli_version, connect)
     } else {
         HelperConnectionStatus::disconnected()
     };
 
-    // Derive fields.
     let helper_version = connection
         .handshake
         .as_ref()
@@ -677,14 +714,29 @@ fn handle_status(json: bool, ctx: &CliContext) -> Result<(), CliError> {
         service_active: service_state == StatusServiceState::Active,
         socket_exists,
         socket_connectable: connection.connectable,
-        helper_version: helper_version.clone(),
-        cli_version: cli_version.clone(),
+        helper_version,
+        cli_version: cli_version.to_string(),
         version_compatible,
         uptime_secs,
-        last_operation: last_operation.clone(),
-        last_operation_time: last_operation_time.clone(),
+        last_operation,
+        last_operation_time,
     };
 
+    SystemStatusObservation {
+        service_state,
+        report,
+    }
+}
+
+fn render_status(
+    json: bool,
+    ctx: &CliContext,
+    observation: SystemStatusObservation,
+) -> Result<(), CliError> {
+    let SystemStatusObservation {
+        service_state,
+        report,
+    } = observation;
     if json || ctx.json {
         return response::render_json("system status", report);
     }
@@ -692,14 +744,14 @@ fn handle_status(json: bool, ctx: &CliContext) -> Result<(), CliError> {
     // Human-readable output.
     print_status_human(
         &service_state,
-        socket_exists,
-        connection.connectable,
-        helper_version.as_deref(),
-        &cli_version,
-        version_compatible,
-        uptime_secs,
-        last_operation.as_deref(),
-        last_operation_time.as_deref(),
+        report.socket_exists,
+        report.socket_connectable,
+        report.helper_version.as_deref(),
+        &report.cli_version,
+        report.version_compatible,
+        report.uptime_secs,
+        report.last_operation.as_deref(),
+        report.last_operation_time.as_deref(),
     );
 
     Ok(())
@@ -728,8 +780,8 @@ impl StatusServiceState {
     }
 }
 
-fn check_service_state() -> StatusServiceState {
-    match Systemd::system().unit_status(STATUS_SERVICE_UNIT) {
+fn check_service_state<R: CommandRunner>(systemd: &Systemd<R>) -> StatusServiceState {
+    match systemd.unit_status(STATUS_SERVICE_UNIT) {
         Ok(status) => {
             if status.failed {
                 StatusServiceState::Failed
@@ -763,12 +815,6 @@ impl HelperConnectionStatus {
 
 /// Attempt to connect to the helper socket, perform handshake, and query
 /// system status while retaining partial typed evidence.
-fn try_status_connection(cli_version: &str) -> HelperConnectionStatus {
-    try_status_connection_with(cli_version, || {
-        HelperClient::connect(Path::new(SYSTEM_HELPER_SOCKET))
-    })
-}
-
 fn try_status_connection_with<F>(cli_version: &str, connect: F) -> HelperConnectionStatus
 where
     F: FnOnce() -> Result<HelperClient, HelperClientError>,
@@ -867,12 +913,12 @@ fn format_status_uptime(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::io;
     use std::rc::Rc;
 
-    use anolisa_core::system_helper::HelperResponse;
+    use anolisa_core::system_helper::{HelperRequest, HelperResponse};
     use anolisa_platform::command::{CommandOutput, CommandRunner};
 
     use super::*;
@@ -1605,6 +1651,688 @@ mod tests {
         HelperClientError::Connect {
             path: PathBuf::from(SYSTEM_HELPER_SOCKET),
             source: io::Error::new(io::ErrorKind::ConnectionRefused, "not listening"),
+        }
+    }
+
+    const STATUS_SERVICES: &[(&str, StatusServiceState, &str)] = &[
+        ("active", StatusServiceState::Active, "active (running)"),
+        ("reloading", StatusServiceState::Active, "active (running)"),
+        (
+            "inactive",
+            StatusServiceState::Inactive,
+            "inactive (stopped)",
+        ),
+        ("failed", StatusServiceState::Failed, "failed"),
+        ("missing", StatusServiceState::NotInstalled, "not installed"),
+        ("masked", StatusServiceState::NotInstalled, "not installed"),
+        ("spawn", StatusServiceState::Unknown, "unknown"),
+        ("non-zero", StatusServiceState::Unknown, "unknown"),
+        ("signal", StatusServiceState::Unknown, "unknown"),
+        ("empty", StatusServiceState::Inactive, "inactive (stopped)"),
+    ];
+
+    const STATUS_HELPERS: &[&str] = &[
+        "missing-socket",
+        "connect-failure",
+        "handshake-send",
+        "handshake-receive",
+        "handshake-remote",
+        "handshake-unexpected",
+        "incompatible",
+        "status-send",
+        "status-receive",
+        "status-remote",
+        "status-unexpected",
+        "complete",
+        "minutes",
+        "no-operation",
+        "no-time",
+    ];
+
+    fn collect_status_fixture(service: &str, helper: &str) -> SystemStatusObservation {
+        let service_result = match service {
+            "active" | "reloading" | "inactive" | "failed" => FakeOutcome::Output(CommandOutput {
+                code: Some(0),
+                stdout: format!(
+                    "LoadState=loaded\nActiveState={service}\nUnitFileState=enabled\nDescription=ANOLISA\n"
+                ),
+                stderr: String::new(),
+            }),
+            "missing" => missing_status(),
+            "masked" => FakeOutcome::Output(CommandOutput {
+                code: Some(0),
+                stdout: "LoadState=masked\nActiveState=inactive\nUnitFileState=\n".to_string(),
+                stderr: String::new(),
+            }),
+            "spawn" => FakeOutcome::Spawn(io::ErrorKind::NotFound),
+            "non-zero" | "signal" => FakeOutcome::Output(CommandOutput {
+                code: (service == "non-zero").then_some(1),
+                // A failed process must not contribute seemingly valid properties.
+                stdout: "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n".to_string(),
+                stderr: "not installed".to_string(),
+            }),
+            "empty" => success(),
+            _ => panic!("unknown service fixture: {service}"),
+        };
+        let (systemd, calls) = fake_systemd(vec![(
+            vec![
+                "show",
+                STATUS_SERVICE_UNIT,
+                "--no-pager",
+                "--property=LoadState,ActiveState,UnitFileState,Description",
+            ],
+            service_result,
+        )]);
+        let compatible = || HelperResponse::HandshakeOk {
+            helper_version: "0.3.9".to_string(),
+            compatible: true,
+        };
+        let remote = || HelperResponse::Error {
+            code: "UNAVAILABLE".to_string(),
+            message: "probe unavailable".to_string(),
+        };
+        let unexpected = || HelperResponse::Success {
+            message: "wrong response".to_string(),
+            exit_code: 0,
+        };
+        let send_error = || Err(io::Error::new(io::ErrorKind::BrokenPipe, "send"));
+        let receive_error = || Err(io::Error::new(io::ErrorKind::UnexpectedEof, "receive"));
+        let (sends, receives, request_count) = match helper {
+            "missing-socket" | "connect-failure" => (vec![], vec![], 0),
+            "handshake-send" => (vec![send_error()], vec![], 1),
+            "handshake-receive" => (vec![], vec![receive_error()], 1),
+            "handshake-remote" => (vec![], vec![Ok(remote())], 1),
+            "handshake-unexpected" => (vec![], vec![Ok(unexpected())], 1),
+            "incompatible" => (
+                vec![],
+                vec![Ok(HelperResponse::HandshakeOk {
+                    helper_version: "0.0.1".to_string(),
+                    compatible: false,
+                })],
+                1,
+            ),
+            "status-send" => (vec![Ok(()), send_error()], vec![Ok(compatible())], 2),
+            "status-receive" => (vec![], vec![Ok(compatible()), receive_error()], 2),
+            "status-remote" => (vec![], vec![Ok(compatible()), Ok(remote())], 2),
+            "status-unexpected" => (vec![], vec![Ok(compatible()), Ok(unexpected())], 2),
+            "complete" | "minutes" | "no-operation" | "no-time" => (
+                vec![],
+                vec![
+                    Ok(compatible()),
+                    Ok(HelperResponse::Status {
+                        // Deliberately disagree with systemd and the handshake.
+                        running: service != "active",
+                        version: "ignored-status-version".to_string(),
+                        uptime_secs: if helper == "minutes" { 75 } else { 3720 },
+                        last_operation: (helper != "no-operation").then(|| "install".to_string()),
+                        last_operation_time: (helper != "no-time").then(|| "now".to_string()),
+                    }),
+                ],
+                2,
+            ),
+            _ => panic!("unknown helper fixture: {helper}"),
+        };
+        let (transport, sent) = ScriptedTransport::new(sends, receives);
+        let socket_calls = Cell::new(0);
+        let connect_calls = Cell::new(0);
+        let observation = collect_status_with(
+            "0.3.2",
+            &systemd,
+            || {
+                assert_systemd_finished(&calls);
+                assert_eq!(connect_calls.get(), 0);
+                assert!(sent.borrow().is_empty());
+                socket_calls.set(socket_calls.get() + 1);
+                helper != "missing-socket"
+            },
+            || {
+                assert_systemd_finished(&calls);
+                assert_eq!(socket_calls.get(), 1);
+                assert!(sent.borrow().is_empty());
+                connect_calls.set(connect_calls.get() + 1);
+                assert_ne!(helper, "missing-socket", "connector must be skipped");
+                if helper == "connect-failure" {
+                    Err(connect_error())
+                } else {
+                    Ok(HelperClient::with_transport(transport))
+                }
+            },
+        );
+        assert_systemd_finished(&calls);
+        assert_eq!(socket_calls.get(), 1);
+        assert_eq!(connect_calls.get(), usize::from(helper != "missing-socket"));
+        let expected_requests = [
+            HelperRequest::Handshake {
+                cli_version: "0.3.2".to_string(),
+            },
+            HelperRequest::SystemStatus,
+        ];
+        assert_eq!(*sent.borrow(), expected_requests[..request_count]);
+        observation
+    }
+
+    fn expected_status_data(service_active: bool, helper: &str) -> serde_json::Value {
+        let (connectable, version, compatible, uptime, operation, time) = match helper {
+            "missing-socket" | "connect-failure" => (false, None, false, None, None, None),
+            "handshake-send"
+            | "handshake-receive"
+            | "handshake-remote"
+            | "handshake-unexpected" => (true, None, false, None, None, None),
+            "incompatible" => (true, Some("0.0.1"), false, None, None, None),
+            "status-send" | "status-receive" | "status-remote" | "status-unexpected" => {
+                (true, Some("0.3.9"), true, None, None, None)
+            }
+            "complete" => (
+                true,
+                Some("0.3.9"),
+                true,
+                Some(3720),
+                Some("install"),
+                Some("now"),
+            ),
+            "minutes" => (
+                true,
+                Some("0.3.9"),
+                true,
+                Some(75),
+                Some("install"),
+                Some("now"),
+            ),
+            "no-operation" => (true, Some("0.3.9"), true, Some(3720), None, Some("now")),
+            "no-time" => (true, Some("0.3.9"), true, Some(3720), Some("install"), None),
+            _ => panic!("unknown helper fixture: {helper}"),
+        };
+        serde_json::json!({
+            "service_active": service_active,
+            "socket_exists": helper != "missing-socket",
+            "socket_connectable": connectable,
+            "helper_version": version,
+            "cli_version": "0.3.2",
+            "version_compatible": compatible,
+            "uptime_secs": uptime,
+            "last_operation": operation,
+            "last_operation_time": time,
+        })
+    }
+
+    #[test]
+    fn status_collector_preserves_service_and_helper_evidence() {
+        for &(service, state, _) in STATUS_SERVICES {
+            for &helper in STATUS_HELPERS {
+                let observation = collect_status_fixture(service, helper);
+                assert_eq!(observation.service_state, state, "{service}/{helper}");
+                assert_eq!(
+                    serde_json::to_value(observation.report).unwrap(),
+                    expected_status_data(state == StatusServiceState::Active, helper),
+                    "{service}/{helper}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn status_preserves_human_and_json_output() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        for &(service, state, label) in STATUS_SERVICES {
+            // Exhaust evidence combinations in-process; cross output flags on the active fixture.
+            let (helpers, modes): (&[&str], &[&str]) = if service == "active" {
+                (
+                    STATUS_HELPERS,
+                    &[
+                        "human",
+                        "quiet",
+                        "local-json",
+                        "global-json",
+                        "both-json",
+                        "quiet-json",
+                    ],
+                )
+            } else {
+                (
+                    &["complete", "incompatible", "missing-socket"],
+                    &["human", "global-json"],
+                )
+            };
+            for &helper in helpers {
+                for &mode in modes {
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            format!("{module}::status_output_child"),
+                            "--exact".to_string(),
+                            "--nocapture".to_string(),
+                        ])
+                        .env("ANOLISA_TEST_SYSTEM_STATUS_SERVICE", service)
+                        .env("ANOLISA_TEST_SYSTEM_STATUS_HELPER", helper)
+                        .env("ANOLISA_TEST_SYSTEM_STATUS_OUTPUT", mode)
+                        .output()
+                        .unwrap();
+                    assert_eq!(
+                        output.status.code(),
+                        Some(0),
+                        "{service}/{helper}/{mode}: {output:?}"
+                    );
+                    assert!(output.stderr.is_empty(), "{output:?}");
+                    let stdout = String::from_utf8(output.stdout).unwrap();
+                    let (_, rendered) = stdout.split_once("STATUS_OUTPUT_BEGIN\n").unwrap();
+                    let (rendered, _) = rendered.split_once("STATUS_OUTPUT_END\n").unwrap();
+                    assert!(stdout.contains("test result: ok."));
+                    if mode.contains("json") {
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(rendered).unwrap(),
+                            serde_json::json!({
+                                "ok": true,
+                                "schema_version": response::SCHEMA_VERSION,
+                                "command": "system status",
+                                "data": expected_status_data(state == StatusServiceState::Active, helper),
+                                "warnings": [],
+                            }),
+                            "{service}/{helper}/{mode}",
+                        );
+                        continue;
+                    }
+                    let socket_label = match helper {
+                        "missing-socket" => "missing",
+                        "connect-failure" => "not connectable",
+                        _ => "connected",
+                    };
+                    let mut expected = format!(
+                        "anolisa system helper:\n  Status:      {label}\n  Socket:      {SYSTEM_HELPER_SOCKET} [{socket_label}]\n"
+                    );
+                    match helper {
+                        "incompatible" => expected
+                            .push_str("  Version:     0.0.1 (CLI: 0.3.2) ⚠ version mismatch\n"),
+                        "status-send" | "status-receive" | "status-remote"
+                        | "status-unexpected" | "complete" | "minutes" | "no-operation"
+                        | "no-time" => {
+                            expected.push_str("  Version:     0.3.9 (CLI: 0.3.2) ✓\n");
+                        }
+                        _ => {}
+                    }
+                    match helper {
+                        "complete" => expected
+                            .push_str("  Uptime:      1h 02m\n  Last op:     install (now)\n"),
+                        "minutes" => {
+                            expected.push_str("  Uptime:      1m\n  Last op:     install (now)\n")
+                        }
+                        "no-operation" => expected.push_str("  Uptime:      1h 02m\n"),
+                        "no-time" => {
+                            expected.push_str("  Uptime:      1h 02m\n  Last op:     install\n")
+                        }
+                        _ => {}
+                    }
+                    expected.push('\n');
+                    if matches!(service, "missing" | "masked") || helper == "missing-socket" {
+                        expected.push_str("  hint: run 'sudo anolisa system setup' to install\n");
+                    } else {
+                        match helper {
+                            "incompatible" => expected.push_str("  warning: CLI and helper versions differ; consider restarting the helper.\n"),
+                            // Preserve the existing success hint even when other evidence degrades.
+                            "status-send" | "status-receive" | "status-remote" | "status-unexpected"
+                            | "complete" | "minutes" | "no-operation" | "no-time" => {
+                                expected.push_str("  All checks passed.\n");
+                            }
+                            _ => {}
+                        }
+                    }
+                    assert_eq!(rendered, expected, "{service}/{helper}/{mode}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn status_output_child() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        // An inherited scenario variable must never redirect an ordinary suite invocation.
+        if std::env::args().skip(1).collect::<Vec<_>>()
+            != [
+                format!("{module}::status_output_child"),
+                "--exact".to_string(),
+                "--nocapture".to_string(),
+            ]
+        {
+            return;
+        }
+        let service = std::env::var("ANOLISA_TEST_SYSTEM_STATUS_SERVICE").unwrap();
+        let helper = std::env::var("ANOLISA_TEST_SYSTEM_STATUS_HELPER").unwrap();
+        let mode = std::env::var("ANOLISA_TEST_SYSTEM_STATUS_OUTPUT").unwrap();
+        let sandbox = crate::test_support::TestSandbox::new();
+        let ctx = sandbox.context_with(
+            crate::context::InstallMode::System,
+            crate::test_support::TestContextOptions {
+                json: matches!(mode.as_str(), "global-json" | "both-json" | "quiet-json"),
+                quiet: matches!(mode.as_str(), "quiet" | "quiet-json"),
+                ..Default::default()
+            },
+        );
+        let observation = collect_status_fixture(&service, &helper);
+        println!("STATUS_OUTPUT_BEGIN");
+        render_status(
+            matches!(mode.as_str(), "local-json" | "both-json"),
+            &ctx,
+            observation,
+        )
+        .unwrap();
+        println!("STATUS_OUTPUT_END");
+    }
+
+    #[test]
+    fn status_capture_environment_does_not_redirect_normal_suite() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        for (service, helper, mode) in [
+            ("active", "complete", "human"),
+            ("invalid", "invalid", "invalid"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    format!("{module}::status_"),
+                    "--skip".to_string(),
+                    format!("{module}::status_capture_environment_does_not_redirect_normal_suite"),
+                    "--skip".to_string(),
+                    format!("{module}::status_preserves_human_and_json_output"),
+                ])
+                .env("ANOLISA_TEST_SYSTEM_STATUS_SERVICE", service)
+                .env("ANOLISA_TEST_SYSTEM_STATUS_HELPER", helper)
+                .env("ANOLISA_TEST_SYSTEM_STATUS_OUTPUT", mode)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(stdout.contains("status_output_child ... ok"), "{stdout}");
+            assert!(
+                stdout.contains("status_collector_preserves_service_and_helper_evidence ... ok"),
+                "{stdout}"
+            );
+            assert!(stdout.contains("test result: ok."), "{stdout}");
+            assert!(
+                !stdout.contains("status_preserves_human_and_json_output ..."),
+                "{stdout}"
+            );
+            assert!(!stdout.contains("STATUS_OUTPUT_BEGIN"), "{stdout}");
+        }
+    }
+
+    const SOCKET_WAIT_SCENARIOS: &[&str] = &[
+        "ready",
+        "delayed",
+        "last-wait",
+        "timeout",
+        "vanished",
+        "final-check",
+        "connect",
+        "send",
+        "receive",
+        "incompatible",
+        "remote",
+        "unexpected",
+    ];
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum SocketWaitEvent {
+        Probe(bool),
+        Sleep(Duration),
+        Connect,
+    }
+
+    fn run_socket_wait_fixture(scenario: &str) -> Result<(), CliError> {
+        let (sleeps, loop_probe, final_probe) = match scenario {
+            "ready" => (0, true, true),
+            "delayed" => (3, true, true),
+            "last-wait" => (10, true, true),
+            "timeout" => (10, false, false),
+            "vanished" => (2, true, false),
+            "final-check" => (10, false, true),
+            "connect" | "send" | "receive" | "incompatible" | "remote" | "unexpected" => {
+                (2, true, true)
+            }
+            _ => panic!("unknown socket wait fixture: {scenario}"),
+        };
+        let mut probes: VecDeque<_> = std::iter::repeat_n(false, sleeps)
+            .chain([loop_probe, final_probe])
+            .collect();
+        let mut expected = Vec::new();
+        for _ in 0..sleeps {
+            expected.push(SocketWaitEvent::Probe(false));
+            expected.push(SocketWaitEvent::Sleep(Duration::from_millis(300)));
+        }
+        expected.extend([
+            SocketWaitEvent::Probe(loop_probe),
+            SocketWaitEvent::Probe(final_probe),
+        ]);
+        if final_probe {
+            expected.push(SocketWaitEvent::Connect);
+        }
+        let (sends, receives) = match scenario {
+            "timeout" | "vanished" | "connect" => (vec![], vec![]),
+            "send" => (
+                vec![Err(io::Error::new(io::ErrorKind::BrokenPipe, "send"))],
+                vec![],
+            ),
+            "receive" => (
+                vec![],
+                vec![Err(io::Error::new(io::ErrorKind::UnexpectedEof, "receive"))],
+            ),
+            "remote" => (
+                vec![],
+                vec![Ok(HelperResponse::Error {
+                    code: "DENIED".to_string(),
+                    message: "no access".to_string(),
+                })],
+            ),
+            "unexpected" => (
+                vec![],
+                vec![Ok(HelperResponse::Success {
+                    message: "wrong response".to_string(),
+                    exit_code: 0,
+                })],
+            ),
+            _ => (
+                vec![],
+                vec![Ok(HelperResponse::HandshakeOk {
+                    helper_version: env!("CARGO_PKG_VERSION").to_string(),
+                    compatible: scenario != "incompatible",
+                })],
+            ),
+        };
+        let (transport, sent) = ScriptedTransport::new(sends, receives);
+        let calls = RefCell::new(Vec::new());
+        let result = verify_socket_with(
+            "system setup",
+            || {
+                assert!(sent.borrow().is_empty(), "probe after handshake");
+                let exists = probes.pop_front().expect("unexpected socket probe");
+                calls.borrow_mut().push(SocketWaitEvent::Probe(exists));
+                exists
+            },
+            |duration| {
+                assert!(sent.borrow().is_empty(), "sleep after handshake");
+                calls.borrow_mut().push(SocketWaitEvent::Sleep(duration));
+            },
+            || {
+                assert!(final_probe, "must not connect after a missing final probe");
+                calls.borrow_mut().push(SocketWaitEvent::Connect);
+                if scenario == "connect" {
+                    return Err(HelperClientError::Connect {
+                        path: PathBuf::from("/scripted/system-helper.sock"),
+                        source: io::Error::new(io::ErrorKind::ConnectionRefused, "connect"),
+                    });
+                }
+                Ok(HelperClient::with_transport(transport))
+            },
+        );
+        assert!(probes.is_empty(), "{scenario}");
+        assert_eq!(*calls.borrow(), expected, "{scenario}");
+        let requests = if final_probe && scenario != "connect" {
+            vec![HelperRequest::Handshake {
+                cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            }]
+        } else {
+            vec![]
+        };
+        assert_eq!(*sent.borrow(), requests, "{scenario}");
+        result
+    }
+
+    fn socket_wait_error_reason(scenario: &str) -> Option<String> {
+        let reason = match scenario {
+            "ready" | "delayed" | "last-wait" | "final-check" => return None,
+            "timeout" | "vanished" => {
+                return Some(format!(
+                    "socket {SYSTEM_HELPER_SOCKET} did not appear within 3 seconds"
+                ));
+            }
+            "connect" => "failed to connect to /scripted/system-helper.sock: connect",
+            "send" => "handshake send failed: send",
+            "receive" => "handshake recv failed: receive",
+            "incompatible" => "handshake succeeded but version is incompatible",
+            "remote" => {
+                "unexpected handshake response: Error { code: \"DENIED\", message: \"no access\" }"
+            }
+            "unexpected" => {
+                "unexpected handshake response: Success { message: \"wrong response\", exit_code: 0 }"
+            }
+            _ => panic!("unknown socket wait fixture: {scenario}"),
+        };
+        Some(reason.to_string())
+    }
+
+    #[test]
+    fn socket_wait_preserves_probe_sleep_and_handshake_sequence() {
+        for &scenario in SOCKET_WAIT_SCENARIOS {
+            let result = run_socket_wait_fixture(scenario);
+            if let Some(reason) = socket_wait_error_reason(scenario) {
+                let error = result.expect_err(scenario);
+                assert!(matches!(error, CliError::Runtime { .. }));
+                assert_eq!(error.command(), "system setup");
+                assert_eq!(error.code(), "EXECUTION_FAILED");
+                assert_eq!(error.exit_code(), 1);
+                assert_eq!(error.reason(), reason, "{scenario}");
+            } else {
+                result.expect(scenario);
+            }
+        }
+    }
+
+    #[test]
+    fn socket_wait_preserves_output() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        for &scenario in SOCKET_WAIT_SCENARIOS {
+            for mode in ["human", "json", "quiet"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        format!("{module}::socket_wait_output_child"),
+                        "--exact".to_string(),
+                        "--nocapture".to_string(),
+                    ])
+                    .env("ANOLISA_TEST_SOCKET_WAIT_SCENARIO", scenario)
+                    .env("ANOLISA_TEST_SOCKET_WAIT_OUTPUT", mode)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{scenario}/{mode}: {output:?}");
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let (_, rendered) = stdout.split_once("SOCKET_WAIT_OUTPUT_BEGIN\n").unwrap();
+                let (rendered, _) = rendered.split_once("SOCKET_WAIT_OUTPUT_END\n").unwrap();
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                if let Some(reason) = socket_wait_error_reason(scenario) {
+                    if mode == "json" {
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(rendered).unwrap(),
+                            serde_json::json!({
+                                "ok": false,
+                                "schema_version": response::SCHEMA_VERSION,
+                                "command": "system setup",
+                                "warnings": [],
+                                "error": {"code": "EXECUTION_FAILED", "reason": reason},
+                            }),
+                        );
+                        assert!(stderr.is_empty(), "{stderr}");
+                    } else {
+                        assert!(rendered.is_empty(), "{rendered}");
+                        assert_eq!(stderr, format!("error: {reason}\n"));
+                    }
+                } else {
+                    assert!(rendered.is_empty(), "{rendered}");
+                    assert_eq!(
+                        stderr,
+                        "[setup] handshake verified — helper is operational\n"
+                    );
+                }
+                assert!(stdout.contains("test result: ok."), "{stdout}");
+            }
+        }
+    }
+
+    #[test]
+    fn socket_wait_output_child() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        if std::env::args().skip(1).collect::<Vec<_>>()
+            != [
+                format!("{module}::socket_wait_output_child"),
+                "--exact".to_string(),
+                "--nocapture".to_string(),
+            ]
+        {
+            return;
+        }
+        let scenario = std::env::var("ANOLISA_TEST_SOCKET_WAIT_SCENARIO").unwrap();
+        let mode = std::env::var("ANOLISA_TEST_SOCKET_WAIT_OUTPUT").unwrap();
+        assert!(["human", "json", "quiet"].contains(&mode.as_str()));
+        let sandbox = crate::test_support::TestSandbox::new();
+        let ctx = sandbox.context_with(
+            crate::context::InstallMode::System,
+            crate::test_support::TestContextOptions {
+                json: mode == "json",
+                quiet: mode == "quiet",
+                ..Default::default()
+            },
+        );
+        println!("SOCKET_WAIT_OUTPUT_BEGIN");
+        let result = run_socket_wait_fixture(&scenario);
+        if socket_wait_error_reason(&scenario).is_some() {
+            assert_eq!(
+                response::render_error(&ctx, &result.unwrap_err()),
+                std::process::ExitCode::from(1),
+            );
+        } else {
+            result.unwrap();
+        }
+        println!("SOCKET_WAIT_OUTPUT_END");
+    }
+
+    #[test]
+    fn socket_wait_capture_environment_does_not_redirect_normal_suite() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        for (scenario, mode) in [("ready", "human"), ("invalid", "invalid")] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    format!("{module}::socket_wait_"),
+                    "--skip".to_string(),
+                    format!(
+                        "{module}::socket_wait_capture_environment_does_not_redirect_normal_suite"
+                    ),
+                    "--skip".to_string(),
+                    format!("{module}::socket_wait_preserves_output"),
+                ])
+                .env("ANOLISA_TEST_SOCKET_WAIT_SCENARIO", scenario)
+                .env("ANOLISA_TEST_SOCKET_WAIT_OUTPUT", mode)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                stdout.contains("socket_wait_output_child ... ok"),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains("socket_wait_preserves_probe_sleep_and_handshake_sequence ... ok"),
+                "{stdout}"
+            );
+            assert!(
+                !stdout.contains("socket_wait_preserves_output ..."),
+                "{stdout}"
+            );
+            assert!(!stdout.contains("SOCKET_WAIT_OUTPUT_BEGIN"), "{stdout}");
+            assert!(stdout.contains("test result: ok."), "{stdout}");
         }
     }
 

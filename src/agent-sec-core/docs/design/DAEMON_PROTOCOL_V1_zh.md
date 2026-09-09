@@ -478,9 +478,17 @@ Policy domain DTO。
 | `policy.bindings.delete` | `{id}` | `BindingView` |
 
 CREATE 的 stable identity 由 PAP 生成；UPDATE 不兼作 upsert。Policy/Scope GET 和 DELETE
-要求精确 current revision；Binding GET 读取唯一 current record。Binding CREATE/UPDATE
-返回 `PENDING_APPLY` intent，DELETE 返回 `PENDING_DELETE` intent；daemon handler 不等待
-Reconciler，也不把 PAP acceptance 表述为 target 已生效或删除完成。
+要求精确 current revision；Binding GET 读取唯一 current record。Binding CREATE 和新
+Apply/Delete 意图返回对应 pending 状态；幂等请求返回已有状态（如 READY、APPLYING、
+DELETING）。daemon handler 不等待 Reconciler，不把 acceptance 表述为目标完成。
+
+[TARGET V2] `bindingRevision` 仅在 spec 改变时递增；同 spec 的 ApplyFailed 重试、
+Delete 和 DeleteFailed 重试均保留 revision。Delete 保留完整 spec 与既有部署记录，
+允许在 Applying 时受理；PendingDelete/Deleting/DeleteFailed 拒绝所有 UPDATE，不能
+撤销删除。全部目标确认 Absent 后，Reconciler 原子移除 Binding 及运行记录；此后
+GET/UPDATE/DELETE 返回 not_found，LIST 不包含该 ID。重新部署须 CREATE 新 ID、revision 1。
+`Deleted` 只作内部完成标记，不作为持久化 current record。当前 daemon 尚未接入后台
+reconcile worker；硬删除行为由 PAP + Reconciler 内存组合测试验证。
 
 Policy CREATE/UPDATE 在 PAP 内同步调用 `PolicyCompiler::lower(TemplateEnvelope) ->
 PolicyEnvelope`。当前产品 compiler 只实现 `prevent_file_deletion`，其输入与完整 Canonical
@@ -491,8 +499,18 @@ Policy IR 输出由
 保护范围内。其它 `PolicyTemplate` kind 在各自 lowering 与直接 Adapter conformance 完成前
 返回 `invalid_argument`，不得生成占位 IR。
 
-参数 object 拒绝未知字段。新 authored Scope 只接受正数 PID 或 cgroup ID，不接受仅用于读取
-旧数据的 `LegacyExecutionDomain`。LIST 的 `limit` 为 `1..=1000`，`offset` 为 `u32`；total 是
+参数 object 拒绝未知字段。ScopeSelector 只包含正数 PID 或 cgroup ID；PreparedScope
+必须显式包含 selector，缺失或 null 均拒绝，不再从 scopeId 推导执行域身份。
+PreparedScope 的输出仅含 `scopeId`、`revision`、`selector`；不再包含自动填充的
+`template` 或 `templateDigest`。读取时显式携带这两个已移除字段会被拒绝，不能
+把其中的 lifetime 等约束静默丢弃。Scope Update 直接按 selector 比较内容是否相同；
+PreparedPolicy 保留 policyId/policyName/revision/template/canonicalPolicy，移除
+templateDigest；Policy 的 authored template 保留，canonicalPolicy 不再含预留的 payloadDigest。
+PreparedBinding 只含 bindingId/bindingRevision/policy/scope，不再接受顶层
+executionDomainId。已删除的 Policy templateDigest 和 Binding executionDomainId
+（包括显式 null）均按未知字段拒绝；Policy/Scope 的 retired 和 canonicalPolicy 的
+payloadDigest 也不再接受。当前三个模型直接派生严格反序列化，不保留旧字段吞入逻辑。
+LIST 的 `limit` 为 `1..=1000`，`offset` 为 `u32`；total 是
 分页前总数。当前 aggregate byte budget 仍是 Repository/PAP/transport 联合 gate，在该 gate
 完成前 LIST 只达到 integration contract，不构成 distribution-ready 大数据量查询能力。
 
