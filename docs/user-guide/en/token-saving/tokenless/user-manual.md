@@ -44,7 +44,8 @@ the [Python SDK guide](sdk.md) for both layers, runnable examples, and configura
 | Capability | Behavior implemented in the current code | Important boundary |
 |------------|------------------------------------------|--------------------|
 | Schema compression | Removes `title` and `examples`, removes fenced and inline code from descriptions, collapses whitespace, and truncates descriptions | Common BeforeModel passes lossy transformations through without marker-authorized recovery; OpenCode's per-tool path and the direct CLI still compress (Qwen Code skips the declared event) |
-| Content-aware response compression | Successful PostTool JSON is routed to `JsonCompressor`; recognized successful build/test command output is routed to `BuildLogCompressor`; CSV/TSV is routed to `TabularCompressor`; only a smaller end-to-end result is accepted | Other content domains and Tool Errors pass through; recoverable reduction requires either Marker-authorized framework retrieval or a supported Marker command path |
+| Content-aware response compression | Successful PostTool JSON is routed to `JsonCompressor`; recognized successful build/test command output is routed to `BuildLogCompressor`; CSV/TSV is routed to `TabularCompressor`; supported search listings use `SearchResultsCompressor`; only a smaller end-to-end result is accepted | Other content domains and Tool Errors pass through; recoverable reduction requires either Marker-authorized framework retrieval or a supported Marker command path |
+| Search path sharing | Shares paths across consecutive API search records, including native Claude Grep, retaining all received text and positions | Enabled by default; requires API response origin, text replacement and no-context records; file and command outputs pass through this domain |
 | TOON encoding | Encodes JSON and keeps the JSON input when the estimated token count does not decrease | Replaces the original when the host accepts text replacement; hosts without replacement capability pass through |
 | Command rewriting | Calls `rtk rewrite` and submits the rewritten shell input when a rule is available | Recognized build/test commands stay native for Build Log handling; other unsupported or denied rewrites pass through |
 | Tool Ready | Legacy pre-call checks for declared binaries, versions, configuration, permissions, and optional dependencies | Hard-disabled; it cannot inspect, repair, or block tool execution |
@@ -59,7 +60,7 @@ After an adapter is enabled, a tool call may pass through these stages:
 ```text
 Before the tool: hard-disabled Tool Ready hook → command rewrite
 Before the tool: reserve recognized build/test commands; otherwise RTK rewrite → carry output-optimization state
-After the tool: status and optimization bypass → JSON/CSV/TSV/Build Log PostTool Pipeline → optional Stash/TOON → statistics
+After the tool: status and optimization bypass → JSON/CSV/TSV/Search/Build Log PostTool Pipeline → optional Stash/TOON → statistics
 Before the model: schema compression → visible Marker extraction → conditional Retrieve declaration
 Retrieve: visible-Marker authorization → byte-identical Stash read
 ```
@@ -99,10 +100,10 @@ anolisa adapter disable tokenless <framework>
 Adapters do not compress every tool result. For response compression, compressed content is produced only when all of the following hold:
 
 1. Compression is not switched off. With `compression_enabled=false` or `TOKENLESS_COMPRESSION_ENABLED=0` the run becomes a dry-run: statistics are still calculated, but the original text is returned (see the previous section).
-2. The tool is not a content-retrieval tool. Read/Glob/Grep/LSP/NotebookRead and their aliases skip response compression so their content stays intact.
+2. The tool is not a content-retrieval tool. Read/Glob/Grep/LSP/NotebookRead and their aliases skip response compression so their content stays intact. Search path sharing adds one narrow exception: a native Claude Code `Grep` result in no-context content mode is routed to that lossless compressor instead, and still keeps every received match (see [Controlling search path sharing](#controlling-search-path-sharing)).
 3. The response reaches the minimum length. The shared response hook, OpenClaw, and Hermes skip responses shorter than 200 characters. Length is counted in characters, not bytes.
 4. The content is valid JSON. Threshold-based response compression works on JSON objects and arrays.
-   - **4a. Shared response hook path:** output that arrives as plain text (not JSON) is routed to the content-aware text compressors (build/test log terminal cleanup and progress reduction, CSV/TSV table compaction) described in [Adapter processing rules](framework-integration.md#adapter-processing-rules); the table rules are detailed in [CSV/TSV views can be incomplete](#csvtsv-views-can-be-incomplete).
+   - **4a. Shared response hook path:** output that arrives as plain text (not JSON) is routed to the content-aware text compressors (build/test log terminal cleanup and progress reduction, CSV/TSV table compaction, API search path sharing) described in [Adapter processing rules](framework-integration.md#adapter-processing-rules); the table rules are detailed in [CSV/TSV views can be incomplete](#csvtsv-views-can-be-incomplete) and the search rules in [Controlling search path sharing](#controlling-search-path-sharing).
    - **4b. OpenClaw and Hermes:** both unwrap a shell result's dominant text field (for example the `output` of a `{"stdout": ...}` envelope) and allow text replacement, so Core can also route that plain text to the build-log and CSV/TSV compressors; OpenClaw's structured slots accept JSON only.
 
    The shared response hook additionally skips skill-like text with YAML frontmatter before spawning a compression subprocess (Core passes such text through anyway).
@@ -125,6 +126,24 @@ Per-path differences worth noting:
 - The OpenClaw plugin reads the same `tool_categories.json` lists to map each tool to a content origin (file content, command output, or API response), falling back to its built-in lists when that file is missing or invalid; Core then applies the matching thresholds. Its former `skip_tools` and `shell_tools` overrides have been removed and no longer control the adapter. See [Configuration and data privacy](configuration-and-privacy.md) for the current options.
 - TOON encoding is a separate trigger decision: it runs only on payloads of at least 500 characters and only when the host slot accepts text, and it is adopted only when the encoded result is smaller than the current content.
 - The AgentScope framework integration does not use the adapter thresholds above; it selects thresholds by `conservative` / `balanced` / `aggressive` mode. See [Framework integration](framework-integration.md).
+
+### Controlling search path sharing
+
+API search path sharing is enabled by default. Set `TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0`
+in the agent process environment to disable it through the CLI. When unset it stays enabled;
+`1`, `true`, and `yes` also enable it (case-insensitively). Empty and other values disable it.
+This setting is independent of `config.json`. Python SDK callers can disable it with
+`TokenlessConfig(search_path_sharing_enabled=False)`; Rust callers set
+`RuntimeConfig.search_path_sharing_enabled` to `false`. All entry points default to enabled.
+
+Disabling this feature returns search listings unchanged. JSON, table, and log compression
+remain available for other tool names. The exact name `Grep` always excludes those compressors
+to preserve received matches, even with path sharing disabled. A custom tool named `Grep`
+therefore cannot restore its pre-feature JSON/table/log compression through this switch.
+Supported no-context Claude Grep results retain all received matches; file reads and command outputs,
+including Bash without RTK, do not enter search path sharing. Other API tools can use the same
+Core capability. Whole-task savings depend on the workload; smaller search results do not
+guarantee lower total token use.
 
 ### CSV/TSV views can be incomplete
 
@@ -157,6 +176,19 @@ provenance are never partially reported.
 
 A reduced candidate must use fewer characters and estimated tokens than both the original and
 full view, including the notice. These checks do not guarantee savings with every model tokenizer.
+
+### Native Grep keeps every received match
+
+On Claude Code 2.1.121 or newer, native Grep content results can share repeated file paths.
+A `File="..."` heading supplies the full path for the following `line:text` rows, until the next
+file heading. All received records, source text, whitespace and line endings are retained.
+The view is used only when it is smaller; it needs no Stash entry or retrieval command.
+
+This first version supports no-context `path:line:text` listings with at least three records
+and paths without colons. Context queries, count/file-list modes, unsupported listings and
+file reads keep their existing behavior. Bash searches continue through RTK. Grep may already
+have applied a host limit before Tokenless receives the result; path sharing does not recover
+those missing matches. Lower first-result size does not guarantee lower total task cost.
 
 ### Reversible compression is conditional
 
