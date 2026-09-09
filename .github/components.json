@@ -175,7 +175,7 @@
       "release_tag_prefix": "ckpt/v",
       "ci_key": "ws_ckpt",
       "issue_triagers": [
-        "Ziqi002"
+        "yummypeng"
       ],
       "status": "active"
     },
