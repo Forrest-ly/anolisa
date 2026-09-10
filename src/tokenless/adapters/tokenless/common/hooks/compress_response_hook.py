@@ -592,7 +592,7 @@ def main() -> None:
         # Host classification is multi-signal and every signal fails
         # safe to the non-CLI path (see the module doc).
         can_replace = _workbuddy_cli_host()
-        replace_with_text = shell_field is not None or not isinstance(
+        replace_with_text = text_field is not None or not isinstance(
             tool_response_raw, (dict, list)
         )
         if not can_replace:
