@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# install.sh — Register tokenless hooks for Kimi Code in ~/.kimi/config.toml.
+# install.sh — Register tokenless hooks in the Kimi config (config.toml).
 #
-# Kimi Code uses a flat TOML config with [[hooks]] entries rather than a
-# plugin manifest. This script injects hook definitions that point to
-# the shared tokenless hooks via the run-hook.sh dispatcher.
+# Kimi uses a flat TOML config with [[hooks]] entries rather than a plugin
+# manifest. This script injects hook definitions that point to the shared
+# tokenless hooks via the run-hook.sh dispatcher, into the data root the
+# installed Kimi CLI actually reads (see _common.sh).
 set -euo pipefail
 
 AGENT="${ANOLISA_TARGET:-kimicode}"
 COMPONENT="${ANOLISA_COMPONENT:-tokenless}"
 ADAPTER_DIR="${ANOLISA_ADAPTER_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
-KIMI_HOME="${KIMI_SHARE_DIR:-${HOME}/.kimi}"
+# Shared Kimi data-root resolution: Kimi Code reads ~/.kimi-code (KIMI_CODE_HOME)
+# while the wound-down kimi-cli read ~/.kimi (KIMI_SHARE_DIR). See _common.sh.
+SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+# shellcheck source=./_common.sh
+source "$SCRIPT_DIR/_common.sh"
+
+KIMI_HOME="$(resolve_kimi_home)"
 CONFIG_FILE="${KIMI_HOME}/config.toml"
 
 DRY_RUN="${ANOLISA_DRY_RUN:-0}"
@@ -26,6 +33,8 @@ if [ "$FORCE_INSTALL" != "1" ] && ! command -v kimi &>/dev/null; then
     echo "[${COMPONENT}] Install Kimi Code first, or re-run with ANOLISA_FORCE_INSTALL=1."
     exit 0
 fi
+
+echo "[${COMPONENT}] kimi data root: ${KIMI_HOME} ($(resolve_kimi_home_origin))"
 
 if [ ! -d "$KIMI_HOME" ]; then
     mkdir -p "$KIMI_HOME"

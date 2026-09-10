@@ -12,6 +12,12 @@ ADAPTER_DIR="${ANOLISA_ADAPTER_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
 ADAPTER_SRC="$ADAPTER_DIR/kimicode"
 
+# Shared Kimi data-root resolution: Kimi Code reads ~/.kimi-code (KIMI_CODE_HOME)
+# while the wound-down kimi-cli read ~/.kimi (KIMI_SHARE_DIR). See _common.sh.
+SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+# shellcheck source=./_common.sh
+source "$SCRIPT_DIR/_common.sh"
+
 KIMI_BIN="${KIMI_BIN:-}"
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 
@@ -36,15 +42,27 @@ else
     note_prereq_missing "kimi CLI"
 fi
 
-# Kimi Code stores global config under ~/.kimi/ (upstream default via
-# get_share_dir() / KIMI_SHARE_DIR).
+# Which data root the installed Kimi CLI reads is a property of the product,
+# not of this adapter: _common.sh resolves it (and says why) so this report
+# never claims readiness against a directory Kimi does not load.
 # Absence is not a prerequisite failure — created on first run.
-KIMI_HOME="${KIMI_SHARE_DIR:-${HOME}/.kimi}"
+KIMI_HOME="$(resolve_kimi_home)"
+field "kimi data root"        "$KIMI_HOME"
+field "kimi data root source" "$(resolve_kimi_home_origin)"
 if [ -d "$KIMI_HOME" ]; then
     field "kimi config dir"     "present ($KIMI_HOME)"
 else
-    field "kimi config dir"     "missing (created on first Kimi Code run)"
+    field "kimi config dir"     "missing (created on first Kimi run)"
 fi
+
+# A second data root on this host means a kimi-cli install was migrated to
+# Kimi Code (or both are installed). Only the resolved one is read; report the
+# other so leftover hooks there are not mistaken for a working install.
+for other_root in "${HOME}/.kimi-code" "${HOME}/.kimi"; do
+    if [ "$other_root" != "$KIMI_HOME" ] && [ -d "$other_root" ]; then
+        field "other kimi data root" "present ($other_root) — not read by this adapter"
+    fi
+done
 
 # Check if config.toml exists (hooks are configured here)
 if [ -f "$KIMI_HOME/config.toml" ]; then

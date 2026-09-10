@@ -235,6 +235,7 @@ install -m 0755 adapters/tokenless/kimicode/hooks/tool-ready-kimi-wrapper.sh %{b
 install -m 0755 adapters/tokenless/kimicode/scripts/detect.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/
 install -m 0755 adapters/tokenless/kimicode/scripts/install.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/
 install -m 0755 adapters/tokenless/kimicode/scripts/uninstall.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/
+install -m 0644 adapters/tokenless/kimicode/scripts/_common.sh %{buildroot}%{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/
 
 # Install cosh extension for auto-discovery at /usr/share/anolisa/extensions/tokenless/
 mkdir -p %{buildroot}%{_datadir}/anolisa/extensions/tokenless/hooks
@@ -366,6 +367,7 @@ install -m 0644 adapters/tokenless/common/commands/tokenless-stats.toml %{buildr
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/detect.sh
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/install.sh
 %attr(0755,root,root) %{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/uninstall.sh
+%attr(0644,root,root) %{_datadir}/anolisa/adapters/tokenless/kimicode/scripts/_common.sh
 # Cosh extension — auto-discovered from /usr/share/anolisa/extensions/
 %dir %{_datadir}/anolisa/extensions
 %dir %{_datadir}/anolisa/extensions/tokenless

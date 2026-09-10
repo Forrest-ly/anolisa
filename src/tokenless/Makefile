@@ -295,6 +295,7 @@ test-adapters: build-openclaw-plugin build-dsh-plugin
 	bash tests/test-qwenpaw-adapter-install.sh
 	@echo "==> Testing Kimi Code adapter..."
 	bash tests/test-kimicode-tool-ready-wrapper.sh
+	bash tests/test-kimicode-config-root.sh
 	bash tests/test-kimicode-uninstall-boundaries.sh
 	bash tests/test-kimicode-install-skip-when-missing.sh
 
