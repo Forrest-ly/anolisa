@@ -51,15 +51,60 @@ fi
 LOCK_SHA=$(sha256_of "$SCRIPT_DIR/Cargo.lock" || echo "unknown")
 FIXTURES_SHA=$(cat "$SCRIPT_DIR"/fixtures/*.json 2>/dev/null | sha256_of /dev/stdin || echo "unknown")
 RTK_BIN_PATH="${RTK_BIN:-$SCRIPT_DIR/../../third_party/rtk/target/release/rtk}"
-# Best-effort RTK version: only invoke the binary when it exists and is
-# executable, mirroring the Rust `find_rtk_binary` convention. This keeps the
-# script runnable when rtk is not built and avoids blocking on a slow-start
-# binary just to collect traceability metadata.
-if [[ -x "$RTK_BIN_PATH" ]]; then
-    RTK_VERSION=$("$RTK_BIN_PATH" --version 2>/dev/null | head -1 || echo "unavailable")
+
+# Resolve an rtk reference to a concrete executable path, mirroring the Rust
+# `find_rtk_binary` convention. `$RTK_BIN` may be a bare command name
+# (`RTK_BIN=rtk`), which the shell would exec through `PATH` — so testing `-x`
+# on the raw reference only inspects the CWD and would report a perfectly
+# usable `PATH` rtk as "unavailable" while the Rust side still finds and runs
+# it. Paths containing a slash are checked as given.
+resolve_rtk_bin() {
+    local ref="$1" resolved=""
+    if [[ "$ref" == */* ]]; then
+        resolved="$ref"
+    else
+        resolved="$(command -v -- "$ref" 2>/dev/null)" || resolved=""
+    fi
+    if [[ -n "$resolved" && -f "$resolved" && -x "$resolved" ]]; then
+        printf '%s' "$resolved"
+        return 0
+    fi
+    return 1
+}
+
+# Best-effort RTK version for traceability only: it must never hang the suite.
+# The probe is bounded with timeout(1) where one exists (`gtimeout` covers
+# macOS hosts that install coreutils) — the helper signals the child at the
+# deadline and reaps it, so a slow-starting or hung rtk degrades to
+# "unavailable" instead of stalling the build/test steps below. Without either
+# helper the probe runs unbounded, exactly as before.
+RTK_VERSION_TIMEOUT_SECS="${RTK_VERSION_TIMEOUT_SECS:-5}"
+if command -v timeout > /dev/null 2>&1; then
+    RTK_TIMEOUT_CMD="timeout"
+elif command -v gtimeout > /dev/null 2>&1; then
+    RTK_TIMEOUT_CMD="gtimeout"
 else
-    RTK_VERSION="unavailable"
+    RTK_TIMEOUT_CMD=""
 fi
+
+rtk_version_probe() {
+    local bin="$1" out=""
+    if [[ -n "$RTK_TIMEOUT_CMD" ]]; then
+        out="$("$RTK_TIMEOUT_CMD" "$RTK_VERSION_TIMEOUT_SECS" "$bin" --version 2>/dev/null | head -1)" || true
+    else
+        out="$("$bin" --version 2>/dev/null | head -1)" || true
+    fi
+    printf '%s' "$out"
+}
+
+if RTK_BIN_RESOLVED="$(resolve_rtk_bin "$RTK_BIN_PATH")"; then
+    RTK_VERSION="$(rtk_version_probe "$RTK_BIN_RESOLVED")"
+else
+    RTK_VERSION=""
+fi
+# Missing binary, non-zero exit, empty stdout and an expired deadline all
+# collapse to the same sentinel the README documents.
+[[ -n "$RTK_VERSION" ]] || RTK_VERSION="unavailable"
 TOKENLESS_VERSION=$(grep -m1 '^version' "$SCRIPT_DIR/../../Cargo.toml" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/' || echo "unknown")
 cat > "$IDENTITY_FILE" <<EOF
 {

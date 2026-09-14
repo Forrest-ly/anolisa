@@ -145,8 +145,11 @@ stacking report) is computed in Rust in-process.
 5. **Default config only**: All measurements use default compressor settings.
    Production adapters may use different configurations with different results.
 6. **RTK version metadata**: `benchmark_identity.json` records `rtk_version` as a
-   best-effort traceability field. It will be `"unavailable"` when the rtk binary
-   is not built or not executable; this does not affect the benchmark results.
+   best-effort traceability field. It will be `"unavailable"` when the rtk
+   reference (`$RTK_BIN` — a path or a bare command name resolved through
+   `PATH` — or the vendored release build) does not point at an executable, or
+   when the bounded `--version` probe exceeds `RTK_VERSION_TIMEOUT_SECS`
+   (default 5). Neither case affects the benchmark results.
 
 ## Version note
 
