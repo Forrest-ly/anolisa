@@ -437,6 +437,34 @@ echo '{"name":"test","value":42}' | tokenless compress-toon --min-toon-chars 0 |
 tokenless compress-toon -f data.json --agent-id my-agent --session-id sess-001
 ```
 
+`tests/test-toon-full.sh` 把上面这套契约做成手动 E2E 校验（不是 make 目标）。它驱动
+PATH 上的 `tokenless`，因此要求该二进制与本 checkout 同版本（`TOKENLESS_ALLOW_VERSION_SKEW=1`
+可放行已安装的旧版本）。场景 1/2 只需要仓库树；场景 3 需要一个启用了 tokenless 插件的
+OpenClaw、GNU `timeout`（coreutils，用于给每次模型调用限时），且必须显式设置
+`TOKENLESS_TOON_FULL_LIVE=1` 才会真实调用模型。OpenClaw 的状态目录按
+`OPENCLAW_STATE_DIR` → `OPENCLAW_HOME` → `~/.openclaw` 解析（与
+`adapters/tokenless/openclaw/scripts/` 下的 install/detect 脚本一致），CLI 路径可用
+`OPENCLAW_BIN` 覆盖。可选前置条件缺失记为 SKIP，不计入失败；但一旦设置了
+`TOKENLESS_TOON_FULL_LIVE=1`，场景 3 的前置条件缺失会直接报错退出，不会以"全部跳过"
+的姿态给出绿色结果。
+
+`timeout` 约束的是**每一次** OpenClaw 调用，只读探测（`openclaw plugins list`）也不例外：
+缺少 `timeout` 时脚本根本不会发起该调用，探测退化为只查磁盘上的
+`<state-dir>/extensions/tokenless` 并在结论里注明"未查询 plugins list"；显式 live 运行则在
+探测之前就报错退出，不会卡在探测里。live 模式下 session 查询失败、超时或返回不可解析的内容
+一律计为 FAIL，只有"查询成功但没有可复用 session"才保留 SKIP——否则一次什么也没验证的 live
+运行会显示 0 failures 并 exit 0。
+
+场景 3 还有一条**既存限制**（早于本次改动，merge base 就存在）：3.1 断言的
+`rtk-rewrite` / `schema-compression` / `response-compression` / `toon-compression`
+并不是插件当前的输出，`adapters/tokenless/openclaw/index.ts` 打印的是 `pre-tool` /
+`post-tool`，且仅在 verbose 开启时打印。重新推导这些断言需要一台启用了 tokenless 插件的
+真实 OpenClaw 主机，因此暂按原样保留；脚本中对应位置已就地标注 KNOWN STALE。
+
+```bash
+PATH="src/tokenless/target/debug:$PATH" bash src/tokenless/tests/test-toon-full.sh
+```
+
 ### 9.2 通过统计数据库验证压缩效果
 
 Tokenless 自动将每次压缩操作记录到 `~/.tokenless/stats.db`（SQLite WAL 模式）。四种操作类型均被追踪：`compress-schema`、`compress-response`、`rewrite-command`、`compress-toon`。
