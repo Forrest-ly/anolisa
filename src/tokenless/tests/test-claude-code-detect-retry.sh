@@ -36,6 +36,20 @@
 # ordinary pre-install state, and scenario 7 keeps the pre-existing rule
 # that an outright failing `plugin list` is transient and is retried.
 #
+# GH #3267 is the same race under concurrent load, where the index lag
+# outlasts a small fixed re-list budget: the #3085 mitigation reduced the
+# frequency but kept returning the false "not installed" verdict (80% of
+# runs under load). detect.sh now confirms an omitted plugin against the
+# enabledPlugins record that `claude plugin install` writes synchronously to
+# ~/.claude/settings.json, which settles the question without waiting for
+# the index at all (scenario 8); that record is a positive signal only, so a
+# different plugin, a disabled record and a malformed file all still fall
+# through to the bounded re-list budget (scenarios 9-11). The budget itself
+# is now a wall-clock window with a backing-off gap and a larger attempt
+# ceiling, which rides out a longer lag (scenario 12, with the pre-fix
+# ceiling as its control) without letting a large ceiling run away
+# (scenario 13) and without hammering the CLI in one burst (scenario 14).
+#
 # detect.sh reads the manifests and the hook dispatcher from
 # $ANOLISA_ADAPTER_DIR, so every scenario points it at a synthetic adapter
 # tree the test controls; no scenario depends on the state of the checked-out
@@ -159,6 +173,38 @@ stage_adapter() { # stage_adapter <marketplace:yes|no> <plugin-json:yes|no>
     fi
 }
 
+write_settings() { # write_settings <enabled|disabled|other|malformed>
+    # Write ~/.claude/settings.json, the state `claude plugin install` leaves
+    # behind (and that uninstall.sh cleans up when the CLI is gone). "other"
+    # registers this adapter's marketplace but enables a different plugin, so
+    # it also pins that a marketplace-name match is not mistaken for the
+    # plugin record.
+    mkdir -p "$FAKE_HOME/.claude"
+    local settings="$FAKE_HOME/.claude/settings.json"
+    case "$1" in
+    enabled)
+        printf '{\n  "enabledPlugins": {\n    "%s": true\n  }\n}\n' \
+            "$PLUGIN_ID" >"$settings"
+        ;;
+    disabled)
+        printf '{\n  "enabledPlugins": {\n    "%s": false\n  }\n}\n' \
+            "$PLUGIN_ID" >"$settings"
+        ;;
+    other)
+        printf '{\n  "enabledPlugins": {\n    "other@anolisa-other": true\n  },\n' \
+            >"$settings"
+        printf '  "extraKnownMarketplaces": {\n    "anolisa-tokenless": {}\n  }\n}\n' \
+            >>"$settings"
+        ;;
+    malformed)
+        printf '{\n  "enabledPlugins": {\n' >"$settings"
+        ;;
+    *)
+        fail "write_settings: unknown shape '$1'"
+        ;;
+    esac
+}
+
 schedule_claude() { # schedule_claude <delay-seconds>
     # Simulate provisioning: the binary becomes visible only after the delay.
     (
@@ -186,7 +232,7 @@ reset_env() {
     LATE_OMISSIONS=1
 }
 
-run_detect() { # run_detect <retries> <retry-delay> <plugin-relists>
+run_detect() { # run_detect <retries> <retry-delay> <plugin-relists> [settle-window]
     : >"$CALL_LOG"
     rm -f "$FLAKY_MARKER" "$LATE_COUNT_FILE"
     # Inherit only /usr/local/bin:/usr/bin:/bin (detect.sh itself prepends
@@ -203,6 +249,7 @@ run_detect() { # run_detect <retries> <retry-delay> <plugin-relists>
     TOKENLESS_DETECT_RETRIES="$1" \
     TOKENLESS_DETECT_RETRY_DELAY="$2" \
     TOKENLESS_DETECT_PLUGIN_RELISTS="$3" \
+    TOKENLESS_DETECT_PLUGIN_SETTLE_SECONDS="${4:-15}" \
         bash "$DETECT" 2>&1
 }
 
@@ -361,5 +408,171 @@ grep -qF "installed ($PLUGIN_ID)" <<<"$out" \
 calls="$(plugin_list_calls)"
 [ "$calls" -eq 2 ] \
     || fail "the transient plugin-list failure should be retried once (saw $calls calls)" "$out"
+
+# --- Scenario 8: GH #3267, a stale index must not decide the verdict ------
+# `claude plugin list` succeeds but still omits the plugin (the registry index
+# has not rescanned), while ~/.claude/settings.json already carries the
+# enabledPlugins record the installer wrote. That record is authoritative, so
+# detect.sh must report installed (exit 0) on the very first list — no
+# re-lists, no waiting out the index — and name the signal that confirmed it.
+# Before the fix this exact state returned "not installed" (exit 1) whenever
+# the re-list budget ran out first, which under load was ~80% of runs.
+reset_env
+install_claude_stub
+stage_adapter yes yes
+echo absent >"$STUB_MODE_FILE"
+write_settings enabled
+if ! out="$(run_detect 3 0 5)"; then
+    fail "a stale registry index must not report an installed plugin as missing" "$out"
+fi
+grep -qF "installed ($PLUGIN_ID)" <<<"$out" \
+    || fail "the settings record should confirm the plugin the index omitted" "$out"
+grep -qF "plugin registry index" <<<"$out" \
+    || fail "detect.sh should surface that the registry index was stale" "$out"
+grep -qF "claude-code: ready" <<<"$out" \
+    || fail "claude-code should be reported ready despite the stale index" "$out"
+calls="$(plugin_list_calls)"
+[ "$calls" -eq 1 ] \
+    || fail "the settings record confirms the plugin without re-listing (saw $calls calls)" "$out"
+
+# --- Scenario 9 (control): another plugin's record is not a confirmation --
+# The marketplace this adapter registers is known to claude, but the enabled
+# plugin is a different one: nothing confirms tokenless, so the omission stays
+# definitive-ish and the bounded re-list budget decides, exactly as before.
+reset_env
+install_claude_stub
+stage_adapter yes yes
+echo absent >"$STUB_MODE_FILE"
+write_settings other
+set +e
+out="$(run_detect 3 0 2)"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] \
+    || fail "a different plugin's record must not confirm tokenless, got rc=$rc" "$out"
+grep -qF "not installed" <<<"$out" \
+    || fail "the plugin should stay not installed when another plugin is enabled" "$out"
+calls="$(plugin_list_calls)"
+[ "$calls" -eq 3 ] \
+    || fail "an unconfirmed omission should still use the re-list budget (saw $calls calls)" "$out"
+
+# --- Scenario 10 (control): a disabled record is not a confirmation -------
+# enabledPlugins carries the plugin but set to false, i.e. the user (or a
+# failed activation) turned it off. detect.sh must keep reporting "not
+# installed" so the install flow re-enables it, instead of using the record to
+# claim a ready adapter whose hooks will never fire.
+reset_env
+install_claude_stub
+stage_adapter yes yes
+echo absent >"$STUB_MODE_FILE"
+write_settings disabled
+set +e
+out="$(run_detect 3 0 2)"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] \
+    || fail "a disabled plugin record must not be reported as installed, got rc=$rc" "$out"
+grep -qF "not installed" <<<"$out" \
+    || fail "a disabled plugin should be reported not installed" "$out"
+
+# --- Scenario 11 (control): a malformed settings.json is not a confirmation
+# The record cannot be read, so it proves nothing: detect.sh must neither
+# crash nor guess, and must fall back to the re-list budget.
+reset_env
+install_claude_stub
+stage_adapter yes yes
+echo absent >"$STUB_MODE_FILE"
+write_settings malformed
+set +e
+out="$(run_detect 3 0 2)"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] \
+    || fail "a malformed settings.json must fall back to the re-list budget, got rc=$rc" "$out"
+grep -qF "not installed" <<<"$out" \
+    || fail "an unreadable settings record should leave the plugin not installed" "$out"
+calls="$(plugin_list_calls)"
+[ "$calls" -eq 3 ] \
+    || fail "an unreadable settings record should still use the re-list budget (saw $calls calls)" "$out"
+
+# --- Scenario 12: GH #3267, the index lag outlasts the old budget ---------
+# The registry index needs four lists before it shows the just-installed
+# plugin — the shape of the loaded nightly run, where the lag outgrew the
+# fixed budget of 2 re-lists. The larger ceiling rides it out (exit 0).
+reset_env
+install_claude_stub
+stage_adapter yes yes
+echo late >"$STUB_MODE_FILE"
+LATE_OMISSIONS=4
+if ! out="$(run_detect 3 0 5)"; then
+    fail "detect.sh should ride out an index lag longer than the GH #3085 budget" "$out"
+fi
+grep -qF "installed ($PLUGIN_ID)" <<<"$out" \
+    || fail "the plugin should be reported installed once the index catches up" "$out"
+calls="$(plugin_list_calls)"
+[ "$calls" -eq 5 ] \
+    || fail "a four-list lag should be settled by the fifth list (saw $calls calls)" "$out"
+
+# --- Scenario 12b (control): the pre-fix budget fails the same run --------
+# With the GH #3085 ceiling of 2 re-lists the very same lag ends in the false
+# "not installed" verdict reported by GH #3267. Proves the raised ceiling (and
+# not something incidental) is what fixes it.
+reset_env
+install_claude_stub
+stage_adapter yes yes
+echo late >"$STUB_MODE_FILE"
+LATE_OMISSIONS=4
+set +e
+out="$(run_detect 3 0 2)"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] \
+    || fail "the pre-fix re-list ceiling should still miss a four-list lag, got rc=$rc" "$out"
+grep -qF "not installed" <<<"$out" \
+    || fail "the pre-fix ceiling should report the plugin not installed" "$out"
+calls="$(plugin_list_calls)"
+[ "$calls" -eq 3 ] \
+    || fail "the pre-fix ceiling stops after 1 + 2 lists (saw $calls calls)" "$out"
+
+# --- Scenario 13: the settle window bounds a large attempt ceiling --------
+# The re-list budget is a wall-clock window with the attempt count as a
+# ceiling, not the other way round: a generous ceiling must not turn a
+# genuinely absent plugin into a minutes-long probe loop. With a 1s window the
+# loop stops after the first backoff step even though 50 attempts are allowed.
+reset_env
+install_claude_stub
+stage_adapter yes yes
+echo absent >"$STUB_MODE_FILE"
+set +e
+out="$(run_detect 3 1 50 1)"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] \
+    || fail "an absent plugin should be reported not installed once the window closes, got rc=$rc" "$out"
+calls="$(plugin_list_calls)"
+[ "$calls" -le 3 ] \
+    || fail "the settle window must bound the re-lists (saw $calls calls with a 1s window)" "$out"
+
+# --- Scenario 14: the re-list gap backs off ------------------------------
+# Pin the schedule directly: the base retry delay doubled per re-list and
+# capped, so a loaded host spends its settle window on a few well-spaced
+# probes instead of burning it in one burst (and a fractional base delay, as
+# scenario 1 uses, still works).
+eval "$(sed -n '/^plugin_relist_delay()/,/^}/p' "$DETECT")"
+# Both variables are read by the eval'd function, which shellcheck cannot see.
+# shellcheck disable=SC2034
+DETECT_RETRY_DELAY=1
+# shellcheck disable=SC2034
+DETECT_PLUGIN_RELIST_DELAY_MAX=4
+schedule="$(plugin_relist_delay 1) $(plugin_relist_delay 2) $(plugin_relist_delay 3)"
+schedule="$schedule $(plugin_relist_delay 4) $(plugin_relist_delay 6)"
+[ "$schedule" = "1 2 4 4 4" ] \
+    || fail "the re-list backoff should double and cap at 4s, got: $schedule"
+# shellcheck disable=SC2034
+DETECT_RETRY_DELAY=0.5
+schedule="$(plugin_relist_delay 1) $(plugin_relist_delay 2) $(plugin_relist_delay 3)"
+[ "$schedule" = "0.5 1 2" ] \
+    || fail "the backoff should honour a fractional base delay, got: $schedule"
+unset -f plugin_relist_delay
 
 echo "claude-code detect retry test passed"

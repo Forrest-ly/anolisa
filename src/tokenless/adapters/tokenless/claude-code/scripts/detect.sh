@@ -30,8 +30,22 @@ DETECT_RETRY_DELAY="${TOKENLESS_DETECT_RETRY_DELAY:-1}"
 # only picks them up on a later scan, so the very first list right after
 # provisioning can succeed and still omit the just-installed plugin (GH
 # #3082). Kept apart from DETECT_RETRIES so a genuinely absent plugin pays a
-# couple of cheap re-lists rather than the whole settling budget.
-DETECT_PLUGIN_RELISTS="${TOKENLESS_DETECT_PLUGIN_RELISTS:-2}"
+# bounded settle rather than the whole settling budget.
+#
+# GH #3267: a bare attempt count is not load-adaptive. Under concurrent load
+# the registry index lags longer than two cheap re-lists, the count budget is
+# exhausted, and the false "not installed" verdict of GH #3082 comes back.
+# The budget is therefore expressed as a wall-clock settle window
+# (DETECT_PLUGIN_SETTLE_SECONDS, integer seconds measured with $SECONDS) with
+# DETECT_PLUGIN_RELISTS kept as a hard attempt ceiling, and the gap between
+# re-lists backs off instead of staying constant. A slow host then spends the
+# same window on fewer, better-spaced probes instead of burning it on calls
+# that all land before the index has refreshed. Both limits are checked
+# before each re-list, so the window is a soft ceiling: the loop can overshoot
+# it by at most one backoff step plus one in-flight `plugin list`.
+DETECT_PLUGIN_RELISTS="${TOKENLESS_DETECT_PLUGIN_RELISTS:-5}"
+DETECT_PLUGIN_SETTLE_SECONDS="${TOKENLESS_DETECT_PLUGIN_SETTLE_SECONDS:-15}"
+DETECT_PLUGIN_RELIST_DELAY_MAX="${TOKENLESS_DETECT_PLUGIN_RELIST_DELAY_MAX:-4}"
 
 # settle <cmd...> — run cmd once; if it reports a retryable failure (exit
 # status 1), sleep DETECT_RETRY_DELAY and retry, up to DETECT_RETRIES retries
@@ -51,6 +65,21 @@ settle() {
     return "$rc"
 }
 
+# plugin_relist_delay <n> — backoff before the n-th re-list: the base retry
+# delay doubled per attempt and capped at DETECT_PLUGIN_RELIST_DELAY_MAX. awk
+# does the arithmetic so a fractional base delay (the retry test uses 0.5)
+# keeps working; without awk the constant base delay is used, i.e. the
+# pre-GH #3267 behaviour.
+plugin_relist_delay() {
+    local delay=""
+    delay="$(awk -v base="$DETECT_RETRY_DELAY" -v n="$1" \
+        -v cap="$DETECT_PLUGIN_RELIST_DELAY_MAX" \
+        'BEGIN { d = base * (2 ^ (n - 1)); printf "%g\n", (d > cap ? cap : d) }' \
+        2>/dev/null)" || delay=""
+    [ -n "$delay" ] || delay="$DETECT_RETRY_DELAY"
+    printf '%s\n' "$delay"
+}
+
 line()  { printf '[%s] %s\n' "$COMPONENT" "$*"; }
 field() { printf '[%s]   %-26s %s\n' "$COMPONENT" "$1" "$2"; }
 
@@ -58,6 +87,11 @@ PREREQ_MISSING=()
 INSTALL_MISSING=()
 note_prereq_missing()  { PREREQ_MISSING+=("$1"); }
 note_install_missing() { INSTALL_MISSING+=("$1"); }
+
+# Set when `claude plugin list` omitted the plugin but the installer's own
+# settings record confirmed it (GH #3267): the registry index was stale, which
+# is worth reporting because it is otherwise invisible and intermittent.
+PLUGIN_INDEX_STALE=0
 
 find_claude_bin() {
     CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
@@ -115,6 +149,33 @@ plugin_manifests_staged() {
         && [ -f "$PLUGIN_SRC/.claude-plugin/plugin.json" ]
 }
 
+# plugin_enabled_in_settings — positive confirmation from the state that
+# `claude plugin install` writes synchronously: the enabledPlugins record in
+# ~/.claude/settings.json (the same record uninstall.sh cleans up when the CLI
+# is gone). The registry index behind `claude plugin list` is refreshed lazily
+# and can lag that write by seconds under load, so when the two disagree the
+# settings record is the stronger signal (GH #3267).
+#
+# Strictly a positive signal: a missing file, a malformed file, an absent jq,
+# an absent record or a disabled one proves nothing and must fall through to
+# the re-list budget below rather than flip the verdict. A disabled plugin in
+# particular stays "not installed" so that the install flow re-enables it.
+plugin_enabled_in_settings() {
+    local settings="$HOME/.claude/settings.json"
+    [ -f "$settings" ] || return 1
+    if command -v jq &>/dev/null; then
+        jq -e --arg id "$PLUGIN_ID" '(.enabledPlugins // {})[$id] == true' \
+            "$settings" &>/dev/null
+        return $?
+    fi
+    # No jq: match the enabledPlugins record literally. $PLUGIN_ID
+    # ("$COMPONENT@anolisa-$COMPONENT") is quoted in the record and differs
+    # from the marketplace name this adapter registers, so neither that name
+    # nor any other adapter's plugin can produce a false match; requiring the
+    # `true` value keeps this path as strict as the jq one.
+    grep -Eq "\"$PLUGIN_ID\"[[:space:]]*:[[:space:]]*true" "$settings"
+}
+
 # claude_plugin_listed — probe the plugin registry, using the settle()
 # exit-status contract: 0 = plugin listed; 1 = `claude plugin list` itself
 # failed (the CLI may still be initializing ~/.claude on first run, so a
@@ -128,6 +189,13 @@ claude_plugin_listed() {
     if printf '%s\n' "$listing" | grep -qF "$PLUGIN_ID"; then
         return 0
     fi
+    # An omission is only *probably* definitive: the index may not have caught
+    # up with the installer yet. Confirm against the installer's own record
+    # before reporting the plugin absent.
+    if plugin_enabled_in_settings; then
+        PLUGIN_INDEX_STALE=1
+        return 0
+    fi
     return 2
 }
 
@@ -139,19 +207,21 @@ claude_plugin_listed() {
 # 2) without spending any budget. With the manifests staged it is also the
 # shape of the GH #3082 first-run race, where the registry index lags one
 # scan behind the installer and the just-installed plugin is missing from an
-# otherwise successful list. Re-list up to DETECT_PLUGIN_RELISTS times to
-# ride out that refresh window; a genuinely absent plugin still ends up
-# reported as "not installed", only a few cheap calls later.
+# otherwise successful list. Re-list to ride out that refresh window, bounded
+# by DETECT_PLUGIN_RELISTS attempts and by DETECT_PLUGIN_SETTLE_SECONDS of
+# wall clock (GH #3267), with a backing-off gap between attempts; a genuinely
+# absent plugin still ends up reported as "not installed", only later.
 #
 # Like settle(), this must be called in a condition context so that `set -e`
 # stays suppressed while the probe reports a non-zero status.
 settle_plugin_listed() {
-    local relist=0 rc=0
+    local relist=0 rc=0 start="${SECONDS:-0}"
     settle claude_plugin_listed; rc=$?
     while [ "$rc" -eq 2 ] && [ "$relist" -lt "$DETECT_PLUGIN_RELISTS" ] \
+        && [ "$((${SECONDS:-0} - start))" -lt "$DETECT_PLUGIN_SETTLE_SECONDS" ] \
         && plugin_manifests_staged; do
         relist=$((relist + 1))
-        sleep "$DETECT_RETRY_DELAY"
+        sleep "$(plugin_relist_delay "$relist")"
         settle claude_plugin_listed; rc=$?
     done
     return "$rc"
@@ -165,6 +235,10 @@ if [ -n "$CLAUDE_BIN" ] && [ -x "$CLAUDE_BIN" ]; then
     # reported only once those budgets are exhausted.
     if settle_plugin_listed; then
         field "plugin install"    "installed ($PLUGIN_ID)"
+        if [ "$PLUGIN_INDEX_STALE" -eq 1 ]; then
+            field "plugin registry index" \
+                "stale (confirmed via ~/.claude/settings.json)"
+        fi
     else
         field "plugin install"    "not installed"
         note_install_missing "$PLUGIN_ID"
