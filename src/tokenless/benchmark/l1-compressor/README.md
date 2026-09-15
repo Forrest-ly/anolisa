@@ -145,11 +145,18 @@ stacking report) is computed in Rust in-process.
 5. **Default config only**: All measurements use default compressor settings.
    Production adapters may use different configurations with different results.
 6. **RTK version metadata**: `benchmark_identity.json` records `rtk_version` as a
-   best-effort traceability field. It will be `"unavailable"` when the rtk
+   best-effort traceability field. A version is recorded only when the rtk
    reference (`$RTK_BIN` — a path or a bare command name resolved through
-   `PATH` — or the vendored release build) does not point at an executable, or
-   when the bounded `--version` probe exceeds `RTK_VERSION_TIMEOUT_SECS`
-   (default 5). Neither case affects the benchmark results.
+   `PATH` — or the vendored release build) points at an executable *and*
+   `<rtk> --version` exits 0 within `RTK_VERSION_TIMEOUT_SECS` (default 5).
+   Every other outcome records `"unavailable"`: unresolvable or non-executable
+   binary, non-zero exit, empty stdout, or an expired deadline — including the
+   case where the binary printed something before the deadline, since an
+   abandoned probe cannot vouch for the version it started printing. The probe
+   runs under `timeout(1)` when the host has one, escalating to `SIGKILL` 1s
+   after the deadline so a binary that ignores `SIGTERM` cannot stall the
+   runner; a host with no `timeout`/`gtimeout` helper falls back to an
+   unbounded probe. None of this affects the benchmark results.
 
 ## Version note
 

@@ -73,11 +73,9 @@ resolve_rtk_bin() {
 }
 
 # Best-effort RTK version for traceability only: it must never hang the suite.
-# The probe is bounded with timeout(1) where one exists (`gtimeout` covers
-# macOS hosts that install coreutils) — the helper signals the child at the
-# deadline and reaps it, so a slow-starting or hung rtk degrades to
-# "unavailable" instead of stalling the build/test steps below. Without either
-# helper the probe runs unbounded, exactly as before.
+# Where the host has a timeout(1) helper (`gtimeout` covers macOS with
+# coreutils installed) the probe runs under it, so a slow-starting or hung rtk
+# costs at most the deadline instead of stalling the build/test steps below.
 RTK_VERSION_TIMEOUT_SECS="${RTK_VERSION_TIMEOUT_SECS:-5}"
 if command -v timeout > /dev/null 2>&1; then
     RTK_TIMEOUT_CMD="timeout"
@@ -87,14 +85,49 @@ else
     RTK_TIMEOUT_CMD=""
 fi
 
-rtk_version_probe() {
-    local bin="$1" out=""
-    if [[ -n "$RTK_TIMEOUT_CMD" ]]; then
-        out="$("$RTK_TIMEOUT_CMD" "$RTK_VERSION_TIMEOUT_SECS" "$bin" --version 2>/dev/null | head -1)" || true
+# SIGTERM alone is not a deadline: a binary that traps or ignores it keeps
+# timeout(1) — and the command substitution around it — waiting long past the
+# deadline. Prefer GNU's second, unignorable SIGKILL deadline; else ask for
+# SIGKILL outright (busybox timeout has no --kill-after); else fall back to the
+# helper's default SIGTERM, which only bounds binaries that honour it. The two
+# capability probes cost one short-lived subprocess each, once per run.
+#
+# So the worst case for the probe is RTK_VERSION_TIMEOUT_SECS plus the 1s
+# SIGKILL grace on helpers that support it, and RTK_VERSION_TIMEOUT_SECS alone
+# where only SIGTERM is available.
+#
+# The result is a command PREFIX that already carries the deadline
+# ("timeout --kill-after=1 5"), and is empty when no helper exists — the probe
+# then runs unbounded, as it did before any of this guarding. It is expanded
+# unquoted on purpose so it splits into words; a plain string is used instead of
+# an array because `"${empty_array[@]}"` aborts under `set -u` on bash 3.2,
+# which is still the stock bash on macOS.
+RTK_TIMEOUT_PREFIX=""
+if [[ -n "$RTK_TIMEOUT_CMD" ]]; then
+    if "$RTK_TIMEOUT_CMD" --kill-after=1 1 true > /dev/null 2>&1; then
+        RTK_TIMEOUT_PREFIX="$RTK_TIMEOUT_CMD --kill-after=1 $RTK_VERSION_TIMEOUT_SECS"
+    elif "$RTK_TIMEOUT_CMD" -s KILL 1 true > /dev/null 2>&1; then
+        RTK_TIMEOUT_PREFIX="$RTK_TIMEOUT_CMD -s KILL $RTK_VERSION_TIMEOUT_SECS"
     else
-        out="$("$bin" --version 2>/dev/null | head -1)" || true
+        RTK_TIMEOUT_PREFIX="$RTK_TIMEOUT_CMD $RTK_VERSION_TIMEOUT_SECS"
     fi
-    printf '%s' "$out"
+fi
+
+rtk_version_probe() {
+    # Prints the first line of `<bin> --version`, and ONLY when the probe
+    # succeeded: exit status 0 within the deadline. A timed-out, killed or
+    # otherwise failing probe prints nothing, so the caller records
+    # "unavailable" — partial stdout from a probe we had to abandon is worse
+    # traceability than an honest sentinel, and a non-zero exit means the
+    # string cannot be attributed to a working rtk. Output is captured whole
+    # and cut at the first newline rather than piped through `head -1`: that
+    # pipe would exit non-zero via SIGPIPE on a chatty binary and, under
+    # `pipefail`, mask the probe's own status.
+    local bin="$1" out="" status=0
+    # shellcheck disable=SC2086 # RTK_TIMEOUT_PREFIX is an intentional flag list.
+    out="$($RTK_TIMEOUT_PREFIX "$bin" --version 2>/dev/null)" || status=$?
+    [[ "$status" -eq 0 ]] || out=""
+    printf '%s' "${out%%$'\n'*}"
 }
 
 if RTK_BIN_RESOLVED="$(resolve_rtk_bin "$RTK_BIN_PATH")"; then
@@ -102,7 +135,7 @@ if RTK_BIN_RESOLVED="$(resolve_rtk_bin "$RTK_BIN_PATH")"; then
 else
     RTK_VERSION=""
 fi
-# Missing binary, non-zero exit, empty stdout and an expired deadline all
+# Unresolvable binary, non-zero exit, empty stdout and an expired deadline all
 # collapse to the same sentinel the README documents.
 [[ -n "$RTK_VERSION" ]] || RTK_VERSION="unavailable"
 TOKENLESS_VERSION=$(grep -m1 '^version' "$SCRIPT_DIR/../../Cargo.toml" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/' || echo "unknown")

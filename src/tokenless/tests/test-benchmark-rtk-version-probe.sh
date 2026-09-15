@@ -12,11 +12,22 @@
 #   1. a bare command name ($RTK_BIN=rtk) is resolved through PATH, matching
 #      the Rust find_rtk_binary convention
 #   2. an explicit path ($RTK_BIN=/abs/rtk) still resolves
-#   3. missing / non-executable / empty-output rtk records "unavailable"
-#   4. a hanging rtk is bounded by RTK_VERSION_TIMEOUT_SECS and reaped
-#   5. only the first --version line is recorded, and a non-zero exit does not
-#      corrupt the identity JSON
-#   6. the probe still works on hosts without a timeout(1) helper
+#   3. missing / non-executable / unknown-on-PATH / silent rtk records
+#      "unavailable"
+#   4. the probe is bounded by RTK_VERSION_TIMEOUT_SECS and its child reaped —
+#      both for a binary that dies on SIGTERM and for one that ignores it
+#      (which needs the helper's unignorable follow-up deadline)
+#   5. only a SUCCESSFUL probe records a version: output printed before an
+#      expired deadline, and stdout from a non-zero exit, are dropped rather
+#      than recorded, and the identity JSON stays valid
+#   6. only the first --version line is recorded
+#   7. resolution and the success-only rule also hold on hosts without a
+#      timeout(1) helper
+
+# SC2016 (file scope): every rtk stub body below is deliberately single-quoted
+# so it reaches the stub file verbatim and is expanded by the stub's own shell
+# at probe time, not by make_stub.
+# shellcheck disable=SC2016
 
 set -euo pipefail
 
@@ -43,6 +54,7 @@ sed 's|^    RTK_TIMEOUT_CMD="timeout"$|    RTK_TIMEOUT_CMD=""|' "$L1_DIR/prelude
 
 CURRENT_RUNNER="$L1_DIR/prelude.sh"
 IDENTITY_FILE="$L1_DIR/benchmark_identity.json"
+FAILED=0
 
 make_stub() { # make_stub <path> <body>
     printf '#!/usr/bin/env bash\n%s\n' "$2" > "$1"
@@ -56,7 +68,6 @@ probe() {
     sed -n 's/^[[:space:]]*"rtk_version": "\(.*\)",[[:space:]]*$/\1/p' "$IDENTITY_FILE"
 }
 
-FAILED=0
 check() { # check <label> <actual> <expected>
     if [ "$2" = "$3" ]; then
         echo "  ok   $1"
@@ -66,7 +77,38 @@ check() { # check <label> <actual> <expected>
     fi
 }
 
+check_true() { # check_true <label> <0-or-1>
+    if [ "$2" -eq 0 ]; then
+        echo "  ok   $1"
+    else
+        echo "  FAIL $1"
+        FAILED=1
+    fi
+}
+
+# The deadline must be enforced by wall clock, not by the stub ending on its own.
+check_elapsed() { # check_elapsed <label> <elapsed-secs> <deadline-secs> <max-secs>
+    if [ "$2" -le "$4" ]; then
+        echo "  ok   $1 (returned after ${2}s, deadline ${3}s)"
+    else
+        echo "  FAIL $1: took ${2}s for a ${3}s deadline"
+        FAILED=1
+    fi
+}
+
+# A probe we abandoned must not leave its child behind.
+check_reaped() { # check_reaped <label> <pid-file>
+    local rc=1
+    [ -f "$2" ] && ! kill -0 "$(cat "$2")" 2>/dev/null && rc=0
+    check_true "$1" "$rc"
+}
+
 echo "benchmark rtk version probe:"
+
+if cmp -s "$L1_DIR/prelude.sh" "$L1_DIR/prelude-no-helper.sh"; then
+    echo "  FAIL could not derive the no-timeout-helper prelude (sed anchor drifted)"
+    FAILED=1
+fi
 
 # 1. Bare command name on PATH, nothing named rtk in the working directory —
 #    the case the Rust discovery still resolves and runs.
@@ -74,13 +116,13 @@ make_stub "$BIN_DIR/rtk" 'echo "rtk 0.1-test"'
 check "bare command name resolved through PATH" \
     "$(probe RTK_BIN=rtk "PATH=$BIN_DIR:$PATH")" "rtk 0.1-test"
 
-# 6. Same binary, no timeout(1) helper available.
+# 7a. Same binary, no timeout(1) helper available.
 CURRENT_RUNNER="$L1_DIR/prelude-no-helper.sh"
 check "PATH resolution without a timeout(1) helper" \
     "$(probe RTK_BIN=rtk "PATH=$BIN_DIR:$PATH")" "rtk 0.1-test"
 CURRENT_RUNNER="$L1_DIR/prelude.sh"
 
-# 2. Explicit paths: absolute and relative-to-CWD.
+# 2. Explicit absolute path.
 make_stub "$BIN_DIR/rtk-abs" 'echo "rtk 0.2-abs"'
 check "absolute RTK_BIN path" \
     "$(probe "RTK_BIN=$BIN_DIR/rtk-abs")" "rtk 0.2-abs"
@@ -102,36 +144,54 @@ check "bare command name absent from PATH" \
 make_stub "$BIN_DIR/rtk-silent" 'exit 0'
 check "empty --version output" "$(probe "RTK_BIN=$BIN_DIR/rtk-silent")" "unavailable"
 
-# 4. Hanging binary: bounded by the deadline, child reaped.
+# 4a. Hanging binary that dies on SIGTERM: bounded by the deadline, reaped.
 HANG_PID_FILE="$WORK/hang.pid"
-# shellcheck disable=SC2016 # Stub body must stay literal: it is expanded by the
-# stub's own shell at probe time, not by make_stub.
 make_stub "$BIN_DIR/rtk-hang" 'echo $$ > "$RTK_HANG_PID_FILE"; exec sleep 30'
 START=$(date +%s)
 check "hanging rtk bounded by RTK_VERSION_TIMEOUT_SECS" \
     "$(probe "RTK_BIN=$BIN_DIR/rtk-hang" RTK_VERSION_TIMEOUT_SECS=1 "RTK_HANG_PID_FILE=$HANG_PID_FILE")" \
     "unavailable"
-ELAPSED=$(( $(date +%s) - START ))
-if [ "$ELAPSED" -le 5 ]; then
-    echo "  ok   probe returned after ${ELAPSED}s (deadline 1s)"
-else
-    echo "  FAIL probe took ${ELAPSED}s for a 1s deadline"
-    FAILED=1
-fi
-if [ -f "$HANG_PID_FILE" ] && ! kill -0 "$(cat "$HANG_PID_FILE")" 2>/dev/null; then
-    echo "  ok   timed-out probe child was reaped"
-else
-    echo "  FAIL timed-out probe child still running"
-    FAILED=1
-fi
+check_elapsed "deadline honoured (SIGTERM-responsive rtk)" \
+    "$(( $(date +%s) - START ))" 1 5
+check_reaped "timed-out probe child was reaped" "$HANG_PID_FILE"
 
-# 5. Multi-line output and non-zero exit must not corrupt the identity file.
+# 4b. Binary that IGNORES SIGTERM: the deadline still has to hold, which needs
+#     the helper's unignorable follow-up signal (--kill-after / -s KILL).
+IGN_PID_FILE="$WORK/ignore-term.pid"
+make_stub "$BIN_DIR/rtk-ignore-term" \
+    'echo $$ > "$RTK_IGNORE_PID_FILE"; trap "" TERM; exec sleep 30'
+START=$(date +%s)
+check "SIGTERM-ignoring rtk still bounded" \
+    "$(probe "RTK_BIN=$BIN_DIR/rtk-ignore-term" RTK_VERSION_TIMEOUT_SECS=1 "RTK_IGNORE_PID_FILE=$IGN_PID_FILE")" \
+    "unavailable"
+check_elapsed "deadline honoured (SIGTERM-ignoring rtk)" \
+    "$(( $(date +%s) - START ))" 1 5
+check_reaped "SIGTERM-ignoring probe child was force-killed and reaped" "$IGN_PID_FILE"
+
+# 5a. Output printed BEFORE the deadline must be discarded, not recorded: an
+#     abandoned probe cannot vouch for the version it started printing.
+PART_PID_FILE="$WORK/partial.pid"
+make_stub "$BIN_DIR/rtk-partial" \
+    'echo $$ > "$RTK_PARTIAL_PID_FILE"; echo "rtk partial"; exec sleep 30'
+check "partial output dropped when the probe times out" \
+    "$(probe "RTK_BIN=$BIN_DIR/rtk-partial" RTK_VERSION_TIMEOUT_SECS=1 "RTK_PARTIAL_PID_FILE=$PART_PID_FILE")" \
+    "unavailable"
+check_reaped "partially-printing probe child was reaped" "$PART_PID_FILE"
+
+# 6. Multi-line output from a successful probe: first line only.
 make_stub "$BIN_DIR/rtk-multi" 'echo "rtk 0.4-multi"; echo "build abc123"'
 check "only the first --version line recorded" \
     "$(probe "RTK_BIN=$BIN_DIR/rtk-multi")" "rtk 0.4-multi"
+
+# 5b. Non-zero exit is a failed probe, so its stdout is not a trustworthy
+#     version — recorded as "unavailable" (with and without a helper).
 make_stub "$BIN_DIR/rtk-nonzero" 'echo "rtk 0.5-nonzero"; exit 3'
-check "version kept when --version exits non-zero" \
-    "$(probe "RTK_BIN=$BIN_DIR/rtk-nonzero")" "rtk 0.5-nonzero"
+check "non-zero --version exit degrades to unavailable" \
+    "$(probe "RTK_BIN=$BIN_DIR/rtk-nonzero")" "unavailable"
+CURRENT_RUNNER="$L1_DIR/prelude-no-helper.sh"
+check "non-zero exit degrades without a timeout(1) helper" \
+    "$(probe "RTK_BIN=$BIN_DIR/rtk-nonzero")" "unavailable"
+CURRENT_RUNNER="$L1_DIR/prelude.sh"
 if command -v python3 > /dev/null 2>&1; then
     python3 -m json.tool "$IDENTITY_FILE" > /dev/null
     echo "  ok   benchmark_identity.json is valid JSON"
