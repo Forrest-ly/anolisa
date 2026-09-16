@@ -8,6 +8,7 @@ Validates the PostToolUse hook output contract:
 - Pass-through when compression yields no size reduction.
 - Legacy path for non-replacement adapters.
 - Hardened permissions on the cached `claude --version` probe.
+- A `claude --version` probe that cannot answer fails open.
 
 Uses subprocess to invoke the hook with a mock tokenless binary,
 avoiding Python version issues with the hook_utils module.
@@ -174,8 +175,46 @@ def _create_mock_claude(tmpdir: str, version: str = "2.1.121") -> str:
     return mock_script
 
 
+def _create_broken_mock_claude(tmpdir: str, mode: str) -> str:
+    """Create a mock claude whose `--version` probe cannot yield a version.
+
+    Mirrors the three failure branches of `_cached_claude_version`:
+    ``exit-nonzero`` (the CLI exits non-zero), ``unparseable`` (it prints
+    something with no ``x.y.z`` in it) and ``unspawnable`` (a PATH entry
+    that `shutil.which` resolves but `execve` rejects, so `subprocess.run`
+    raises). A hanging probe lands in the same `except Exception` branch as
+    ``unspawnable``, so it is not exercised separately here.
+
+    ``exit-nonzero`` answers with a *supported* version before failing, so the
+    exit status alone has to void an otherwise parseable probe. With an empty
+    stdout instead, dropping the ``proc.returncode != 0`` guard would still
+    parse to ``None`` and the mode would pass vacuously.
+    """
+    mock_script = os.path.join(tmpdir, "claude")
+    if mode == "unspawnable":
+        # Executable bit set so the resolver finds it, but not a valid
+        # executable image: execve fails with ENOEXEC.
+        with open(mock_script, "wb") as f:
+            f.write(b"\x00\x01not-an-executable-image\n")
+    elif mode in ("exit-nonzero", "unparseable"):
+        body = ('print("2.1.210"); sys.exit(1)' if mode == "exit-nonzero"
+                else 'print("Claude Code (no version)")')
+        script = textwrap.dedent(f"""\
+            #!/usr/bin/env python3
+            import sys
+            if "--version" in sys.argv:
+                {body}
+        """)
+        with open(mock_script, "w") as f:
+            f.write(script)
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+    os.chmod(mock_script, os.stat(mock_script).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return mock_script
+
+
 def _run_hook(stdin_data: dict, agent_id: str, mock_tokenless_path: str,
-              isolated_home: str = None) -> dict:
+              isolated_home: str = None, stderr_sink: list = None) -> dict:
     """Run the hook as a subprocess with mocked tokenless binary.
 
     Args:
@@ -184,6 +223,8 @@ def _run_hook(stdin_data: dict, agent_id: str, mock_tokenless_path: str,
         mock_tokenless_path: Path to the mock tokenless binary.
         isolated_home: Temporary HOME directory for the subprocess to avoid
             touching the caller's ~/.tokenless state.
+        stderr_sink: Optional list; when given, the hook's stderr is appended
+            to it so callers can assert on `warn()` diagnostics.
 
     Returns:
         Parsed JSON output dict from the hook, or a dict with ``_subprocess_error``
@@ -212,6 +253,9 @@ def _run_hook(stdin_data: dict, agent_id: str, mock_tokenless_path: str,
         timeout=10,
         env=env,
     )
+
+    if stderr_sink is not None:
+        stderr_sink.append(proc.stderr)
 
     # Check returncode first — a non-zero exit indicates a real failure
     # (import error, runtime crash, etc.) that should not be silently
@@ -754,6 +798,70 @@ class TestClaudeVersionCacheHardening(unittest.TestCase):
             stat.S_IMODE(os.stat(cache).st_mode), 0o600,
             ".claude-version must be owner-only",
         )
+
+
+@unittest.skipIf(_needs_py39, "hook_utils requires Python 3.9+")
+class TestClaudeVersionProbeFailure(unittest.TestCase):
+    """A `claude --version` probe that cannot answer must fail open.
+
+    Replacement capability is gated on the detected Claude Code version, so a
+    probe that yields nothing is an ordinary deployment state rather than an
+    exotic one: the CLI can exit non-zero, print a banner with no `x.y.z` in
+    it, or be unspawnable. `_cached_claude_version` returns None for all
+    three, and the hook must then declare no replacement capability — never
+    emit `updatedToolOutput`, and never fall back to appending the compressed
+    copy through `additionalContext` beside the still-visible original.
+
+    The payload below is compressible and the mock *would* replace it, so a
+    regression that reads "version unknown" as "new enough" fails loudly
+    instead of passing vacuously. The `exit-nonzero` mock likewise prints a
+    supported version before failing, so that subtest pins the exit-status
+    guard rather than an empty stdout that parses to None anyway. A failed
+    probe must also leave ~/.tokenless/.claude-version unwritten: only a
+    parsed version is cached, so one broken invocation cannot pin a verdict
+    for later ones.
+    """
+
+    # One entry per failure branch of `_cached_claude_version`.
+    BROKEN_PROBE_MODES = ("exit-nonzero", "unparseable", "unspawnable")
+
+    def test_broken_probe_disables_replacement_and_fails_open(self) -> None:
+        for mode in self.BROKEN_PROBE_MODES:
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as directory:
+                    isolated_home = tempfile.mkdtemp(prefix="test_hook_home_")
+                    try:
+                        binary = _create_mock_tokenless(directory, "compress-text")
+                        _create_broken_mock_claude(directory, mode)
+                        stderr: list = []
+                        result = _run_hook(
+                            {"tool_name": "Grep", "tool_response": {
+                                "mode": "content", "content": "file.rs:1:match\n" * 20,
+                            }},
+                            "claude-code", binary, isolated_home, stderr_sink=stderr,
+                        )
+                        self.assertEqual(
+                            result, {},
+                            "an undetectable claude version must fail open")
+                        with open(os.path.join(directory, "request.json")) as captured:
+                            request = json.load(captured)
+                        self.assertFalse(
+                            request["capabilities"]["replace_output"],
+                            "the probe must still have run: capability stays off")
+                        # The payload is otherwise fully eligible for the text
+                        # slot, so replace_output is the only thing holding it.
+                        self.assertTrue(request["capabilities"]["replace_with_text"])
+                        self.assertEqual(request["content_origin"], "api_response")
+                        self.assertEqual(_spawn_log_lines(binary), ["compress"])
+                        self.assertIn(
+                            "version unknown", "".join(stderr),
+                            f"hook did not report the disabled gate: {stderr}")
+                        self.assertFalse(
+                            os.path.exists(os.path.join(
+                                isolated_home, ".tokenless", ".claude-version")),
+                            "a failed probe must not write the version cache")
+                    finally:
+                        shutil.rmtree(isolated_home, ignore_errors=True)
 
 
 @unittest.skipIf(_needs_py39, "hook_utils requires Python 3.9+")
