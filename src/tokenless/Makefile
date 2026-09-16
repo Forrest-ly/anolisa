@@ -263,7 +263,18 @@ test-claude-code-detect:
 # without that binary tests/test_hook_parity.py skips itself (skipUnless), so the
 # goldens would go unenforced while the job still reported green. make runs the
 # prerequisite once even though the aggregate `test` target lists both names.
-test-integration: test-hook-parity
+#
+# The two shell suites ride along for the same reason: they are members of the
+# `make test` aggregate that no workflow ever called (grepping .github/ for the
+# targets and for test-claude-code-detect-retry.sh / test-toon-cleanup.sh
+# returns nothing), so detect.sh's first-run plugin re-list retry and the
+# stale-toon ownership rules in install-helpers/uninstall only ran on developer
+# machines. Both are plain bash plus recursive make over a mktemp sandbox with
+# stub binaries -- no cargo, node or jq, and no rtk build -- so they cost about
+# a second and are safe to run ahead of the Python contract below. They cannot
+# go on `test-rtk-integration` instead: that target's own recipe is what fetches
+# and builds the vendored rtk, and this one runs earlier in the CI job.
+test-integration: test-hook-parity test-claude-code-detect test-toon-cleanup
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_compress_response_hook.py
 	python3 tests/test_codex_response_diagnostics.py
