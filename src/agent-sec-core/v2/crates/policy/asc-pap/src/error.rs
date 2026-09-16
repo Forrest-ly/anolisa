@@ -1,8 +1,38 @@
+/// Scheduling admission result, independent of storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum EnqueueError {
+    #[error("reconciliation queue is full")]
+    Full,
+    #[error("reconciliation queue is stopped")]
+    Stopped,
+}
+impl EnqueueError {
+    pub fn failure(self) -> asc_policy_types::target::Failure {
+        use asc_policy_types::target::{Failure, FailureKind};
+        Failure::new(
+            FailureKind::Rejected,
+            match self {
+                Self::Full => "RECONCILE_QUEUE_FULL",
+                Self::Stopped => "RECONCILE_QUEUE_STOPPED",
+            },
+        )
+    }
+}
+
 use asc_policy_types::error::ValidationError;
 
 /// Stable PAP failure categories independent of transport and persistence.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PapError {
+    /// Intent exists, but its termination could not be confirmed.
+    #[error(
+        "binding {id} revision {} was saved; {reason}; could not confirm request termination; background reconciliation may still run", .revision.get()
+    )]
+    SchedulingRejected {
+        id: asc_foundation_types::ResourceId,
+        revision: asc_foundation_types::Revision,
+        reason: EnqueueError,
+    },
     /// A shared identifier cannot be represented by a required domain type.
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(String),
@@ -39,6 +69,9 @@ pub enum PapError {
     /// No further positive `u32` revision can be allocated.
     #[error("revision space exhausted")]
     RevisionExhausted,
+    /// Reconciliation cannot accept requests before intent is saved.
+    #[error("reconciliation runtime is unavailable")]
+    Unavailable,
     /// Persistence failed without exposing implementation details.
     #[error("persistence failed")]
     Persistence,

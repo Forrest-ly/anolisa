@@ -14,11 +14,12 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
             "Enter send · Shift+Enter newline · Esc cancel"
         }
         MessageId::PromptDraftFooterSubmitted => "Sent to agent",
+        MessageId::PromptDraftFooterControlSubmitted => "Command submitted",
         MessageId::PromptDraftFooterCancelled => "Draft cancelled",
         MessageId::AgentComposerTitle => "Agent Composer",
         MessageId::PromptDraftRuntimeLabel => "Runtime",
         MessageId::AgentComposerFooterEditing => {
-            "Enter send · Shift+Enter newline · Tab complete · @path · /skill:name · Esc cancel"
+            "/ commands · ↑↓ select · Tab complete · Enter submit · Shift+Enter newline · Esc cancel"
         }
         MessageId::AgentComposerRejectedTitle => "References skipped",
         MessageId::AgentComposerRejectedInvalidPathLine => {
@@ -116,6 +117,7 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
         }
         MessageId::HelpGroupSessions => "Sessions",
         MessageId::HelpSummarySession => "discover, resume, and clear Agent sessions",
+        MessageId::HelpSummaryTask => "delegate and inspect persistent local Agent Tasks",
         MessageId::HelpGroupRegistry => "Registry",
         MessageId::HelpSummaryExtensions => "list/manage cosh-core extensions",
         MessageId::HelpSummarySkills => "list/inspect cosh-core skills",

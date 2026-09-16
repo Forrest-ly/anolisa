@@ -210,7 +210,7 @@ stage_sec_core_payload() {
     cp -p "${SEC_DIR}/tools/sign-skill.sh" "$pkg_dir/tools/"
     cp "${SEC_DIR}/Makefile" "$pkg_dir/"
     tar -cf - -C "${SEC_DIR}" \
-        .anolisa/ packaging/systemd/ | tar -xf - -C "$pkg_dir/"
+        .anolisa/ | tar -xf - -C "$pkg_dir/"
     [ -f "${SEC_DIR}/LICENSE" ] && cp "${SEC_DIR}/LICENSE" "$pkg_dir/"
     [ -f "${SEC_DIR}/README.md" ] && cp "${SEC_DIR}/README.md" "$pkg_dir/"
 
@@ -281,6 +281,8 @@ build_agent_sec_core() {
     local pkg_dir="${tmp_dir}/${pkg_name}-${version}"
     mkdir -p "$pkg_dir"/{agent-sec-cli,scripts}
     stage_sec_core_payload "$pkg_dir"
+    mkdir -p "$pkg_dir/packaging/systemd"
+    cp -p "${SEC_DIR}/packaging/systemd/agent-sec-core.service.in" "$pkg_dir/packaging/systemd/"
 
     cp -p "${SEC_DIR}/scripts/agent-sec-cli-wrapper.sh" "$pkg_dir/scripts/"
     cp -p "${SEC_DIR}/scripts/agent-sec-daemon-wrapper.sh" "$pkg_dir/scripts/"
@@ -347,7 +349,7 @@ build_agent_sec_core_v2() {
     # Both versions are bumped together by scripts/bump-version.sh; warn (do not
     # fail) on drift, because V1 is on its way out and must not gate a V2 build.
     local v1_version
-    v1_version=$(grep -m1 '^version' "${SEC_DIR}/agent-sec-cli/pyproject.toml" 2>/dev/null | sed 's/.*"\(.*\)"/\1/')
+    v1_version=$(grep -m1 '^version' "${SEC_DIR}/agent-sec-cli/pyproject.toml" 2>/dev/null | sed 's/.*"\(.*\)"/\1/' || true)
     if [ -n "$v1_version" ] && [ "$v1_version" != "$version" ]; then
         warn "V1 version ($v1_version) differs from V2 version ($version); bump-version.sh may have missed a file"
     fi
@@ -371,6 +373,9 @@ build_agent_sec_core_v2() {
     local pkg_dir="${tmp_dir}/${pkg_name}-${version}"
     mkdir -p "$pkg_dir"
     stage_sec_core_payload "$pkg_dir"
+    mkdir -p "$pkg_dir/packaging/systemd"
+    cp -p "${SEC_DIR}/packaging/systemd/agent-sec-core-v2.service.in" \
+        "$pkg_dir/packaging/systemd/"
 
     # V2 layer: the Rust workspace replaces agent-sec-cli/ and the two Python
     # wrapper scripts, which are therefore absent from this tarball.
@@ -1018,6 +1023,11 @@ build_cosh_ng() {
         || ! grep -Fq "%{buildroot}${gateway_unit}" "$spec_in" \
         || ! grep -Fqx "$gateway_unit" "$spec_in"; then
         err "cosh-ng spec must render, install, and own ${gateway_unit}"
+        return 1
+    fi
+    if grep -Fq "packaging/systemd/cosh-gateway-acp@.service.in" "$spec_in" \
+        || grep -Fqx "%{_unitdir}/cosh-gateway-acp@.service" "$spec_in"; then
+        err "cosh-ng spec must not ship the retired split ACP Gateway unit"
         return 1
     fi
     local tarball_name="${pkg_name}-${version}.tar.gz"

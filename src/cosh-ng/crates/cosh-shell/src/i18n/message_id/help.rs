@@ -192,3 +192,22 @@ macro_rules! agent_composer_ids {
         );
     };
 }
+
+// Managed Task entrypoint additions remain trailing so existing stable
+// MessageId discriminants do not shift.
+macro_rules! managed_task_ids {
+    ($next:ident, $remaining:tt, $($ids:ident,)*) => {
+        $next!(
+            $remaining,
+            $($ids,)*
+            HelpSummaryTask,
+        );
+    };
+}
+
+// Append submission status separately to preserve existing MessageId values.
+macro_rules! composer_control_submit_ids {
+    ($next:ident, $remaining:tt, $($ids:ident,)*) => {
+        $next!($remaining, $($ids,)* PromptDraftFooterControlSubmitted,);
+    };
+}

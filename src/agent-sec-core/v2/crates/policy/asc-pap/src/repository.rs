@@ -117,15 +117,15 @@ pub trait PapRepository: Send + Sync {
     ) -> Result<PreparedScope, PapError>;
 
     /// Inserts a fresh Binding (`expected: None`) or conditionally replaces an
-    /// existing Binding (`Some`). Compare the complete expected spec/status under
+    /// existing Binding (`Some`). Compare the expected spec and complete status (including error) under
     /// the same transaction as the write. An update of an absent ID is `NotFound`;
     /// it must never insert. Creation uses a fresh server-generated ID at revision 1.
     ///
     /// Only changed specs increment revision. Same-spec Apply retries and Delete
-    /// requests keep revision and deployments. Reset retry controls for a new
-    /// request; retain prepared bytes for the same spec, clear them on spec change.
+    /// requests keep revision and deployments. Clear the status error for a new
+    /// request; scheduling progress belongs to the caller, not this repository.
     /// Delete intent cannot return to Apply. Repeated requests that do not change
-    /// the record preserve runtime state. No dispatch occurs in this operation.
+    /// the record preserve its status explanation. No dispatch occurs in this operation.
     ///
     /// # Errors
     /// Returns not-found, operation-in-progress, conflict or persistence failures.
@@ -135,7 +135,19 @@ pub trait PapRepository: Send + Sync {
         binding: &BindingView,
     ) -> Result<BindingView, PapError>;
 
-    /// Gets the current Binding spec and status as a read-only aggregate.
+    /// Atomically fail only the supplied ID, revision and pending status.
+    /// Set the failed phase and status error in the same transaction; preserve
+    /// spec and deployments. No retry progress is stored. Return false on contention, never retry
+    /// against a newer snapshot. No operation identity is implied by revision.
+    /// # Errors
+    /// Returns persistence failures; a non-pending expectation is a conflict.
+    fn fail_pending_binding(
+        &self,
+        expected: &BindingView,
+        reason: crate::EnqueueError,
+    ) -> Result<bool, PapError>;
+
+    /// Gets the current Binding spec, status and safe last error as a read-only aggregate.
     ///
     /// # Errors
     /// Returns not-found or persistence failures.

@@ -1,61 +1,12 @@
 //! Reconciliation decisions over generic aggregate reads and CAS writes.
 use crate::model::PendingWrite;
 use crate::{
-    AttemptOutcome, BindingStateRepository, BindingStateWrite, Deployment, ExecutionSlot,
-    ExpectedBinding, Presence, ReconcileRecord, RetryPolicy, SavedApply, StoreError, TargetRef,
-    WriteResult,
+    AttemptOutcome, BindingStateRepository, BindingStateWrite, Deployment, ExpectedBinding,
+    PreparedAttempt, Presence, ReconcileRecord, RetryPolicy, StoreError, TargetRef, WriteResult,
 };
 use asc_foundation_types::ResourceId;
 use asc_policy_types::binding::BindingStatus;
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-
-/// Process-local execution ownership and pending outcomes. The composition root
-/// MUST share one instance across every reconciler accessing the same store.
-/// It is independent of storage and survives replacement of a worker instance.
-#[derive(Debug, Default)]
-pub struct ReconcileExecution {
-    slots: Mutex<BTreeMap<String, Arc<Mutex<ExecutionSlot>>>>,
-}
-impl ReconcileExecution {
-    /// Inspect an existing slot without allocating for unknown Binding IDs.
-    /// # Errors
-    /// Returns an execution ownership lock failure.
-    pub(crate) fn execution_slot(
-        &self,
-        id: &ResourceId,
-    ) -> Result<Option<Arc<Mutex<ExecutionSlot>>>, StoreError> {
-        Ok(self
-            .slots
-            .lock()
-            .map_err(|_| StoreError::Unavailable)?
-            .get(id.as_str())
-            .cloned())
-    }
-    pub(crate) fn retire(
-        &self,
-        id: &ResourceId,
-        slot: &Arc<Mutex<ExecutionSlot>>,
-    ) -> Result<(), StoreError> {
-        let mut slots = self.slots.lock().map_err(|_| StoreError::Unavailable)?;
-        if slots
-            .get(id.as_str())
-            .is_some_and(|current| Arc::ptr_eq(current, slot))
-        {
-            slots.remove(id.as_str());
-        }
-        Ok(())
-    }
-    pub(crate) fn slot(&self, id: &ResourceId) -> Result<Arc<Mutex<ExecutionSlot>>, StoreError> {
-        Ok(self
-            .slots
-            .lock()
-            .map_err(|_| StoreError::Unavailable)?
-            .entry(id.to_string())
-            .or_default()
-            .clone())
-    }
-}
+use std::sync::Arc;
 
 pub(crate) struct ReconcileState {
     pub repository: Arc<dyn BindingStateRepository>,
@@ -64,13 +15,48 @@ impl ReconcileState {
     pub fn read(&self, id: &ResourceId) -> Result<Option<ReconcileRecord>, StoreError> {
         self.repository.get_binding_state(id)
     }
+    pub fn recover(
+        &self,
+        record: &ReconcileRecord,
+        now: u64,
+        policy: RetryPolicy,
+        schedule: &mut crate::AttemptSchedule,
+    ) -> Result<bool, StoreError> {
+        let mut next = record.clone();
+        let exhausted = schedule.attempts_started >= policy.max_attempts;
+        next.binding.status.phase = if exhausted {
+            record.binding.status.phase.fail_reconcile()
+        } else {
+            record.binding.status.phase.retry_reconcile()
+        }
+        .map_err(|_| StoreError::Invalid)?;
+        next.binding.status.error = Some(crate::Failure::new(
+            crate::FailureKind::Retryable,
+            "RECONCILE_INTERRUPTED",
+        ));
+        let next_attempt_at = if exhausted {
+            None
+        } else {
+            Some(now.saturating_add(crate::retry::delay(policy, schedule.attempts_started)))
+        };
+        let matched = self
+            .repository
+            .compare_exchange_binding_state(record, &BindingStateWrite::new(next))?
+            != WriteResult::Conflict;
+        if matched {
+            schedule.next_attempt_at = next_attempt_at;
+        }
+        Ok(matched)
+    }
     pub fn claim(
         &self,
         record: &ReconcileRecord,
         now: u64,
         policy: RetryPolicy,
+        schedule: &mut crate::AttemptSchedule,
     ) -> Result<Option<ReconcileRecord>, StoreError> {
-        let Some(next) = claim(record.clone(), now, policy)? else {
+        let before = schedule.clone();
+        let Some(next) = claim(record.clone(), now, policy, schedule)? else {
             return Ok(None);
         };
         let write = BindingStateWrite::new(next.clone());
@@ -79,13 +65,16 @@ impl ReconcileState {
             .compare_exchange_binding_state(record, &write)?
         {
             WriteResult::Applied | WriteResult::AlreadyApplied => Ok(Some(next)),
-            WriteResult::Conflict => Ok(None),
+            WriteResult::Conflict => {
+                *schedule = before;
+                Ok(None)
+            }
         }
     }
     pub fn register(
         &self,
         expected: &ExpectedBinding,
-        prepared: Option<&SavedApply>,
+        prepared: Option<&PreparedAttempt>,
         targets: &[TargetRef],
     ) -> Result<bool, StoreError> {
         for _ in 0..16 {
@@ -95,7 +84,10 @@ impl ReconcileState {
             let Some(next) = register(record.clone(), expected, prepared, targets)? else {
                 return Ok(false);
             };
-            let write = BindingStateWrite::new(next);
+            let write = BindingStateWrite::patch(asc_policy_repository::ReconciliationPatch {
+                deployments: Some(next.deployments),
+                ..Default::default()
+            });
             if self
                 .repository
                 .compare_exchange_binding_state(&record, &write)?
@@ -104,7 +96,7 @@ impl ReconcileState {
                 return Ok(true);
             }
         }
-        Err(StoreError::Unavailable)
+        Err(StoreError::Contended)
     }
 
     pub fn finish(
@@ -113,7 +105,7 @@ impl ReconcileState {
         completion: &mut Option<PendingWrite>,
     ) -> Result<bool, StoreError> {
         // A conflict is recomputed against the latest aggregate. Bound contention
-        // work per call; retain the outcome for a later bookkeeping-only retry.
+        // work per call; no outcome or write is retained after reconcile returns.
         for _ in 0..16 {
             if completion.is_none() {
                 let Some(record) = self.read(&outcome.expected.id)? else {
@@ -124,8 +116,13 @@ impl ReconcileState {
                     expected: record,
                     write: if matched && outcome.next_status == BindingStatus::Deleted {
                         BindingStateWrite::delete()
-                    } else {
+                    } else if matched {
                         BindingStateWrite::new(next)
+                    } else {
+                        BindingStateWrite::patch(asc_policy_repository::ReconciliationPatch {
+                            deployments: Some(next.deployments),
+                            ..Default::default()
+                        })
                     },
                     matched,
                 });
@@ -150,7 +147,7 @@ impl ReconcileState {
                 WriteResult::Conflict => *completion = None,
             }
         }
-        Err(StoreError::Unavailable)
+        Err(StoreError::Contended)
     }
 }
 
@@ -158,29 +155,29 @@ fn claim(
     mut record: ReconcileRecord,
     now: u64,
     policy: RetryPolicy,
+    schedule: &mut crate::AttemptSchedule,
 ) -> Result<Option<ReconcileRecord>, StoreError> {
     crate::retry::validate(policy)?;
-    if record.runtime.next_attempt_at.is_some_and(|at| at > now) {
+    if schedule.next_attempt_at.is_some_and(|at| at > now) {
         return Ok(None);
     }
-    let Ok(running) = record.binding.status.start_reconcile() else {
+    let Ok(running) = record.binding.status.phase.start_reconcile() else {
         return Ok(None);
     };
-    let policy = record.runtime.retry_policy.unwrap_or(policy);
     crate::retry::validate(policy)?;
-    if record.runtime.attempts_started >= policy.max_attempts {
+    if schedule.attempts_started >= policy.max_attempts {
         return Ok(None);
     }
-    record.binding.status = running;
-    record.runtime.retry_policy = Some(policy);
-    record.runtime.attempts_started += 1;
-    record.runtime.next_attempt_at = None;
+    record.binding.status.phase = running;
+    record.binding.status.error = None;
+    schedule.attempts_started += 1;
+    schedule.next_attempt_at = None;
     Ok(Some(record))
 }
 fn register(
     mut record: ReconcileRecord,
     expected: &ExpectedBinding,
-    prepared: Option<&SavedApply>,
+    prepared: Option<&PreparedAttempt>,
     targets: &[TargetRef],
 ) -> Result<Option<ReconcileRecord>, StoreError> {
     if !expected.matches(&record.binding) {
@@ -189,18 +186,10 @@ fn register(
     if !expected.status.is_reconciling() {
         return Err(StoreError::Invalid);
     }
-    if let Some(saved) = prepared {
-        if expected.status != BindingStatus::Applying
-            || saved.revision != expected.revision
-            || record
-                .runtime
-                .prepared
-                .as_ref()
-                .is_some_and(|p| p.revision == saved.revision && p != saved)
-        {
-            return Err(StoreError::Invalid);
-        }
-        record.runtime.prepared = Some(saved.clone());
+    if let Some(saved) = prepared
+        && (expected.status != BindingStatus::Applying || saved.revision != expected.revision)
+    {
+        return Err(StoreError::Invalid);
     }
     for (index, target) in targets.iter().enumerate() {
         if targets[..index].iter().any(|t| t.same_identity(target)) {
@@ -212,7 +201,9 @@ fn register(
             .iter_mut()
             .find(|d| d.target.same_identity(target))
         {
-            if !new_target && deployment.target != *target {
+            if deployment.target != *target
+                && (!new_target || deployment.revision == expected.revision)
+            {
                 return Err(StoreError::Invalid);
             }
             deployment.presence = Presence::Unknown;
@@ -306,18 +297,14 @@ fn finish(
             return Ok((record, true));
         }
         if outcome.next_status == BindingStatus::Ready
-            && !record.runtime.prepared.as_ref().is_some_and(|saved| {
-                saved.revision == outcome.expected.revision
-                    && record.deployments.len() == 1
-                    && record.deployments[0].target == saved.prepared.target
-                    && record.deployments[0].presence == Presence::Present
-            })
+            && !(record.deployments.len() == 1
+                && record.deployments[0].revision == outcome.expected.revision
+                && record.deployments[0].presence == Presence::Present)
         {
             return Err(StoreError::Invalid);
         }
-        record.binding.status = outcome.next_status;
-        record.runtime.next_attempt_at = outcome.next_attempt_at;
-        record.runtime.last_error.clone_from(&outcome.error);
+        record.binding.status.phase = outcome.next_status;
+        record.binding.status.error.clone_from(&outcome.error);
     }
     Ok((record, matches))
 }

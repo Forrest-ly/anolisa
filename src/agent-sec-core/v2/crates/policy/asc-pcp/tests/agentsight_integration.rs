@@ -11,17 +11,14 @@ mod store;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use store::TestStore;
+use store::{TestAdmission, TestStore};
 
 use asc_agentsight_client::*;
 use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_pcp::*;
-use asc_policy_adapter_agentsight::{
-    AGENTSIGHT_BINDING_PLAN_FORMAT, AgentSightAdapter, AgentSightBindingPlan,
-};
+use asc_policy_adapter_agentsight::AgentSightAdapter;
 use asc_policy_types::binding::{BindingStatus, BindingView, PreparedBinding};
 use asc_policy_types::identifiers::{ResourceId, Revision};
-use asc_policy_types::target::TargetBindingPlan;
 use common::*;
 use http::{Exchange, MockHttp};
 use serde_json::Value;
@@ -48,30 +45,16 @@ fn spec(revision: u32) -> PreparedBinding {
     ))
     .unwrap();
     spec.binding_revision = Revision::new(revision).unwrap();
+    spec.scope.revision = Revision::new(revision).unwrap();
     spec
-}
-
-fn saved(revision: u32, is_update: bool) -> SavedApply {
-    let mut golden: AgentSightBindingPlan = serde_json::from_str(include_str!("../../../../fixtures/adapters/agentsight/prevent-file-deletion/agentsight-binding-plan.json")).unwrap();
-    golden.source.binding_revision = Revision::new(revision).unwrap();
-    SavedApply {
-        revision: Revision::new(revision).unwrap(),
-        is_update,
-        prepared: prepared(revision),
-        plan: TargetBindingPlan {
-            format: AGENTSIGHT_BINDING_PLAN_FORMAT.into(),
-            content: serde_json::to_vec(&golden).unwrap(),
-        },
-    }
 }
 
 fn initial() -> ReconcileRecord {
     ReconcileRecord {
         binding: BindingView {
             spec: spec(7),
-            status: BindingStatus::PendingApply,
+            status: (BindingStatus::PendingApply).into(),
         },
-        runtime: RuntimeState::default(),
         deployments: vec![],
     }
 }
@@ -85,19 +68,17 @@ fn deployment(revision: u32, presence: Presence, confirmed: Option<Presence>) ->
     }
 }
 
-fn ready(revision: u32, attempts: u32, is_update: bool) -> ReconcileRecord {
+fn ready(revision: u32, _attempts: u32, _is_update: bool) -> ReconcileRecord {
     ReconcileRecord {
-        binding: BindingView {
-            spec: spec(revision),
-            status: BindingStatus::Ready,
+        binding: {
+            let mut binding = BindingView {
+                spec: spec(revision),
+                status: (BindingStatus::Ready).into(),
+            };
+            binding.status.error = None;
+            binding
         },
-        runtime: RuntimeState {
-            attempts_started: attempts,
-            next_attempt_at: None,
-            retry_policy: Some(policy()),
-            last_error: None,
-            prepared: Some(saved(revision, is_update)),
-        },
+
         deployments: vec![deployment(
             revision,
             Presence::Present,
@@ -159,11 +140,13 @@ fn core(
     BindingReconciler::new(
         repo,
         Arc::new(adapter),
-        BTreeMap::from([(DEFAULT_AGENTSIGHT_ROUTE.into(), client)]),
+        BTreeMap::from([(
+            DEFAULT_AGENTSIGHT_ROUTE.into(),
+            Arc::new(move || Ok(client.clone())) as Arc<dyn asc_pcp::TargetDeploymentClientFactory>,
+        )]),
         DEFAULT_AGENTSIGHT_ROUTE.into(),
         clock,
         policy(),
-        Arc::new(ReconcileExecution::default()),
     )
     .unwrap()
 }
@@ -174,7 +157,7 @@ fn inspect_registered(repo: &ProcessLocalPapRepository, request: &AgentSightHttp
     }
     let record = repo.read(&spec(7).binding_id).unwrap().unwrap();
     if request.method == AgentSightHttpMethod::Post {
-        let prepared = &record.runtime.prepared.as_ref().unwrap().prepared;
+        let prepared = prepared(record.binding.spec.binding_revision.get());
         let payload: Value = serde_json::from_slice(&prepared.content).unwrap();
         assert_eq!(
             request.body.as_ref().unwrap(),
@@ -198,6 +181,7 @@ fn inspect_registered(repo: &ProcessLocalPapRepository, request: &AgentSightHttp
 
 #[test]
 fn real_http_apply_then_uncertain_delete_and_retry() {
+    let mut schedule = AttemptSchedule::default();
     let repo = Arc::new(ProcessLocalPapRepository::with_binding_states(vec![initial()]).unwrap());
     let inspect = repo.clone();
     let server = MockHttp::start(
@@ -212,11 +196,14 @@ fn real_http_apply_then_uncertain_delete_and_retry() {
     let clock = Arc::new(TestClock::default());
     let worker = core(repo.clone(), clock.clone(), &server.base_url);
     let id = spec(7).binding_id;
-    assert_eq!(worker.reconcile(&id).unwrap(), Disposition::Completed);
+    assert_eq!(
+        worker.reconcile(&id, &mut schedule).unwrap(),
+        Disposition::Completed
+    );
     assert_eq!(repo.read(&id).unwrap(), Some(ready(7, 1, false)));
 
     let mut desired = ready(7, 1, false).binding;
-    desired.status = BindingStatus::PendingDelete;
+    desired.status = BindingStatus::PendingDelete.into();
     assert!(
         repo.compare_exchange_reconcile_intent(
             &ExpectedBinding::from_binding(&ready(7, 1, false).binding),
@@ -225,34 +212,39 @@ fn real_http_apply_then_uncertain_delete_and_retry() {
         .unwrap()
     );
     assert_eq!(
-        worker.reconcile(&id).unwrap(),
+        worker.reconcile(&id, &mut schedule).unwrap(),
         Disposition::RetryAt { at: 100 }
     );
     let failed = ReconcileRecord {
-        binding: desired.clone(),
-        runtime: RuntimeState {
-            attempts_started: 1,
-            next_attempt_at: Some(100),
-            retry_policy: Some(policy()),
-            last_error: Some(Failure::new(
+        binding: {
+            let mut binding = desired.clone();
+            binding.status.error = Some(Failure::new(
                 FailureKind::Retryable,
                 "AGENTSIGHT_TRANSPORT_UNAVAILABLE",
-            )),
-            prepared: None,
+            ));
+            binding
         },
+
         deployments: vec![deployment(7, Presence::Unknown, Some(Presence::Present))],
     };
     assert_eq!(repo.read(&id).unwrap(), Some(failed));
     clock.0.store(99, Ordering::SeqCst);
-    assert_eq!(worker.reconcile(&id).unwrap(), Disposition::Skipped);
+    assert_eq!(
+        worker.reconcile(&id, &mut schedule).unwrap(),
+        Disposition::Skipped
+    );
     clock.0.store(100, Ordering::SeqCst);
-    assert_eq!(worker.reconcile(&id).unwrap(), Disposition::Completed);
+    assert_eq!(
+        worker.reconcile(&id, &mut schedule).unwrap(),
+        Disposition::Completed
+    );
     assert_eq!(repo.read(&id).unwrap(), None);
     server.finish(4);
 }
 
 #[test]
 fn real_http_partial_update_retry_cleans_old_once_and_reuses_new_request() {
+    let mut schedule = AttemptSchedule::default();
     let repo =
         Arc::new(ProcessLocalPapRepository::with_binding_states(vec![ready(7, 1, false)]).unwrap());
     let inspect = repo.clone();
@@ -271,7 +263,7 @@ fn real_http_partial_update_retry_cleans_old_once_and_reuses_new_request() {
     let id = spec(7).binding_id;
     let desired = BindingView {
         spec: spec(8),
-        status: BindingStatus::PendingApply,
+        status: (BindingStatus::PendingApply).into(),
     };
     assert!(
         repo.compare_exchange_reconcile_intent(
@@ -281,34 +273,36 @@ fn real_http_partial_update_retry_cleans_old_once_and_reuses_new_request() {
         .unwrap()
     );
     assert_eq!(
-        worker.reconcile(&id).unwrap(),
+        worker.reconcile(&id, &mut schedule).unwrap(),
         Disposition::RetryAt { at: 100 }
     );
     assert_eq!(
         repo.read(&id).unwrap(),
         Some(ReconcileRecord {
-            binding: desired,
-            runtime: RuntimeState {
-                attempts_started: 1,
-                next_attempt_at: Some(100),
-                retry_policy: Some(policy()),
-                last_error: Some(Failure::new(
+            binding: {
+                let mut binding = desired;
+                binding.status.error = Some(Failure::new(
                     FailureKind::Retryable,
-                    "AGENTSIGHT_ENFORCER_UNAVAILABLE"
-                )),
-                prepared: Some(saved(8, true))
+                    "AGENTSIGHT_ENFORCER_UNAVAILABLE",
+                ));
+                binding
             },
+
             deployments: vec![deployment(8, Presence::Unknown, None)]
         })
     );
     clock.0.store(100, Ordering::SeqCst);
-    assert_eq!(worker.reconcile(&id).unwrap(), Disposition::Completed);
+    assert_eq!(
+        worker.reconcile(&id, &mut schedule).unwrap(),
+        Disposition::Completed
+    );
     assert_eq!(repo.read(&id).unwrap(), Some(ready(8, 2, true)));
     server.finish(5);
 }
 
 #[test]
 fn same_revision_delete_during_real_http_apply_preserves_target_for_cleanup() {
+    let mut schedule = AttemptSchedule::default();
     let repo = Arc::new(ProcessLocalPapRepository::with_binding_states(vec![initial()]).unwrap());
     let inspect = repo.clone();
     let server = MockHttp::start(
@@ -322,7 +316,7 @@ fn same_revision_delete_during_real_http_apply_preserves_target_for_cleanup() {
             if req.method == AgentSightHttpMethod::Post {
                 let record = inspect.read(&spec(7).binding_id).unwrap().unwrap();
                 let mut desired = record.binding.clone();
-                desired.status = BindingStatus::PendingDelete;
+                desired.status = BindingStatus::PendingDelete.into();
                 assert!(
                     inspect
                         .compare_exchange_reconcile_intent(
@@ -340,19 +334,24 @@ fn same_revision_delete_during_real_http_apply_preserves_target_for_cleanup() {
         &server.base_url,
     );
     let id = spec(7).binding_id;
-    assert_eq!(worker.reconcile(&id).unwrap(), Disposition::Superseded);
+    assert_eq!(
+        worker.reconcile(&id, &mut schedule).unwrap(),
+        Disposition::Superseded
+    );
     assert_eq!(
         repo.read(&id).unwrap(),
         Some(ReconcileRecord {
             binding: BindingView {
                 spec: spec(7),
-                status: BindingStatus::PendingDelete
+                status: BindingStatus::PendingDelete.into()
             },
-            runtime: RuntimeState::default(),
             deployments: vec![deployment(7, Presence::Present, Some(Presence::Present))]
         })
     );
-    assert_eq!(worker.reconcile(&id).unwrap(), Disposition::Completed);
+    assert_eq!(
+        worker.reconcile(&id, &mut schedule).unwrap(),
+        Disposition::Completed
+    );
     assert_eq!(repo.read(&id).unwrap(), None);
     server.finish(3);
 }
@@ -383,25 +382,109 @@ impl BindingStateRepository for FailFinishOnce {
 }
 
 #[test]
-fn completed_http_is_not_repeated_after_result_storage_failure() {
+fn result_storage_failure_reprepares_and_safely_replays_http() {
+    let mut schedule = AttemptSchedule::default();
     let repo = Arc::new(ProcessLocalPapRepository::with_binding_states(vec![initial()]).unwrap());
     let inspect = repo.clone();
-    let server = MockHttp::start(vec![health(), post(7, applied(7))], move |req| {
-        inspect_registered(&inspect, req);
-    });
+    let server = MockHttp::start(
+        vec![health(), post(7, applied(7)), health(), post(7, applied(7))],
+        move |req| {
+            inspect_registered(&inspect, req);
+        },
+    );
     let wrapped = Arc::new(FailFinishOnce {
         repo: repo.clone(),
         fail: AtomicBool::new(true),
     });
-    let worker = core(wrapped, Arc::new(TestClock::default()), &server.base_url);
+    let clock = Arc::new(TestClock::default());
+    let worker = core(wrapped, clock.clone(), &server.base_url);
     let id = spec(7).binding_id;
-    assert_eq!(worker.reconcile(&id), Err(StoreError::Unavailable));
+    assert_eq!(
+        worker.reconcile(&id, &mut schedule),
+        Err(StoreError::Unavailable)
+    );
     let mut expected = ready(7, 1, false);
-    expected.binding.status = BindingStatus::Applying;
+    expected.binding.status.phase = BindingStatus::Applying;
     expected.deployments = vec![deployment(7, Presence::Unknown, None)];
     assert_eq!(repo.read(&id).unwrap(), Some(expected));
-    // The HTTP mock has consumed its script; any replay would fail the case.
-    server.finish(2);
-    assert_eq!(worker.reconcile(&id).unwrap(), Disposition::Completed);
-    assert_eq!(repo.read(&id).unwrap(), Some(ready(7, 1, false)));
+    assert_eq!(
+        worker.reconcile(&id, &mut schedule).unwrap(),
+        Disposition::Skipped
+    );
+    assert_eq!(schedule.attempts_started, 1);
+    clock.0.store(100, Ordering::SeqCst);
+    assert_eq!(
+        worker.reconcile(&id, &mut schedule).unwrap(),
+        Disposition::Completed
+    );
+    assert_eq!(repo.read(&id).unwrap(), Some(ready(7, 2, true)));
+    server.finish(4);
+}
+
+#[test]
+fn retry_prepares_current_process_identity_without_storing_it_in_cleanup() {
+    let mut schedule = AttemptSchedule::default();
+    for change_boot in [false, true] {
+        let repo =
+            Arc::new(ProcessLocalPapRepository::with_binding_states(vec![initial()]).unwrap());
+        let wire = Wire::new([
+            Ok(response(200, HEALTH)),
+            Err(AgentSightTransportError::Unavailable),
+            Ok(response(200, HEALTH)),
+            Err(AgentSightTransportError::Unavailable),
+        ]);
+        let identity = Identity::default();
+        let client = Arc::new(AgentSightClient::with_dependencies(
+            wire.clone(),
+            identity.clone(),
+        ));
+        let clock = Arc::new(TestClock::default());
+        let core = BindingReconciler::new(
+            repo.clone(),
+            Arc::new(|b: &PreparedBinding| AgentSightAdapter.translate(b)),
+            BTreeMap::from([(DEFAULT_AGENTSIGHT_ROUTE.into(), {
+                Arc::new(move || Ok(client.clone() as Arc<dyn TargetDeploymentClient>))
+                    as Arc<dyn asc_pcp::TargetDeploymentClientFactory>
+            })]),
+            DEFAULT_AGENTSIGHT_ROUTE.into(),
+            clock.clone(),
+            policy(),
+        )
+        .unwrap();
+        let id = spec(7).binding_id;
+        assert_eq!(
+            core.reconcile(&id, &mut schedule).unwrap(),
+            Disposition::RetryAt { at: 100 }
+        );
+        let previous = repo.read(&id).unwrap().unwrap();
+        if change_boot {
+            identity.0.lock().unwrap().boot = Ok("20000000-0000-4000-8000-000000000002".into());
+        } else {
+            identity.0.lock().unwrap().start = Ok(987_655);
+        }
+        clock.0.store(100, Ordering::SeqCst);
+        assert_eq!(
+            core.reconcile(&id, &mut schedule).unwrap(),
+            Disposition::RetryAt { at: 250 }
+        );
+        let after = repo.read(&id).unwrap().unwrap();
+        assert_eq!(after.binding.spec, previous.binding.spec);
+        assert_eq!(after.deployments, previous.deployments);
+        assert_eq!(schedule.attempts_started, 2);
+        let requests = wire.requests();
+        assert_eq!(requests.len(), 4);
+        let body: Value = serde_json::from_slice(requests[3].body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["process_start_time"],
+            if change_boot { 987_654 } else { 987_655 }
+        );
+        let cleanup: Value = serde_json::from_slice(&after.deployments[0].target.cleanup).unwrap();
+        assert_eq!(
+            cleanup,
+            serde_json::json!({
+                "schemaVersion": 1, "bindingId": id, "bindingRevision": 7
+            })
+        );
+        wire.consumed();
+    }
 }

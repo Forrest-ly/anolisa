@@ -59,14 +59,14 @@ fn nested_shared_objects_expand_to_complete_independent_values() {
         ),
         (
             "pending".into(),
-            json!({"spec": {"$ref": "spec"}, "status": "PENDING_APPLY"}),
+            json!({"spec": {"$ref": "spec"}, "status": {"phase": "PENDING_APPLY"}}),
         ),
     ]);
     let input = json!([{"$ref": "pending"}, {"$ref": "pending"}]);
     let mut actual = expand(input.clone(), &objects);
     let expected = json!([
-        {"spec": {"policy": "complete policy", "revision": 7}, "status": "PENDING_APPLY"},
-        {"spec": {"policy": "complete policy", "revision": 7}, "status": "PENDING_APPLY"}
+        {"spec": {"policy": "complete policy", "revision": 7}, "status": {"phase": "PENDING_APPLY"}},
+        {"spec": {"policy": "complete policy", "revision": 7}, "status": {"phase": "PENDING_APPLY"}}
     ]);
     assert_eq!(actual, expected);
     actual[0]["spec"]["revision"] = json!(8);
@@ -97,8 +97,8 @@ fn missing_nested_references_are_rejected() {
 #[should_panic(expected = "reference must not silently override fields")]
 fn reference_overrides_are_rejected() {
     use serde_json::json;
-    let objects = BTreeMap::from([("a".into(), json!({"status": "PENDING_APPLY"}))]);
-    expand(json!({"$ref": "a", "status": "READY"}), &objects);
+    let objects = BTreeMap::from([("a".into(), json!({"status": {"phase": "PENDING_APPLY"}}))]);
+    expand(json!({"$ref": "a", "status": {"phase": "READY"}}), &objects);
 }
 
 #[test]

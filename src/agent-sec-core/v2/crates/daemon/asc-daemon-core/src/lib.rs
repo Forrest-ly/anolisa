@@ -10,6 +10,6 @@ pub use identity::{
     RootManagedPrincipalPolicy,
 };
 pub use pap::{
-    NotFoundResource, PolicyAdministration, PolicyAdministrationError, PolicyInputError,
-    ResourcePage,
+    EnqueueError, NotFoundResource, PolicyAdministration, PolicyAdministrationError,
+    PolicyInputError, ResourcePage,
 };

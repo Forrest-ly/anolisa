@@ -170,12 +170,12 @@ impl BindingStatus {
         }
         let valid = matches!(
             (self, next),
-            (Self::PendingApply, Self::Applying)
+            (Self::PendingApply, Self::Applying | Self::ApplyFailed)
                 | (
                     Self::Applying,
                     Self::Ready | Self::PendingApply | Self::ApplyFailed,
                 )
-                | (Self::PendingDelete, Self::Deleting)
+                | (Self::PendingDelete, Self::Deleting | Self::DeleteFailed)
                 | (
                     Self::Deleting,
                     Self::Deleted | Self::PendingDelete | Self::DeleteFailed,
@@ -193,6 +193,36 @@ fn illegal_status(operation: &str, status: BindingStatus) -> ValidationError {
     ValidationError::new("status", format!("cannot {operation} from {status:?}"))
 }
 
+/// Lifecycle and its current explanation are one repository value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BindingLifecycle {
+    pub phase: BindingStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<crate::target::Failure>,
+}
+impl From<BindingStatus> for BindingLifecycle {
+    fn from(phase: BindingStatus) -> Self {
+        Self { phase, error: None }
+    }
+}
+impl std::ops::Deref for BindingLifecycle {
+    type Target = BindingStatus;
+    fn deref(&self) -> &BindingStatus {
+        &self.phase
+    }
+}
+impl PartialEq<BindingStatus> for BindingLifecycle {
+    fn eq(&self, other: &BindingStatus) -> bool {
+        self.phase == *other
+    }
+}
+impl PartialEq<BindingLifecycle> for BindingStatus {
+    fn eq(&self, other: &BindingLifecycle) -> bool {
+        *self == other.phase
+    }
+}
+
 /// Current Binding snapshot and its lifecycle status.
 ///
 /// Repositories construct this value for GET/LIST and atomically replace the
@@ -204,7 +234,7 @@ pub struct BindingView {
     /// Immutable Binding spec.
     pub spec: PreparedBinding,
     /// Mutable lifecycle status for `spec`.
-    pub status: BindingStatus,
+    pub status: BindingLifecycle,
 }
 
 impl Validate for BindingView {

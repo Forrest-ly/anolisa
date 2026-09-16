@@ -28,6 +28,7 @@ enum WriteTarget<'a> {
 pub struct PapService<R, C> {
     repository: Arc<R>,
     compiler: Arc<C>,
+    enqueuer: Option<Arc<dyn crate::BindingReconcileEnqueuer>>,
 }
 
 impl<R, C> Clone for PapService<R, C> {
@@ -35,6 +36,7 @@ impl<R, C> Clone for PapService<R, C> {
         Self {
             repository: Arc::clone(&self.repository),
             compiler: Arc::clone(&self.compiler),
+            enqueuer: self.enqueuer.clone(),
         }
     }
 }
@@ -49,7 +51,66 @@ where
         Self {
             repository,
             compiler,
+            enqueuer: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_reconcile_enqueuer(
+        mut self,
+        enqueuer: Arc<dyn crate::BindingReconcileEnqueuer>,
+    ) -> Self {
+        self.enqueuer = Some(enqueuer);
+        self
+    }
+    fn check_ready(&self) -> Result<(), PapError> {
+        self.enqueuer.as_ref().map_or(Ok(()), |e| e.check_ready())
+    }
+    fn notify(&self, mut binding: BindingView) -> Result<BindingView, PapError> {
+        let Some(enqueuer) = &self.enqueuer else {
+            return Ok(binding);
+        };
+        // Terminal/running no-ops need no admission and must never be failed.
+        if !matches!(
+            binding.status.phase,
+            BindingStatus::PendingApply | BindingStatus::PendingDelete
+        ) {
+            return Ok(binding);
+        }
+        let Err(reason) = enqueuer.enqueue(&binding.spec.binding_id) else {
+            return Ok(binding);
+        };
+        match self.repository.fail_pending_binding(&binding, reason) {
+            Ok(true) => {
+                // Return the snapshot confirmed by the conditional write, without
+                // a second read that could observe a newer request or fail.
+                binding.status.phase = match binding.status.phase {
+                    BindingStatus::PendingApply => BindingStatus::ApplyFailed,
+                    BindingStatus::PendingDelete => BindingStatus::DeleteFailed,
+                    _ => unreachable!("only pending requests notify"),
+                };
+                binding.status.error = Some(reason.failure());
+                return Ok(binding);
+            }
+            Ok(false) => match self.repository.get_binding(&binding.spec.binding_id) {
+                Ok(current)
+                    if current.spec.binding_revision != binding.spec.binding_revision
+                        || current.status != binding.status =>
+                {
+                    return Ok(current);
+                }
+                Err(PapError::NotFound) => return Err(PapError::NotFound),
+                // Do not retry an old rejection against a fresh pending request.
+                // A failed reread also cannot confirm termination.
+                _ => {}
+            },
+            Err(_) => {}
+        }
+        Err(PapError::SchedulingRejected {
+            id: binding.spec.binding_id,
+            revision: binding.spec.binding_revision,
+            reason,
+        })
     }
 
     /// Creates one Policy identity from an authored template.
@@ -292,11 +353,11 @@ where
     ///
     /// Policy and Scope references are resolved to complete immutable snapshots.
     /// An identical spec is idempotent while Apply is pending, running, or
-    /// complete. Same-spec retry after `ApplyFailed` keeps the revision and saved
-    /// request; only changed specs receive the next revision. Changed specs are
+    /// complete. Same-spec retry after `ApplyFailed` keeps the revision and target
+    /// responsibility; only changed specs receive the next revision. Changed specs are
     /// rejected while Applying, and every UPDATE is rejected after Delete intent.
-    /// This PAP-only phase leaves accepted work in `PENDING_APPLY` and does not
-    /// translate or dispatch the Binding.
+    /// Admission returns `PENDING_APPLY` and notifies the configured runtime;
+    /// translation and target I/O execute outside the request.
     ///
     /// # Errors
     /// Returns not-found, validation, operation-in-progress, conflict, revision,
@@ -326,6 +387,7 @@ where
         scope_id: &ResourceId,
         scope_revision: Revision,
     ) -> Result<BindingView, PapError> {
+        self.check_ready()?;
         let (update_existing, mut selected_id) = match target {
             WriteTarget::Create => (false, generated_resource_id()?),
             WriteTarget::Update(id) => (true, id.clone()),
@@ -344,7 +406,7 @@ where
             };
             if let Some(current) = current.as_ref() {
                 if matches!(
-                    current.status,
+                    current.status.phase,
                     BindingStatus::PendingDelete
                         | BindingStatus::Deleting
                         | BindingStatus::DeleteFailed
@@ -358,7 +420,7 @@ where
                         && current.spec.scope.scope_id == *scope_id
                         && current.spec.scope.revision == scope_revision;
                     return if identical_reference {
-                        Ok(current.clone())
+                        self.notify(current.clone())
                     } else {
                         Err(PapError::OperationInProgress)
                     };
@@ -376,7 +438,7 @@ where
                         .request_apply()
                         .map_err(|_| PapError::OperationInProgress)?;
                     if next_status == current.status {
-                        return Ok(current.clone());
+                        return self.notify(current.clone());
                     }
                 }
             }
@@ -396,15 +458,15 @@ where
             let initial_status = BindingStatus::PendingApply;
             let binding = binding_view(spec, initial_status)?;
 
-            // The conditional write saves pending intent and retry controls atomically.
-            // Durable storage and post-commit daemon notification remain separate work.
+            // The conditional write saves pending intent and clears its previous error.
+            // Notify only after this write succeeds; rejection is terminalized conditionally by PAP.
             match self.repository.update_binding(current.as_ref(), &binding) {
                 Err(PapError::Conflict) => {
                     if !update_existing {
                         selected_id = generated_resource_id()?;
                     }
                 }
-                result => return result,
+                result => return result.and_then(|binding| self.notify(binding)),
             }
         }
         Err(PapError::Conflict)
@@ -474,18 +536,19 @@ where
     /// # Errors
     /// Returns not-found, conflict or persistence errors.
     pub fn delete_binding(&self, id: &ResourceId) -> Result<BindingView, PapError> {
+        self.check_ready()?;
         for _ in 0..MAX_WRITE_ATTEMPTS {
             let current = self.repository.get_binding(id)?;
             let next_status = current.status.request_delete();
             if next_status == current.status {
-                return Ok(current);
+                return self.notify(current);
             }
             let binding = binding_view(current.spec.clone(), next_status)?;
 
             // Preserve cleanup responsibility while atomically admitting Delete.
             // The daemon will notify its worker only after this write commits.
             match self.repository.update_binding(Some(&current), &binding) {
-                Ok(binding) => return Ok(binding),
+                Ok(binding) => return self.notify(binding),
                 Err(PapError::Conflict) => {}
                 Err(error) => return Err(error),
             }
@@ -538,7 +601,10 @@ where
 }
 
 fn binding_view(spec: PreparedBinding, status: BindingStatus) -> Result<BindingView, PapError> {
-    let view = BindingView { spec, status };
+    let view = BindingView {
+        spec,
+        status: status.into(),
+    };
     view.validate().map_err(PapError::InvalidBinding)?;
     Ok(view)
 }

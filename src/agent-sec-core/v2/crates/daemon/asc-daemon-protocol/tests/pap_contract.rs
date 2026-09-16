@@ -86,7 +86,7 @@ fn method_results_reuse_complete_domain_contracts() {
     let scope = binding.scope.clone();
     let binding = BindingView {
         spec: binding,
-        status: BindingStatus::PendingApply,
+        status: (BindingStatus::PendingApply).into(),
     };
 
     round_trip_value::<PreparedPolicy>(&policy);
