@@ -16,7 +16,10 @@
 #      "unavailable"
 #   4. the probe is bounded by RTK_VERSION_TIMEOUT_SECS and its child reaped —
 #      both for a binary that dies on SIGTERM and for one that ignores it
-#      (which needs the helper's unignorable follow-up deadline)
+#      (which needs the helper's unignorable follow-up deadline). A host with
+#      neither timeout(1) nor gtimeout gets an UNBOUNDED probe by design, so
+#      these groups report "skip" there instead of failing; everything else
+#      (1-3, 6, 7, the exit-status half of 5, and 8) runs on every host
 #   5. only a SUCCESSFUL probe records a version: output printed before an
 #      expired deadline, and stdout from a non-zero exit, are dropped rather
 #      than recorded, and the identity JSON stays valid
@@ -27,6 +30,11 @@
 # The reaping checks go through pid_is_gone rather than a bare `kill -0`, and
 # check 8 self-tests that helper — see the comments there for why a zombie has
 # to count as gone.
+#
+# The deadline-and-reaping groups are gated on the host actually having a
+# timeout(1) helper (HAVE_TIMEOUT_HELPER below): the runner treats "no helper"
+# as supported and probes unbounded, so failing there would block
+# test-rtk-integration on a host production explicitly permits.
 
 # SC2016 (file scope): every rtk stub body below is deliberately single-quoted
 # so it reaches the stub file verbatim and is expanded by the stub's own shell
@@ -59,6 +67,7 @@ sed 's|^    RTK_TIMEOUT_CMD="timeout"$|    RTK_TIMEOUT_CMD=""|' "$L1_DIR/prelude
 CURRENT_RUNNER="$L1_DIR/prelude.sh"
 IDENTITY_FILE="$L1_DIR/benchmark_identity.json"
 FAILED=0
+SKIPPED=0
 
 make_stub() { # make_stub <path> <body>
     printf '#!/usr/bin/env bash\n%s\n' "$2" > "$1"
@@ -122,9 +131,11 @@ pid_is_gone() { # pid_is_gone <pid>
     fi
     # With neither /proc nor ps the state stays unknown, so the answer falls
     # back to `kill -0` alone — the previous, stricter behaviour.
-    if [ "$state" = "Z" ]; then
-        return 0
-    fi
+    # Linux prints a single state char; BSD/macOS `ps -o state=` prints a
+    # sequence ("Z+", "SN"…), so match on the leading char, not the whole.
+    case "$state" in
+        Z*) return 0 ;;
+    esac
     ! kill -0 "$pid" 2>/dev/null   # ...or it was collected between the checks
 }
 
@@ -132,6 +143,25 @@ check_reaped() { # check_reaped <label> <pid-file>
     local rc=1
     [ -f "$2" ] && pid_is_gone "$(cat "$2")" && rc=0
     check_true "$1" "$rc"
+}
+
+# Mirror the runner's own discovery: with neither timeout(1) nor gtimeout it
+# leaves RTK_TIMEOUT_PREFIX empty and the probe runs unbounded — documented,
+# supported behaviour. Asserting a deadline on such a host would fail an
+# environment production permits, and (since this suite now gates
+# test-rtk-integration) block the RTK integration recipe with it.
+HAVE_TIMEOUT_HELPER=1
+if ! command -v timeout > /dev/null 2>&1 && ! command -v gtimeout > /dev/null 2>&1; then
+    HAVE_TIMEOUT_HELPER=0
+fi
+NO_HELPER_REASON="no timeout(1) or gtimeout(1) helper on this host"
+
+skip_checks() { # skip_checks <label>...
+    local label
+    for label in "$@"; do
+        echo "  skip $label ($NO_HELPER_REASON)"
+        SKIPPED=$((SKIPPED + 1))
+    done
 }
 
 echo "benchmark rtk version probe:"
@@ -175,39 +205,54 @@ check "bare command name absent from PATH" \
 make_stub "$BIN_DIR/rtk-silent" 'exit 0'
 check "empty --version output" "$(probe "RTK_BIN=$BIN_DIR/rtk-silent")" "unavailable"
 
-# 4a. Hanging binary that dies on SIGTERM: bounded by the deadline, reaped.
-HANG_PID_FILE="$WORK/hang.pid"
-make_stub "$BIN_DIR/rtk-hang" 'echo $$ > "$RTK_HANG_PID_FILE"; exec sleep 30'
-START=$(date +%s)
-check "hanging rtk bounded by RTK_VERSION_TIMEOUT_SECS" \
-    "$(probe "RTK_BIN=$BIN_DIR/rtk-hang" RTK_VERSION_TIMEOUT_SECS=1 "RTK_HANG_PID_FILE=$HANG_PID_FILE")" \
-    "unavailable"
-check_elapsed "deadline honoured (SIGTERM-responsive rtk)" \
-    "$(( $(date +%s) - START ))" 1 5
-check_reaped "timed-out probe child was reaped" "$HANG_PID_FILE"
+if [ "$HAVE_TIMEOUT_HELPER" -eq 1 ]; then
+    # 4a. Hanging binary that dies on SIGTERM: bounded by the deadline, reaped.
+    HANG_PID_FILE="$WORK/hang.pid"
+    make_stub "$BIN_DIR/rtk-hang" 'echo $$ > "$RTK_HANG_PID_FILE"; exec sleep 30'
+    START=$(date +%s)
+    check "hanging rtk bounded by RTK_VERSION_TIMEOUT_SECS" \
+        "$(probe "RTK_BIN=$BIN_DIR/rtk-hang" RTK_VERSION_TIMEOUT_SECS=1 "RTK_HANG_PID_FILE=$HANG_PID_FILE")" \
+        "unavailable"
+    check_elapsed "deadline honoured (SIGTERM-responsive rtk)" \
+        "$(( $(date +%s) - START ))" 1 5
+    check_reaped "timed-out probe child was reaped" "$HANG_PID_FILE"
 
-# 4b. Binary that IGNORES SIGTERM: the deadline still has to hold, which needs
-#     the helper's unignorable follow-up signal (--kill-after / -s KILL).
-IGN_PID_FILE="$WORK/ignore-term.pid"
-make_stub "$BIN_DIR/rtk-ignore-term" \
-    'echo $$ > "$RTK_IGNORE_PID_FILE"; trap "" TERM; exec sleep 30'
-START=$(date +%s)
-check "SIGTERM-ignoring rtk still bounded" \
-    "$(probe "RTK_BIN=$BIN_DIR/rtk-ignore-term" RTK_VERSION_TIMEOUT_SECS=1 "RTK_IGNORE_PID_FILE=$IGN_PID_FILE")" \
-    "unavailable"
-check_elapsed "deadline honoured (SIGTERM-ignoring rtk)" \
-    "$(( $(date +%s) - START ))" 1 5
-check_reaped "SIGTERM-ignoring probe child was force-killed and reaped" "$IGN_PID_FILE"
+    # 4b. Binary that IGNORES SIGTERM: the deadline still has to hold, which needs
+    #     the helper's unignorable follow-up signal (--kill-after / -s KILL).
+    IGN_PID_FILE="$WORK/ignore-term.pid"
+    make_stub "$BIN_DIR/rtk-ignore-term" \
+        'echo $$ > "$RTK_IGNORE_PID_FILE"; trap "" TERM; exec sleep 30'
+    START=$(date +%s)
+    check "SIGTERM-ignoring rtk still bounded" \
+        "$(probe "RTK_BIN=$BIN_DIR/rtk-ignore-term" RTK_VERSION_TIMEOUT_SECS=1 "RTK_IGNORE_PID_FILE=$IGN_PID_FILE")" \
+        "unavailable"
+    check_elapsed "deadline honoured (SIGTERM-ignoring rtk)" \
+        "$(( $(date +%s) - START ))" 1 5
+    check_reaped "SIGTERM-ignoring probe child was force-killed and reaped" "$IGN_PID_FILE"
 
-# 5a. Output printed BEFORE the deadline must be discarded, not recorded: an
-#     abandoned probe cannot vouch for the version it started printing.
-PART_PID_FILE="$WORK/partial.pid"
-make_stub "$BIN_DIR/rtk-partial" \
-    'echo $$ > "$RTK_PARTIAL_PID_FILE"; echo "rtk partial"; exec sleep 30'
-check "partial output dropped when the probe times out" \
-    "$(probe "RTK_BIN=$BIN_DIR/rtk-partial" RTK_VERSION_TIMEOUT_SECS=1 "RTK_PARTIAL_PID_FILE=$PART_PID_FILE")" \
-    "unavailable"
-check_reaped "partially-printing probe child was reaped" "$PART_PID_FILE"
+    # 5a. Output printed BEFORE the deadline must be discarded, not recorded: an
+    #     abandoned probe cannot vouch for the version it started printing.
+    PART_PID_FILE="$WORK/partial.pid"
+    make_stub "$BIN_DIR/rtk-partial" \
+        'echo $$ > "$RTK_PARTIAL_PID_FILE"; echo "rtk partial"; exec sleep 30'
+    check "partial output dropped when the probe times out" \
+        "$(probe "RTK_BIN=$BIN_DIR/rtk-partial" RTK_VERSION_TIMEOUT_SECS=1 "RTK_PARTIAL_PID_FILE=$PART_PID_FILE")" \
+        "unavailable"
+    check_reaped "partially-printing probe child was reaped" "$PART_PID_FILE"
+else
+    # Unbounded probe: there is no deadline to honour, no abandonment to
+    # discard partial output for, and no child to reap early. The stubs
+    # would each sit out their full `sleep 30` for nothing.
+    skip_checks \
+        "hanging rtk bounded by RTK_VERSION_TIMEOUT_SECS" \
+        "deadline honoured (SIGTERM-responsive rtk)" \
+        "timed-out probe child was reaped" \
+        "SIGTERM-ignoring rtk still bounded" \
+        "deadline honoured (SIGTERM-ignoring rtk)" \
+        "SIGTERM-ignoring probe child was force-killed and reaped" \
+        "partial output dropped when the probe times out" \
+        "partially-printing probe child was reaped"
+fi
 
 # 6. Multi-line output from a successful probe: first line only.
 make_stub "$BIN_DIR/rtk-multi" 'echo "rtk 0.4-multi"; echo "build abc123"'
@@ -265,4 +310,8 @@ if [ "$FAILED" -ne 0 ]; then
     echo "benchmark rtk version probe test FAILED"
     exit 1
 fi
-echo "benchmark rtk version probe test passed"
+if [ "$SKIPPED" -gt 0 ]; then
+    echo "benchmark rtk version probe test passed ($SKIPPED checks skipped: $NO_HELPER_REASON)"
+else
+    echo "benchmark rtk version probe test passed"
+fi
