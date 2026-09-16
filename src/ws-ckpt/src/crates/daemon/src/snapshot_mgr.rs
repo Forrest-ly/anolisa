@@ -10,117 +10,157 @@ use std::path::{Path, PathBuf};
 use crate::index_store;
 use crate::state::{DaemonState, WorkspaceState};
 
-/// Result of [`delete_snapshots_locked`]: per-snap outcome, no early bail
-/// (caller decides whether failures escalate to an error or just warn).
-pub struct CleanupOutcome {
-    pub removed: Vec<String>,
-    pub failed: Vec<(String, String)>,
+/// Result of [`delete_snapshots_locked`]: per-snapshot outcome, no early bail.
+pub(crate) struct CleanupOutcome {
+    pub(crate) removed: Vec<String>,
+    pub(crate) failed: Vec<(String, String)>,
+    pub(crate) index_changed: bool,
 }
 
-/// Shared per-snap detach-then-delete loop, used by both
-/// [`cleanup_snapshots`] (user-triggered Count cleanup) and the scheduler's
-/// background pass. Invariants:
+/// Batch-deletes eligible snapshots while the caller holds `state.lock_wsid(ws_id)`.
 ///
-/// 1. **detach under write lock, delete unlocked** — a concurrent pin RPC
-///    either wins (we skip) or loses (it sees SnapshotNotFound). No
-///    read→fs window where pin sneaks in between recheck and delete.
-/// 2. **per-snap try/recover** — on backend Err the meta is re-inserted so
-///    the index stays in sync with on-disk subvolumes.
-/// 3. **no short-circuit** — earlier successes must persist even if a later
-///    snap fails; the caller persists `index` + manifest from
-///    `outcome.removed`. An early `?` would lose the prior in-memory removes.
-///
-/// `label` ("cleanup" / "auto-cleanup") prefixes log lines.
-pub async fn delete_snapshots_locked(
+/// The index stays unchanged during the backend call. Once every outcome is known,
+/// one write-lock acquisition applies only confirmed removals and `NotFound` markers.
+pub(crate) async fn delete_snapshots_locked(
     state: &DaemonState,
     arc: &Arc<RwLock<WorkspaceState>>,
     ws_id: &str,
     to_remove: &[String],
     label: &str,
 ) -> CleanupOutcome {
-    // Relink DAG + detach all non-pinned snaps in one write lock (pure memory, no fs I/O).
-    // Holding a single lock eliminates the TOCTOU window where a concurrent
-    // checkpoint/rollback could reference a node we're about to delete.
-    let detached: Vec<(String, SnapshotMeta)> = {
-        let ids: std::collections::HashSet<String> = to_remove.iter().cloned().collect();
-        let mut ws = arc.write().await;
-        ws.index.prune_chain(&ids);
+    // Recheck the plan while serialized against every workspace mutation. Pins,
+    // missing markers, and prior removals may have changed since selection.
+    let requested = {
+        let ws = arc.read().await;
         to_remove
             .iter()
-            .filter_map(|snap_id| match ws.index.snapshots.get(snap_id) {
-                Some(m) if !m.pinned => ws
-                    .index
+            .filter(|id| {
+                ws.index
                     .snapshots
-                    .remove(snap_id)
-                    .map(|m| (snap_id.clone(), m)),
-                _ => None,
+                    .get(*id)
+                    .is_some_and(|meta| !meta.pinned && !meta.missing)
             })
-            .collect()
+            .cloned()
+            .collect::<Vec<_>>()
     };
+    if requested.is_empty() {
+        return CleanupOutcome {
+            removed: Vec::new(),
+            failed: Vec::new(),
+            index_changed: false,
+        };
+    }
+
+    // Keep the workspace RwLock free while the backend performs the batch.
+    let batch = state.backend.cleanup_snapshots(ws_id, &requested).await;
+    let requested_set: std::collections::HashSet<String> = requested.iter().cloned().collect();
     let mut removed = Vec::new();
-    let mut failed: Vec<(String, String)> = Vec::new();
-    for (snap_id, meta) in &detached {
-        match state
-            .backend
-            .cleanup_snapshots(ws_id, std::slice::from_ref(snap_id))
-            .await
-        {
-            Ok(deleted) if deleted.is_empty() => {
-                // Backend reported no-op (already gone); roll back the detach
-                // so the index doesn't drift.
-                tracing::warn!(
-                    "{}: re-inserted {} after backend no-op; DAG links may be stale (orphaned node)",
-                    label, snap_id,
-                );
-                arc.write()
-                    .await
-                    .index
-                    .snapshots
-                    .insert(snap_id.clone(), meta.clone());
+    let mut not_found = Vec::new();
+    let mut failed = Vec::new();
+
+    use ws_ckpt_common::backend::SnapshotDeleteOutcome as Outcome;
+    match batch {
+        Ok(report) => {
+            let mut reported = std::collections::HashSet::with_capacity(report.len());
+            for (snap_id, outcome) in report {
+                if !requested_set.contains(snap_id.as_str()) {
+                    tracing::warn!(
+                        "{}: backend reported unrequested snapshot {}; ignoring",
+                        label,
+                        snap_id
+                    );
+                    continue;
+                }
+                if !reported.insert(snap_id.clone()) {
+                    tracing::warn!(
+                        "{}: backend reported snapshot {} more than once; ignoring duplicate",
+                        label,
+                        snap_id
+                    );
+                    continue;
+                }
+                match outcome {
+                    Outcome::Removed => {
+                        info!("{}: removed snapshot {}", label, snap_id);
+                        removed.push(snap_id);
+                    }
+                    Outcome::NotFound => {
+                        tracing::warn!(
+                            "{}: backend no-op for {} (subvolume absent on disk); marking missing",
+                            label,
+                            snap_id,
+                        );
+                        not_found.push(snap_id);
+                    }
+                    Outcome::Failed(error) => {
+                        tracing::warn!(
+                            "{}: backend delete failed for {}: {}",
+                            label,
+                            snap_id,
+                            error
+                        );
+                        failed.push((snap_id, error));
+                    }
+                }
             }
-            Ok(_) => {
-                // Successful deletion ends the receipt's retention lifetime.
-                // Do this only after the backend confirms deletion so a failed
-                // cleanup can restore both metadata and evidence together.
-                arc.write().await.index.governed_evidence.remove(snap_id);
-                info!("{}: removed snapshot {}", label, snap_id);
-                removed.push(snap_id.clone());
-            }
-            Err(e) => {
-                arc.write()
-                    .await
-                    .index
-                    .snapshots
-                    .insert(snap_id.clone(), meta.clone());
+            for snap_id in requested.iter().filter(|id| !reported.contains(*id)) {
                 tracing::warn!(
-                    "{}: backend delete failed for {}: {:#}; re-inserted as orphaned node",
+                    "{}: backend report is missing an entry for {}; leaving index unchanged",
                     label,
-                    snap_id,
-                    e
+                    snap_id
                 );
-                failed.push((snap_id.clone(), format!("{:#}", e)));
+                failed.push((
+                    snap_id.clone(),
+                    "backend cleanup report did not include this snapshot".to_string(),
+                ));
+            }
+        }
+        Err(error) => {
+            for snap_id in &requested {
+                failed.push((snap_id.clone(), format!("{:#}", error)));
+            }
+            tracing::warn!(
+                "{}: backend batch delete failed for {} snapshot(s): {:#}",
+                label,
+                requested.len(),
+                error
+            );
+        }
+    }
+
+    let index_changed = !removed.is_empty() || !not_found.is_empty();
+    if index_changed {
+        let removed_set = removed.iter().cloned().collect();
+        let mut ws = arc.write().await;
+        ws.index.prune_chain(&removed_set);
+        for id in &removed {
+            ws.index.snapshots.remove(id);
+            ws.index.governed_evidence.remove(id);
+        }
+        for id in &not_found {
+            if let Some(meta) = ws.index.snapshots.get_mut(id) {
+                meta.missing = true;
             }
         }
     }
-    CleanupOutcome { removed, failed }
+
+    CleanupOutcome {
+        removed,
+        failed,
+        index_changed,
+    }
 }
 
-/// After [`delete_snapshots_locked`] succeeded for ≥1 snap, persist the
-/// current in-memory index to `index.json` + manifest. The index save retains a
-/// read lock so a stale cleanup writer cannot overwrite a concurrently published
-/// checkpoint. Both writes are best-effort and warn-only — by the time we get
-/// here the subvolumes are already gone, so an index-save failure just means
-/// restart will rebuild from fs (cheap), and a manifest failure leaves stale
-/// entries but the ws is still usable.
-pub async fn persist_index_after_cleanup(
+/// Persists cleanup changes to `index.json` and the manifest.
+///
+/// Callers retain the workspace mutation mutex through this function, so no
+/// newer workspace mutation can be overwritten by this index snapshot.
+pub(crate) async fn persist_index_after_cleanup(
     state: &DaemonState,
     arc: &Arc<RwLock<WorkspaceState>>,
     snap_dir: &Path,
     label: &str,
 ) {
-    // Keep the read guard through the rename. A stale cleanup snapshot must
-    // not overwrite guarded evidence that a concurrent checkpoint has
-    // already durably published under the workspace write lock.
     let ws = arc.read().await;
     if let Err(e) = index_store::save(snap_dir, &ws.index).await {
         tracing::warn!("{}: failed to save index: {:#}", label, e);
@@ -166,8 +206,17 @@ pub async fn checkpoint(
         Some(a) => a,
         None => return Ok(workspace_not_found(workspace)),
     };
+    let Some((_ws_id, _mutation_guard)) = state.lock_workspace_mutation_if_current(&arc).await
+    else {
+        return Ok(workspace_not_found(workspace));
+    };
 
-    // 2. Acquire write lock
+    // 1a. Detached-registration guard: refuse before snapshotting the stale subvolume.
+    if let Some(resp) = state.detached_registration_error(&arc).await {
+        return Ok(resp);
+    }
+
+    // 2. Acquire write lock after the mutation mutex.
     let mut ws = arc.write().await;
 
     // 2a. Check write-lock quiescence (inotify-based)
@@ -270,6 +319,16 @@ pub async fn rollback(
         Some(a) => a,
         None => return Ok(workspace_not_found(workspace)),
     };
+    let Some((_ws_id, _mutation_guard)) = state.lock_workspace_mutation_if_current(&arc).await
+    else {
+        return Ok(workspace_not_found(workspace));
+    };
+
+    // 1a. Detached-registration guard: without it a rollback "succeeds" on the
+    // stale subvolume while the user's replacement directory never changes.
+    if let Some(resp) = state.detached_registration_error(&arc).await {
+        return Ok(resp);
+    }
 
     // 2. Read lock: grab workspace path for /proc scan
     let ws_path_str = {
@@ -337,6 +396,15 @@ pub async fn rollback_preview(
         Some(a) => a,
         None => return Ok(workspace_not_found(workspace)),
     };
+    let Some((_ws_id, _mutation_guard)) = state.lock_workspace_mutation_if_current(&arc).await
+    else {
+        return Ok(workspace_not_found(workspace));
+    };
+
+    // Detached-registration guard: a preview of a rollback the user will never see.
+    if let Some(resp) = state.detached_registration_error(&arc).await {
+        return Ok(resp);
+    }
 
     let (ws_id, resolved_id) = {
         let ws = arc.read().await;
@@ -414,6 +482,12 @@ pub async fn list_snapshots(state: &Arc<DaemonState>, workspace: &str) -> anyhow
         None => return Ok(workspace_not_found(workspace)),
     };
 
+    // Detached-registration guard: the listed snapshots belong to a subvolume
+    // the registered path no longer exposes to the user.
+    if let Some(resp) = state.detached_registration_error(&arc).await {
+        return Ok(resp);
+    }
+
     let ws = arc.read().await;
     let ws_path = ws.index.workspace_path.to_string_lossy().to_string();
     let mut snapshots: Vec<(String, SnapshotMeta)> = ws
@@ -476,6 +550,16 @@ pub async fn diff_snapshots(
         Some(a) => a,
         None => return Ok(workspace_not_found(workspace)),
     };
+    let Some((_ws_id, _mutation_guard)) = state.lock_workspace_mutation_if_current(&arc).await
+    else {
+        return Ok(workspace_not_found(workspace));
+    };
+
+    // Detached-registration guard: the diff would describe a subvolume the
+    // registered path no longer exposes to the user.
+    if let Some(resp) = state.detached_registration_error(&arc).await {
+        return Ok(resp);
+    }
 
     let ws = arc.read().await;
 
@@ -540,18 +624,31 @@ pub async fn cleanup_snapshots(
         Some(a) => a,
         None => return Ok(workspace_not_found(workspace)),
     };
+    let Some((ws_id, _mutation_guard)) = state.lock_workspace_mutation_if_current(&arc).await
+    else {
+        return Ok(workspace_not_found(workspace));
+    };
 
-    // P1: plan under read lock — pure in-memory work, no fs I/O.
-    let (ws_id, to_remove_ids, snap_dir) = {
+    // Detached-registration guard: refuse before mutating the stale subvolume's
+    // snapshot set. Auto-cleanup intentionally skips this user-facing check so
+    // detached registrations do not prevent retention from reclaiming space.
+    if let Some(resp) = state.detached_registration_error(&arc).await {
+        return Ok(resp);
+    }
+
+    // Plan under a read lock while holding the mutation mutex.
+    let (to_remove_ids, snap_dir) = {
         let ws = arc.read().await;
-        let ws_id = ws.ws_id.clone();
         let snap_dir = state.index_dir(&ws_id);
 
+        // `missing` entries are skipped: their subvolume is already gone
+        // (flagged by reconcile or by a NotFound cleanup, #3053 review P2),
+        // re-selecting them would retry-and-warn on every pass forever.
         let mut unpinned: Vec<(String, chrono::DateTime<chrono::Utc>)> = ws
             .index
             .snapshots
             .iter()
-            .filter(|(_, meta)| !meta.pinned)
+            .filter(|(_, meta)| !meta.pinned && !meta.missing)
             .map(|(id, meta)| (id.clone(), meta.created_at))
             .collect();
         unpinned.sort_by_key(|(_, ts)| *ts);
@@ -565,17 +662,17 @@ pub async fn cleanup_snapshots(
             Vec::new()
         };
 
-        (ws_id, to_remove_ids, snap_dir)
+        (to_remove_ids, snap_dir)
     };
 
-    // P1.5: create index dir unlocked (slow fs must not block the ws write lock).
+    // Create the index directory without the workspace RwLock. The mutation
+    // mutex remains held so recover and other snapshot operations cannot race.
     tokio::fs::create_dir_all(&snap_dir)
         .await
         .with_context(|| format!("Failed to create index dir: {:?}", snap_dir))?;
 
-    // P2: detach-then-delete (shared helper); persist (shared helper).
     let outcome = delete_snapshots_locked(state, &arc, &ws_id, &to_remove_ids, "cleanup").await;
-    if !outcome.removed.is_empty() {
+    if outcome.index_changed {
         persist_index_after_cleanup(state, &arc, &snap_dir, "cleanup").await;
     }
     if !outcome.failed.is_empty() {
@@ -656,6 +753,346 @@ mod tests {
         }
     }
 
+    // ── Detached-registration guard fixtures ──
+    //
+    // Real topology: a tempdir doubles as the backend data root
+    // (BtrfsLoopBackend::data_root() is exactly its mount path), `<root>/ws-<id>`
+    // stands in for the live subvolume, and a workspace symlink points at it.
+    // Registering fake paths like `/home/user/ws` no longer works: the guard
+    // (correctly) treats them as detached.
+
+    /// How a registration got detached from its live subvolume.
+    enum DetachMode {
+        /// Registered path replaced by a plain directory (issue #3059 repro).
+        ReplacedByDir,
+        /// Registered path removed entirely.
+        Missing,
+        /// Registered symlink repointed at another directory.
+        Repointed,
+    }
+
+    struct GuardFixture {
+        _temp: tempfile::TempDir,
+        state: Arc<DaemonState>,
+        ws_id: String,
+        ws_link: PathBuf,
+    }
+
+    impl GuardFixture {
+        fn new(ws_id: &str) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let backend: Arc<dyn StorageBackend> =
+                Arc::new(crate::backends::btrfs_loop::BtrfsLoopBackend::new(
+                    temp.path().to_path_buf(),
+                    temp.path().join("test.img"),
+                ));
+            let state = Arc::new(DaemonState::new(
+                test_config(),
+                backend,
+                temp.path().join("state"),
+            ));
+            let subvol = temp.path().join(ws_id);
+            std::fs::create_dir_all(&subvol).unwrap();
+            let ws_link = temp.path().join("ws-link");
+            std::os::unix::fs::symlink(&subvol, &ws_link).unwrap();
+            state.register_workspace(
+                ws_id.to_string(),
+                ws_link.clone(),
+                SnapshotIndex::new(ws_link.clone()),
+            );
+            Self {
+                _temp: temp,
+                state,
+                ws_id: ws_id.to_string(),
+                ws_link,
+            }
+        }
+
+        /// Break the registration the way an external `rm -rf $W; mkdir $W` does.
+        fn detach(&self, mode: DetachMode) {
+            std::fs::remove_file(&self.ws_link).unwrap();
+            match mode {
+                DetachMode::ReplacedByDir => {
+                    std::fs::create_dir(&self.ws_link).unwrap();
+                }
+                DetachMode::Missing => {}
+                DetachMode::Repointed => {
+                    let other = self._temp.path().join("other-target");
+                    std::fs::create_dir(&other).unwrap();
+                    std::os::unix::fs::symlink(&other, &self.ws_link).unwrap();
+                }
+            }
+        }
+
+        /// Insert a snapshot record so post-guard resolution stages are meaningful.
+        async fn add_snapshot(&self, snapshot_id: &str) {
+            let arc = self.state.get_by_wsid(&self.ws_id).unwrap();
+            arc.write()
+                .await
+                .index
+                .snapshots
+                .insert(snapshot_id.to_string(), make_snapshot_meta(false));
+        }
+    }
+
+    /// The detach error is uniform across ops: InternalError, points at recover.
+    /// The data-loss note must appear only for the replaced-by-directory case.
+    fn assert_detach_error(resp: Response, op: &str, expect_dir_note: bool) {
+        match resp {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::InternalError, "{op}: {message}");
+                assert!(message.contains("recover"), "{op}: {message}");
+                assert!(message.contains("re-init"), "{op}: {message}");
+                assert_eq!(
+                    message.contains("regular directory"),
+                    expect_dir_note,
+                    "{op}: {message}"
+                );
+            }
+            other => panic!("{op}: expected detach error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_snapshot_ops_refuse_detached_registration() {
+        for mode in [
+            DetachMode::ReplacedByDir,
+            DetachMode::Missing,
+            DetachMode::Repointed,
+        ] {
+            let expect_dir_note = matches!(mode, DetachMode::ReplacedByDir);
+            let fx = GuardFixture::new("ws-guard");
+            fx.add_snapshot("snap-1").await;
+            fx.detach(mode);
+            let ws_ref = fx.ws_link.to_string_lossy().to_string();
+
+            let resp = checkpoint(&fx.state, &ws_ref, "snap-1", None, None, false)
+                .await
+                .unwrap();
+            assert_detach_error(resp, "checkpoint", expect_dir_note);
+
+            let resp = rollback(&fx.state, &ws_ref, Some("snap-1"), None)
+                .await
+                .unwrap();
+            assert_detach_error(resp, "rollback", expect_dir_note);
+
+            let resp = rollback_preview(&fx.state, &ws_ref, Some("snap-1"), None)
+                .await
+                .unwrap();
+            assert_detach_error(resp, "rollback_preview", expect_dir_note);
+
+            let resp = list_snapshots(&fx.state, &ws_ref).await.unwrap();
+            assert_detach_error(resp, "list_snapshots", expect_dir_note);
+
+            let resp = diff_snapshots(&fx.state, &ws_ref, "snap-1", None)
+                .await
+                .unwrap();
+            assert_detach_error(resp, "diff_snapshots", expect_dir_note);
+
+            let resp = cleanup_snapshots(&fx.state, &ws_ref, None).await.unwrap();
+            assert_detach_error(resp, "cleanup_snapshots", expect_dir_note);
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_snapshot_ops_proceed_past_guard_on_healthy_registration() {
+        let fx = GuardFixture::new("ws-live");
+        fx.add_snapshot("snap-1").await;
+        let ws_ref = fx.ws_link.to_string_lossy().to_string();
+
+        // Every op must reach a stage after the guard (or fully succeed);
+        // none may return the detach error.
+        match checkpoint(&fx.state, &ws_ref, "snap-1", None, None, false)
+            .await
+            .unwrap()
+        {
+            Response::Error { code, .. } => assert_eq!(code, ErrorCode::SnapshotAlreadyExists),
+            other => panic!("checkpoint: {other:?}"),
+        }
+
+        match rollback(&fx.state, &ws_ref, Some("no-such"), None)
+            .await
+            .unwrap()
+        {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::SnapshotNotFound);
+                assert!(message.contains("no-such"), "{message}");
+            }
+            other => panic!("rollback: {other:?}"),
+        }
+
+        match rollback_preview(&fx.state, &ws_ref, Some("no-such"), None)
+            .await
+            .unwrap()
+        {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::SnapshotNotFound);
+                assert!(message.contains("no-such"), "{message}");
+            }
+            other => panic!("rollback_preview: {other:?}"),
+        }
+
+        assert!(matches!(
+            list_snapshots(&fx.state, &ws_ref).await.unwrap(),
+            Response::ListOk { .. }
+        ));
+
+        match diff_snapshots(&fx.state, &ws_ref, "no-such", None)
+            .await
+            .unwrap()
+        {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::SnapshotNotFound);
+                assert!(message.contains("no-such"), "{message}");
+            }
+            other => panic!("diff_snapshots: {other:?}"),
+        }
+
+        assert!(matches!(
+            cleanup_snapshots(&fx.state, &ws_ref, Some(20))
+                .await
+                .unwrap(),
+            Response::CleanupOk { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn guard_parks_on_lock_while_writer_swaps_subvolume() {
+        // The read guard held across the probe must not deadlock against a
+        // writer: a guard that starts while rollback holds the write lock
+        // parks on read acquisition, then probes only after the swap
+        // completed — and must report the registration live.
+        let fx = GuardFixture::new("ws-swap");
+        let arc = fx.state.get_by_wsid(&fx.ws_id).unwrap();
+        let live = fx._temp.path().join(&fx.ws_id);
+        let tmp = fx._temp.path().join(format!("{}.rollback-tmp", fx.ws_id));
+
+        let (mid_swap, swapped) = tokio::sync::oneshot::channel::<()>();
+        let writer_arc = arc.clone();
+        let writer = tokio::spawn(async move {
+            let _ws = writer_arc.write().await;
+            std::fs::rename(&live, &tmp).unwrap();
+            let _ = mid_swap.send(());
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            std::fs::rename(&tmp, &live).unwrap();
+        });
+        swapped.await.unwrap(); // registered path currently resolves nowhere
+
+        let state = fx.state.clone();
+        let mut guard = tokio::spawn(async move { state.detached_registration_error(&arc).await });
+
+        // While the writer holds the lock mid-swap the guard must be parked
+        // on the read lock — it may not conclude "detached" from the
+        // transiently missing path.
+        match tokio::time::timeout(std::time::Duration::from_millis(50), &mut guard).await {
+            Ok(Ok(resp)) => panic!("guard concluded during subvolume swap: {resp:?}"),
+            Ok(Err(e)) => panic!("guard task failed: {e}"),
+            Err(_) => {}
+        }
+
+        let resp = guard.await.unwrap();
+        writer.await.unwrap();
+        assert!(
+            resp.is_none(),
+            "guard must report the registration live once the swap completes: {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_probe_spans_read_lock_across_subvolume_swap() {
+        // The discriminating race from review: the probe must hold the
+        // workspace read lock across its await points. A probe that released
+        // the lock first would let a concurrent rollback (write lock + rename
+        // of the live subvolume to `.rollback-tmp`) open its swap window
+        // while the probe is still in flight, making a healthy workspace look
+        // detached.
+        //
+        // Fixture: the backend data root is a 300-deep directory chain, so
+        // the real canonicalize() inside registration_is_live walks ~300
+        // components (~hundreds of microseconds). That widens the probe's
+        // in-flight window enough to observe lock ownership deterministically:
+        // acquiring the write lock implies the read lock was released, and
+        // under the fix that can only happen after the probe finished.
+        let temp = tempfile::tempdir().unwrap();
+        let mut deep = temp.path().to_path_buf();
+        for i in 0..300 {
+            deep = deep.join(format!("d{i}"));
+            std::fs::create_dir(&deep).unwrap();
+        }
+        let backend: Arc<dyn StorageBackend> = Arc::new(
+            crate::backends::btrfs_loop::BtrfsLoopBackend::new(deep.clone(), deep.join("test.img")),
+        );
+        let state = Arc::new(DaemonState::new(
+            test_config(),
+            backend,
+            temp.path().join("state"),
+        ));
+        let ws_id = "ws-deep";
+        let subvol = deep.join(ws_id);
+        std::fs::create_dir(&subvol).unwrap();
+        let ws_link = temp.path().join("ws-link");
+        std::os::unix::fs::symlink(&subvol, &ws_link).unwrap();
+        state.register_workspace(
+            ws_id.to_string(),
+            ws_link.clone(),
+            SnapshotIndex::new(ws_link),
+        );
+        let arc = state.get_by_wsid(ws_id).unwrap();
+
+        let probe_state = state.clone();
+        let probe_arc = arc.clone();
+        let guard =
+            tokio::spawn(async move { probe_state.detached_registration_error(&probe_arc).await });
+        // Run the guard to its first await: the probe is now in flight.
+        tokio::task::yield_now().await;
+
+        // Acquire the write lock as soon as the read lock frees up.
+        // Buggy (probe outside the lock): this succeeds while the probe is
+        // still resolving the 300-deep chain, so the rename below lands
+        // inside the probe's window and the guard misjudges the workspace.
+        // Fixed: the read lock spans the probe, so acquisition here implies
+        // the guard already computed its verdict on the pre-swap state.
+        let write = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(g) = arc.try_write() {
+                    return g;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("write lock must become acquirable while the guard runs");
+
+        let tmp = deep.join(format!("{ws_id}.rollback-tmp"));
+        std::fs::rename(&subvol, &tmp).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        std::fs::rename(&tmp, &subvol).unwrap();
+        drop(write);
+
+        let resp = guard.await.unwrap();
+        assert!(
+            resp.is_none(),
+            "guard misjudged a healthy workspace as detached across a subvolume swap: {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_applies_when_workspace_addressed_by_ws_id() {
+        let fx = GuardFixture::new("ws-byid");
+        fx.add_snapshot("snap-1").await;
+        fx.detach(DetachMode::ReplacedByDir);
+
+        let resp = checkpoint(&fx.state, &fx.ws_id, "snap-1", None, None, false)
+            .await
+            .unwrap();
+        assert_detach_error(resp, "checkpoint by ws_id", true);
+
+        let resp = rollback(&fx.state, &fx.ws_id, Some("snap-1"), None)
+            .await
+            .unwrap();
+        assert_detach_error(resp, "rollback by ws_id", true);
+    }
+
     // ── Duplicate snapshot ID tests ──
 
     #[test]
@@ -730,19 +1167,11 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_duplicate_id_returns_already_exists() {
-        let state = Arc::new(crate::state::DaemonState::new(
-            test_config(),
-            test_backend(),
-            test_state_dir(),
-        ));
+        let fx = GuardFixture::new("ws-dup");
         // Register a workspace with an existing snapshot
-        let mut index = SnapshotIndex::new(PathBuf::from("/home/user/ws"));
-        index
-            .snapshots
-            .insert("existing-id".to_string(), make_snapshot_meta(false));
-        state.register_workspace("ws-dup".to_string(), PathBuf::from("/home/user/ws"), index);
+        fx.add_snapshot("existing-id").await;
 
-        let resp = checkpoint(&state, "ws-dup", "existing-id", None, None, false)
+        let resp = checkpoint(&fx.state, &fx.ws_id, "existing-id", None, None, false)
             .await
             .unwrap();
         match resp {
@@ -756,37 +1185,27 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_cannot_reuse_id_reserved_by_guarded_evidence() {
-        use ws_ckpt_common::{
-            GuardedCheckpointEvidenceV2, GuardedCheckpointOutcomeV2, WorkspaceGenerationTokenV2,
-        };
-
-        let state = Arc::new(crate::state::DaemonState::new(
-            test_config(),
-            test_backend(),
-            test_state_dir(),
-        ));
-        let mut index = SnapshotIndex::new(PathBuf::from("/home/user/ws"));
-        index.governed_evidence.insert(
-            "reserved-id".to_string(),
-            GuardedCheckpointEvidenceV2 {
-                ws_id: "ws-abcdef".to_string(),
-                registered_path: "/home/user/ws".to_string(),
-                generation: WorkspaceGenerationTokenV2::from_bytes([1; 32]),
-                checkpoint_id: "reserved-id".to_string(),
-                operation_digest: [2; 32],
-                caller_uid: 1000,
-                outcome: GuardedCheckpointOutcomeV2::Created {
-                    snapshot_id: "reserved-id".to_string(),
+        let fx = GuardFixture::new("ws-abcdef");
+        let arc = fx.state.get_by_wsid(&fx.ws_id).unwrap();
+        {
+            let mut ws = arc.write().await;
+            ws.index.governed_evidence.insert(
+                "reserved-id".to_string(),
+                GuardedCheckpointEvidenceV2 {
+                    ws_id: fx.ws_id.clone(),
+                    registered_path: fx.ws_link.to_string_lossy().into_owned(),
+                    generation: WorkspaceGenerationTokenV2::from_bytes([1; 32]),
+                    checkpoint_id: "reserved-id".to_string(),
+                    operation_digest: [2; 32],
+                    caller_uid: 1000,
+                    outcome: GuardedCheckpointOutcomeV2::Created {
+                        snapshot_id: "reserved-id".to_string(),
+                    },
                 },
-            },
-        );
-        state.register_workspace(
-            "ws-abcdef".to_string(),
-            PathBuf::from("/home/user/ws"),
-            index,
-        );
+            );
+        }
 
-        let response = checkpoint(&state, "ws-abcdef", "reserved-id", None, None, false)
+        let response = checkpoint(&fx.state, &fx.ws_id, "reserved-id", None, None, false)
             .await
             .unwrap();
         match response {
@@ -1133,18 +1552,10 @@ mod tests {
     /// `SnapshotNotFound`, not as `InternalError` via the dispatcher fallback.
     #[tokio::test]
     async fn diff_snapshots_missing_id_returns_snapshot_not_found() {
-        let state = Arc::new(crate::state::DaemonState::new(
-            test_config(),
-            test_backend(),
-            test_state_dir(),
-        ));
-        let mut index = SnapshotIndex::new(PathBuf::from("/home/user/ws"));
-        index
-            .snapshots
-            .insert("real-id".to_string(), make_snapshot_meta(false));
-        state.register_workspace("ws-diff".to_string(), PathBuf::from("/home/user/ws"), index);
+        let fx = GuardFixture::new("ws-diff");
+        fx.add_snapshot("real-id").await;
 
-        let resp = diff_snapshots(&state, "ws-diff", "does-not-exist", Some("real-id"))
+        let resp = diff_snapshots(&fx.state, &fx.ws_id, "does-not-exist", Some("real-id"))
             .await
             .unwrap();
         match resp {
@@ -1156,7 +1567,7 @@ mod tests {
         }
 
         // Also covers the `to`-side branch.
-        let resp = diff_snapshots(&state, "ws-diff", "real-id", Some("missing-to"))
+        let resp = diff_snapshots(&fx.state, &fx.ws_id, "real-id", Some("missing-to"))
             .await
             .unwrap();
         match resp {
@@ -1172,7 +1583,9 @@ mod tests {
     async fn diff_and_rollback_preview_reach_live_diff_backend() {
         use ws_ckpt_common::DiffEntry;
 
-        struct DiffStubBackend;
+        struct DiffStubBackend {
+            data_root: PathBuf,
+        }
 
         #[async_trait::async_trait]
         impl StorageBackend for DiffStubBackend {
@@ -1180,7 +1593,7 @@ mod tests {
                 ws_ckpt_common::backend::BackendType::BtrfsBase
             }
             fn data_root(&self) -> &std::path::Path {
-                std::path::Path::new("/tmp/stub")
+                &self.data_root
             }
             fn snapshots_root(&self) -> &std::path::Path {
                 std::path::Path::new("/tmp/stub-snaps")
@@ -1223,7 +1636,8 @@ mod tests {
                 &self,
                 _: &str,
                 _: &[String],
-            ) -> anyhow::Result<Vec<String>> {
+            ) -> anyhow::Result<Vec<(String, ws_ckpt_common::backend::SnapshotDeleteOutcome)>>
+            {
                 unimplemented!()
             }
             async fn fork(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
@@ -1245,20 +1659,27 @@ mod tests {
             }
         }
 
+        // Real registration topology: subvolume stand-in under the stub's
+        // data root, workspace symlink pointing at it.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("stub-data");
+        let subvol = data_root.join("ws-diff-live");
+        std::fs::create_dir_all(&subvol).unwrap();
+        let ws_link = tmp.path().join("ws-link");
+        std::os::unix::fs::symlink(&subvol, &ws_link).unwrap();
+
         let state = Arc::new(crate::state::DaemonState::new(
             test_config(),
-            Arc::new(DiffStubBackend),
+            Arc::new(DiffStubBackend {
+                data_root: data_root.clone(),
+            }),
             test_state_dir(),
         ));
-        let mut index = SnapshotIndex::new(PathBuf::from("/home/user/ws"));
+        let mut index = SnapshotIndex::new(ws_link.clone());
         index
             .snapshots
             .insert("snap-from".to_string(), make_snapshot_meta(false));
-        state.register_workspace(
-            "ws-diff-live".to_string(),
-            PathBuf::from("/home/user/ws"),
-            index,
-        );
+        state.register_workspace("ws-diff-live".to_string(), ws_link.clone(), index);
 
         let resp = diff_snapshots(&state, "ws-diff-live", "snap-from", None)
             .await
@@ -1306,18 +1727,9 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_preview_snapshot_not_found() {
-        let state = Arc::new(crate::state::DaemonState::new(
-            test_config(),
-            test_backend(),
-            test_state_dir(),
-        ));
-        state.register_workspace(
-            "ws-preview".to_string(),
-            PathBuf::from("/home/user/ws"),
-            SnapshotIndex::new(PathBuf::from("/home/user/ws")),
-        );
+        let fx = GuardFixture::new("ws-preview");
 
-        let resp = rollback_preview(&state, "ws-preview", Some("missing-snapshot"), None)
+        let resp = rollback_preview(&fx.state, &fx.ws_id, Some("missing-snapshot"), None)
             .await
             .unwrap();
         match resp {
@@ -1331,27 +1743,54 @@ mod tests {
 
     // ── cleanup_snapshots partial-failure tests ──
     //
-    // Backstop for the "no early `?` in the delete loop" invariant
-    // (delete_snapshots_locked): if backend.cleanup_snapshots succeeds for
-    // snaps A,B,C then fails for D, the index must still have A/B/C removed
-    // (and persisted) and D rolled back to its previous meta. The caller
-    // (cleanup_snapshots) then bails with a count summary so the CLI exits
-    // non-zero. Without the shared helper or with an early `?`, prior
-    // in-memory removes would be lost.
+    // The backend returns one outcome per requested snapshot. Confirmed
+    // removals must be reflected and persisted even when another item fails;
+    // failed and missing-report entries remain untouched.
 
     struct PartialFailBackend {
         data_root: PathBuf,
         snapshots_root: PathBuf,
         fail_ids: std::collections::HashSet<String>,
+        not_found_ids: std::collections::HashSet<String>,
+        calls: std::sync::atomic::AtomicUsize,
+        create_calls: std::sync::atomic::AtomicUsize,
+        rollback_calls: std::sync::atomic::AtomicUsize,
+        cleanup_started: Option<Arc<tokio::sync::Semaphore>>,
+        cleanup_release: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     impl PartialFailBackend {
-        fn new(fail_ids: impl IntoIterator<Item = String>) -> Self {
+        fn new(data_root: PathBuf, fail_ids: impl IntoIterator<Item = String>) -> Self {
             Self {
-                data_root: PathBuf::from("/tmp/pfb-data"),
-                snapshots_root: PathBuf::from("/tmp/pfb-snaps"),
+                snapshots_root: data_root.join("snapshots"),
+                data_root,
                 fail_ids: fail_ids.into_iter().collect(),
+                not_found_ids: std::collections::HashSet::new(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                create_calls: std::sync::atomic::AtomicUsize::new(0),
+                rollback_calls: std::sync::atomic::AtomicUsize::new(0),
+                cleanup_started: None,
+                cleanup_release: None,
             }
+        }
+
+        fn with_not_found(mut self, ids: impl IntoIterator<Item = String>) -> Self {
+            self.not_found_ids = ids.into_iter().collect();
+            self
+        }
+
+        fn with_cleanup_gate(
+            mut self,
+            started: Arc<tokio::sync::Semaphore>,
+            release: Arc<tokio::sync::Semaphore>,
+        ) -> Self {
+            self.cleanup_started = Some(started);
+            self.cleanup_release = Some(release);
+            self
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1370,18 +1809,35 @@ mod tests {
             &self,
             _ws_id: &str,
             snapshot_ids: &[String],
-        ) -> anyhow::Result<Vec<String>> {
-            // Single-snap calls only (matches snapshot_mgr's per-snap loop).
-            let id = snapshot_ids
-                .first()
-                .expect("PartialFailBackend expects per-snap calls");
-            if self.fail_ids.contains(id) {
-                anyhow::bail!("simulated backend failure for {}", id);
+        ) -> anyhow::Result<Vec<(String, ws_ckpt_common::backend::SnapshotDeleteOutcome)>> {
+            // Batch contract: one outcome per requested id. Ids in fail_ids
+            // come back as per-item Failed, ids in not_found_ids as NotFound
+            // — the batch itself succeeds, which is exactly the partial-
+            // failure shape the real btrfs backends produce (#3053 P1-c/P2).
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let (Some(started), Some(release)) = (&self.cleanup_started, &self.cleanup_release) {
+                started.add_permits(1);
+                release.acquire().await.unwrap().forget();
             }
-            Ok(vec![id.clone()])
+            use ws_ckpt_common::backend::SnapshotDeleteOutcome as Outcome;
+            Ok(snapshot_ids
+                .iter()
+                .map(|id| {
+                    if self.fail_ids.contains(id) {
+                        (
+                            id.clone(),
+                            Outcome::Failed(format!("simulated backend failure for {}", id)),
+                        )
+                    } else if self.not_found_ids.contains(id) {
+                        (id.clone(), Outcome::NotFound)
+                    } else {
+                        (id.clone(), Outcome::Removed)
+                    }
+                })
+                .collect())
         }
-        // Everything else: panic if hit — keeps the test honest about which
-        // backend methods cleanup actually exercises.
+        // Other methods remain unused by these cleanup-focused tests, except
+        // create/rollback counters used by the serialization regression.
         async fn init_workspace(
             &self,
             _: &str,
@@ -1390,10 +1846,14 @@ mod tests {
             unimplemented!()
         }
         async fn create_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
-            unimplemented!()
+            self.create_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
-        async fn rollback(&self, _: &str, _: &str) -> anyhow::Result<PathBuf> {
-            unimplemented!()
+        async fn rollback(&self, ws_id: &str, _: &str) -> anyhow::Result<PathBuf> {
+            self.rollback_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.data_root.join(ws_id))
         }
         async fn delete_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
             unimplemented!()
@@ -1429,20 +1889,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_snapshots_persists_partial_success_and_bails() {
-        // 5 unpinned snapshots, the 3rd fails. Expectation:
-        //   - bail with "deleted 4/5, failed: [snap-3]"
-        //   - in-memory index keeps only snap-3 (others removed)
-        //   - failed snap meta is re-inserted (no detach drift)
+    async fn cleanup_blocks_same_workspace_checkpoint_and_rollback_backends() {
         let tmp = tempfile::tempdir().unwrap();
-        let backend = Arc::new(PartialFailBackend::new(["snap-3".to_string()]));
+        let data_root = tmp.path().join("serialized-data");
+        let cleanup_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let cleanup_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let backend = Arc::new(
+            PartialFailBackend::new(data_root.clone(), std::iter::empty())
+                .with_cleanup_gate(cleanup_started.clone(), cleanup_release.clone()),
+        );
+        let state = Arc::new(crate::state::DaemonState::new(
+            test_config(),
+            backend.clone() as Arc<dyn StorageBackend>,
+            tmp.path().join("state"),
+        ));
+
+        let ws_id = "ws-serialized";
+        let subvol = data_root.join(ws_id);
+        std::fs::create_dir_all(&subvol).unwrap();
+        std::fs::write(subvol.join("content"), b"non-empty").unwrap();
+        let ws_path = tmp.path().join("ws-link");
+        std::os::unix::fs::symlink(&subvol, &ws_path).unwrap();
+        state.register_workspace(
+            ws_id.to_string(),
+            ws_path.clone(),
+            chain_index(&ws_path, ws_id, 2),
+        );
+
+        let cleanup_state = state.clone();
+        let cleanup =
+            tokio::spawn(async move { cleanup_snapshots(&cleanup_state, ws_id, Some(1)).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), cleanup_started.acquire())
+            .await
+            .expect("cleanup did not reach backend")
+            .unwrap()
+            .forget();
+
+        let mut checkpoint_op = Box::pin(checkpoint(&state, ws_id, "snap-new", None, None, false));
+        let checkpoint_pending = std::future::poll_fn(|cx| {
+            let poll = std::future::Future::poll(checkpoint_op.as_mut(), cx);
+            std::task::Poll::Ready(poll.is_pending())
+        })
+        .await;
+        let mut rollback_op = Box::pin(rollback(&state, ws_id, Some("snap-2"), None));
+        let rollback_pending = std::future::poll_fn(|cx| {
+            let poll = std::future::Future::poll(rollback_op.as_mut(), cx);
+            std::task::Poll::Ready(poll.is_pending())
+        })
+        .await;
+        assert!(checkpoint_pending && rollback_pending);
+        assert_eq!(
+            backend
+                .create_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "checkpoint reached the backend while cleanup was blocked"
+        );
+        assert_eq!(
+            backend
+                .rollback_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "rollback reached the backend while cleanup was blocked"
+        );
+
+        cleanup_release.add_permits(1);
+        assert!(matches!(
+            cleanup.await.unwrap().unwrap(),
+            Response::CleanupOk { .. }
+        ));
+        assert!(matches!(
+            checkpoint_op.await.unwrap(),
+            Response::CheckpointOk { .. }
+        ));
+        assert!(matches!(
+            rollback_op.await.unwrap(),
+            Response::RollbackOk { .. }
+        ));
+        assert_eq!(
+            backend
+                .create_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            backend
+                .rollback_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_snapshots_persists_partial_success_and_bails() {
+        // Five unpinned snapshots form a chain and the third deletion fails.
+        // Only confirmed removals are pruned, leaving snap-3 as the consistent
+        // root and head, and the partial result must still be persisted.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("pfb-data");
+        let backend = Arc::new(PartialFailBackend::new(
+            data_root.clone(),
+            ["snap-3".to_string()],
+        ));
         let state = Arc::new(crate::state::DaemonState::new(
             test_config(),
             backend as Arc<dyn StorageBackend>,
             tmp.path().to_path_buf(),
         ));
 
-        let ws_path = PathBuf::from("/ws/partial-fail");
+        // Real registration topology: subvolume stand-in under the stub's
+        // data root, workspace symlink pointing at it, registered by that path.
+        let subvol = data_root.join("ws-partial");
+        std::fs::create_dir_all(&subvol).unwrap();
+        let ws_path = tmp.path().join("ws-link");
+        std::os::unix::fs::symlink(&subvol, &ws_path).unwrap();
+
         let mut idx = SnapshotIndex::new(ws_path.clone());
         let now = Utc::now();
         for (i, off) in [0i64, 1, 2, 3, 4].iter().enumerate() {
@@ -1464,6 +2025,19 @@ mod tests {
                 },
             );
         }
+        // Real DAG chain: snap-1 <- snap-2 <- snap-3 <- snap-4 <- snap-5,
+        // head at snap-5 with the LIVE_CHILD marker.
+        for i in 1..=5usize {
+            let id = format!("snap-{}", i);
+            let meta = idx.snapshots.get_mut(&id).unwrap();
+            meta.parent_id = (i > 1).then(|| format!("snap-{}", i - 1));
+            meta.child_ids = if i < 5 {
+                vec![format!("snap-{}", i + 1)]
+            } else {
+                vec![ws_ckpt_common::LIVE_CHILD.to_string()]
+            };
+        }
+        idx.head = Some("snap-5".to_string());
         state.register_workspace("ws-partial".to_string(), ws_path.clone(), idx);
 
         // keep=0 → all 5 are removal candidates. cleanup_snapshots returns
@@ -1483,13 +2057,30 @@ mod tests {
             msg
         );
 
-        // In-memory index: snap-3 stays (re-inserted), others gone.
+        // In-memory index: the failed snapshot was never removed or rewritten
+        // before the backend result, and pruning the confirmed removals leaves
+        // a consistent DAG.
         let arc = state
             .get_by_wsid("ws-partial")
             .expect("ws still registered");
         let ws = arc.read().await;
         assert_eq!(ws.index.snapshots.len(), 1, "only the failed snap remains");
-        assert!(ws.index.snapshots.contains_key("snap-3"));
+        let m3 = ws.index.snapshots.get("snap-3").expect("snap-3 retained");
+        assert_eq!(
+            m3.parent_id, None,
+            "ancestors snap-1/2 were deleted — parent must be None, not dangling"
+        );
+        assert!(
+            m3.child_ids
+                .contains(&ws_ckpt_common::LIVE_CHILD.to_string()),
+            "snap-3 became head — LIVE_CHILD marker must move with it, got {:?}",
+            m3.child_ids
+        );
+        assert_eq!(
+            ws.index.head.as_deref(),
+            Some("snap-3"),
+            "head must move onto the retained snap"
+        );
         assert_eq!(ws.index.governed_evidence.len(), 1);
         assert!(ws.index.governed_evidence.contains_key("snap-3"));
 
@@ -1500,7 +2091,113 @@ mod tests {
             .expect("index.json saved");
         assert_eq!(on_disk.snapshots.len(), 1);
         assert!(on_disk.snapshots.contains_key("snap-3"));
+        assert_eq!(
+            on_disk.head.as_deref(),
+            Some("snap-3"),
+            "the reconciled index must be what got persisted"
+        );
+        assert_eq!(on_disk.snapshots["snap-3"].parent_id, None);
         assert_eq!(on_disk.governed_evidence.len(), 1);
         assert!(on_disk.governed_evidence.contains_key("snap-3"));
+    }
+
+    /// Chain fixture: snap-1 <- ... <- snap-`n`, head at snap-n carrying the
+    /// LIVE_CHILD marker, each snap with a governed-evidence receipt.
+    fn chain_index(ws_path: &Path, ws_id: &str, n: usize) -> SnapshotIndex {
+        let mut idx = SnapshotIndex::new(ws_path.to_path_buf());
+        let now = Utc::now();
+        for i in 1..=n {
+            let id = format!("snap-{}", i);
+            let mut meta = make_snapshot_meta_at(false, now - Duration::seconds((n - i) as i64));
+            meta.parent_id = (i > 1).then(|| format!("snap-{}", i - 1));
+            meta.child_ids = if i < n {
+                vec![format!("snap-{}", i + 1)]
+            } else {
+                vec![ws_ckpt_common::LIVE_CHILD.to_string()]
+            };
+            idx.snapshots.insert(id.clone(), meta);
+            idx.governed_evidence.insert(
+                id.clone(),
+                GuardedCheckpointEvidenceV2 {
+                    ws_id: ws_id.to_string(),
+                    registered_path: ws_path.to_string_lossy().into_owned(),
+                    generation: WorkspaceGenerationTokenV2::from_bytes([1; 32]),
+                    checkpoint_id: id.clone(),
+                    operation_digest: [i as u8; 32],
+                    caller_uid: 1000,
+                    outcome: GuardedCheckpointOutcomeV2::Created { snapshot_id: id },
+                },
+            );
+        }
+        idx.head = Some(format!("snap-{}", n));
+        idx
+    }
+
+    #[tokio::test]
+    async fn cleanup_not_found_marks_missing_and_stops_recleaning() {
+        // A NotFound entry remains in the DAG but is marked `missing`, persisted,
+        // and excluded from later cleanup passes.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("nf-data");
+        let backend = Arc::new(
+            PartialFailBackend::new(data_root.clone(), std::iter::empty())
+                .with_not_found(["snap-2".to_string()]),
+        );
+        let state = Arc::new(crate::state::DaemonState::new(
+            test_config(),
+            backend.clone() as Arc<dyn StorageBackend>,
+            tmp.path().to_path_buf(),
+        ));
+
+        let subvol = data_root.join("ws-nf");
+        std::fs::create_dir_all(&subvol).unwrap();
+        let ws_path = tmp.path().join("ws-nf-link");
+        std::os::unix::fs::symlink(&subvol, &ws_path).unwrap();
+        let idx = chain_index(&ws_path, "ws-nf", 3);
+        state.register_workspace("ws-nf".to_string(), ws_path.clone(), idx);
+
+        // keep=0 → all three selected; snap-2 comes back NotFound. NotFound
+        // is not a failure → no bail, the CLI stays exit-zero.
+        let resp = cleanup_snapshots(&state, "ws-nf", Some(0)).await.unwrap();
+        match resp {
+            Response::CleanupOk { removed } => {
+                let mut r = removed;
+                r.sort();
+                assert_eq!(r, vec!["snap-1".to_string(), "snap-3".to_string()]);
+            }
+            other => panic!("expected CleanupOk, got {:?}", other),
+        }
+        assert_eq!(backend.call_count(), 1);
+
+        let arc = state.get_by_wsid("ws-nf").expect("registered");
+        {
+            let ws = arc.read().await;
+            assert_eq!(ws.index.snapshots.len(), 1);
+            let m2 = ws.index.snapshots.get("snap-2").expect("retained");
+            assert!(m2.missing, "NotFound entry must be flagged missing");
+            assert_eq!(m2.parent_id, None, "deleted ancestors must relink");
+            assert_eq!(ws.index.head.as_deref(), Some("snap-2"));
+            assert!(m2
+                .child_ids
+                .contains(&ws_ckpt_common::LIVE_CHILD.to_string()));
+        }
+        let on_disk = crate::index_store::load(&state.index_dir("ws-nf"))
+            .await
+            .expect("NotFound marker persisted");
+        assert!(on_disk.snapshots["snap-2"].missing);
+        assert!(on_disk.governed_evidence.contains_key("snap-2"));
+
+        // Second pass: the missing entry must NOT be re-selected — no
+        // backend call, no churn, no repeated warnings.
+        let resp = cleanup_snapshots(&state, "ws-nf", Some(0)).await.unwrap();
+        match resp {
+            Response::CleanupOk { removed } => assert!(removed.is_empty()),
+            other => panic!("expected CleanupOk, got {:?}", other),
+        }
+        assert_eq!(
+            backend.call_count(),
+            1,
+            "missing entries must not be re-cleaned on every pass"
+        );
     }
 }

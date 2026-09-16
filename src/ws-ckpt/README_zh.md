@@ -23,7 +23,7 @@
 ws-ckpt/
 ├── src/                       # Rust Cargo workspace
 │   ├── Cargo.toml
-│   ├── config.toml.sample     # 配置示例（安装到 /etc/ws-ckpt/；复制为 config.toml 启用）
+│   ├── config.toml.sample     # 默认配置（安装为 /etc/ws-ckpt/config.toml，%config(noreplace)，另附 .sample 参考）
 │   ├── crates/
 │   │   ├── common/            # 共享类型、IPC 协议编解码
 │   │   ├── daemon/            # 守护进程核心逻辑
@@ -158,6 +158,8 @@ ws-ckpt reload
 | `config` | 查看或修改 daemon 配置（写入 `/etc/ws-ckpt/config.toml`） |
 | `reload` | 通知 daemon 重新加载 `config.toml` |
 | `plugin` | 安装/卸载 ws-ckpt Agent runtime（openclaw/hermes）插件 |
+
+OpenClaw adapter 要求 OpenClaw >= 2026.2.13。若检测到的版本或配置能力无法安全更新工具 allowlist，安装会中止，避免留下不完整的集成。
 
 ## 组件
 

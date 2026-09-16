@@ -13,9 +13,8 @@ fn initial() -> BindingStateSnapshot {
                 "../../asc-policy-types/tests/fixtures/prepared-binding.json"
             ))
             .unwrap(),
-            status: BindingStatus::PendingApply,
+            status: (BindingStatus::PendingApply).into(),
         },
-        runtime: RuntimeState::default(),
         deployments: vec![],
     }
 }
@@ -33,8 +32,11 @@ fn concurrent_writes_from_one_snapshot_have_exactly_one_winner() {
             let before = before.clone();
             std::thread::spawn(move || {
                 let mut next = before.clone();
-                next.binding.status = BindingStatus::Applying;
-                next.runtime.attempts_started = attempts;
+                next.binding.status.phase = BindingStatus::Applying;
+                next.binding.status.error = Some(Failure::new(
+                    FailureKind::Retryable,
+                    &format!("WRITER_{attempts}"),
+                ));
                 let write = BindingStateWrite::new(next);
                 barrier.wait();
                 (
@@ -69,16 +71,25 @@ fn concurrent_writes_from_one_snapshot_have_exactly_one_winner() {
     assert_eq!(
         repo.get_binding_state(&before.binding.spec.binding_id)
             .unwrap(),
-        winner.next.clone()
+        Some(BindingStateSnapshot {
+            binding: BindingView {
+                spec: before.binding.spec.clone(),
+                status: winner.next.as_ref().unwrap().status.clone().unwrap()
+            },
+            deployments: winner.next.as_ref().unwrap().deployments.clone().unwrap(),
+        })
     );
     assert_eq!(
         repo.get_binding(&before.binding.spec.binding_id).unwrap(),
-        winner.next.as_ref().unwrap().binding
+        BindingView {
+            spec: before.binding.spec.clone(),
+            status: winner.next.as_ref().unwrap().status.clone().unwrap()
+        }
     );
 }
 
 #[test]
-fn runtime_and_deployment_changes_invalidate_stale_snapshot() {
+fn status_error_and_deployment_changes_invalidate_stale_snapshot() {
     for deployments in [false, true] {
         let before = initial();
         let repo = ProcessLocalPapRepository::with_binding_states(vec![before.clone()]).unwrap();
@@ -95,7 +106,7 @@ fn runtime_and_deployment_changes_invalidate_stale_snapshot() {
                 last_confirmed: None,
             });
         } else {
-            next.runtime.next_attempt_at = Some(100);
+            next.binding.status.error = Some(Failure::new(FailureKind::Retryable, "RETRY"));
         }
         let write = BindingStateWrite::new(next.clone());
         assert_eq!(
@@ -104,7 +115,7 @@ fn runtime_and_deployment_changes_invalidate_stale_snapshot() {
             WriteResult::Applied
         );
         let mut stale_next = before.clone();
-        stale_next.binding.status = BindingStatus::Applying;
+        stale_next.binding.status.phase = BindingStatus::Applying;
         assert_eq!(
             repo.compare_exchange_binding_state(&before, &BindingStateWrite::new(stale_next))
                 .unwrap(),
@@ -123,7 +134,7 @@ fn replay_after_pap_write_is_acknowledged_without_overwriting_new_intent() {
     let before = initial();
     let repo = ProcessLocalPapRepository::with_binding_states(vec![before.clone()]).unwrap();
     let mut next = before.clone();
-    next.binding.status = BindingStatus::ApplyFailed;
+    next.binding.status.phase = BindingStatus::ApplyFailed;
     let write = BindingStateWrite::new(next);
     assert_eq!(
         repo.compare_exchange_binding_state(&before, &write)
@@ -131,8 +142,11 @@ fn replay_after_pap_write_is_acknowledged_without_overwriting_new_intent() {
         WriteResult::Applied
     );
     let new_intent = before.binding.clone();
-    repo.update_binding(Some(&write.next.as_ref().unwrap().binding), &new_intent)
-        .unwrap();
+    repo.update_binding(
+        Some(&repo.get_binding(&before.binding.spec.binding_id).unwrap()),
+        &new_intent,
+    )
+    .unwrap();
     let current = repo
         .get_binding_state(&before.binding.spec.binding_id)
         .unwrap();
@@ -142,7 +156,8 @@ fn replay_after_pap_write_is_acknowledged_without_overwriting_new_intent() {
         WriteResult::AlreadyApplied
     );
     let mut reused = write.clone();
-    reused.next.as_mut().unwrap().runtime.attempts_started = 99;
+    reused.next.as_mut().unwrap().status.as_mut().unwrap().error =
+        Some(Failure::new(FailureKind::Rejected, "CHANGED"));
     assert_eq!(
         repo.compare_exchange_binding_state(&before, &reused),
         Err(StoreError::Invalid)
@@ -159,21 +174,26 @@ fn replay_after_pap_write_is_acknowledged_without_overwriting_new_intent() {
 }
 
 #[test]
-fn mismatched_identity_cannot_partially_write_an_aggregate() {
+fn reconciliation_patch_cannot_write_a_spec_or_change_identity() {
     let before = initial();
     let repo = ProcessLocalPapRepository::with_binding_states(vec![before.clone()]).unwrap();
     let mut next = before.clone();
     next.binding.spec.binding_id =
         asc_foundation_types::ResourceId::new("10000000-0000-4000-8000-000000000002").unwrap();
-    next.runtime.attempts_started = 5;
+    next.binding.status.error = Some(Failure::new(FailureKind::Retryable, "RETRY"));
     assert_eq!(
-        repo.compare_exchange_binding_state(&before, &BindingStateWrite::new(next)),
-        Err(StoreError::Invalid)
-    );
-    assert_eq!(
-        repo.get_binding_state(&before.binding.spec.binding_id)
+        repo.compare_exchange_binding_state(&before, &BindingStateWrite::new(next))
             .unwrap(),
-        Some(before)
+        WriteResult::Applied
+    );
+    let current = repo
+        .get_binding_state(&before.binding.spec.binding_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.binding.spec, before.binding.spec);
+    assert_eq!(
+        current.binding.status.error,
+        Some(Failure::new(FailureKind::Retryable, "RETRY"))
     );
 }
 
@@ -214,8 +234,8 @@ fn stale_removal_cannot_erase_a_newer_status_or_target_observation() {
     let before = initial();
     let repo = ProcessLocalPapRepository::with_binding_states(vec![before.clone()]).unwrap();
     let mut next = before.clone();
-    next.binding.status = BindingStatus::PendingDelete;
-    next.runtime.last_error = Some(Failure::new(FailureKind::Retryable, "TEST_NEW_OBSERVATION"));
+    next.binding.status.phase = BindingStatus::PendingDelete;
+    next.binding.status.error = Some(Failure::new(FailureKind::Retryable, "TEST_NEW_OBSERVATION"));
     repo.compare_exchange_binding_state(&before, &BindingStateWrite::new(next.clone()))
         .unwrap();
     assert_eq!(

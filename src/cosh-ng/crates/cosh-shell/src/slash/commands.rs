@@ -16,6 +16,7 @@ use crate::slash::recommendations::render_recommendations_command;
 use crate::slash::session::render_session_command;
 use crate::slash::skills::{completion_skill_names, render_skills_command};
 use crate::slash::status::{render_stats_command, render_status_command};
+use crate::slash::task::render_task_command;
 
 pub(super) fn render_slash_command<W: Write>(
     command: SlashCommand<'_>,
@@ -33,12 +34,16 @@ pub(super) fn render_slash_command<W: Write>(
     // COSH_SLASH_VIA_SHELL=0) creates events with cwd=None because
     // the input never reaches the shell; fall back to the last
     // ShellReady cwd tracked by the dispatcher so registry queries
-    // still resolve the correct project root. If both sources are
-    // unavailable the cached cwd may be stale (e.g. a `cd` whose OSC
+    // and local health checks resolve the correct project root. If both
+    // sources are unavailable the cached cwd may be stale (e.g. a `cd` whose OSC
     // 1337 markers were lost), so clear it rather than forwarding the
     // old project root.
+    let shell_cwd = shell_cwd
+        .map(str::to_string)
+        .or_else(|| state.shell_prompt_cwd.clone());
+    let shell_cwd = shell_cwd.as_deref();
     if let AdapterInstance::CoshCore(cosh_core) = adapter {
-        match shell_cwd.or(state.shell_prompt_cwd.as_deref()) {
+        match shell_cwd {
             Some(cwd) => cosh_core.set_shell_cwd(Some(cwd)),
             None => cosh_core.clear_shell_cwd(),
         }
@@ -134,6 +139,7 @@ pub(super) fn render_slash_command<W: Write>(
         SlashCommand::Session(arguments) => {
             render_session_command(arguments, blocks, adapter, state, output)
         }
+        SlashCommand::Task(arguments) => render_task_command(arguments, state, output),
         SlashCommand::Recommendations(sub, arg, extra) => {
             render_recommendations_command(sub, arg, extra, event, adapter, state, output)?;
             Ok(true)

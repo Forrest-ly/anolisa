@@ -41,7 +41,6 @@ struct State {
 
 #[derive(Debug, Default, Clone)]
 struct BindingStateData {
-    runtime: asc_policy_repository::RuntimeState,
     deployments: Vec<asc_policy_repository::Deployment>,
     // Latest atomic write receipt, independent of reconciliation decisions.
     last_write: Option<asc_policy_repository::BindingStateWrite>,
@@ -196,7 +195,7 @@ impl PapRepository for ProcessLocalPapRepository {
         binding: &BindingView,
     ) -> Result<BindingView, PapError> {
         if !matches!(
-            binding.status,
+            binding.status.phase,
             BindingStatus::PendingApply | BindingStatus::PendingDelete
         ) {
             return Err(PapError::Conflict);
@@ -207,20 +206,19 @@ impl PapRepository for ProcessLocalPapRepository {
         if expected.is_some() && current.is_none() {
             return Err(PapError::NotFound);
         }
-        if current != expected {
+        if current.map(|b| (&b.spec, &b.status)) != expected.map(|b| (&b.spec, &b.status)) {
             return Err(PapError::Conflict);
         }
-        let mut same_spec = false;
         if let Some(current) = current {
-            if current == binding {
+            if current.spec == binding.spec && current.status == binding.status {
                 return Ok(current.clone());
             }
-            same_spec = current.spec.policy == binding.spec.policy
+            let same_spec = current.spec.policy == binding.spec.policy
                 && current.spec.scope == binding.spec.scope;
             let permitted = if binding.status == BindingStatus::PendingDelete {
                 same_spec && current.status.request_delete() == binding.status
             } else if same_spec {
-                current.status.request_apply().ok() == Some(binding.status)
+                current.status.request_apply().ok() == Some(binding.status.phase)
             } else {
                 current.status.request_apply().is_ok() && current.status != BindingStatus::Applying
             };
@@ -243,33 +241,63 @@ impl PapRepository for ProcessLocalPapRepository {
         {
             return Err(PapError::Conflict);
         }
-        if let Some(record) = state.binding_states.get_mut(&id) {
-            let prepared = if same_spec {
-                record.runtime.prepared.take()
-            } else {
-                None
-            };
-            record.runtime = asc_policy_repository::RuntimeState {
-                prepared,
-                ..Default::default()
-            };
-        }
         state.bindings.insert(id, binding.clone());
         Ok(binding.clone())
     }
 
+    fn fail_pending_binding(
+        &self,
+        expected: &BindingView,
+        reason: asc_pap::EnqueueError,
+    ) -> Result<bool, PapError> {
+        let failed = match expected.status.phase {
+            BindingStatus::PendingApply => BindingStatus::ApplyFailed,
+            BindingStatus::PendingDelete => BindingStatus::DeleteFailed,
+            _ => return Err(PapError::Conflict),
+        };
+        let mut state = self.lock()?;
+        let id = expected.spec.binding_id.as_str();
+        let Some(current) = state.bindings.get_mut(id) else {
+            return Ok(false);
+        };
+        if current.spec.binding_revision != expected.spec.binding_revision
+            || current.status != expected.status
+        {
+            return Ok(false);
+        }
+        current.status = failed.into();
+        current.status.error = Some(reason.failure());
+        let data = state.binding_states.entry(id.to_owned()).or_default();
+
+        // Invalidate an earlier worker write replay after this lifecycle change.
+        data.last_write = None;
+        Ok(true)
+    }
+
     fn get_binding(&self, id: &ResourceId) -> Result<BindingView, PapError> {
-        self.lock()?
-            .bindings
-            .get(id.as_str())
-            .cloned()
-            .ok_or(PapError::NotFound)
+        let state = self.lock()?;
+        let binding = state.bindings.get(id.as_str()).ok_or(PapError::NotFound)?;
+        let mut view = binding.clone();
+        project_binding_error(&state, &mut view);
+        Ok(view)
     }
 
     fn list_bindings(&self, limit: u32, offset: u32) -> Result<Page<BindingView>, PapError> {
         let state = self.lock()?;
-        Ok(page(state.bindings.values(), limit, offset))
+        let mut result = page(state.bindings.values(), limit, offset);
+        for binding in &mut result.items {
+            project_binding_error(&state, binding);
+        }
+        Ok(result)
     }
+}
+
+fn project_binding_error(_state: &State, view: &mut BindingView) {
+    view.status.error = view
+        .status
+        .error
+        .as_ref()
+        .map(|error| asc_policy_types::target::Failure::new(error.kind, &error.code));
 }
 
 fn is_next_revision(current: Option<Revision>, candidate: Revision) -> bool {

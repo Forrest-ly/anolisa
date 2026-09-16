@@ -17,7 +17,6 @@ use crate::config::ResolvedProvider;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
-const ALIYUN_SYSOM_ENDPOINT: &str = "https://sysom.cn-hangzhou.aliyuncs.com";
 const ALIYUN_PERMISSION_PATH: &str = "/api/v1/openapi/initial";
 const ALIYUN_PERMISSION_ACTION: &str = "InitialSysom";
 const ALIYUN_COPILOT_PATH: &str = "/api/v1/copilot/generate_copilot_stream_response";
@@ -81,16 +80,16 @@ impl fmt::Display for AuthPreflightError {
                 "Model {model:?} is unavailable. Check the Model name and access entitlement."
             ),
             Self::EndpointUnreachable => formatter.write_str(
-                "The endpoint could not be reached. Check the Base URL and network connection.",
+                "The endpoint could not be reached. Check the endpoint configuration and network connection.",
             ),
             Self::Timeout => formatter.write_str(
-                "The endpoint did not respond in time. Check the Base URL and network connection.",
+                "The endpoint did not respond in time. Check the endpoint configuration and network connection.",
             ),
             Self::RateLimited => formatter.write_str(
                 "The provider rate-limited the validation request. Check quota or try again later.",
             ),
             Self::ProviderUnavailable => formatter.write_str(
-                "The provider is temporarily unavailable. Try again later or check the Base URL.",
+                "The provider is temporarily unavailable. Try again later or check the endpoint configuration.",
             ),
             Self::ServiceNotReady => formatter.write_str(
                 "Aliyun SysOM is not authorized for this account. Complete service authorization and try again.",
@@ -99,7 +98,7 @@ impl fmt::Display for AuthPreflightError {
                 "ECS RAM Role credentials are not available yet. Authorize the instance role and try again.",
             ),
             Self::UnsupportedResponse => formatter.write_str(
-                "The endpoint returned an unsupported validation response. Check the Base URL and provider compatibility.",
+                "The endpoint returned an unsupported validation response. Check the endpoint configuration and provider compatibility.",
             ),
         }
     }
@@ -139,7 +138,7 @@ async fn preflight_auth_inner(provider: &ResolvedProvider) -> Result<(), AuthPre
         return preflight_aliyun(provider).await;
     }
 
-    let client = build_client()?;
+    let client = build_client(None)?;
     match provider.provider_type.as_str() {
         "dashscope" => {
             preflight_model_endpoint(&client, provider, ModelFallback::ListThenChat).await
@@ -155,11 +154,18 @@ async fn preflight_auth_inner(provider: &ResolvedProvider) -> Result<(), AuthPre
     }
 }
 
-fn build_client() -> Result<Client, AuthPreflightError> {
-    Client::builder()
+fn build_client(
+    endpoint: Option<&crate::provider::sysom::endpoint::ResolvedEndpoint>,
+) -> Result<Client, AuthPreflightError> {
+    let builder = Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    let builder = match endpoint {
+        Some(endpoint) => endpoint.configure_client(builder),
+        None => builder,
+    };
+    builder
         .build()
         .map_err(|_| AuthPreflightError::EndpointUnreachable)
 }
@@ -369,12 +375,15 @@ async fn preflight_aliyun(provider: &ResolvedProvider) -> Result<(), AuthPreflig
         .ok_or(AuthPreflightError::CredentialSourceUnavailable);
     }
 
-    let client = build_client()?;
-    let base_url = if provider.base_url.trim().is_empty() {
-        ALIYUN_SYSOM_ENDPOINT
-    } else {
-        provider.base_url.as_str()
-    };
+    let resolved = crate::provider::sysom::endpoint::resolve(&provider.sysom_endpoint).await;
+    let client = build_client(Some(&resolved))?;
+    tracing::debug!(
+        host = %resolved.host,
+        origin = resolved.origin.as_str(),
+        "sysom preflight endpoint"
+    );
+    let base_url = resolved.base_url();
+    let base_url = base_url.as_str();
     let payload = br#"{"check_only":true,"source":"cosh"}"#;
     let request = signed_aliyun_request(
         &client,
@@ -717,10 +726,11 @@ fn hex_sha256(value: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::io::{ErrorKind, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::Instant;
 
     use super::*;
 
@@ -750,14 +760,50 @@ mod tests {
     }
 
     impl MockServer {
+        /// How long the mock waits for a connection that may never come.
+        ///
+        /// A client that gives up before it dials — `request_timeout_is_classified`
+        /// uses a 10ms timeout, which under a saturated CPU can fire before the
+        /// request future is ever polled — leaves nothing to accept. A blocking
+        /// accept would then leave the thread alive forever and `finish()`'s
+        /// `join()` would stall the whole test binary rather than failing one
+        /// test.
+        const ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+
         fn spawn(replies: Vec<Reply>) -> Self {
+            Self::spawn_with_accept_timeout(replies, Self::ACCEPT_TIMEOUT)
+        }
+
+        fn spawn_with_accept_timeout(replies: Vec<Reply>, accept_timeout: Duration) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
             let address = listener.local_addr().expect("mock address");
             let requests = Arc::new(Mutex::new(Vec::new()));
             let captured = Arc::clone(&requests);
             let thread = thread::spawn(move || {
+                listener
+                    .set_nonblocking(true)
+                    .expect("mock listener nonblocking");
                 for reply in replies {
-                    let (mut stream, _) = listener.accept().expect("accept mock request");
+                    let deadline = Instant::now() + accept_timeout;
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                                if Instant::now() >= deadline {
+                                    // No client arrived. Leave the recorded
+                                    // requests short so an assertion fails
+                                    // instead of the suite hanging.
+                                    return;
+                                }
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(err) => panic!("accept mock request: {err}"),
+                        }
+                    };
+                    // `read_request` relies on a read timeout, which needs a
+                    // blocking socket; accepted sockets can inherit the
+                    // listener's non-blocking flag.
+                    stream.set_nonblocking(false).expect("mock stream blocking");
                     let request = read_request(&mut stream);
                     captured.lock().unwrap().push(request);
                     if !reply.delay.is_zero() {
@@ -840,7 +886,12 @@ mod tests {
 
     fn provider(base_url: &str, provider_type: &str) -> ResolvedProvider {
         ResolvedProvider {
-            base_url: base_url.to_string(),
+            base_url: if provider_type == "aliyun" {
+                "http://127.0.0.1:1".to_string()
+            } else {
+                base_url.to_string()
+            },
+            sysom_endpoint: base_url.to_string(),
             api_key: "sk-private-value".to_string(),
             model: "test-model".to_string(),
             provider_type: provider_type.to_string(),
@@ -851,6 +902,52 @@ mod tests {
             security_token: None,
             explicit_cache: false,
         }
+    }
+
+    #[test]
+    fn endpoint_error_messages_are_provider_neutral() {
+        for (error, code) in [
+            (
+                AuthPreflightError::EndpointUnreachable,
+                "endpoint_unreachable",
+            ),
+            (AuthPreflightError::Timeout, "timeout"),
+            (
+                AuthPreflightError::ProviderUnavailable,
+                "provider_unavailable",
+            ),
+            (
+                AuthPreflightError::UnsupportedResponse,
+                "unsupported_response",
+            ),
+        ] {
+            let message = error.to_string();
+            assert_eq!(error.code(), code);
+            assert!(
+                message.contains("endpoint configuration"),
+                "{code}: {message}"
+            );
+            assert!(!message.contains("Base URL"), "{code}: {message}");
+            assert!(!message.contains("sysom_endpoint"), "{code}: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn aliyun_connection_failure_uses_neutral_endpoint_hint() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut aliyun = provider(&format!("http://{address}"), "aliyun");
+        aliyun.access_key_id = "test-access-key".to_string();
+        aliyun.access_key_secret = "test-secret".to_string();
+
+        let error = preflight_auth(&aliyun)
+            .await
+            .expect_err("unreachable SysOM endpoint");
+        assert_eq!(error, AuthPreflightError::EndpointUnreachable);
+        let message = error.to_string();
+        assert!(message.contains("endpoint configuration"), "{message}");
+        assert!(!message.contains("Base URL"), "{message}");
     }
 
     #[tokio::test]
@@ -1107,6 +1204,32 @@ mod tests {
         assert_eq!(
             preflight_auth(&provider(&format!("http://{address}/v1"), "dashscope")).await,
             Err(AuthPreflightError::EndpointUnreachable)
+        );
+    }
+
+    /// `finish()` must return even when no client ever connects.
+    ///
+    /// This is the hang `request_timeout_is_classified` triggered: a 10ms client
+    /// timeout can fire before the request future is first polled, so nothing is
+    /// ever dialed. With a blocking accept the mock thread never exits and
+    /// `join()` stalls the entire test binary — one flaky test becomes a hung
+    /// suite with no failing assertion to point at.
+    #[test]
+    fn mock_server_finish_returns_when_no_client_connects() {
+        let accept_timeout = Duration::from_millis(200);
+        let server = MockServer::spawn_with_accept_timeout(
+            vec![Reply::json(200, r#"{"id":"unused"}"#)],
+            accept_timeout,
+        );
+
+        let started = Instant::now();
+        let requests = server.finish();
+        let elapsed = started.elapsed();
+
+        assert!(requests.is_empty(), "no request should have been recorded");
+        assert!(
+            elapsed < accept_timeout * 10,
+            "finish() blocked for {elapsed:?}, accept timeout was {accept_timeout:?}"
         );
     }
 

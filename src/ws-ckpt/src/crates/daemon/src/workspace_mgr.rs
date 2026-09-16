@@ -68,6 +68,7 @@ async fn adopt_existing_subvol(
                 // Re-adoption may recover orphan snapshot metadata, but it
                 // must not discard guarded receipts loaded from index.json.
                 rebuilt.governed_evidence = index.governed_evidence.clone();
+                rebuilt.guarded_rollbacks = index.guarded_rollbacks.clone();
                 info!(
                     "Recovered {} snapshot(s) from filesystem for {}",
                     rebuilt.snapshots.len(),
@@ -467,8 +468,21 @@ pub async fn delete_snapshot(
             ));
         }
     };
+    let Some((_ws_id, _mutation_guard)) = state.lock_workspace_mutation_if_current(&ws_lock).await
+    else {
+        return Ok(error_resp(
+            ErrorCode::WorkspaceNotFound,
+            format!("workspace not found: {}", workspace),
+        ));
+    };
 
-    // 2. Write lock
+    // 1a. Detached-registration guard: refuse before unlinking snapshots of a
+    // subvolume the registered path no longer exposes to the user.
+    if let Some(resp) = state.detached_registration_error(&ws_lock).await {
+        return Ok(resp);
+    }
+
+    // 2. Write lock after the mutation mutex.
     let mut ws = ws_lock.write().await;
 
     // 2a. Resolve snapshot by prefix within this workspace
@@ -573,19 +587,19 @@ pub async fn recover_workspace(
         }
     };
 
-    // 2. read lock to get ws_id and original_path
-    let (ws_id, original_path) = {
-        let ws = ws_lock.read().await;
-        (ws.ws_id.clone(), ws.path.to_string_lossy().to_string())
+    // Block every mutation of this workspace through unregister, index removal,
+    // and manifest persistence.
+    let Some((ws_id, _mutation_guard)) = state.lock_workspace_mutation_if_current(&ws_lock).await
+    else {
+        return Ok(error_resp(
+            ErrorCode::WorkspaceNotFound,
+            format!("workspace not found: {}", workspace),
+        ));
     };
+    let original_path = ws_lock.read().await.path.to_string_lossy().to_string();
 
     // Intentionally no cwd guard: recover is a terminal "tear out" operation
     // gated by CLI ConfirmationRequired. The CLI prompt is the contract.
-
-    // Block a concurrent init on the same path (ws_id is SHA256(path), so it
-    // would target the same workspaces slot and index_dir we're about to
-    // unregister + wipe). Held until save_manifest finishes.
-    let _wsid_guard = state.lock_wsid(&ws_id).await;
 
     // 3. call backend recover
     state
@@ -1028,6 +1042,96 @@ mod tests {
         }
     }
 
+    // ── Detached-registration guard: delete_snapshot ──
+
+    /// Real registration topology: tempdir as backend data root,
+    /// `<root>/ws-<id>` as the live-subvolume stand-in, workspace symlink at it.
+    /// Returns (state, workspace symlink, tempdir to keep alive).
+    fn live_topology(ws_id: &str) -> (Arc<DaemonState>, PathBuf, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(crate::backends::btrfs_loop::BtrfsLoopBackend::new(
+                temp.path().to_path_buf(),
+                temp.path().join("test.img"),
+            ));
+        let state = Arc::new(DaemonState::new(
+            test_config(),
+            backend,
+            temp.path().join("state"),
+        ));
+        let subvol = temp.path().join(ws_id);
+        std::fs::create_dir_all(&subvol).unwrap();
+        let ws_link = temp.path().join("ws-link");
+        std::os::unix::fs::symlink(&subvol, &ws_link).unwrap();
+        let mut index = SnapshotIndex::new(ws_link.clone());
+        index.snapshots.insert(
+            "snap-1".to_string(),
+            ws_ckpt_common::SnapshotMeta {
+                message: None,
+                metadata: None,
+                pinned: false,
+                created_at: chrono::Utc::now(),
+                missing: false,
+                parent_id: None,
+                child_ids: vec![],
+            },
+        );
+        state.register_workspace(ws_id.to_string(), ws_link.clone(), index);
+        (state, ws_link, temp)
+    }
+
+    #[tokio::test]
+    async fn delete_snapshot_healthy_registration_reaches_snapshot_resolution() {
+        let (state, _ws_link, _temp) = live_topology("ws-del-live");
+        // A healthy registration must get PAST the guard: the unknown snapshot
+        // id fails at the later resolve-by-prefix stage, not the detach guard.
+        let resp = delete_snapshot(&state, "ws-del-live", "no-such", false)
+            .await
+            .unwrap();
+        match resp {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::SnapshotNotFound);
+                assert!(message.contains("no-such"), "got: {message}");
+            }
+            other => panic!("expected SnapshotNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_snapshot_refuses_detached_registration() {
+        let (state, ws_link, _temp) = live_topology("ws-del-gone");
+        // Detach: replace the symlink with a plain directory (issue #3059 repro).
+        std::fs::remove_file(&ws_link).unwrap();
+        std::fs::create_dir(&ws_link).unwrap();
+
+        // Addressing by registered path …
+        let resp = delete_snapshot(&state, &ws_link.to_string_lossy(), "snap-1", false)
+            .await
+            .unwrap();
+        match resp {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::InternalError);
+                assert!(message.contains("recover"), "hint missing: {message}");
+                assert!(
+                    message.contains("regular directory"),
+                    "note missing: {message}"
+                );
+            }
+            other => panic!("expected detach error, got {other:?}"),
+        }
+        // … and by ws_id: the guard checks the registered path either way.
+        let resp = delete_snapshot(&state, "ws-del-gone", "snap-1", false)
+            .await
+            .unwrap();
+        match resp {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::InternalError);
+                assert!(message.contains("recover"), "hint missing: {message}");
+            }
+            other => panic!("expected detach error, got {other:?}"),
+        }
+    }
+
     // ── Pure logic: ws-id edge cases ──
 
     #[test]
@@ -1292,7 +1396,11 @@ mod tests {
         ) -> anyhow::Result<Vec<ws_ckpt_common::DiffEntry>> {
             unimplemented!()
         }
-        async fn cleanup_snapshots(&self, _: &str, _: &[String]) -> anyhow::Result<Vec<String>> {
+        async fn cleanup_snapshots(
+            &self,
+            _: &str,
+            _: &[String],
+        ) -> anyhow::Result<Vec<(String, ws_ckpt_common::backend::SnapshotDeleteOutcome)>> {
             unimplemented!()
         }
         async fn fork(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {

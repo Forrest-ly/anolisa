@@ -24,18 +24,21 @@ source, even if a stage errors; a `Hidden` skill is never read or transformed.
 
 ### Pinned open handles
 
-An open read handle captures the skill's `ActiveTarget` at open time and stores
-it on the handle. Subsequent reads resolve against that pinned target rather
-than re-consulting the live resolver, so a resolver change after open cannot
-re-point an in-flight read (a `Snapshot` handle keeps reading the snapshot; a
-`Current` handle stays readable if the skill is later hidden). Flat and Hermes
-nested `SKILL.md` share this contract via the same pinned-resolution helper.
+A non-mutating read-only open of a transformed flat or Hermes `SKILL.md`
+captures the complete transformed UTF-8 bytes after selecting activation once.
+Reads slice that immutable result until close, including after Current edits,
+atomic replacement, activation changes, or removal of the selected snapshot.
+A new open reads the newly selected source; a missing snapshot fails without
+live fallback. Empty pipelines, writable or truncating opens, staging, pending
+installs, passthrough files, and skill-discover retain their existing behavior.
 
-`getattr` operates on the inode and is not handle-pinned: after an activation
-change, a fresh `stat` reflects the new target's transformed size. Open handles
-continue to serve their pinned target's bytes; only the kernel's cached size may
-change. Within a stable activation state, `getattr` size, offset/partial reads,
-and full reads all agree on the transformed bytes.
+Captured handles use FUSE direct I/O so the inode's shared page cache cannot
+mix different open-time versions. This bypasses kernel readahead and does not
+enable shared mmap for these handles. `getattr` remains an inode operation:
+it reports the currently selected target's transformed length, not necessarily
+an old handle's length. Reads and EOF on a captured handle use its own bytes.
+Linux may omit the handle even for `fstat`; inode-only queries must not choose
+an arbitrary open handle as the size authority.
 
 ## 2. Optional stages, fixed order
 
@@ -208,10 +211,54 @@ Write, staging, pending, passthrough, adapter-disabled, and failed/hidden paths
 are not labeled as adapter transforms. Successful per-syscall Read events remain
 suppressed to avoid audit flooding.
 
-## 8. Out of scope (tracked by #1488)
+## 8. Bounded cross-open reuse
 
-This change does not store transformed bytes in `HandleEntry`, add a per-open
-cache, add a cross-open LRU, or change the existing `getattr`/`read`
-recomputation behavior. Those cache and handle-lifetime changes are tracked by
-#1488. Additional text-file types, script transforms, LLM/network calls in the
-read path, and rule hot-reload without a remount also remain out of scope.
+Each mount owns an in-memory LRU of at most 128 entries and 8 MiB of transformed
+UTF-8 payload. `lookup`, `getattr`, and eligible read-only opens reuse the same
+`Arc<str>` when the complete key matches: Skill identity (including Hermes
+category), physical path, pinned activation target (including snapshot path
+and version), source device/inode/size/nanosecond mtime and ctime, a SHA-256
+digest of the selected source bytes, and pipeline fingerprint. Activation is selected once for both metadata and transformed
+size. Reads on captured handles never consult the LRU or the physical source.
+
+The pipeline fingerprint covers the ordered enabled stages, the directive
+stage's captured OS, sorted available commands and environment key/value pairs,
+and the adapter's resolved target and rule-artifact digest. Length-prefixed
+fields prevent ambiguous concatenation. It is computed when configuring stages,
+not on reads; environment or rule-file edits still require a remount to take
+effect. No environment values or Skill content appear in cache diagnostics.
+
+Cache lookup opens and reads the selected physical file, then hashes those
+bytes before checking the key. Timestamp precision does not guarantee a unique
+version: same-size writes can share mtime and ctime, including when mtime is
+restored. Every lookup/getattr/new open therefore pays for source reading and
+hashing, while hits avoid pipeline execution and transformed-result allocation.
+Population uses those same bytes and checks both the fd metadata and the
+selected path after transformation. If an edit or replacement is detected, the
+captured result is returned without insertion. This fixes the bytes for that
+handle; it does not promise an atomic snapshot of a source being concurrently
+written in place. Snapshot failures never trigger live-source fallback.
+
+The cache lock covers LRU ordering and entry/byte accounting, not I/O or
+transformation. Concurrent cold misses may perform duplicate work; insertion
+deduplicates an exact key. Debug events report only hit, miss, invalidation,
+eviction, entry count, and payload bytes. Tests count transformations through
+the loader closure without production pipeline counters.
+
+Oversize results are kept only by their open handles. Eviction drops the LRU's
+reference without revoking open handles; the 8 MiB limit bounds cached payload,
+not in-flight transformations. Captured handles have a separate mount-wide
+budget of 64 MiB and 1,024 handles, charged at the full transformed length per
+handle even when the payload is shared. Admission and release update both
+counters under the handle-table lock. Exceeding either limit (including a
+single result larger than 64 MiB) returns `ENOMEM` for the new open; existing
+handles keep their bytes and closing them restores capacity. Counting empty
+handles also bounds their bookkeeping. Thus retained transformed payload is
+bounded by 64 MiB for handles plus the 8 MiB LRU; temporary load/transform
+allocations are outside these retained-memory budgets. Closing handles and
+dropping the mount release their references. Nothing is persisted to disk.
+Empty/raw pipelines and mutable, staging, pending-install, passthrough, and generated
+skill-discover reads do not use the transformed-content cache.
+
+Additional text-file types, script transforms, LLM/network calls in the read
+path, and rule hot-reload without a remount remain out of scope.

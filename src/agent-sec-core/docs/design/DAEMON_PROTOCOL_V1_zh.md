@@ -482,6 +482,16 @@ CREATE 的 stable identity 由 PAP 生成；UPDATE 不兼作 upsert。Policy/Sco
 Apply/Delete 意图返回对应 pending 状态；幂等请求返回已有状态（如 READY、APPLYING、
 DELETING）。daemon handler 不等待 Reconciler，不把 acceptance 表述为目标完成。
 
+[TARGET V2] Binding 入队被拒且条件失败写入成功时，命令返回错误：队列满为
+`resource_exhausted`，提交后队列停止为 `unavailable`。message 包含已保存的 Binding
+ID/revision 及具体原因。Failed 写入未确认时返回 `internal`，明确后台仍可能执行；
+worker 已抢先认领则返回当前状态，不覆盖为 Failed。BindingView 的 status 从字符串改为
+`{phase, error?: {kind, code}}`；无错误时省略 error，显式重试及 worker 认领时清除旧错误。
+Repository 不保存尝试次数、重试时间或策略；它们仅为进程内调度信息，重启不继承。调度原因码为
+`RECONCILE_QUEUE_FULL`/`RECONCILE_QUEUE_STOPPED`，kind 为 `REJECTED`。
+这是未发布 V2 契约修订，不改 V1；详见
+[调度拒绝验收及并发边界](BINDING_QUEUE_ADMISSION_ACCEPTANCE_zh.md)。
+
 [TARGET V2] `bindingRevision` 仅在 spec 改变时递增；同 spec 的 ApplyFailed 重试、
 Delete 和 DeleteFailed 重试均保留 revision。Delete 保留完整 spec 与既有部署记录，
 允许在 Applying 时受理；PendingDelete/Deleting/DeleteFailed 拒绝所有 UPDATE，不能

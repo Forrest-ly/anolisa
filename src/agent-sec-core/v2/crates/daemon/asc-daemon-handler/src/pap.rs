@@ -217,6 +217,7 @@ impl From<PolicyAdministrationError> for PapDispatchError {
 
 fn project_application_error(error: &PolicyAdministrationError) -> (&'static str, String) {
     let code = match error {
+        PolicyAdministrationError::Unavailable => error_code::UNAVAILABLE,
         PolicyAdministrationError::Forbidden => error_code::PERMISSION_DENIED,
         PolicyAdministrationError::InvalidArgument(_) => error_code::INVALID_ARGUMENT,
         PolicyAdministrationError::Conflict | PolicyAdministrationError::OperationInProgress => {
@@ -224,7 +225,8 @@ fn project_application_error(error: &PolicyAdministrationError) -> (&'static str
         }
         PolicyAdministrationError::NotFound(_) => error_code::NOT_FOUND,
         PolicyAdministrationError::ResourceExhausted => error_code::RESOURCE_EXHAUSTED,
-        PolicyAdministrationError::Internal => error_code::INTERNAL,
+        PolicyAdministrationError::Internal
+        | PolicyAdministrationError::SchedulingRejected { .. } => error_code::INTERNAL,
     };
     (code, error.to_string())
 }
@@ -254,6 +256,13 @@ mod tests {
     #[test]
     fn application_error_projection_is_complete_and_sanitized() {
         assert_eq!(
+            project_application_error(&PolicyAdministrationError::Unavailable),
+            (
+                error_code::UNAVAILABLE,
+                "reconciliation runtime is unavailable".to_owned()
+            )
+        );
+        assert_eq!(
             project_application_error(&PolicyAdministrationError::Forbidden),
             (
                 error_code::PERMISSION_DENIED,
@@ -267,5 +276,26 @@ mod tests {
                 "policy state could not be processed".to_owned()
             )
         );
+    }
+    #[test]
+    fn unconfirmed_scheduling_failure_preserves_reason_and_does_not_claim_termination() {
+        for reason in [
+            asc_daemon_core::EnqueueError::Full,
+            asc_daemon_core::EnqueueError::Stopped,
+        ] {
+            let error = PolicyAdministrationError::SchedulingRejected {
+                id: serde_json::from_value(serde_json::json!(
+                    "10000000-0000-4000-8000-000000000001"
+                ))
+                .unwrap(),
+                revision: serde_json::from_value(serde_json::json!(1)).unwrap(),
+                reason,
+            };
+            let (code, message) = project_application_error(&error);
+            assert_eq!(code, error_code::INTERNAL);
+            assert!(message.contains(&reason.to_string()));
+            assert!(message.contains("background reconciliation may still run"));
+            assert!(!message.contains("request failed"));
+        }
     }
 }

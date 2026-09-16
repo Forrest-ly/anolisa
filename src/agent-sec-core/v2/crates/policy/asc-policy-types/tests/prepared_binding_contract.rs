@@ -125,14 +125,14 @@ fn binding_validation_addresses_invalid_scope_fields() {
 fn binding_view_exposes_status_without_duplicate_spec_identity() {
     let spec = prepared_binding();
     let view = BindingView {
-        status: BindingStatus::PendingApply,
+        status: BindingStatus::PendingApply.into(),
         spec,
     };
 
     view.validate().unwrap();
     let wire = serde_json::to_value(&view).unwrap();
     assert!(wire.get("lifecycle").is_none());
-    assert_eq!(wire["status"], "PENDING_APPLY");
+    assert_eq!(wire["status"], serde_json::json!({"phase":"PENDING_APPLY"}));
     assert!(wire["spec"].get("desiredState").is_none());
     assert_eq!(serde_json::from_value::<BindingView>(wire).unwrap(), view);
 }
@@ -274,4 +274,13 @@ fn canonical_policy_rejects_removed_payload_digest_at_every_embedding_boundary()
         assert!(serde_json::from_value::<PreparedPolicy>(legacy["policy"].clone()).is_err());
         assert!(serde_json::from_value::<PreparedBinding>(legacy).is_err());
     }
+}
+
+#[test]
+fn scheduling_rejection_allows_only_corresponding_pending_failure() {
+    use BindingStatus::{ApplyFailed, DeleteFailed, PendingApply, PendingDelete};
+    PendingApply.validate_successor(ApplyFailed).unwrap();
+    PendingDelete.validate_successor(DeleteFailed).unwrap();
+    assert!(PendingApply.validate_successor(DeleteFailed).is_err());
+    assert!(PendingDelete.validate_successor(ApplyFailed).is_err());
 }

@@ -1,4 +1,5 @@
 use asc_foundation_types::{ResourceId, Revision};
+pub use asc_pap::EnqueueError;
 use asc_pap::{Page, PapError, PapRepository, PapService, PolicyCompiler};
 use asc_policy_types::authoring::PolicyTemplate;
 use asc_policy_types::binding::BindingView;
@@ -52,6 +53,15 @@ pub enum NotFoundResource {
 /// Stable PAP application failures safe for a daemon adapter to project.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyAdministrationError {
+    /// Saved intent rejected by scheduling with unconfirmed termination.
+    #[error(
+        "binding {id} revision {} was saved; {reason}; could not confirm request termination; background reconciliation may still run", .revision.get()
+    )]
+    SchedulingRejected {
+        id: ResourceId,
+        revision: Revision,
+        reason: asc_pap::EnqueueError,
+    },
     /// The server-assigned principal lacks Policy administration authority.
     #[error("principal is not authorized to administer policy")]
     Forbidden,
@@ -70,6 +80,9 @@ pub enum PolicyAdministrationError {
     /// No further positive revision can be allocated.
     #[error("revision space is exhausted")]
     ResourceExhausted,
+    /// Reconciliation cannot accept requests before intent is saved.
+    #[error("reconciliation runtime is unavailable")]
+    Unavailable,
     /// Serialization or persistence failed with details withheld.
     #[error("policy state could not be processed")]
     Internal,
@@ -80,6 +93,15 @@ fn project_pap_error(
     missing_resource: Option<NotFoundResource>,
 ) -> PolicyAdministrationError {
     match error {
+        PapError::SchedulingRejected {
+            id,
+            revision,
+            reason,
+        } => PolicyAdministrationError::SchedulingRejected {
+            id,
+            revision,
+            reason,
+        },
         PapError::InvalidPolicyName(message) => PolicyAdministrationError::InvalidArgument(
             PolicyInputError::new(format!("invalid policy name: {message}")),
         ),
@@ -105,6 +127,7 @@ fn project_pap_error(
             PolicyAdministrationError::NotFound(NotFoundResource::ReferencedScopeRevision)
         }
         PapError::RevisionExhausted => PolicyAdministrationError::ResourceExhausted,
+        PapError::Unavailable => PolicyAdministrationError::Unavailable,
         PapError::InvalidIdentifier(_) | PapError::InvalidBinding(_) | PapError::Persistence => {
             PolicyAdministrationError::Internal
         }
@@ -539,6 +562,10 @@ mod tests {
 
     #[test]
     fn pap_errors_are_projected_once_at_the_application_boundary() {
+        assert_eq!(
+            project_pap_error(PapError::Unavailable, None),
+            PolicyAdministrationError::Unavailable
+        );
         assert_eq!(
             project_pap_error(PapError::OperationInProgress, None),
             PolicyAdministrationError::OperationInProgress

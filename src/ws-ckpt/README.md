@@ -23,7 +23,7 @@ Btrfs-based workspace snapshot system for AI Agents, providing sub-second checkp
 ws-ckpt/
 ├── src/                       # Rust Cargo workspace
 │   ├── Cargo.toml
-│   ├── config.toml.sample     # Config template (installed to /etc/ws-ckpt/)
+│   ├── config.toml.sample     # Default config (shipped as /etc/ws-ckpt/config.toml, %config(noreplace), plus .sample reference)
 │   ├── crates/
 │   │   ├── common/            # Shared types, IPC protocol codec
 │   │   ├── daemon/            # Daemon core logic
@@ -160,6 +160,8 @@ ws-ckpt reload
 | `config` | View or modify daemon configuration |
 | `reload` | Notify daemon to reload `config.toml` |
 | `plugin` | Install/uninstall ws-ckpt Agent runtime plugins (openclaw/hermes) |
+
+The OpenClaw adapter requires OpenClaw >= 2026.2.13. Installation stops rather than leaving a partial integration when the detected version or config capabilities cannot update the tool allowlist safely.
 
 ## License
 

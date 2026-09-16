@@ -22,6 +22,7 @@ const COMPLETE_BINDING: &str =
 #[derive(Default)]
 struct FakeRepository {
     inner: ProcessLocalPapRepository,
+    failure_write_mode: std::sync::atomic::AtomicUsize,
     scope_read_gate: Mutex<ScopeReadGate>,
     policy_read_override: Mutex<Option<PolicyRevisionState>>,
 }
@@ -40,9 +41,14 @@ impl FakeRepository {
     // Set up worker-owned state through the same aggregate CAS used by the reconciler.
     fn transition(&self, id: &ResourceId, status: BindingStatus) {
         let current = self.binding_state(id);
-        current.binding.status.validate_successor(status).unwrap();
+        current
+            .binding
+            .status
+            .phase
+            .validate_successor(status)
+            .unwrap();
         let mut next = current.clone();
-        next.binding.status = status;
+        next.binding.status.phase = status;
         assert_eq!(
             self.inner
                 .compare_exchange_binding_state(&current, &BindingStateWrite::new(next)),
@@ -143,7 +149,35 @@ impl PapRepository for FakeRepository {
         self.inner.update_binding(expected, binding)
     }
 
+    fn fail_pending_binding(
+        &self,
+        expected: &BindingView,
+        reason: asc_pap::EnqueueError,
+    ) -> Result<bool, PapError> {
+        match self
+            .failure_write_mode
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            1 => return Err(PapError::Persistence),
+            2 => return Ok(false),
+            3 => {
+                self.failure_write_mode
+                    .store(4, std::sync::atomic::Ordering::SeqCst);
+                return Ok(false);
+            }
+            _ => {}
+        }
+        self.inner.fail_pending_binding(expected, reason)
+    }
+
     fn get_binding(&self, id: &ResourceId) -> Result<BindingView, PapError> {
+        if self
+            .failure_write_mode
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 4
+        {
+            return Err(PapError::Persistence);
+        }
         self.inner.get_binding(id)
     }
 
@@ -446,7 +480,7 @@ fn delete_supersedes_running_apply_without_rewriting_spec() {
             &applying,
             &BindingStateWrite::new({
                 let mut completed = applying.clone();
-                completed.binding.status = BindingStatus::Ready;
+                completed.binding.status.phase = BindingStatus::Ready;
                 completed
             })
         ),
@@ -608,13 +642,13 @@ fn repository_rejects_stale_worker_revision_while_status_is_unchanged() {
             scope.revision,
         )
         .unwrap();
-    assert_eq!(updated.status, pending.binding.status);
+    assert_eq!(updated.status, pending.binding.status.phase);
     assert_ne!(
         updated.spec.binding_revision,
         pending.binding.spec.binding_revision
     );
     let mut claimed = pending.clone();
-    claimed.binding.status = BindingStatus::Applying;
+    claimed.binding.status.phase = BindingStatus::Applying;
     assert_eq!(
         repository
             .inner
@@ -669,4 +703,42 @@ fn revision_exhaustion_and_pagination_bounds_are_explicit() {
         pap.list_policies(1_001, 0),
         Err(PapError::InvalidPagination)
     );
+}
+
+#[test]
+fn scheduling_failure_write_error_does_not_claim_terminal_state() {
+    struct Reject;
+    impl asc_pap::BindingReconcileEnqueuer for Reject {
+        fn check_ready(&self) -> Result<(), PapError> {
+            Ok(())
+        }
+        fn enqueue(&self, _: &ResourceId) -> Result<(), asc_pap::EnqueueError> {
+            Err(asc_pap::EnqueueError::Full)
+        }
+    }
+    // Failed write, unchanged Pending after conflict, and failed conflict reread.
+    for mode in [1, 2, 3] {
+        let (pap, repo) = service();
+        repo.failure_write_mode
+            .store(mode, std::sync::atomic::Ordering::SeqCst);
+        let pap = pap.with_reconcile_enqueuer(Arc::new(Reject));
+        let policy = pap
+            .create_policy("test", &policy_template("/workspace/a"))
+            .unwrap();
+        let scope = pap.create_scope(&ScopeSelector::Pid { pid: 10 }).unwrap();
+        let error = pap
+            .create_binding(
+                &policy.policy_id,
+                policy.revision,
+                &scope.scope_id,
+                scope.revision,
+            )
+            .unwrap_err();
+        let PapError::SchedulingRejected { id, .. } = error else {
+            panic!("expected scheduling rejection")
+        };
+        let state = repo.binding_state(&id);
+        assert_eq!(state.binding.status.phase, BindingStatus::PendingApply);
+        assert_eq!(state.binding.status.error, None);
+    }
 }
