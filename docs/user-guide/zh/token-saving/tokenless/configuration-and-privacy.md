@@ -62,6 +62,34 @@ tokenless stats disable
 
 执行这些命令后，环境变量覆盖仍然优先。例如 `TOKENLESS_STATS_ENABLED=0 tokenless stats enable` 会把文件保存为 `true`，但带有该环境变量的进程仍会关闭统计。
 
+## 可选 Git Diff 上下文裁剪
+
+Git Diff 裁剪默认关闭。在 Tokenless 或宿主 Agent 继承的环境中设置
+`TOKENLESS_DIFF_COMPRESSION_ENABLED=1` 启用；取消变量或设为 `0` 关闭。
+`1`、`true`、`yes`（不区分大小写）表示启用。此开关独立于总压缩开关，
+不是 `config.json` 字段。启用裁剪后，设置 `TOKENLESS_COMPRESSION_ENABLED=0`
+会测量候选，但仍返回原文。
+
+Rust 使用 `RuntimeConfig.diff_compression_enabled`；Python 使用
+`TokenlessConfig(diff_compression_enabled=True)` 或原生 `TokenlessRuntime`
+的同名参数。SDK 参数默认 false，显式配置；上述 CLI 环境变量不覆盖 SDK 参数。
+
+压缩器处理成功命令输出中收到的完整普通 Git Diff，需要文本替换能力、可用的
+Stash 和支持的恢复方式。保留全部增删行、元信息，以及修改附近两行可用上下文。
+在每个 hunk 内，如果拆分增加的头部开销更大，可以多留上下文。仅在字符数减少、
+且计入说明和恢复指令后至少节省 16 个估算 token 时采用。此估算不调用运行时
+ tokenizer，不能保证对所有模型 tokenizer 都减少 token。
+
+采用后的操作名为 `diff_reduction`，恢复等级是 `retrievable`，而非 `lossless`：
+可见输出省略了部分未修改上下文。原文仍在 Stash 时，可按输出中的 shell 或工具
+指令取回收到的原始内容；恢复需要额外工具调用。文件读取和已标记由 RTK 优化的
+结果直接透传；启用此功能不改变 RTK 命令重写。不支持或不完整的 Diff 透传。
+重命名、二进制摘要等特殊文件段保留收到的字节；编码二进制补丁整份透传。
+Tokenless 不读取宿主持久化输出文件以补全被截断的 Diff，也不改变宿主截断上限。
+
+有限样本已验证局部压缩及原文恢复，尚未证实稳定的 Agent 整轮 token 收益，
+因此该功能保持可选启用。
+
 ## 环境变量
 
 ### 用户常用变量
@@ -83,11 +111,15 @@ tokenless stats disable
 | `TOKENLESS_AGENT_ID` | Adapter 注入的 Agent 标识 |
 | `TOKENLESS_SESSION_ID` | Adapter 注入的 Session 标识 |
 | `TOKENLESS_TOOL_USE_ID` | Adapter 注入的工具调用标识 |
+| `TOKENLESS_TRACEPARENT` | 覆盖写入 SLS 记录的 W3C trace context |
+| `TRACEPARENT` | 标准 W3C trace context 变量，由启动方宿主或 Adapter 注入 |
 | `TOKENLESS_TOOL_READY_SPEC` | 覆盖 Tool Ready 依赖规范路径 |
 | `TOKENLESS_ENV_FIX_SCRIPT` | 覆盖环境修复脚本路径 |
 | `TOKENLESS_PACKAGE_MANAGER` | 覆盖包管理器探测，主要用于测试 |
 
 当前构建已硬关闭 Tool Ready。依赖规范和修复脚本覆盖仅为休眠的旧版实现保留，运行时不会生效；这些路径会经过信任校验，也不建议普通用户修改。
+
+`TOKENLESS_TRACEPARENT` 与标准变量 `TRACEPARENT` 用于为 SLS 记录提供 W3C trace context。注入是启动方的责任：OpenTelemetry 通过进程内 carrier 传播 W3C context，不会把 active span 导出为进程环境变量，因此需要关联能力的宿主或 Adapter 必须在启动 Tokenless 的环境中显式写入这两个变量之一，Tokenless 只负责读取：先看覆盖项，覆盖项为空或无法解析时回退到标准变量，因此一次拼写错误不会让整个会话失去关联能力。两者都是可选的：两个变量都没有可用上下文时，记录结构与之前完全一致，即以未关联形式写出；该标识只写入 SLS JSONL，本地统计数据库不保存。
 
 数据库路径优先级如下：
 
@@ -141,7 +173,7 @@ TTL 表示条目超过一小时后不能再通过 `retrieve` 返回。过期行�
 
 ### SLS 不包含原文
 
-Tokenless 的 SLS JSONL 只写入组件、Operation、Session/Tool Use 标识和字符/Token 度量，不写 `before_text` 或 `after_text`。但标识字段本身仍可能属于组织的运行元数据，应按照平台日志策略管理。
+Tokenless 的 SLS JSONL 只写入组件、Operation、Session/Tool Use 标识、宿主传入的 trace 标识（若存在）和字符/Token 度量，不写 `before_text` 或 `after_text`。但标识字段本身仍可能属于组织的运行元数据，应按照平台日志策略管理。
 
 ## 敏感工作负载建议
 

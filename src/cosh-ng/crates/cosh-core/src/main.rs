@@ -18,6 +18,7 @@ mod logging;
 mod loop_detect;
 mod metrics;
 mod migrate;
+mod paths;
 mod process;
 mod protocol;
 mod redaction;
@@ -56,7 +57,9 @@ fn create_provider(config: &CoreConfig) -> Box<dyn provider::ContentGenerator> {
     // Aliyun provider uses AK/SK, not API key
     if resolved.provider_type == "aliyun" {
         if resolved.auth_source.as_deref() == Some("ecs_ram_role") {
-            return Box::new(provider::sysom::SysomProvider::from_ecs_ram_role());
+            return Box::new(provider::sysom::SysomProvider::from_ecs_ram_role(
+                &resolved.sysom_endpoint,
+            ));
         }
         if resolved.access_key_id.is_empty() || resolved.access_key_secret.is_empty() {
             tracing::warn!("no AK/SK configured for aliyun, using mock provider");
@@ -68,6 +71,7 @@ fn create_provider(config: &CoreConfig) -> Box<dyn provider::ContentGenerator> {
             &resolved.access_key_id,
             &resolved.access_key_secret,
             resolved.security_token.as_deref(),
+            &resolved.sysom_endpoint,
         ));
     }
     if resolved.api_key.is_empty() {
@@ -146,9 +150,20 @@ async fn run() {
             || args.allowed_tools.is_some()
             || args.tools.is_some())
     {
-        eprintln!(
-            "[cosh-core] gateway-brokered-v1 requires persistent headless mode and rejects legacy tool or approval overrides"
-        );
+        match args.execution_profile {
+            cli::ExecutionProfile::GatewayBrokeredV1 => eprintln!(
+                "[cosh-core] gateway-brokered-v1 requires persistent headless mode and rejects legacy tool or approval overrides"
+            ),
+            cli::ExecutionProfile::GatewayBrokeredCheckpointV1 => eprintln!(
+                "[cosh-core] gateway-brokered-checkpoint-v1 requires persistent headless mode and rejects legacy tool or approval overrides"
+            ),
+            cli::ExecutionProfile::GatewayBrokeredWorkspaceWriteV1 => eprintln!(
+                "[cosh-core] gateway-brokered-workspace-write-v1 requires persistent headless mode and rejects legacy tool or approval overrides"
+            ),
+            cli::ExecutionProfile::Legacy => unreachable!(
+                "legacy execution cannot enter the brokered launch validation branch"
+            ),
+        }
         std::process::exit(2);
     }
     if args.is_session_control() {

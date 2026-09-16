@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.12.1
+
+### Breaking
+- Align kernel event timestamps by calibrating BPF monotonic clocks against realtime instead of container uptime. Historical wall-clock steps for events queued at the time cannot be reconstructed; already persisted records are unchanged.
+
+### Features
+- Capture rustls plaintext for cosh-ng and attach the cosh plaintext tap by name. (#3191)
+
+### Fixes
+- Stop counting cached tokens twice in token totals. (#3081)
+- Stream the static SSL pattern scan. (#3087)
+- Shorten the SSL uprobe re-attach TTL to 30s.
+- Assemble fragmented HTTP responses.
+- Complete HTTP/2 streams when SSE ends, and record streaming calls that signal via request headers instead of a body flag. (#3147)
+- Merge duplicate records when a long-running call completes after an idle snapshot.
+- Retry startup database cleanup when the database is locked, and recognise structured oom-kill records during startup recovery. (#3135)
+- Match the OpenClaw gateway launched with the --max-old-space-size V8 flag.
+- Add agentsight-enforcer logging.
+
+## 0.12.0
+
+### Features
+- Add `--no-ebpf` trajectory-only trace mode for environments where eBPF is unavailable.
+- Support the DashScope/Bailian native protocol. (#2954)
+- Add Kubernetes DaemonSet packaging. (#2976)
+- Monitor agent resource usage. (#3005)
+- Ground causal attribution in deterministic, re-checkable evidence. (#3011)
+- Add an LSM-only agent file-delete guard profile and report its capability. (#2979)
+- Add a vendored ABI guard, one-click audit protection, and Dashboard linkage. (#2775)
+
+### Fixes
+- Avoid cgroup OOM during database purge by skipping VACUUM. (#2916)
+- Merge Anthropic SSE token usage across events. (#2920)
+- Warn when the data directory is on overlay storage. (#2977)
+- Resolve PID lookups through a configurable procfs root.
+- Keep conversation counts scoped by session. (#3014)
+- Preserve tool results for causal attribution.
+- Synchronize ActPlane policy deltas and prevent fail-open enforcement. (#2979, #3016)
+- Reject oversized enforcement file paths instead of truncating them.
+- Extract container IDs from systemd cgroup driver layouts. (#2997)
+- Recognize modern OOM-kill dmesg format. (#3001)
+- Resolve the PID namespace before seeding BPF `cap_task` state. (#3022)
+- Pin Dockerfile RPM package selection to `TARGETARCH`. (#3025)
+
+### Docs
+- Document `--no-ebpf` trace mode.
+
 ## 0.11.2
 
 ### Features

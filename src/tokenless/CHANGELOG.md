@@ -9,6 +9,35 @@ Releases from 0.7.2 onward follow
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-15
+
+### Added
+
+- Supported search listings, including Claude Code native `Grep` results without context lines, now share consecutive file paths while retaining every received match, line number, and line ending. This lossless optimization is enabled by default and requires a text replacement slot; disable it with `TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0` or SDK `search_path_sharing_enabled=False` ([#3173](https://github.com/alibaba/anolisa/pull/3173)).
+
+### Changed
+
+- Bundled RTK is upgraded to 0.49.0, with conservative pipeline rewriting and unchanged `sudo` commands. Direct `rtk grep` users must use `--max-len` and `--max` for RTK display limits: `-l` and `-m` now retain native grep meanings, and file-type filtering moves to `rtk rg -t` ([#3273](https://github.com/alibaba/anolisa/pull/3273)).
+- Supported RTK filters now provide `rtk recall HASH` hints for retained failure or truncated output. Recovery storage is scoped to the host OS user, with limits and expiry; sessions sharing that user can access the same store. RTK recall and Tokenless Stash retrieval remain separate ([#3273](https://github.com/alibaba/anolisa/pull/3273)).
+
+### Fixed
+
+- Cosh-NG and copilot-shell now correctly attribute failures carried inside JSON-encoded shell results under Protocol v2, preserving the original failed output and sending error details for diagnosis ([#2238](https://github.com/alibaba/anolisa/pull/2238)).
+- Bundled RTK preserves pytest startup and fallback diagnostics, including when recovery storage is disabled, and keeps the no-tests summary alongside stderr ([#3273](https://github.com/alibaba/anolisa/pull/3273)).
+
+## [0.8.1] - 2026-09-09
+
+### Added
+
+- CSV/TSV tool output can now preserve all cells through quoting and line-ending compaction, or reduce larger tables to boundary rows, diagnostic rows, and a representative sample when recovery is available. Reduced views identify omitted rows and provide byte-exact original retrieval; complete enumeration or calculations require the original table. File reads and hosts without a text replacement slot pass through unchanged ([#3089](https://github.com/alibaba/anolisa/pull/3089)).
+- SLS records can now carry `tokenless.trace_id` and `tokenless.span_id` from `TOKENLESS_TRACEPARENT` or `TRACEPARENT`, so observability backends can correlate token savings with a host trace. The launching host or adapter must inject the context; without a usable value, records remain uncorrelated, and local `stats.db` data is unchanged ([#3094](https://github.com/alibaba/anolisa/pull/3094)).
+
+### Fixed
+
+- Claude Code detection now briefly re-lists a staged plugin missing from the first successful registry scan, avoiding false “not installed” results immediately after installation ([#3085](https://github.com/alibaba/anolisa/pull/3085)).
+- Hermes now skips trusted shared hook modules whose APIs or call signatures are incompatible with the adapter, tries later compatible candidates, and reports rejected candidates when none work. This prevents stale installations or cached modules from breaking lifecycle hooks ([#2249](https://github.com/alibaba/anolisa/pull/2249)).
+- OpenClaw installation now accepts declared capabilities when the host supports that option and sends the unsafe-install flag only when the host advertises it as effective. Hosts marking it as a no-op receive no bypass flag, and rejected installs point operators to `security.installPolicy` ([#3126](https://github.com/alibaba/anolisa/pull/3126), [#3152](https://github.com/alibaba/anolisa/pull/3152)).
+
 ## [0.8.0] - 2026-09-06
 
 ### Added

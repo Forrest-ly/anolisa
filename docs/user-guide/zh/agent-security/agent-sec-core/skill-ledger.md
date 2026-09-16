@@ -24,6 +24,10 @@ agent-sec-cli skill-ledger init
 baseline 是批量写操作。由 host 提供的只读已打包系统 Skill 会遵循
 [只读的已打包系统 Skill](#只读的已打包系统-skill) 中的跳过契约；密钥初始化仍会完成。
 
+`init --no-baseline` 只初始化密钥，不扫描 Skill。重复初始化复用密钥，返回
+`keyCreated: false`、`key: null`；新建密钥时返回 `keyCreated: true`，密钥信息位于
+`key`。`init --force-keys` 更换密钥对，并归档原公钥供签名校验。
+
 密钥存放位置：
 
 | 文件 | 路径 | 权限 |
@@ -142,6 +146,14 @@ child.on("close", (code) => {
 跳过项不会写入逐 Skill scanner 结果、manifest、snapshot 或 `.skill-meta` 状态，
 全局密钥初始化行为保持不变。显式 `scan <dir>` 仍保持严格语义：退出码为 `1`，并提示
 调用方使用 `analyze` 获取只读 findings。
+
+同样的批量跳过规则也适用于 `$XDG_DATA_HOME/anolisa/skills/`（默认
+`~/.local/share/anolisa/skills/`）直接子目录中由 host 提供的 Skill：
+当账本状态不可写且未被 `managedSkillDirs` 覆盖时，返回
+`reasonCode=readonly_default_skill`。这包括镜像中对运行用户只读的 raw 用户 Skill。
+可写的 raw 用户 Skill 正常扫描；跳过项不会加入 `managedSkillDirs`。
+显式扫描和已纳管用户 Skill 的写入仍会因权限错误而失败。
+SkillFS backing 和 resolver 的错误仍按错误处理。
 
 `check` 和 `status` 的语义不变。若跳过项此前不存在任何账本 artifact，`check`
 返回 `none`，聚合健康度仍可能为 `unscanned`；这些值不会把批量跳过转化为认证或
@@ -424,7 +436,16 @@ Codex 和 Qoder CLI 是低层完整性门禁，均在完成 canonical path 和�
 
 六个 adapter 均默认启用 Skill Ledger；Hermes 使用 `observe`，其它 adapter 保持 `ask`。copilot-shell、Codex、Qoder CLI 和 Qwen Code 在默认 manifest 注册各自的 hook 边界。OpenClaw 和 Hermes 还可使用 capability 配置，`SKILL_LEDGER_MODE` 仍作为部署级覆盖。除上述明确说明的 Qoder CLI 低层门禁外，其它兼容 hook 在 CLI 基础设施异常时保持 fail-open，避免阻断 Skill 加载。
 
-copilot-shell hook 当前仅覆盖 project / user / system 三类目录：`<cwd>/.copilot-shell/skills/`、`~/.copilot-shell/skills/`，以及 RPM 与 raw install 对应的 system 根目录 `/usr/share/anolisa/skills/` 和 `/usr/local/share/anolisa/skills/`。若 Skill 来自 custom、extension、remote 或其它路径，hook 会 fail-open 并跳过 skill-ledger 检查；OpenClaw 插件则按读取到的 `SKILL.md` 路径提取 Skill 目录。
+Ledger 内置发现项也包含 raw 用户目录。对此目录，`XDG_DATA_HOME`
+未设置、为空、为相对路径或包含 `.`、`..` 路径段时使用 `~/.local/share`，
+与 ANOLISA 和 cosh 保持一致。`enableDefaultSkillDirs=false` 也会禁用此内置项。
+hook 保留现有 policy 和未管理 Skill 的处理规则；识别目录不代表认证其内容。
+
+`agent-sec-cli capabilities --agent cosh --capability skill-ledger --output json`
+会显示生效的 XDG 数据根目录设置，不解析用户 home，也不读取 Agent 配置；
+回退值显示为 `~/.local/share`。
+
+copilot-shell hook 当前仅覆盖 project / user / system 三类目录：`<cwd>/.copilot-shell/skills/`、`~/.copilot-shell/skills/`、raw 用户目录 `$XDG_DATA_HOME/anolisa/skills/`（默认 `~/.local/share/anolisa/skills/`），以及 RPM 与 raw install 对应的 system 根目录 `/usr/share/anolisa/skills/` 和 `/usr/local/share/anolisa/skills/`。若 Skill 来自 custom、extension、remote 或其它路径，hook 会 fail-open 并跳过 skill-ledger 检查；OpenClaw 插件则按读取到的 `SKILL.md` 路径提取 Skill 目录。
 
 批量认证或安装后认证场景中，建议先完成目录定位和认证，再让 Agent 读取未认证 Skill 内容：批量认证前避免主动读取未认证 Skill 的 `SKILL.md` 或辅助文件；安装成功后应先定位最终本地目录，确认包含 `SKILL.md`，再执行快速扫描认证。
 
@@ -511,7 +532,7 @@ agent-sec-cli skill-ledger decide /path/to/skill --clear
 
 #### 配置 Skill 目录（批量扫描使用）
 
-默认已包含六个内置目录：`~/.openclaw/skills/*`、`~/.copilot-shell/skills/*`、`~/.hermes/skills/**`、`~/.qoder/skills/*`、`/usr/share/anolisa/skills/*`、`/usr/local/share/anolisa/skills/*`。项目级 Qoder 目录不作为相对默认项；对项目 Skill 显式执行 `scan` 或 `certify` 后，其绝对目录会沿用自动记忆机制写入 `managedSkillDirs`。如需添加其它目录，创建或编辑 `~/.config/agent-sec/skill-ledger/config.json`：
+默认已包含以下静态目录及 raw 用户目录：`~/.openclaw/skills/*`、`~/.copilot-shell/skills/*`、`~/.hermes/skills/**`、`~/.qoder/skills/*`、`/usr/share/anolisa/skills/*`、`/usr/local/share/anolisa/skills/*`。项目级 Qoder 目录不作为相对默认项；对项目 Skill 显式执行 `scan` 或 `certify` 后，其绝对目录会沿用自动记忆机制写入 `managedSkillDirs`。如需添加其它目录，创建或编辑 `~/.config/agent-sec/skill-ledger/config.json`：
 
 ```json
 {
@@ -529,6 +550,13 @@ agent-sec-cli skill-ledger decide /path/to/skill --clear
 - `"path/to/skill"` — 单个 Skill 目录（同样需包含 `SKILL.md`）
 
 不存在的目录会被静默忽略。此外，对 Skill 执行 `scan` 或 `certify` 时，未收录的目录会自动追加到配置中，方便后续 `--all` 批量操作。`check` 是只读状态检查，不会写入配置。
+
+对于 raw 用户根 `$XDG_DATA_HOME/anolisa/skills/`（默认
+`~/.local/share/anolisa/skills/`）的直接子 Skill，自动记忆仅登记该 Skill
+自身路径，即使存在其它兄弟 Skill 也不扩大为父目录通配符。因此，扫描可写 Skill
+不会把只读兄弟 Skill 一并加入 `managedSkillDirs`。其它根目录保留现有父目录通配符规则。
+已有配置条目不会自动改写：已有通配符覆盖的用户 Skill 仍视为已纳管，写入失败仍会报错。
+若确认 raw 根通配符属于误添加，可将它替换为实际需要纳管的各个 Skill 路径，保留有意配置的覆盖范围。
 
 #### 定时执行默认快速扫描
 
@@ -639,9 +667,11 @@ agent-sec-cli skill-ledger audit /path/to/my-skill --verify-snapshots
 | `agent-sec-cli skill-ledger audit <dir>` | 深度验证版本链 |
 | `agent-sec-cli skill-ledger list-scanners` | 查看已注册的扫描器列表 |
 
-`decide` 是记录单个 Skill 用户决策的唯一受支持命令。早期隐藏的 `set-policy`
-占位命令从未实现且现已移除；继续调用会得到 unknown-command 用法错误和退出码 2。
-`rotate-keys` 仍是隐藏的预留接口：调用时会在 stderr 报告 `not implemented`，以非零
+`activationPolicy` 和 `show/export --policy` 接受 `pass_warn_only`。通过
+`list-scanners` 查询 `init/scan --scanners`、`certify --scanner` 可用的注册名称；
+自定义扫描器可在 `config.json` 中注册。
+
+`rotate-keys` 在 help 中可见，尚未实现：调用时会在 stderr 报告 `not implemented`，以非零
 退出码结束，且不会修改 `key.enc`、`key.pub` 或 keyring。
 
 ## 关键路径

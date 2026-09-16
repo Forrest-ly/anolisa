@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{Context, Result};
@@ -580,6 +580,10 @@ fn generate_auto_id() -> String {
 }
 
 fn handle_plugin(action: PluginAction) -> Result<()> {
+    handle_plugin_with_adapter_root(action, Path::new("/usr/share/anolisa/adapters/ws-ckpt"))
+}
+
+fn handle_plugin_with_adapter_root(action: PluginAction, adapter_root: &Path) -> Result<()> {
     let (runtime, runtime_dir) = match &action {
         PluginAction::Install { runtime } | PluginAction::Uninstall { runtime } => match runtime {
             PluginRuntime::Openclaw => (runtime, "openclaw"),
@@ -587,7 +591,7 @@ fn handle_plugin(action: PluginAction) -> Result<()> {
         },
     };
 
-    let adapter_dir = PathBuf::from("/usr/share/anolisa/adapters/ws-ckpt").join(runtime_dir);
+    let adapter_dir = adapter_root.join(runtime_dir);
 
     if let PluginAction::Install { .. } = &action {
         let detect_script = adapter_dir.join(format!("detect-{runtime_dir}.sh"));
@@ -604,10 +608,16 @@ fn handle_plugin(action: PluginAction) -> Result<()> {
             .code()
             .unwrap_or(-1);
         match detect_code {
-            0 => {
-                eprintln!("{runtime_dir} plugin already installed");
-                return Ok(());
-            }
+            0 => match runtime {
+                PluginRuntime::Openclaw => {
+                    // Reinstall also reconciles the tool allowlist after configuration drift.
+                    eprintln!("openclaw plugin already installed; refreshing configuration");
+                }
+                PluginRuntime::Hermes => {
+                    eprintln!("hermes plugin already installed");
+                    return Ok(());
+                }
+            },
             1 => {}
             2 => anyhow::bail!("missing prerequisites for {runtime:?}"),
             _ => anyhow::bail!("detect failed for {runtime:?} (exit {detect_code})"),
@@ -1957,6 +1967,7 @@ async fn handle_recover(workspace: Option<String>, all: bool, force: bool) -> Re
             }
         }
 
+        let mut failed: usize = 0;
         for ws in &workspaces {
             let req = Request::Recover {
                 workspace: ws.path.clone(),
@@ -1971,26 +1982,50 @@ async fn handle_recover(workspace: Option<String>, all: bool, force: bool) -> Re
                         "\x1b[31mError [{:?}] recovering {}: {}\x1b[0m",
                         code, ws.path, message
                     );
+                    failed += 1;
                 }
                 _ => {
                     eprintln!("\x1b[33mUnexpected response for {}\x1b[0m", ws.path);
+                    failed += 1;
                 }
             }
         }
-        println!("All workspaces recovered.");
+        if failed == 0 {
+            println!("All workspaces recovered.");
+        } else {
+            // RPM %preun and other automation chain destructive cleanup off
+            // this exit code; a partially failed batch must not look successful.
+            let summary = format!(
+                "Recover failed for {}/{} workspace(s); failed workspaces \
+                 and their snapshots are preserved for retry.",
+                failed,
+                workspaces.len(),
+            );
+            eprintln!("\x1b[31m{}\x1b[0m", summary);
+            process::exit(1);
+        }
     } else {
         // Single workspace mode
         let ws_arg = resolve_workspace_arg(workspace.as_deref().unwrap());
 
-        // Get status for snapshot count
-        let status_req = Request::Status {
-            workspace: Some(ws_arg.clone()),
-        };
+        // Snapshot count comes from the GLOBAL status, not `Status -w`: the
+        // per-workspace form now refuses detached registrations (the very
+        // state recover exists to repair), which would abort this flow before
+        // the Recover request is ever sent. Global status lists detached
+        // workspaces too, so the confirm prompt keeps its metadata either way.
+        // Match both path and ws_id: the daemon resolves `recover -w` either
+        // way, and a count of 0 for the ID form would understate what the
+        // confirmation is about to delete.
+        let status_req = Request::Status { workspace: None };
         let status_resp = send_request_to_daemon(&status_req).await?;
         let snapshot_count = match &status_resp {
             Response::StatusOk { report } => report
                 .workspaces
-                .first()
+                .iter()
+                .find(|w| {
+                    w.ws_id == ws_arg
+                        || w.path.trim_end_matches('/') == ws_arg.trim_end_matches('/')
+                })
                 .map(|w| w.snapshot_count)
                 .unwrap_or(0),
             Response::Error { code, message } => {
@@ -2043,6 +2078,49 @@ async fn handle_recover(workspace: Option<String>, all: bool, force: bool) -> Re
 mod tests {
     use super::*;
     use clap::Parser;
+
+    fn assert_existing_plugin_install_behavior(
+        runtime: PluginRuntime,
+        runtime_dir: &str,
+        expect_install: bool,
+    ) {
+        let adapter_root = std::env::temp_dir().join(format!(
+            "ws-ckpt-{runtime_dir}-existing-{}",
+            std::process::id()
+        ));
+        let adapter_dir = adapter_root.join(runtime_dir);
+        let marker = adapter_dir.join("install-ran");
+        let _ = std::fs::remove_dir_all(&adapter_root);
+        std::fs::create_dir_all(&adapter_dir).unwrap();
+        std::fs::write(
+            adapter_dir.join(format!("detect-{runtime_dir}.sh")),
+            "exit 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            adapter_dir.join(format!("install-{runtime_dir}.sh")),
+            "#!/bin/bash\n: > \"${0%/*}/install-ran\"\n",
+        )
+        .unwrap();
+
+        let result =
+            handle_plugin_with_adapter_root(PluginAction::Install { runtime }, &adapter_root);
+        let install_ran = marker.is_file();
+        let _ = std::fs::remove_dir_all(&adapter_root);
+
+        result.unwrap();
+        assert_eq!(install_ran, expect_install);
+    }
+
+    #[test]
+    fn openclaw_install_refreshes_an_existing_plugin() {
+        assert_existing_plugin_install_behavior(PluginRuntime::Openclaw, "openclaw", true);
+    }
+
+    #[test]
+    fn hermes_install_keeps_existing_plugin() {
+        assert_existing_plugin_install_behavior(PluginRuntime::Hermes, "hermes", false);
+    }
 
     // ── Subcommand basic parsing ──
 

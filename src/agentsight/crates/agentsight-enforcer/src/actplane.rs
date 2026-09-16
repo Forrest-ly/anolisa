@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::mem::MaybeUninit;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -45,12 +47,16 @@ struct ActiveBinding {
     binding: Binding,
     credential_policy: Option<CredentialExfiltrationPolicy>,
     /// When the target process runs inside a PID namespace, this holds the
-    /// global kernel PID resolved by [`resolve_kernel_pid`].  `None` when
+    /// global kernel PID resolved by [`resolve_to_host_pid`].  `None` when
     /// the namespace PID equals the kernel PID (root namespace).
     kernel_pid: Option<i32>,
     reasons: Vec<String>,
     rule_names: Vec<String>,
     label_names: HashMap<u64, String>,
+    /// Inodes guarded in the BPF inode_guard map for this binding.
+    /// Each entry is `(ino, dev)` and must be cleaned up when the binding
+    /// is detached so the map does not leak stale entries.
+    guarded_inodes: Vec<(u64, u32)>,
 }
 
 struct PreparedBinding {
@@ -98,6 +104,10 @@ pub struct ActPlaneBackend {
     stop: Arc<AtomicBool>,
     poller: Mutex<Option<JoinHandle<()>>>,
     lifecycle: Mutex<()>,
+    /// True when the enforcer is running in the init PID namespace.
+    /// File-delete-guard requires this for correct cap_task seeding and
+    /// domain propagation.  When false, health reports file_delete_guard=false.
+    in_init_pidns: bool,
 }
 
 impl ActPlaneBackend {
@@ -124,7 +134,7 @@ impl ActPlaneBackend {
         engine
             .protect_pid(std::process::id() as i32)
             .map_err(|error| kernel_error("protect enforcer pid", error))?;
-        let _ = prepare_runtime(
+        let drained = prepare_runtime(
             || {
                 reload
                     .clear_runtime_state()
@@ -137,9 +147,18 @@ impl ActPlaneBackend {
             },
         )?;
 
+        // Clear stale inode guards that may survive a crash or SIGKILL so
+        // they do not leak into the next binding.
+        if let Err(e) = engine.clear_inode_guards() {
+            eprintln!("agentsight: failed to clear stale inode guards on startup: {e}");
+        }
+
         let state = Arc::new(RuntimeState::new());
         let stop = Arc::new(AtomicBool::new(false));
         let poller = spawn_poller(Arc::clone(&engine), Arc::clone(&state), Arc::clone(&stop));
+        log::info!(
+            "ActPlane engine ready: drained {drained} stale pinned events, violation poller started"
+        );
         Ok(Self {
             engine,
             reload,
@@ -148,6 +167,7 @@ impl ActPlaneBackend {
             stop,
             poller: Mutex::new(Some(poller)),
             lifecycle: Mutex::new(()),
+            in_init_pidns: is_init_pid_namespace(),
         })
     }
 
@@ -182,9 +202,19 @@ impl ActPlaneBackend {
 
     fn prepare_binding(
         &self,
-        request: ApplyPolicy,
+        mut request: ApplyPolicy,
         credential_policy: Option<CredentialExfiltrationPolicy>,
     ) -> Result<PreparedBinding, BackendError> {
+        // Resolve namespace-local PID to host PID BEFORE start-time validation,
+        // so that the stale-process check reads the correct /proc/<host_pid>/stat.
+        let host_pid = resolve_to_host_pid(request.root_pid, request.process_start_time);
+        if host_pid != request.root_pid {
+            eprintln!(
+                "resolve_to_host_pid: namespace pid {} -> host pid {}",
+                request.root_pid, host_pid
+            );
+            request.root_pid = host_pid;
+        }
         let actual_start = read_process_start_time(request.root_pid)?;
         if actual_start != request.process_start_time {
             return Err(BackendError::StaleProcess {
@@ -231,15 +261,8 @@ impl ActPlaneBackend {
                 )
             })?;
         let id = runtime_domain.unwrap_or_else(|| domain_id(request.binding_id));
-        let kernel_pid = resolve_kernel_pid(request.root_pid);
-        if kernel_pid != request.root_pid {
-            eprintln!(
-                "PID namespace detected: namespace pid {} -> kernel pid {}",
-                request.root_pid, kernel_pid
-            );
-        }
         self.engine
-            .seed_label_in_domain(kernel_pid, id, label)
+            .seed_label_in_domain(request.root_pid, id, label)
             .map_err(|error| kernel_error("seed target process domain", error))?;
 
         let control_pid = std::process::id() as i32;
@@ -257,13 +280,10 @@ impl ActPlaneBackend {
             label_mask: u64::MAX,
             ..CapState::default()
         };
-        let kpid = if kernel_pid != request.root_pid {
-            Some(kernel_pid)
-        } else {
-            None
-        };
+        // After prepare_binding, request.root_pid is already the host PID
+        // (resolve_to_host_pid was called there).  No separate kernel_pid needed.
         if let Err(error) = self.engine.bind_state(control_pid, id, control_state) {
-            let cleanup = self.cleanup_binding(&request, id, kpid);
+            let cleanup = self.cleanup_binding(&request, id, None);
             return Err(kernel_error_with_cleanup(
                 "bind control process",
                 error,
@@ -274,7 +294,7 @@ impl ActPlaneBackend {
             .reload
             .append_policy_delta(control_pid, id, &compiled.bytes)
         {
-            let cleanup = self.cleanup_binding(&request, id, kpid);
+            let cleanup = self.cleanup_binding(&request, id, None);
             return Err(kernel_error_with_cleanup(
                 "append policy delta",
                 error,
@@ -282,13 +302,18 @@ impl ActPlaneBackend {
             ));
         }
         if let Err(error) = self.engine.unbind_pid_from_domain(control_pid, id) {
-            let cleanup = self.cleanup_binding(&request, id, kpid);
+            let cleanup = self.cleanup_binding(&request, id, None);
             return Err(kernel_error_with_cleanup(
                 "unbind control process",
                 error,
                 cleanup,
             ));
         }
+
+        // Populate inode guard map for kernel-level fast-path protection.
+        // This allows 5.10/6.6 kernels (where bpf_d_path is unavailable in
+        // LSM hooks) to still block file deletion via inode matching.
+        let guarded_inodes = populate_inode_guards(&self.engine, &request.policy_dsl, id);
 
         let binding = Binding {
             request,
@@ -301,7 +326,7 @@ impl ActPlaneBackend {
             ActiveBinding {
                 binding: binding.clone(),
                 credential_policy,
-                kernel_pid: kpid,
+                kernel_pid: None,
                 reasons: compiled.reasons,
                 rule_names: compiled.meta.into_iter().map(|meta| meta.name).collect(),
                 label_names: compiled
@@ -309,6 +334,7 @@ impl ActPlaneBackend {
                     .into_iter()
                     .map(|(name, mask)| (mask, name))
                     .collect(),
+                guarded_inodes,
             },
         );
         Ok(binding)
@@ -336,8 +362,25 @@ impl ActPlaneBackend {
         if !bindings.is_empty() {
             return Err(BackendError::BindingConflict(request.binding_id));
         }
-        let prepared = self.prepare_binding(request, credential_policy)?;
-        self.install_prepared_locked(&mut bindings, prepared, None)
+        let binding_id = request.binding_id;
+        let prepared = match self.prepare_binding(request, credential_policy) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                log::warn!("policy apply rejected: binding_id={binding_id}: {error}");
+                return Err(error);
+            }
+        };
+        let result = self.install_prepared_locked(&mut bindings, prepared, None);
+        match &result {
+            Ok(binding) => log::info!(
+                "policy enforced: binding_id={} root_pid={} domain_id={:?}",
+                binding.request.binding_id,
+                binding.request.root_pid,
+                binding.domain_id
+            ),
+            Err(error) => log::error!("policy apply failed: binding_id={binding_id}: {error}"),
+        }
+        result
     }
 
     fn detach_binding_locked(
@@ -352,6 +395,13 @@ impl ActPlaneBackend {
         else {
             return Err(BackendError::MissingBinding(binding_id));
         };
+        // Clean up inode guard entries before tearing down the domain so the
+        // BPF map does not retain stale entries for a detached binding.
+        for &(ino, dev) in &active.guarded_inodes {
+            if let Err(e) = self.engine.unguard_inode(ino, dev) {
+                eprintln!("failed to unguard inode {ino}:{dev}: {e}");
+            }
+        }
         let cleanup = self.cleanup_binding(&active.binding.request, id, active.kernel_pid);
         if !cleanup.is_empty() {
             return Err(BackendError::KernelFailure(cleanup.join("; ")));
@@ -374,8 +424,18 @@ impl EnforcementBackend for ActPlaneBackend {
         // state so a host without an active BPF-LSM reports file_delete_guard=false
         // (fail-closed) instead of advertising a capability that silently enforces
         // nothing.
-        capabilities.file_delete_guard =
-            self.engine.supports_file_delete_guard() && ebpf_ifc_engine::bpf_lsm_active();
+        capabilities.file_delete_guard = self.engine.supports_file_delete_guard()
+            && ebpf_ifc_engine::bpf_lsm_active()
+            && self.in_init_pidns;
+        capabilities.file_delete_guard_mode = if capabilities.file_delete_guard {
+            if self.engine.bpf_d_path_in_lsm_available() {
+                Some("path".into())
+            } else {
+                Some("inode".into())
+            }
+        } else {
+            None
+        };
         let health = self.state.events.reflect_delivery_loss(HealthStatus {
             ready: runtime_error.is_none(),
             backend: "actplane".into(),
@@ -540,12 +600,17 @@ impl Drop for ActPlaneBackend {
             if errors.is_empty() {
                 self.state.bindings().remove(&domain_id);
             } else {
-                eprintln!(
+                log::error!(
                     "agentsight-enforcer could not clear binding {} during shutdown: {}",
                     binding.binding.request.binding_id,
                     errors.join("; ")
                 );
             }
+        }
+        // Batch-clear all remaining inode guard entries so no stale inodes
+        // survive the enforcer shutdown — covers both normal and error paths.
+        if let Err(e) = self.engine.clear_inode_guards() {
+            eprintln!("agentsight-enforcer: failed to clear inode guards during shutdown: {e}");
         }
         self.stop.store(true, Ordering::Release);
         let poller = self
@@ -556,7 +621,7 @@ impl Drop for ActPlaneBackend {
         if let Some(poller) = poller
             && poller.join().is_err()
         {
-            eprintln!("agentsight-enforcer ActPlane poller panicked during shutdown");
+            log::error!("agentsight-enforcer ActPlane poller panicked during shutdown");
         }
     }
 }
@@ -590,14 +655,17 @@ fn spawn_poller(
                             }
                         }
                         Err(error) => {
-                            *callback_state.runtime_error() =
-                                Some(format!("normalize ActPlane evidence: {error}"));
+                            let message = format!("normalize ActPlane evidence: {error}");
+                            log::error!("{message}");
+                            *callback_state.runtime_error() = Some(message);
                         }
                     }
                 }
             }
         }) {
-            *state.runtime_error() = Some(format!("violation poller stopped: {error}"));
+            let message = format!("violation poller stopped: {error}");
+            log::error!("{message}");
+            *state.runtime_error() = Some(message);
         }
     })
 }
@@ -1145,45 +1213,221 @@ fn kernel_error_with_cleanup(
     BackendError::KernelFailure(message)
 }
 
-/// Translate a potentially namespace-local PID to the global kernel PID.
+/// Resolve a potentially namespace-local PID to the global (init namespace)
+/// kernel PID that BPF `handle_fork` / `cap_fork` will use.
 ///
-/// When a process runs inside a PID namespace (containers, WSL2, etc.),
-/// `/proc/<pid>/status` contains an `NSpid:` line listing the PID at each
-/// nesting level — the first value is always the global kernel PID.  BPF
-/// helpers like `bpf_get_current_pid_tgid()` return that global PID, so
-/// `cap_task` entries must be keyed by it for `handle_fork` lookups to
-/// succeed.
+/// The enforcer **must** run in the init PID namespace for this to work.
+/// When it does, host `/proc/<pid>/status` exposes the full `NSpid` chain.
 ///
-/// Returns `ns_pid` unchanged when running in the root namespace (no
-/// `NSpid` line, or only one level listed).
-///
-/// **Assumption**: the enforcer process runs in the root PID namespace,
-/// so host `/proc/<pid>/status` exposes the full `NSpid` chain.  If the
-/// enforcer is ever deployed inside a sidecar container sharing the
-/// target's PID namespace, this function becomes a no-op and a
-/// different identity resolution strategy is needed.
-fn resolve_kernel_pid(ns_pid: i32) -> i32 {
-    let path = format!("/proc/{ns_pid}/status");
-    let status = match fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return ns_pid,
+/// **Algorithm**:
+/// 1. Fast path: `/proc/<input_pid>/stat` exists and `start_time` matches →
+///    the PID is valid in the host namespace.  Return `NSpid[0]` (always the
+///    host PID when reading from init ns).
+/// 2. Slow path: the PID does not exist in host `/proc` or `start_time` does
+///    not match (namespace-local PID collides with a different host process).
+///    Scan `/proc/*/status` for a process whose innermost `NSpid` value equals
+///    `input_pid` and whose `start_time` matches.  Return its host PID.
+/// 3. Fallback: no match found — return `input_pid` unchanged and let the
+///    caller handle the stale-process / not-found case.
+fn resolve_to_host_pid(input_pid: i32, input_start_time: u64) -> i32 {
+    // Fast path: pid exists in host /proc and start_time matches.
+    if let Ok(start_time) = proc_start_time(input_pid) {
+        if start_time == input_start_time {
+            return first_nspid(input_pid).unwrap_or(input_pid);
+        }
+        // pid exists but belongs to a different process (namespace collision).
+    }
+
+    // Slow path: scan /proc for a process whose innermost NSpid == input_pid
+    // and whose start_time matches.
+    let proc_dir = match fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return input_pid,
+    };
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let Ok(host_pid) = name.to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if host_pid <= 0 {
+            continue;
+        }
+        let nspid = read_nspid_chain(host_pid);
+        if nspid.len() < 2 {
+            continue; // not in a nested namespace
+        }
+        if *nspid.last().unwrap() != input_pid {
+            continue; // innermost ns PID doesn't match
+        }
+        if let Ok(pst) = proc_start_time(host_pid) {
+            if pst == input_start_time {
+                return nspid[0]; // host PID
+            }
+        }
+    }
+
+    input_pid // fallback
+}
+
+/// Read the `NSpid:` chain from `/proc/<pid>/status`.  Returns a Vec where
+/// index 0 is the outermost (host) PID and the last element is the innermost
+/// (namespace-local) PID.
+fn read_nspid_chain(pid: i32) -> Vec<i32> {
+    let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return vec![];
     };
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("NSpid:") {
-            let mut parts = rest.split_whitespace();
-            if let Some(first) = parts.next() {
-                // Only translate when there are multiple levels (i.e. we are
-                // inside a nested PID namespace).
-                if parts.next().is_some() {
-                    if let Ok(global) = first.parse::<i32>() {
-                        return global;
-                    }
-                }
-            }
-            break;
+            return rest
+                .split_whitespace()
+                .filter_map(|s| s.parse::<i32>().ok())
+                .collect();
         }
     }
-    ns_pid
+    vec![]
+}
+
+/// Return the first (host-namespace) value from the `NSpid:` line of
+/// `/proc/<pid>/status`, or `None` if unavailable.
+fn first_nspid(pid: i32) -> Option<i32> {
+    read_nspid_chain(pid).first().copied()
+}
+
+/// Read `start_time` (field 22) from `/proc/<pid>/stat`.
+fn proc_start_time(pid: i32) -> Result<u64, ()> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| ())?;
+    let after_comm = &stat[stat.rfind(')').ok_or(())? + 2..];
+    after_comm
+        .split_ascii_whitespace()
+        .nth(19) // field 22 = index 19 after ')'
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or(())
+}
+
+/// Check whether the current process runs in the init PID namespace by
+/// comparing its pid-namespace inode with that of PID 1.
+fn is_init_pid_namespace() -> bool {
+    let Ok(self_ns) = fs::read_link("/proc/self/ns/pid") else {
+        return false; // can't read → assume not init, fail-closed
+    };
+    let Ok(init_ns) = fs::read_link("/proc/1/ns/pid") else {
+        return false;
+    };
+    let result = self_ns == init_ns;
+    if !result {
+        eprintln!(
+            "agentsight-enforcer: not in init PID namespace \
+             (self={}, pid1={}); file_delete_guard will be disabled",
+            self_ns.display(),
+            init_ns.display(),
+        );
+    }
+    result
+}
+
+/// Extract concrete file paths from DSL `block (unlink|write|rename) file "..."`
+/// clauses only.  Source definitions (`source X = file "..."`) and non-block
+/// rules (`notify`, `audit`) are excluded so that credential source files and
+/// observation-only policies do not receive unintended delete protection.
+///
+/// Paths containing glob characters (`*`, `?`) are skipped because they cannot
+/// be stat'd for an inode.  Only absolute paths are returned.
+fn extract_guarded_paths(dsl: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    // Only match `block <op> file "..."` — not `source X = file` or `notify`.
+    let block_file_needles = [
+        "block unlink file \"",
+        "block write file \"",
+        "block rename file \"",
+    ];
+    for needle in &block_file_needles {
+        let mut rest = dsl;
+        while let Some(pos) = rest.find(needle) {
+            let start = pos + needle.len();
+            rest = &rest[start..];
+            if let Some(end) = rest.find('"') {
+                let path = &rest[..end];
+                if path.starts_with('/')
+                    && !path.contains('*')
+                    && !path.contains('?')
+                    && !paths.iter().any(|p| p == path)
+                {
+                    // The inode guard fast path only checks te_pid_active()
+                    // (= process is in any domain), which is semantically
+                    // equivalent to "if AGENT" / "if COMMAND" (all exec in
+                    // domain).  Rules with other labels (e.g. "if CREDENTIAL")
+                    // or with "unless" conditions cannot be faithfully evaluated
+                    // by the fast path and must be excluded.
+                    let line_rest = rest[end + 1..].split('\n').next().unwrap_or("");
+                    let has_unless = line_rest.contains("unless");
+                    let has_non_standard_label = line_rest.contains(" if ")
+                        && !line_rest.contains("if AGENT")
+                        && !line_rest.contains("if COMMAND");
+                    if !has_unless && !has_non_standard_label {
+                        paths.push(path.to_string());
+                    }
+                }
+                rest = &rest[end + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+    paths
+}
+
+/// Stat each guarded file path from the DSL and insert the `(ino, dev)` pair
+/// into the BPF inode guard map with UNLINK | RENAME protection flags.
+///
+/// Returns the list of successfully guarded `(ino, dev)` pairs so the caller
+/// can store them for later cleanup.
+#[cfg(target_os = "linux")]
+fn populate_inode_guards(
+    engine: &PinnedEngine,
+    policy_dsl: &str,
+    domain_id: u32,
+) -> Vec<(u64, u32)> {
+    let mut guarded: Vec<(u64, u32)> = Vec::new();
+    for path in extract_guarded_paths(policy_dsl) {
+        match fs::metadata(&path) {
+            Ok(meta) => {
+                let ino = meta.ino();
+                let dev = userspace_dev_to_kernel(meta.dev());
+                let flags =
+                    ebpf_ifc_engine::INODE_GUARD_UNLINK | ebpf_ifc_engine::INODE_GUARD_RENAME;
+                if let Err(e) = engine.guard_inode(ino, dev, flags, domain_id) {
+                    eprintln!("failed to guard inode {ino}:{dev} for {path}: {e}");
+                } else {
+                    guarded.push((ino, dev));
+                }
+            }
+            Err(e) => eprintln!("cannot stat {path} for inode guard: {e}"),
+        }
+    }
+    guarded
+}
+
+#[cfg(not(target_os = "linux"))]
+fn populate_inode_guards(
+    _engine: &PinnedEngine,
+    _policy_dsl: &str,
+    _domain_id: u32,
+) -> Vec<(u64, u32)> {
+    Vec::new()
+}
+
+/// Convert a userspace `stat.st_dev` value (glibc `new_encode_dev` format) to
+/// the kernel-internal `dev_t` layout used by `super_block.s_dev` and read by
+/// BPF via `BPF_CORE_READ(inode, i_sb, s_dev)`.
+///
+/// Userspace:  `(minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)`
+/// Kernel:     `MKDEV(major, minor)` = `(major << 20) | minor`
+#[cfg(target_os = "linux")]
+fn userspace_dev_to_kernel(dev: u64) -> u32 {
+    let dev = dev as u32;
+    let major = (dev & 0xfff00) >> 8;
+    let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
+    (major << 20) | minor
 }
 
 #[cfg(test)]
@@ -1224,6 +1468,7 @@ mod tests {
             reasons: vec!["credential reached an external sink".into()],
             rule_names: vec!["block-exfiltration".into()],
             label_names: HashMap::from([(1, "CREDENTIAL".into())]),
+            guarded_inodes: Vec::new(),
         }
     }
 

@@ -64,6 +64,10 @@ pub struct RuntimeConfig {
     /// Whether compressed output is returned. Disabled mode calculates and
     /// records predicted savings but returns the original input.
     pub compression_enabled: bool,
+    /// Whether API search results share consecutive file paths. Enabled by default.
+    pub search_path_sharing_enabled: bool,
+    /// Whether command-output Git diffs may omit context with original recovery. Disabled by default.
+    pub diff_compression_enabled: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -73,6 +77,8 @@ impl Default for RuntimeConfig {
             stats_enabled: true,
             sls_enabled: false,
             compression_enabled: true,
+            search_path_sharing_enabled: true,
+            diff_compression_enabled: false,
         }
     }
 }
@@ -407,6 +413,8 @@ impl TokenlessRuntime {
     ) -> Result<BeforeModelResponse, RuntimeError> {
         let options = EntryOptions {
             compression_enabled: self.config.compression_enabled,
+            search_path_sharing_enabled: self.config.search_path_sharing_enabled,
+            diff_compression_enabled: self.config.diff_compression_enabled,
             stash_enabled: true,
             rtk_path: None,
             rtk_data_dir: None,
@@ -452,6 +460,8 @@ impl TokenlessRuntime {
     ) -> Result<PostToolResponse, RuntimeError> {
         let options = EntryOptions {
             compression_enabled: self.config.compression_enabled,
+            search_path_sharing_enabled: self.config.search_path_sharing_enabled,
+            diff_compression_enabled: self.config.diff_compression_enabled,
             stash_enabled: true,
             rtk_path: None,
             rtk_data_dir: None,
@@ -811,6 +821,8 @@ pub fn compress_response_with_store(
             max_input_bytes: MAX_INPUT_BYTES,
             min_input_chars: 0,
             compression_enabled,
+            search_path_sharing_enabled: false,
+            diff_compression_enabled: false,
             stash_enabled: options.stash_enabled,
             require_reversibility: options.require_reversible,
             force_json: true,

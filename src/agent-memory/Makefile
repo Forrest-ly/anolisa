@@ -47,9 +47,9 @@ COMPONENT_CONTRACT := .anolisa/component.toml
 RPMBUILD_DIR ?= $(HOME)/rpmbuild
 SPEC_FILE := $(NAME).spec
 
-.PHONY: all build build-openclaw-plugin sync-versions generate-component-contract test lint fmt clean install \
+.PHONY: all build build-openclaw-plugin sync-versions generate-component-contract test test-openclaw-install lint fmt clean install \
         install-adapter-resources uninstall dist spec rpm srpm \
-        smoke help
+        test-openclaw-plugin smoke help
 
 all: build
 
@@ -119,6 +119,16 @@ build-openclaw-plugin: sync-versions generate-component-contract ## Build opencl
 	# stable plugin-sdk surface), so we keep --legacy-peer-deps until
 	# openclaw publishes a semver-compatible package range.
 	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm install --legacy-peer-deps --no-audit --no-fund
+	# esbuild (what `npm run build` runs) strips types without checking them, so
+	# a type error in src/ or tests/ still produces a dist/index.js. Nothing else
+	# in the pipeline would catch it either: agent-memory.spec.in's %build
+	# deliberately runs no npm and consumes the bundle `make dist` pre-built here,
+	# and the `Test agent-memory` CI job has no Node step. Type-check first so the
+	# bundle that ships is the bundle tsc accepted. `npm run build:check` is
+	# `tsc --project tsconfig.json --noEmit` over the same tsconfig the plugin is
+	# written against, and needs only the devDependencies installed just above.
+	@echo "==> Type-checking $(NAME) OpenClaw plugin (tsc --noEmit)..."
+	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm run build:check
 	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm run build
 	@test -f $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js \
 	    || { echo "ERROR: $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js was not produced"; exit 1; }
@@ -130,15 +140,36 @@ build-debug: ## Build debug binary
 # TEST
 # =============================================================================
 
-test: ## Run all tests (Linux only — use `make remote-test` on macOS/Windows)
+test: test-openclaw-install ## Run all tests (Linux only — use `make remote-test` on macOS/Windows)
 	@echo "==> Running tests..."
 	cargo test --locked
+
+# Bash-only flag-negotiation test for the OpenClaw installer (no Node):
+# capability consent plus the legacy unsafe-install bypass.
+# A future npm/tsx-based plugin unit-test target is a separate entry point
+# and deliberately not part of `make test`.
+test-openclaw-install: ## Run the OpenClaw adapter installer flag-negotiation test
+	@echo "==> Testing OpenClaw adapter installer..."
+	bash tests/test-openclaw-adapter-install.sh
 
 test-mcp: ## Run MCP integration tests only
 	cargo test --test mcp_integration_test
 
 test-tools: ## Run Tier A file-tool integration tests only
 	cargo test --test file_tools_test
+
+# The openclaw adapter ships TS unit tests (tests/unit/*-test.ts) that `npm test`
+# runs through tsx. They are deliberately not a prerequisite of `test:` above —
+# that target is cargo-only and must stay runnable without a Node toolchain or
+# registry access. Use this target to exercise the adapter suite. CI runs it
+# from the `package-source` action, right after `build-openclaw-plugin` has
+# npm-installed the same directory, so the nightly and release packaging paths
+# gate on it. The per-PR `Test agent-memory` job still has no Node step —
+# wiring one there needs the `workflow` token scope (#3255).
+test-openclaw-plugin: ## Run openclaw adapter TS unit tests (needs npm registry)
+	@echo "==> Running openclaw adapter unit tests..."
+	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm install --legacy-peer-deps --no-audit --no-fund
+	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm test
 
 # =============================================================================
 # REMOTE Linux build/test (for cross-platform development)
@@ -164,7 +195,7 @@ remote-build: remote-push ## Push + ssh $(REMOTE_HOST): pull + cargo build --rel
 
 remote-test: remote-push ## Push + ssh $(REMOTE_HOST): full test + clippy
 	@echo "==> Testing on $(REMOTE_HOST):$(REMOTE_PATH)..."
-	ssh $(REMOTE_HOST) 'cd $(REMOTE_PATH) && $(REMOTE_RESET_GUARD) git fetch $(REMOTE_REPO) $(REMOTE_BRANCH) && git reset --hard $(REMOTE_REPO)/$(REMOTE_BRANCH) && cd src/agent-memory && cargo test --release | grep "test result" && cargo clippy --release --all-targets -- -D warnings | tail -3'
+	ssh $(REMOTE_HOST) 'cd $(REMOTE_PATH) && $(REMOTE_RESET_GUARD) git fetch $(REMOTE_REPO) $(REMOTE_BRANCH) && git reset --hard $(REMOTE_REPO)/$(REMOTE_BRANCH) && cd src/agent-memory && bash tests/test-openclaw-adapter-install.sh && cargo test --release | grep "test result" && cargo clippy --release --all-targets -- -D warnings | tail -3'
 
 # =============================================================================
 # CODE QUALITY
@@ -252,8 +283,21 @@ dist: clean build-openclaw-plugin ## Create source + vendor tarballs for RPM bui
 	@mkdir -p dist
 	# Top-level dir is $(NAME)-$(VERSION) so it matches the spec's
 	# `%setup -n %{name}-%{version}` and the CI archive shape.
+	#
+	# `examples/` belongs in the copy list because Cargo.toml declares
+	# `[[example]] mcp-harness` with an explicit path, and cargo refuses
+	# to build a declared target whose file is missing — an archive
+	# without it breaks `cargo test` and `cargo build --examples` inside
+	# the unpacked source. The spec's own `%build` runs a plain
+	# `cargo build --release`, which does not select examples, so rpmbuild
+	# cannot catch that omission.
+	#
+	# `docs/` is deliberately not copied: the component manuals moved to
+	# the repository-level docs/user-guide tree (a46aea8d) and the spec
+	# packages CHANGELOG.md only. Listing the removed directory made
+	# `cp -R` exit non-zero, so this target failed outright.
 	@rm -rf dist/$(NAME)-$(VERSION) && mkdir -p dist/$(NAME)-$(VERSION)
-	@cp -R Cargo.toml Cargo.lock src config tests docs \
+	@cp -R Cargo.toml Cargo.lock src examples config tests \
 		Makefile agent-memory.spec.in CHANGELOG.md LICENSE \
 		.gitignore .anolisa dist/$(NAME)-$(VERSION)/
 	@mkdir -p dist/$(NAME)-$(VERSION)/.cargo
@@ -266,6 +310,29 @@ dist: clean build-openclaw-plugin ## Create source + vendor tarballs for RPM bui
 		--exclude='.tsbuildinfo' \
 		--exclude='tests' \
 		. | tar -xf - -C dist/$(NAME)-$(VERSION)/$(ADAPTER_SRC_DIR)/
+	# Fail here rather than inside rpmbuild: every path the spec's %build
+	# and %install read, plus every target path Cargo.toml declares, must
+	# be in the staged tree. A copy list that silently rots is what broke
+	# this target the first time.
+	@set -e; \
+	staged="dist/$(NAME)-$(VERSION)"; \
+	for f in src/main.rs src/lib.rs examples/mcp_harness.rs \
+			config/default.toml config/mcp-server.json \
+			config/systemd/anolisa-memory@.service \
+			config/systemd/anolisa-memory-tmpfiles.conf \
+			$(ADAPTER_SRC_DIR)/manifest.json \
+			$(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js \
+			$(OPENCLAW_PLUGIN_SRC_DIR)/openclaw.plugin.json \
+			$(OPENCLAW_PLUGIN_SRC_DIR)/package.json \
+			$(OPENCLAW_PLUGIN_SRC_DIR)/scripts/detect.sh \
+			$(OPENCLAW_PLUGIN_SRC_DIR)/scripts/install.sh \
+			$(OPENCLAW_PLUGIN_SRC_DIR)/scripts/uninstall.sh \
+			$(COMPONENT_CONTRACT) CHANGELOG.md LICENSE; do \
+		test -e "$$staged/$$f" || { \
+			echo "ERROR: $$f is missing from $$staged but agent-memory.spec.in or Cargo.toml requires it" >&2; \
+			exit 1; \
+		}; \
+	done
 	tar czf dist/$(NAME)-$(VERSION).tar.gz -C dist $(NAME)-$(VERSION)
 	@echo "==> Creating $(NAME)-$(VERSION)-vendor.tar.gz..."
 	# Top-level dir is `vendor/` (no $(NAME)-vendor wrapper) so that

@@ -14,13 +14,14 @@ use anolisa_core::domain::{
     Installation, InstallationScope, LifecycleStatus, ManagementRelation, ProviderBinding,
 };
 use anolisa_core::facts::{FactsError, JournalEvidence, JournalInventory};
+use anolisa_core::manifest::RuntimeDependency;
 use anolisa_core::{
     CheckEnv, CheckOutcome, CheckSpec, CheckStatus, ComponentManifest, ComponentSnapshot,
     DependencyKind, DependencyResolution, DependencyResolver, DependencyStatus, HealthEntry,
     IntegrityStatus, ManifestHealthProvenance, ManifestHealthSnapshot, NativePackageProvenance,
-    NativePackageSnapshot, ProbeEvidence, ResolverEnv, ServiceManager, ServiceRef, ServiceScope,
-    ServiceState, StateRootScope, StateSnapshot, check_owned_file, run_check,
-    service_for_install_mode, user_service_for_install_mode,
+    NativePackageSnapshot, ProbeEvidence, ResolutionPlan, ResolverEnv, ResolverError,
+    ServiceManager, ServiceRef, ServiceScope, ServiceState, StateRootScope, StateSnapshot,
+    check_owned_file, run_check, service_for_install_mode, user_service_for_install_mode,
 };
 use anolisa_platform::fs_layout::FsLayout;
 use anolisa_platform::pkg_query::PackageQuery;
@@ -197,9 +198,21 @@ struct FixSuggestion {
     automatic: bool,
 }
 
+type ResolveRuntimeDependencies<'a> =
+    dyn Fn(&[RuntimeDependency], &ResolverEnv) -> Result<ResolutionPlan, ResolverError> + 'a;
+
+#[cfg(test)]
+fn unexpected_runtime_dependencies(
+    _: &[RuntimeDependency],
+    _: &ResolverEnv,
+) -> Result<ResolutionPlan, ResolverError> {
+    panic!("runtime dependency resolution must not run for this fixture")
+}
+
 struct DoctorProbeContext<'a> {
     layout: &'a FsLayout,
     resolver_env: &'a ResolverEnv,
+    resolve_runtime_dependencies: &'a ResolveRuntimeDependencies<'a>,
     rpm_query: &'a dyn PackageQuery,
     system_service: &'a dyn ServiceManager,
     user_service: &'a dyn ServiceManager,
@@ -208,6 +221,7 @@ struct DoctorProbeContext<'a> {
 
 struct DoctorViewContext<'a> {
     resolver_env: &'a ResolverEnv,
+    resolve_runtime_dependencies: &'a ResolveRuntimeDependencies<'a>,
     rpm_query: &'a dyn PackageQuery,
     current_system_service: &'a dyn ServiceManager,
     system_scope_service: &'a dyn ServiceManager,
@@ -282,11 +296,15 @@ fn diagnose(component: Option<&str>, ctx: &CliContext) -> Result<DoctorPayload, 
         .transpose()?;
     let env = anolisa_env::EnvService::detect();
     let resolver_env = resolver_env_from_facts(&env);
+    let resolver = DependencyResolver::system();
+    let resolve_runtime_dependencies =
+        |deps: &[RuntimeDependency], env: &ResolverEnv| resolver.resolve(deps, env);
     let current_system_service = service_for_install_mode(ctx.install_mode.as_str(), &env);
     let system_scope_service = service_for_install_mode(InstallMode::System.as_str(), &env);
     let user_service = user_service_for_install_mode(ctx.install_mode.as_str(), &env);
     let view_ctx = DoctorViewContext {
         resolver_env: &resolver_env,
+        resolve_runtime_dependencies: &resolve_runtime_dependencies,
         rpm_query: &rpm_query,
         current_system_service: current_system_service.as_ref(),
         system_scope_service: system_scope_service.as_ref(),
@@ -321,6 +339,7 @@ fn diagnose_from_view(
         let probe_ctx = DoctorProbeContext {
             layout,
             resolver_env: view_ctx.resolver_env,
+            resolve_runtime_dependencies: view_ctx.resolve_runtime_dependencies,
             rpm_query: view_ctx.rpm_query,
             system_service: view_ctx.system_service_for_root(Some(root)),
             user_service: view_ctx.user_service,
@@ -360,6 +379,7 @@ fn diagnose_from_view(
         let probe_ctx = DoctorProbeContext {
             layout: &view.writable.layout,
             resolver_env: view_ctx.resolver_env,
+            resolve_runtime_dependencies: view_ctx.resolve_runtime_dependencies,
             rpm_query: view_ctx.rpm_query,
             system_service: view_ctx.system_service_for_root(None),
             user_service: view_ctx.user_service,
@@ -440,6 +460,7 @@ pub(super) fn snapshot_for_conformance(
     let probe_ctx = DoctorProbeContext {
         layout: &record.root.layout,
         resolver_env: &resolver_env,
+        resolve_runtime_dependencies: &unexpected_runtime_dependencies,
         rpm_query,
         system_service: &service,
         user_service: &service,
@@ -461,6 +482,7 @@ pub(super) fn projection_for_conformance(
     let probe_ctx = DoctorProbeContext {
         layout,
         resolver_env: &resolver_env,
+        resolve_runtime_dependencies: &unexpected_runtime_dependencies,
         rpm_query,
         system_service: &service,
         user_service: &service,
@@ -672,6 +694,7 @@ fn diagnose_component(
         manifest,
         object,
         probe_ctx.resolver_env,
+        probe_ctx.resolve_runtime_dependencies,
         probe_ctx.dry_run,
         &mut out,
     );
@@ -1413,6 +1436,7 @@ fn add_runtime_dependencies(
     manifest: Option<&ComponentManifest>,
     object: Option<&Installation>,
     resolver_env: &ResolverEnv,
+    resolve_runtime_dependencies: &ResolveRuntimeDependencies<'_>,
     dry_run: bool,
     out: &mut DoctorComponent,
 ) {
@@ -1450,7 +1474,7 @@ fn add_runtime_dependencies(
         return;
     }
 
-    match DependencyResolver::system().resolve(&manifest.runtime_deps, resolver_env) {
+    match resolve_runtime_dependencies(&manifest.runtime_deps, resolver_env) {
         Ok(plan) => {
             for warning in plan.warnings {
                 out.findings.push(finding(
@@ -1492,17 +1516,42 @@ fn add_dependency_resolution(resolution: &DependencyResolution, out: &mut Doctor
         DependencyStatus::Unresolvable { reason } => {
             (DoctorDependencyStatus::Unresolvable, Some(reason.clone()))
         }
+        DependencyStatus::ProbeFailed { error } => (
+            DoctorDependencyStatus::Unresolvable,
+            Some(format!("dependency probe failed: {error}")),
+        ),
     };
     out.dependencies.push(DoctorDependency {
         name: resolution.name.clone(),
         kind: resolution.kind,
         status,
         note: note.clone(),
-        detail: resolution.detail.clone(),
+        detail: match &resolution.status {
+            DependencyStatus::ProbeFailed { error } => Some(error.to_string()),
+            _ => resolution.detail.clone(),
+        },
     });
 
     match &resolution.status {
         DependencyStatus::Resolved => {}
+        DependencyStatus::ProbeFailed { error } => {
+            out.findings.push(finding(
+                FindingSeverity::Error,
+                "dependency_probe_failed",
+                format!(
+                    "runtime dependency '{}' [{}] could not be probed",
+                    resolution.name,
+                    resolution.kind.as_str()
+                ),
+                "dependency",
+                Some(error.to_string()),
+            ));
+            out.fix_plan.push(suggestion(
+                "inspect_dependency_probe",
+                None,
+                "inspect the dependency query failure before installing packages",
+            ));
+        }
         DependencyStatus::Unresolved { remediation } => {
             out.findings.push(finding(
                 FindingSeverity::Error,
@@ -1531,7 +1580,11 @@ fn add_dependency_resolution(resolution: &DependencyResolution, out: &mut Doctor
                 Some(reason.clone()),
             ));
             out.fix_plan.push(suggestion(
-                "satisfy_platform_requirement",
+                if resolution.kind == DependencyKind::SystemPackage {
+                    "inspect_package_state"
+                } else {
+                    "satisfy_platform_requirement"
+                },
                 None,
                 reason.clone(),
             ));
@@ -2644,6 +2697,7 @@ mod tests {
         DoctorProbeContext {
             layout,
             resolver_env,
+            resolve_runtime_dependencies: &unexpected_runtime_dependencies,
             rpm_query,
             system_service,
             user_service,
@@ -2663,6 +2717,7 @@ mod tests {
         let user_service = FakeServiceManager::with_scope(ServiceScope::User);
         let view_ctx = DoctorViewContext {
             resolver_env: &resolver_env,
+            resolve_runtime_dependencies: &unexpected_runtime_dependencies,
             rpm_query: &query,
             current_system_service: &system_service,
             system_scope_service: &system_service,
@@ -2685,6 +2740,7 @@ mod tests {
         let user_service = FakeServiceManager::with_scope(ServiceScope::User);
         let view_ctx = DoctorViewContext {
             resolver_env: &resolver_env,
+            resolve_runtime_dependencies: &unexpected_runtime_dependencies,
             rpm_query: &rpm_query,
             current_system_service: &system_service,
             system_scope_service: &system_service,
@@ -2835,6 +2891,7 @@ mod tests {
         let user_service = FakeServiceManager::with_scope(ServiceScope::User);
         let view_ctx = DoctorViewContext {
             resolver_env: &resolver_env,
+            resolve_runtime_dependencies: &unexpected_runtime_dependencies,
             rpm_query: &rpm_query,
             current_system_service: &system_service,
             system_scope_service: &system_service,
@@ -2967,6 +3024,7 @@ mod tests {
         let user_service = FakeServiceManager::with_scope(ServiceScope::User);
         let view_ctx = DoctorViewContext {
             resolver_env: &resolver_env,
+            resolve_runtime_dependencies: &unexpected_runtime_dependencies,
             rpm_query: &query,
             current_system_service: &system_service,
             system_scope_service: &system_service,
@@ -3075,6 +3133,7 @@ mod tests {
         let user_service = FakeServiceManager::with_scope(ServiceScope::User);
         let view_ctx = DoctorViewContext {
             resolver_env: &resolver_env,
+            resolve_runtime_dependencies: &unexpected_runtime_dependencies,
             rpm_query: &rpm_query,
             current_system_service: &invocation_system_service,
             system_scope_service: &system_scope_service,
@@ -3114,6 +3173,7 @@ mod tests {
         user_service.set_state(ServiceState::Active);
         let view_ctx = DoctorViewContext {
             resolver_env: &resolver_env,
+            resolve_runtime_dependencies: &unexpected_runtime_dependencies,
             rpm_query: &rpm_query,
             current_system_service: &invocation_system_service,
             system_scope_service: &system_scope_service,
@@ -3175,6 +3235,7 @@ mod tests {
         let user_service = FakeServiceManager::with_scope(ServiceScope::User);
         let view_ctx = DoctorViewContext {
             resolver_env: &resolver_env,
+            resolve_runtime_dependencies: &unexpected_runtime_dependencies,
             rpm_query: &rpm_query,
             current_system_service: &system_service,
             system_scope_service: &system_service,
@@ -3237,6 +3298,7 @@ mod tests {
         let user_service = FakeServiceManager::with_scope(ServiceScope::User);
         let view_ctx = DoctorViewContext {
             resolver_env: &resolver_env,
+            resolve_runtime_dependencies: &unexpected_runtime_dependencies,
             rpm_query: &rpm_query,
             current_system_service: &system_service,
             system_scope_service: &system_service,
@@ -3438,6 +3500,177 @@ mod tests {
             component.fix_plan[0].command.as_deref(),
             Some("sudo anolisa --install-mode system repair agentsight")
         );
+    }
+
+    struct ServiceProbeRunner {
+        scope: ServiceScope,
+        response:
+            std::sync::Arc<std::sync::Mutex<Option<anolisa_platform::command::CommandOutput>>>,
+    }
+
+    impl anolisa_platform::command::CommandRunner for ServiceProbeRunner {
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+        ) -> std::io::Result<anolisa_platform::command::CommandOutput> {
+            assert_eq!(program, "systemctl");
+            let expected = if self.scope == ServiceScope::System {
+                vec!["is-active", "service-tool.service"]
+            } else {
+                vec!["--user", "is-active", "service-tool.service"]
+            };
+            assert_eq!(args, expected);
+            Ok(self
+                .response
+                .lock()
+                .unwrap()
+                .take()
+                .expect("probe must run exactly once"))
+        }
+    }
+
+    #[test]
+    fn doctor_real_service_backend_distinguishes_probe_error_from_unit_state() {
+        use anolisa_core::SystemdServiceManager;
+        use anolisa_platform::command::CommandOutput;
+        use std::sync::{Arc, Mutex};
+
+        for scope in [ServiceScope::System, ServiceScope::User] {
+            for (code, stdout, stderr, expected_status, expected_finding) in [
+                (
+                    1,
+                    "",
+                    "Failed to connect to bus: Host is down\n",
+                    "probe_error",
+                    Some("service_probe_failed"),
+                ),
+                (
+                    3,
+                    "unknown\n",
+                    "",
+                    "not_installed",
+                    Some("service_unit_missing"),
+                ),
+                (
+                    4,
+                    "unknown\n",
+                    "",
+                    "not_installed",
+                    Some("service_unit_missing"),
+                ),
+                (3, "inactive\n", "", "inactive", Some("service_not_active")),
+                (3, "failed\n", "", "failed", Some("service_not_active")),
+                (
+                    3,
+                    "maintenance\n",
+                    "",
+                    "unknown",
+                    Some("service_not_active"),
+                ),
+                (0, "active\n", "", "active", None),
+            ] {
+                for (dry_run, disabled) in [(false, false), (true, false), (false, true)] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let layout = FsLayout::system(Some(temp.path().to_path_buf()));
+                    write_manifest_snapshot(
+                        &layout,
+                        "service-tool",
+                        "[component]\nname = \"service-tool\"\nversion = \"1.0.0\"\n",
+                    );
+                    let mut object = owned_object(
+                        "service-tool",
+                        if disabled {
+                            LifecycleStatus::Disabled
+                        } else {
+                            LifecycleStatus::Installed
+                        },
+                    );
+                    push_owned_service(&mut object, service_ref("service-tool.service", scope));
+                    let view = system_view_with_layout(layout, state_with_component(object));
+                    let response = Arc::new(Mutex::new(Some(CommandOutput {
+                        code: Some(code),
+                        stdout: stdout.to_string(),
+                        stderr: stderr.to_string(),
+                    })));
+                    let manager = SystemdServiceManager::with_runner(
+                        scope,
+                        ServiceProbeRunner {
+                            scope,
+                            response: response.clone(),
+                        },
+                    );
+                    let env = ResolverEnv::default();
+                    let ctx = DoctorViewContext {
+                        resolver_env: &env,
+                        resolve_runtime_dependencies: &unexpected_runtime_dependencies,
+                        rpm_query: &MissingPackageQuery,
+                        current_system_service: &manager,
+                        system_scope_service: &manager,
+                        user_service: &manager,
+                        dry_run,
+                    };
+                    let payload = diagnose_from_view(&view, Some("service-tool"), &ctx).unwrap();
+                    let component = &payload.components[0];
+                    let health = component
+                        .health_checks
+                        .iter()
+                        .find(|check| check.source == "service_ref")
+                        .unwrap();
+                    assert_eq!(response.lock().unwrap().is_some(), dry_run || disabled);
+                    let service_findings: Vec<_> = component
+                        .findings
+                        .iter()
+                        .filter(|finding| finding.source == "service_ref")
+                        .collect();
+                    if dry_run || disabled {
+                        assert_eq!(health.status, "skipped");
+                        assert!(service_findings.is_empty());
+                        continue;
+                    }
+                    assert_eq!(health.status, expected_status);
+                    assert_eq!(
+                        service_findings
+                            .iter()
+                            .map(|finding| finding.code.as_str())
+                            .collect::<Vec<_>>(),
+                        expected_finding.into_iter().collect::<Vec<_>>()
+                    );
+                    if code == 1 {
+                        let detail = "systemctl is-active service-tool.service exited with status 1: Failed to connect to bus: Host is down";
+                        assert_eq!(health.detail.as_deref(), Some(detail));
+                        assert_eq!(service_findings[0].detail.as_deref(), Some(detail));
+                        assert!(
+                            component
+                                .fix_plan
+                                .iter()
+                                .any(|fix| fix.action == "inspect_logs"
+                                    && fix.command.as_deref()
+                                        == Some(
+                                            "sudo anolisa --install-mode system logs service-tool"
+                                        ))
+                        );
+                        assert!(
+                            !component
+                                .fix_plan
+                                .iter()
+                                .any(|fix| fix.action == "repair_component"
+                                    || fix.action == "restart_component")
+                        );
+                    }
+                    let json = serde_json::to_value(component).unwrap();
+                    assert_eq!(
+                        json["health_checks"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|check| check["source"] == "service_ref")
+                            .unwrap()["status"],
+                        expected_status
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -4430,5 +4663,925 @@ mod tests {
             None,
         ));
         assert_eq!(component_status(&component), "failed");
+    }
+
+    const RUNTIME_DEPS: &str = r#"
+        [[component.dependencies]]
+        name = "libfoo"
+        kind = "system-package"
+        [[component.dependencies]]
+        name = "node"
+        kind = "language-runtime"
+        version = ">=20"
+        [[component.dependencies]]
+        name = "kernel-btrfs"
+        kind = "platform-capability"
+        check = "btrfs"
+    "#;
+
+    struct RuntimeRunner {
+        calls: std::cell::RefCell<Vec<String>>,
+        outputs: std::cell::RefCell<
+            std::collections::VecDeque<std::io::Result<anolisa_platform::command::CommandOutput>>,
+        >,
+    }
+
+    impl RuntimeRunner {
+        fn new(outputs: Vec<std::io::Result<anolisa_platform::command::CommandOutput>>) -> Self {
+            Self {
+                calls: Default::default(),
+                outputs: std::cell::RefCell::new(outputs.into()),
+            }
+        }
+    }
+
+    impl anolisa_platform::command::CommandRunner for &RuntimeRunner {
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+        ) -> std::io::Result<anolisa_platform::command::CommandOutput> {
+            self.calls
+                .borrow_mut()
+                .push(format!("{program} {}", args.join(" ")));
+            self.outputs
+                .borrow_mut()
+                .pop_front()
+                .expect("unexpected runtime probe")
+        }
+    }
+
+    fn runtime_output(
+        code: Option<i32>,
+        stdout: &str,
+    ) -> std::io::Result<anolisa_platform::command::CommandOutput> {
+        Ok(anolisa_platform::command::CommandOutput {
+            code,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        })
+    }
+
+    fn diagnose_runtime_fixture(
+        layout: &FsLayout,
+        object: Option<Installation>,
+        deps: Option<&str>,
+        dry_run: bool,
+        resolve: &ResolveRuntimeDependencies<'_>,
+    ) -> DoctorPayload {
+        diagnose_runtime_fixture_with_env(
+            layout,
+            object,
+            deps,
+            dry_run,
+            resolve,
+            &ResolverEnv {
+                pkg_base: Some("rpm".into()),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn diagnose_runtime_fixture_with_env(
+        layout: &FsLayout,
+        object: Option<Installation>,
+        deps: Option<&str>,
+        dry_run: bool,
+        resolve: &ResolveRuntimeDependencies<'_>,
+        env: &ResolverEnv,
+    ) -> DoctorPayload {
+        if let Some(deps) = deps {
+            write_manifest_snapshot(
+                layout,
+                "runtime-tool",
+                &format!("[component]\nname = \"runtime-tool\"\nversion = \"1.0.0\"\n{deps}"),
+            );
+        }
+        let view = system_view_with_layout(
+            layout.clone(),
+            object
+                .map(state_with_component)
+                .unwrap_or_else(StateStore::empty),
+        );
+        let service = FakeServiceManager::new();
+        let user_service = FakeServiceManager::with_scope(ServiceScope::User);
+        let ctx = DoctorViewContext {
+            resolver_env: env,
+            resolve_runtime_dependencies: resolve,
+            rpm_query: &MissingPackageQuery,
+            current_system_service: &service,
+            system_scope_service: &service,
+            user_service: &user_service,
+            dry_run,
+        };
+        let payload = diagnose_from_view(&view, Some("runtime-tool"), &ctx)
+            .expect("diagnose runtime fixture");
+        assert!(service.calls().is_empty());
+        assert!(user_service.calls().is_empty());
+        payload
+    }
+
+    #[test]
+    fn doctor_dpkg_state_output() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        for scenario in ["installed", "config-files", "unpacked", "failure"] {
+            for mode in ["human", "json", "dry-run"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        format!("{module}::doctor_dpkg_output_child"),
+                        "--exact".into(),
+                        "--nocapture".into(),
+                    ])
+                    .env("ANOLISA_TEST_DPKG_OUTPUT", format!("{scenario}:{mode}"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(output.stderr.is_empty());
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let rendered = stdout
+                    .split_once("DPKG_BEGIN\n")
+                    .unwrap()
+                    .1
+                    .split_once("DPKG_END\n")
+                    .unwrap()
+                    .0;
+                assert!(
+                    stdout.contains(if mode == "dry-run" || scenario == "installed" {
+                        "DOMAIN_EXIT=0"
+                    } else {
+                        "DOMAIN_EXIT=2"
+                    })
+                );
+                if mode == "dry-run" {
+                    assert!(!rendered.contains("[dependency_"));
+                    continue;
+                }
+                let (status, finding, action) = match scenario {
+                    "installed" => ("resolved", "", ""),
+                    "config-files" => ("unresolved", "dependency_unresolved", "install_package"),
+                    "unpacked" => (
+                        "unresolvable",
+                        "dependency_unresolvable",
+                        "inspect_package_state",
+                    ),
+                    _ => (
+                        "unresolvable",
+                        "dependency_probe_failed",
+                        "inspect_dependency_probe",
+                    ),
+                };
+                if mode == "json" {
+                    let json: serde_json::Value = serde_json::from_str(rendered).unwrap();
+                    assert_eq!(json["command"], "doctor");
+                    assert_eq!(json["ok"], scenario == "installed");
+                    let component = &json["data"]["components"][0];
+                    assert_eq!(component["dependencies"][0]["status"], status);
+                    if scenario == "installed" {
+                        assert!(component.get("findings").is_none());
+                        assert!(component.get("fix_plan").is_none());
+                    } else {
+                        assert_eq!(component["findings"][0]["code"], finding);
+                        assert_eq!(component["fix_plan"].as_array().unwrap().len(), 1);
+                        assert_eq!(component["fix_plan"][0]["action"], action);
+                        if scenario == "config-files" {
+                            assert_eq!(
+                                component["fix_plan"][0]["command"],
+                                "sudo apt install libfoo"
+                            );
+                        } else {
+                            assert!(component["fix_plan"][0]["command"].is_null());
+                            assert_eq!(component["fix_plan"][0]["automatic"], false);
+                        }
+                    }
+                } else if scenario != "installed" {
+                    assert!(
+                        rendered.contains(&format!("[{finding}]")),
+                        "{scenario}/{mode}: {rendered}"
+                    );
+                    if scenario != "config-files" {
+                        assert!(rendered.contains(action));
+                    }
+                }
+                match scenario {
+                    "config-files" => assert!(rendered.contains("sudo apt install libfoo")),
+                    "unpacked" => {
+                        assert!(rendered.contains("install ok unpacked"));
+                        assert!(!rendered.contains("sudo apt install"));
+                    }
+                    "failure" => {
+                        assert!(rendered.contains("database unavailable"));
+                        assert!(!rendered.contains("sudo apt install"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_dpkg_output_child() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        if std::env::args().skip(1).collect::<Vec<_>>()
+            != [
+                format!("{module}::doctor_dpkg_output_child"),
+                "--exact".into(),
+                "--nocapture".into(),
+            ]
+        {
+            return;
+        }
+        let Ok(value) = std::env::var("ANOLISA_TEST_DPKG_OUTPUT") else {
+            return;
+        };
+        let Some((scenario, mode)) = value.split_once(':') else {
+            return;
+        };
+        if !matches!(
+            scenario,
+            "installed" | "config-files" | "unpacked" | "failure"
+        ) || !matches!(mode, "human" | "json" | "dry-run")
+        {
+            return;
+        }
+        let sandbox = crate::test_support::TestSandbox::new();
+        let ctx = sandbox.context_with(
+            crate::context::InstallMode::System,
+            crate::test_support::TestContextOptions {
+                json: mode == "json",
+                dry_run: mode == "dry-run",
+                quiet: false,
+                ..Default::default()
+            },
+        );
+        let runner = RuntimeRunner::new(vec![Ok(anolisa_platform::command::CommandOutput {
+            code: Some(if scenario == "failure" { 2 } else { 0 }),
+            stdout: if scenario == "failure" {
+                String::new()
+            } else {
+                format!("libfoo\tamd64\tinstall ok {scenario}\n")
+            },
+            stderr: if scenario == "failure" {
+                "database unavailable\n"
+            } else {
+                ""
+            }
+            .into(),
+        })]);
+        let resolver = DependencyResolver::with_probes(&runner, || panic!("no btrfs read"));
+        let payload = diagnose_runtime_fixture_with_env(
+            ctx.layout(),
+            Some(owned_object("runtime-tool", LifecycleStatus::Installed)),
+            Some("[[component.dependencies]]\nname = \"libfoo\"\nkind = \"system-package\""),
+            ctx.dry_run,
+            &|deps, env| resolver.resolve(deps, env),
+            &ResolverEnv {
+                pkg_base: Some("deb".into()),
+                ..Default::default()
+            },
+        );
+        if ctx.dry_run {
+            assert!(runner.calls.borrow().is_empty());
+        } else {
+            assert_eq!(
+                *runner.calls.borrow(),
+                [
+                    "dpkg-query --show --showformat=${Package}\t${Architecture}\t${Status}\n -- libfoo"
+                ]
+            );
+            assert!(runner.outputs.borrow().is_empty());
+        }
+        let has_issues = payload_has_issues(&payload);
+        println!("DPKG_BEGIN");
+        render_doctor(&ctx, &payload, !has_issues).unwrap();
+        println!("DPKG_END");
+        let code = if has_issues {
+            CliError::DiagnosticsFound {
+                command: COMMAND.into(),
+            }
+            .exit_code()
+        } else {
+            0
+        };
+        println!("DOMAIN_EXIT={code}");
+    }
+
+    #[test]
+    fn doctor_native_rpm_probe_failure_output() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        for mode in [
+            "human",
+            "json",
+            "quiet",
+            "dry-run",
+            "stdout-human",
+            "stdout-json",
+            "custom-system-human",
+            "custom-system-json",
+            "custom-system-dry-run",
+            "custom-language-human",
+            "custom-language-json",
+            "custom-language-dry-run",
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    format!("{module}::doctor_native_rpm_output_child"),
+                    "--exact".into(),
+                    "--nocapture".into(),
+                ])
+                .env("ANOLISA_TEST_NATIVE_RPM_OUTPUT", mode)
+                .output()
+                .expect("isolated renderer");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stderr.is_empty());
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let rendered = stdout
+                .split_once("RPM_OUTPUT_BEGIN\n")
+                .unwrap()
+                .1
+                .split_once("RPM_OUTPUT_END\n")
+                .unwrap()
+                .0;
+            assert!(stdout.contains(if mode.ends_with("dry-run") {
+                "DOMAIN_EXIT=0"
+            } else {
+                "DOMAIN_EXIT=2"
+            }));
+            assert!(!rendered.contains("sudo dnf install"));
+            assert!(!rendered.contains("fix_manifest"));
+            match mode {
+                "json" | "stdout-json" | "custom-system-json" | "custom-language-json" => {
+                    let json: serde_json::Value = serde_json::from_str(rendered).unwrap();
+                    assert_eq!(json["command"], "doctor");
+                    assert_eq!(json["ok"], false);
+                    assert_eq!(json["schema_version"], crate::response::SCHEMA_VERSION);
+                    let component = &json["data"]["components"][0];
+                    assert_eq!(component["fix_plan"].as_array().unwrap().len(), 1);
+                    assert_eq!(component["dependencies"][0]["status"], "unresolvable");
+                    assert_eq!(
+                        component["dependencies"][0]["detail"],
+                        if mode.starts_with("custom-") {
+                            "unexpected libfoo output: libfoo --version failed (code None); stdout: partial version\n"
+                        } else if mode == "stdout-json" {
+                            "unexpected rpm output: rpm -q libfoo failed (code Some(1)); stdout: package libfoo is not installed\nextra\n"
+                        } else {
+                            "rpm failed (code Some(1)): rpmdb broken\n"
+                        }
+                    );
+                    assert_eq!(component["findings"][0]["code"], "dependency_probe_failed");
+                    assert_eq!(
+                        component["fix_plan"][0]["action"],
+                        "inspect_dependency_probe"
+                    );
+                    assert_eq!(component["fix_plan"][0]["automatic"], false);
+                    assert!(component["fix_plan"][0]["command"].is_null());
+                }
+                "human" | "stdout-human" | "custom-system-human" | "custom-language-human" => {
+                    assert!(rendered.contains("[dependency_probe_failed]"));
+                    if mode.starts_with("custom-") {
+                        assert!(rendered.contains("libfoo --version failed (code None)"));
+                        assert!(rendered.contains("partial version\n"));
+                    } else if mode == "stdout-human" {
+                        assert!(rendered.contains("code Some(1)"));
+                        assert!(rendered.contains("package libfoo is not installed\nextra\n"));
+                    } else {
+                        assert!(rendered.contains("rpmdb broken"));
+                    }
+                    assert!(rendered.contains("inspect_dependency_probe"));
+                }
+                "quiet" => assert!(rendered.is_empty()),
+                "dry-run" | "custom-system-dry-run" | "custom-language-dry-run" => {
+                    assert!(!rendered.contains("dependency_probe_failed"))
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_native_rpm_output_child() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        if std::env::args().skip(1).collect::<Vec<_>>()
+            != [
+                format!("{module}::doctor_native_rpm_output_child"),
+                "--exact".into(),
+                "--nocapture".into(),
+            ]
+        {
+            return;
+        }
+        let Ok(mode) = std::env::var("ANOLISA_TEST_NATIVE_RPM_OUTPUT") else {
+            return;
+        };
+        if !matches!(
+            mode.as_str(),
+            "human"
+                | "json"
+                | "quiet"
+                | "dry-run"
+                | "stdout-human"
+                | "stdout-json"
+                | "custom-system-human"
+                | "custom-system-json"
+                | "custom-system-dry-run"
+                | "custom-language-human"
+                | "custom-language-json"
+                | "custom-language-dry-run"
+        ) {
+            return;
+        }
+        let sandbox = crate::test_support::TestSandbox::new();
+        let ctx = sandbox.context_with(
+            crate::context::InstallMode::System,
+            crate::test_support::TestContextOptions {
+                json: mode.ends_with("json"),
+                quiet: mode == "quiet",
+                dry_run: mode.ends_with("dry-run"),
+                ..Default::default()
+            },
+        );
+        let runner = RuntimeRunner::new(vec![Ok(anolisa_platform::command::CommandOutput {
+            code: if mode.starts_with("custom-") {
+                None
+            } else {
+                Some(1)
+            },
+            stdout: if mode.starts_with("custom-") {
+                "partial version\n"
+            } else if mode.starts_with("stdout-") {
+                "package libfoo is not installed\nextra\n"
+            } else {
+                "package libfoo is not installed\n"
+            }
+            .into(),
+            stderr: if mode.starts_with("stdout-") || mode.starts_with("custom-") {
+                ""
+            } else {
+                "rpmdb broken\n"
+            }
+            .into(),
+        })]);
+        let resolver = DependencyResolver::with_probes(&runner, || panic!("no btrfs probe"));
+        let payload = diagnose_runtime_fixture(
+            ctx.layout(),
+            Some(owned_object("runtime-tool", LifecycleStatus::Installed)),
+            Some(if mode.starts_with("custom-system-") {
+                "[[component.dependencies]]\nname = \"libfoo\"\nkind = \"system-package\"\nprobe = \"libfoo --version\""
+            } else if mode.starts_with("custom-language-") {
+                "[[component.dependencies]]\nname = \"libfoo\"\nkind = \"language-runtime\"\nversion = \">=20\""
+            } else {
+                "[[component.dependencies]]\nname = \"libfoo\"\nkind = \"system-package\""
+            }),
+            ctx.dry_run,
+            &|deps, env| resolver.resolve(deps, env),
+        );
+        assert_eq!(runner.calls.borrow().len(), usize::from(!ctx.dry_run));
+        if !ctx.dry_run {
+            assert!(runner.outputs.borrow().is_empty());
+            assert_eq!(
+                *runner.calls.borrow(),
+                [if mode.starts_with("custom-") {
+                    "libfoo --version"
+                } else {
+                    "rpm -q libfoo"
+                }]
+            );
+        }
+        let has_issues = payload_has_issues(&payload);
+        println!("RPM_OUTPUT_BEGIN");
+        render_doctor(&ctx, &payload, !has_issues).expect("render");
+        println!("RPM_OUTPUT_END");
+        let code = if has_issues {
+            CliError::DiagnosticsFound {
+                command: COMMAND.into(),
+            }
+            .exit_code()
+        } else {
+            0
+        };
+        println!("DOMAIN_EXIT={code}");
+    }
+
+    #[test]
+    fn doctor_runtime_dependencies_use_real_resolver_exactly_once() {
+        for healthy in [true, false] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let layout = FsLayout::system(Some(temp.path().to_path_buf()));
+            let runner = RuntimeRunner::new(vec![
+                runtime_output(
+                    Some(if healthy { 0 } else { 1 }),
+                    if healthy {
+                        ""
+                    } else {
+                        "package libfoo is not installed\n"
+                    },
+                ),
+                runtime_output(Some(0), if healthy { "v20.0.0" } else { "v18.0.0" }),
+            ]);
+            let reads = Cell::new(0);
+            let resolutions = Cell::new(0);
+            let resolver = DependencyResolver::with_probes(&runner, || {
+                reads.set(reads.get() + 1);
+                Ok(if healthy { "btrfs\n" } else { "ext4\n" }.to_string())
+            });
+            let resolve = |deps: &[RuntimeDependency], env: &ResolverEnv| {
+                resolutions.set(resolutions.get() + 1);
+                resolver.resolve(deps, env)
+            };
+            let payload = diagnose_runtime_fixture(
+                &layout,
+                Some(owned_object("runtime-tool", LifecycleStatus::Installed)),
+                Some(RUNTIME_DEPS),
+                false,
+                &resolve,
+            );
+            assert_eq!(resolutions.get(), 1);
+            assert_eq!(reads.get(), 1);
+            assert_eq!(*runner.calls.borrow(), ["rpm -q libfoo", "node --version"]);
+            assert!(runner.outputs.borrow().is_empty());
+            let component = &payload.components[0];
+            assert_eq!(
+                component
+                    .dependencies
+                    .iter()
+                    .map(|dep| dep.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["libfoo", "node", "kernel-btrfs"]
+            );
+            assert_eq!(payload_has_issues(&payload), !healthy);
+            assert_eq!(component.status, if healthy { "ok" } else { "failed" });
+            if healthy {
+                assert!(
+                    component
+                        .dependencies
+                        .iter()
+                        .all(|dep| dep.status == DoctorDependencyStatus::Resolved)
+                );
+                assert!(component.findings.is_empty());
+                assert!(component.fix_plan.is_empty());
+                assert_eq!(payload.summary.ok, 1);
+            } else {
+                assert_eq!(
+                    component
+                        .dependencies
+                        .iter()
+                        .map(|dep| dep.status)
+                        .collect::<Vec<_>>(),
+                    [
+                        DoctorDependencyStatus::Unresolved,
+                        DoctorDependencyStatus::Unresolved,
+                        DoctorDependencyStatus::Unresolvable
+                    ]
+                );
+                assert_eq!(
+                    component.dependencies[1].detail.as_deref(),
+                    Some("found 18.0.0, need >=20")
+                );
+                assert_eq!(
+                    component
+                        .findings
+                        .iter()
+                        .map(|finding| finding.code.as_str())
+                        .collect::<Vec<_>>(),
+                    [
+                        "dependency_unresolved",
+                        "dependency_unresolved",
+                        "dependency_unresolvable"
+                    ]
+                );
+                assert_eq!(component.fix_plan.len(), 3);
+                assert_eq!(
+                    component.fix_plan[0].command.as_deref(),
+                    Some("sudo dnf install libfoo")
+                );
+                assert_eq!(component.fix_plan[2].action, "satisfy_platform_requirement");
+                assert_eq!(payload.summary.failed, 1);
+                assert_eq!(
+                    CliError::DiagnosticsFound {
+                        command: COMMAND.to_string()
+                    }
+                    .exit_code(),
+                    2
+                );
+            }
+            let json = serde_json::to_value(&payload).expect("serialize report");
+            assert_eq!(json["dry_run"], false);
+            assert_eq!(
+                json["components"][0]["dependencies"][0]["status"],
+                if healthy { "resolved" } else { "unresolved" }
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_runtime_probe_errors_distinguish_execution_faults_from_platform_limits() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let layout = FsLayout::system(Some(temp.path().to_path_buf()));
+            let runner = RuntimeRunner::new(vec![
+                Err(std::io::Error::new(kind, "scripted spawn failure")),
+                runtime_output(None, ""),
+            ]);
+            let resolver = DependencyResolver::with_probes(&runner, || {
+                Err(std::io::Error::new(kind, "scripted read failure"))
+            });
+            let payload = diagnose_runtime_fixture(
+                &layout,
+                Some(owned_object("runtime-tool", LifecycleStatus::Installed)),
+                Some(RUNTIME_DEPS),
+                false,
+                &|deps, env| resolver.resolve(deps, env),
+            );
+            let component = &payload.components[0];
+            assert_eq!(
+                component.dependencies[0].status,
+                DoctorDependencyStatus::Unresolvable
+            );
+            assert_eq!(component.findings[0].code, "dependency_probe_failed");
+            assert!(
+                !component
+                    .fix_plan
+                    .iter()
+                    .any(|fix| fix.command.as_deref() == Some("sudo dnf install libfoo"))
+            );
+            assert_eq!(
+                component.dependencies[1].status,
+                DoctorDependencyStatus::Unresolvable
+            );
+            assert_eq!(component.findings[1].code, "dependency_probe_failed");
+            assert_eq!(
+                component.dependencies[1].detail.as_deref(),
+                Some("node failed (code None): ")
+            );
+            assert!(
+                !component
+                    .fix_plan
+                    .iter()
+                    .any(|fix| fix.action == "install_runtime")
+            );
+            assert_eq!(
+                component.dependencies[2].status,
+                DoctorDependencyStatus::Unresolvable
+            );
+            assert_eq!(
+                component.findings[2].detail.as_deref(),
+                Some("could not read /proc/filesystems to verify btrfs support")
+            );
+            assert_eq!(*runner.calls.borrow(), ["rpm -q libfoo", "node --version"]);
+        }
+    }
+
+    #[test]
+    fn doctor_runtime_declaration_error_uses_manifest_finding() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = FsLayout::system(Some(temp.path().to_path_buf()));
+        let runner = RuntimeRunner::new(Vec::new());
+        let resolver = DependencyResolver::with_probes(&runner, || -> std::io::Result<String> {
+            panic!("unknown checks must not read filesystems")
+        });
+        let payload = diagnose_runtime_fixture(
+            &layout,
+            Some(owned_object("runtime-tool", LifecycleStatus::Installed)),
+            Some(
+                "[[component.dependencies]]\nname = \"future\"\nkind = \"platform-capability\"\ncheck = \"unknown\"",
+            ),
+            false,
+            &|deps, env| resolver.resolve(deps, env),
+        );
+        let component = &payload.components[0];
+        assert!(component.dependencies.is_empty());
+        assert_eq!(component.findings.len(), 1);
+        assert_eq!(component.findings[0].code, "invalid_dependency_declaration");
+        assert_eq!(
+            component.findings[0].detail.as_deref(),
+            Some("dependency 'future' has unknown platform-capability check 'unknown'")
+        );
+        assert_eq!(component.fix_plan[0].action, "fix_manifest");
+        assert!(runner.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn doctor_runtime_skip_paths_never_resolve() {
+        for scenario in [
+            "absent",
+            "no-manifest",
+            "empty",
+            "rpm",
+            "dry-run",
+            "rpm-dry-run",
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let layout = FsLayout::system(Some(temp.path().to_path_buf()));
+            let object = match scenario {
+                "absent" => None,
+                "rpm" | "rpm-dry-run" => {
+                    Some(delegated_object("runtime-tool", LifecycleStatus::Installed))
+                }
+                _ => Some(owned_object("runtime-tool", LifecycleStatus::Installed)),
+            };
+            let deps = match scenario {
+                "no-manifest" => None,
+                "empty" => Some(""),
+                _ => Some(RUNTIME_DEPS),
+            };
+            let payload = diagnose_runtime_fixture(
+                &layout,
+                object,
+                deps,
+                scenario.contains("dry-run"),
+                &unexpected_runtime_dependencies,
+            );
+            let dependencies = &payload.components[0].dependencies;
+            if matches!(scenario, "rpm" | "dry-run" | "rpm-dry-run") {
+                assert_eq!(dependencies.len(), 3);
+                let note = if scenario.starts_with("rpm") {
+                    "RPM backend owns runtime dependency resolution"
+                } else {
+                    "dry-run: dependency probe not executed"
+                };
+                assert!(
+                    dependencies
+                        .iter()
+                        .all(|dep| dep.status == DoctorDependencyStatus::Skipped
+                            && dep.note.as_deref() == Some(note))
+                );
+            } else {
+                assert!(dependencies.is_empty(), "{scenario}");
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_runtime_warning_and_version_detail_keep_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = FsLayout::system(Some(temp.path().to_path_buf()));
+        let runner = RuntimeRunner::new(vec![
+            runtime_output(Some(0), ""),
+            runtime_output(Some(0), "unknown version"),
+        ]);
+        let resolver = DependencyResolver::with_probes(&runner, || Ok("ext4\n".to_string()));
+        let resolve = |deps: &[RuntimeDependency], env: &ResolverEnv| {
+            let mut plan = resolver.resolve(deps, env)?;
+            // The resolver currently emits no aggregate warnings; exercise the
+            // callback's existing warning projection without changing that policy.
+            plan.warnings.push("scripted resolver warning".to_string());
+            Ok(plan)
+        };
+        let payload = diagnose_runtime_fixture(
+            &layout,
+            Some(owned_object("runtime-tool", LifecycleStatus::Disabled)),
+            Some(RUNTIME_DEPS),
+            false,
+            &resolve,
+        );
+        let component = &payload.components[0];
+        assert_eq!(
+            component.dependencies[1].status,
+            DoctorDependencyStatus::Resolved
+        );
+        assert_eq!(
+            component.dependencies[1].detail.as_deref(),
+            Some("version not verified against '>=20'")
+        );
+        assert_eq!(
+            component
+                .findings
+                .iter()
+                .map(|finding| finding.code.as_str())
+                .collect::<Vec<_>>(),
+            ["dependency_warning", "dependency_unresolvable"]
+        );
+        assert_eq!(component.findings[0].severity, FindingSeverity::Warning);
+        assert_eq!(component.findings[0].message, "scripted resolver warning");
+        assert_eq!(*runner.calls.borrow(), ["rpm -q libfoo", "node --version"]);
+    }
+
+    #[test]
+    fn doctor_runtime_output_preserves_human_json_and_quiet() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        for healthy in [true, false] {
+            for mode in ["human", "json", "quiet"] {
+                // Capture the real renderer without redirecting process-global stdout
+                // in this test process, which runs other diagnostics concurrently.
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        format!("{module}::doctor_runtime_output_child"),
+                        "--exact".to_string(),
+                        "--nocapture".to_string(),
+                    ])
+                    .env("ANOLISA_TEST_DOCTOR_RUNTIME_OUTPUT", mode)
+                    .env("ANOLISA_TEST_DOCTOR_RUNTIME_HEALTHY", healthy.to_string())
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(if healthy { 0 } else { 2 }));
+                assert!(output.stderr.is_empty());
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let (_, rendered) = stdout.split_once("DOCTOR_OUTPUT_BEGIN\n").unwrap();
+                let (rendered, _) = rendered.split_once("DOCTOR_OUTPUT_END\n").unwrap();
+                match mode {
+                    "json" => {
+                        let json: serde_json::Value = serde_json::from_str(rendered).unwrap();
+                        assert_eq!(json["command"], "doctor");
+                        assert_eq!(json["schema_version"], crate::response::SCHEMA_VERSION);
+                        assert_eq!(json["ok"], healthy);
+                        assert_eq!(json["data"]["dry_run"], false);
+                        assert_eq!(json["data"]["summary"]["failed"], usize::from(!healthy));
+                        let component = &json["data"]["components"][0];
+                        assert_eq!(component["dependencies"][0]["name"], "libfoo");
+                        assert_eq!(component["dependencies"][1]["name"], "node");
+                        assert_eq!(component["dependencies"][2]["name"], "kernel-btrfs");
+                        if !healthy {
+                            assert_eq!(
+                                component["fix_plan"][0]["command"],
+                                "sudo dnf install libfoo"
+                            );
+                            assert_eq!(component["findings"][2]["code"], "dependency_unresolvable");
+                        }
+                    }
+                    "human" if healthy => {
+                        assert!(
+                            rendered.starts_with("Doctor: 1 checked, 1 ok, 0 degraded, 0 failed\n")
+                        );
+                        assert!(rendered.contains("no issues found"));
+                    }
+                    "human" => {
+                        assert!(
+                            rendered.starts_with("Doctor: 1 checked, 0 ok, 0 degraded, 1 failed\n")
+                        );
+                        let package = rendered.find("[dependency_unresolved]").unwrap();
+                        let detail = rendered.find("found 18.0.0, need >=20").unwrap();
+                        let platform = rendered.find("[dependency_unresolvable]").unwrap();
+                        let fix = rendered.find("Recommended:").unwrap();
+                        assert!(package < detail && detail < platform && platform < fix);
+                        assert!(rendered.contains("sudo dnf install libfoo"));
+                        assert!(rendered.contains("satisfy_platform_requirement"));
+                    }
+                    "quiet" => assert!(rendered.is_empty()),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_runtime_output_child() {
+        let Ok(mode) = std::env::var("ANOLISA_TEST_DOCTOR_RUNTIME_OUTPUT") else {
+            return;
+        };
+        let healthy = std::env::var("ANOLISA_TEST_DOCTOR_RUNTIME_HEALTHY").unwrap() == "true";
+        let sandbox = crate::test_support::TestSandbox::new();
+        let ctx = sandbox.context_with(
+            crate::context::InstallMode::System,
+            crate::test_support::TestContextOptions {
+                json: mode == "json",
+                quiet: mode == "quiet",
+                ..Default::default()
+            },
+        );
+        let runner = RuntimeRunner::new(vec![
+            runtime_output(
+                Some(if healthy { 0 } else { 1 }),
+                if healthy {
+                    ""
+                } else {
+                    "package libfoo is not installed\n"
+                },
+            ),
+            runtime_output(Some(0), if healthy { "v20.0.0" } else { "v18.0.0" }),
+        ]);
+        let resolver = DependencyResolver::with_probes(&runner, || {
+            Ok(if healthy { "btrfs\n" } else { "ext4\n" }.to_string())
+        });
+        let payload = diagnose_runtime_fixture(
+            ctx.layout(),
+            Some(owned_object("runtime-tool", LifecycleStatus::Installed)),
+            Some(RUNTIME_DEPS),
+            false,
+            &|deps, env| resolver.resolve(deps, env),
+        );
+        let has_issues = payload_has_issues(&payload);
+        println!("DOCTOR_OUTPUT_BEGIN");
+        render_doctor(&ctx, &payload, !has_issues).unwrap();
+        println!("DOCTOR_OUTPUT_END");
+        let code = if has_issues {
+            CliError::DiagnosticsFound {
+                command: COMMAND.to_string(),
+            }
+            .exit_code()
+        } else {
+            0
+        };
+        drop(sandbox);
+        std::process::exit(code.into());
     }
 }

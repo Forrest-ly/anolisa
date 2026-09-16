@@ -23,6 +23,7 @@ fn raw_plan(steps: &[(&[&str], SegmentConnector)]) -> ReadonlyCompoundPlan {
                 program: resolve_trusted_executable(argv[0])
                     .unwrap_or_else(|| std::path::PathBuf::from(argv[0])),
                 argv: argv.iter().map(ToString::to_string).collect(),
+                suppress_stderr: false,
             })
             .collect(),
     }
@@ -86,6 +87,11 @@ fn build_plan_fails_closed_for_ineligible_shapes() {
         "pwd && echo x > f",
         "pwd && echo $(id)",
         "pwd && echo `id`",
+        // issue #2184 vector-level pin: ANSI-C `$'...'` quoting is
+        // rejected before any path check (rule 5 denies `$`), so the
+        // quoting bypass cannot reach the executor
+        "cat $'/proc/version' && pwd",
+        "cat $'/etc/shadow' && pwd",
         // expansion intent the executor would not honor
         "pwd && echo $HOME",
         // complex shapes

@@ -9,6 +9,35 @@ Tokenless 的所有重要变更都会记录在此文件中。
 
 ## [未发布]
 
+## [0.8.2] - 2026-09-15
+
+### 新增
+
+- 支持的搜索结果列表（包括不带上下文行的 Claude Code 原生 `Grep` 结果）现在会共享连续重复的文件路径，同时保留每条已接收的匹配、行号和行尾。这项无损优化默认开启，要求宿主支持文本替换；可通过 `TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0` 或 SDK `search_path_sharing_enabled=False` 关闭（[#3173](https://github.com/alibaba/anolisa/pull/3173)）。
+
+### 变更
+
+- 内置 RTK 升级至 0.49.0，采用保守的管道改写规则，并保持 `sudo` 命令不变。直接使用 `rtk grep` 时，须改用 `--max-len` 和 `--max` 设置 RTK 显示限制：`-l` 和 `-m` 现在保留原生 grep 含义，文件类型过滤改用 `rtk rg -t`（[#3273](https://github.com/alibaba/anolisa/pull/3273)）。
+- 支持的 RTK 过滤器现在会通过 `rtk recall HASH` 提示恢复已保留的失败或截断输出。恢复存储以宿主 OS 用户为范围，受容量和过期限制；共用该用户的会话可以访问同一存储。RTK recall 与 Tokenless Stash 检索仍相互独立（[#3273](https://github.com/alibaba/anolisa/pull/3273)）。
+
+### 修复
+
+- Cosh-NG 和 copilot-shell 在 Protocol v2 下现在能正确归因 JSON 编码的 shell 结果中的失败，保留原始失败输出，并将错误详情送交诊断（[#2238](https://github.com/alibaba/anolisa/pull/2238)）。
+- 内置 RTK 保留 pytest 启动和回退诊断，即使关闭恢复存储也不会丢失这些信息，并在 stderr 旁保留未发现测试的摘要（[#3273](https://github.com/alibaba/anolisa/pull/3273)）。
+
+## [0.8.1] - 2026-09-09
+
+### 新增
+
+- CSV/TSV 工具输出现在可以通过精简引号和行结束符保留全部单元格；具备恢复能力时，较大的表格可以保留首尾行、诊断行及代表性采样。缩减视图会标明省略情况，并提供逐字节恢复原文的入口；完整枚举或计算必须使用原始表格。文件读取和缺少文本替换能力的宿主保持原样 ([#3089](https://github.com/alibaba/anolisa/pull/3089))。
+- SLS 记录现在可以从 `TOKENLESS_TRACEPARENT` 或 `TRACEPARENT` 携带 `tokenless.trace_id` 和 `tokenless.span_id`，让可观测后端将 Token 节省关联到宿主 trace。上下文必须由启动 Tokenless 的宿主或适配器注入；没有有效值时记录保持未关联状态，本地 `stats.db` 数据不变 ([#3094](https://github.com/alibaba/anolisa/pull/3094))。
+
+### 修复
+
+- Claude Code 检测现在会在首次成功查询注册表却未列出已准备好的插件时进行短暂重试，避免刚安装后误报“未安装” ([#3085](https://github.com/alibaba/anolisa/pull/3085))。
+- Hermes 现在会跳过 API 或调用签名与适配器不兼容的可信共享 hook 模块，继续寻找兼容候选；全部失败时会列出拒绝原因，避免旧安装或缓存模块破坏生命周期 hook ([#2249](https://github.com/alibaba/anolisa/pull/2249))。
+- OpenClaw 安装现在会在宿主支持相应选项时接受声明的能力，并且仅在宿主声明 unsafe-install 标志仍有效时传入该标志。将其标记为 no-op 的宿主不会收到绕过标志，安装被拒绝时会提示检查 `security.installPolicy` ([#3126](https://github.com/alibaba/anolisa/pull/3126), [#3152](https://github.com/alibaba/anolisa/pull/3152))。
+
 ## [0.8.0] - 2026-09-06
 
 ### 新增

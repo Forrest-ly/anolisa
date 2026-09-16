@@ -65,7 +65,7 @@ rust-lint: ## Run cargo clippy on Rust crates (linux-sandbox on Linux only)
 test-python: ## Run Python unit and integration tests
 	@echo "🧪 Running Python tests..."
 	cd agent-sec-cli && uv sync
-	uv run --project agent-sec-cli pytest tests/ --ignore=tests/e2e/ -v
+	uv run --project agent-sec-cli pytest tests/ --ignore=tests/e2e/ --ignore=tests/v2 -v
 	uv run --project agent-sec-cli pytest tests/e2e/cli -v
 	uv run --project agent-sec-cli pytest tests/e2e/daemon -v
 	uv run --project agent-sec-cli pytest tests/e2e/prompt-scanner -v
@@ -85,12 +85,57 @@ test-e2e-rpm: ## Run E2E tests against RPM-installed agent-sec-cli binary
 	@echo "🧪 Running E2E tests on installed RPM..."
 	@command -v agent-sec-cli >/dev/null 2>&1 || { echo "ERROR: agent-sec-cli not found on PATH"; exit 1; }
 	@command -v pytest >/dev/null 2>&1 || pip3 install --quiet pytest
+	@# The code-scanner rule inventory test parses rule YAML directly, so PyYAML
+	@# is required even though the CLI itself is installed from the RPM.
+	@python3 -c 'import yaml' >/dev/null 2>&1 || pip3 install --quiet pyyaml
 	python3 -m pytest tests/e2e/ \
 		--import-mode=importlib \
 		--ignore=tests/e2e/linux-sandbox \
 		-k 'not test_error_event_writes_to_sqlite' \
 		-v --tb=short
 	@# linux-sandbox e2e skipped: requires privileged container
+
+# V1 e2e files are ignored one by one, each with the V2 capability it waits for.
+# Delete a line as soon as its capability lands in the V2 CLI/daemon; do not
+# collapse the list into a directory-level ignore, or migrated coverage will
+# stay silently disabled.
+.PHONY: test-e2e-rpm-v2
+test-e2e-rpm-v2: ## Run E2E tests against V2 RPM-installed binaries
+	@echo "🧪 Running V2 E2E tests on installed RPM..."
+	@command -v agent-sec-cli >/dev/null 2>&1 || { echo "ERROR: agent-sec-cli not found on PATH"; exit 1; }
+	@command -v agent-sec-daemon >/dev/null 2>&1 || { echo "ERROR: agent-sec-daemon not found on PATH"; exit 1; }
+	@command -v pytest >/dev/null 2>&1 || pip3 install --quiet pytest
+	@# The shared code-scanner E2E imports rule metadata before it can decide
+	@# whether source-only inventory assertions apply to this installed V2 RPM.
+	@python3 -c 'import yaml' >/dev/null 2>&1 || pip3 install --quiet pyyaml
+	CODE_SCANNER_E2E_SKIP_TELEMETRY=1 python3 -m pytest tests/e2e/ tests/v2/ \
+		--import-mode=importlib -ra \
+		--ignore=tests/e2e/cli/test_events_e2e.py \
+		--ignore=tests/e2e/cli/test_observability_record_jsonl_e2e.py \
+		--ignore=tests/e2e/cli/test_observability_record_sqlite_e2e.py \
+		--ignore=tests/e2e/cli/test_scan_pii_e2e.py \
+		--ignore=tests/e2e/cli/test_session_report_e2e.py \
+		--ignore=tests/e2e/cli/test_skill_ledger_analyze_e2e.py \
+		--ignore=tests/e2e/codex-hooks/test_codex_hooks_e2e.py \
+		--ignore=tests/e2e/daemon/test_daemon_e2e.py \
+		--ignore=tests/e2e/prompt-scanner/test_prompt_scanner_e2e.py \
+		--ignore=tests/e2e/qoder-hooks/test_qoder_skill_ledger_hook_e2e.py \
+		--ignore=tests/e2e/qwen-code-extension/test_qwen_direct_hook_execution.py \
+		--ignore=tests/e2e/skill-ledger/e2e_test.py \
+		--ignore=tests/e2e/skill-signing/e2e_test.py \
+		--ignore=tests/e2e/linux-sandbox \
+		-v --tb=short
+	@# Pending V2 capabilities behind the ignores above:
+	@#   cli/test_events_e2e.py                   -> security event query
+	@#   cli/test_observability_record_*_e2e.py   -> observability record sinks
+	@#   cli/test_scan_pii_e2e.py                 -> PII scanning
+	@#   cli/test_session_report_e2e.py           -> session report
+	@#   cli/test_skill_ledger_analyze_e2e.py     -> skill ledger analyze
+	@#   codex|qoder|qwen hook tests              -> hooks calling the V2 CLI
+	@#   daemon/test_daemon_e2e.py                -> V1 daemon wire protocol
+	@#   prompt-scanner/test_prompt_scanner_e2e.py -> prompt scanning
+	@#   skill-ledger, skill-signing              -> skill ledger and signing
+	@#   linux-sandbox                            -> privileged container (same as V1)
 
 VENV_PYTHON ?= $(HOME)/.local/lib/anolisa/sec-core/venv/bin/python
 
@@ -114,6 +159,7 @@ test-python-coverage: ## Run Python tests with coverage report
 		--ignore=tests/e2e/linux-sandbox \
 		--ignore=tests/e2e/skill-ledger \
 		--ignore=tests/e2e/skill-signing \
+		--ignore=tests/v2 \
 		-v --cov --cov-config=agent-sec-cli/pyproject.toml --cov-report=xml --cov-report=term-missing
 
 .PHONY: test-rust
@@ -171,6 +217,24 @@ BUILD_DIR ?= target
 CLI_WHEEL_BUILD_DIR ?= agent-sec-cli/target/wheels
 CLI_WHEEL_PATTERN := agent_sec_cli-*.whl
 
+# Component targets shared by the V1 and V2 aggregates. Only the CLI/daemon
+# build differs between them, so one list prevents the two aggregates from
+# drifting apart as components are added. $(1) is the CLI slot; its position is
+# preserved so prerequisite order stays identical to the pre-V2 build-all.
+define component_build_targets
+build-sandbox $(1) build-openclaw-plugin build-hermes-plugin build-qwen-code-extension stage-codex-plugin stage-qoder-plugin stage-cosh-extension stage-skills stage-component-manifest
+endef
+
+# Install targets shared by the V1 and V2 rpmbuild aggregates; the CLI install
+# target is prepended by each aggregate.
+RPM_INSTALL_COMMON_TARGETS := install-cosh-hook install-codex-plugin install-qoder-plugin \
+	install-openclaw-plugin install-hermes-plugin install-qwen-code-extension \
+	install-skills install-component-manifest
+
+# V2 Rust binaries are collected here by build-cli-v2 and consumed by
+# install-cli-v2, mirroring the build/install split used for linux-sandbox.
+V2_BIN_BUILD_DIR ?= $(BUILD_DIR)/v2/bin
+
 define require_single_cli_wheel
 set -- "$(1)"/$(CLI_WHEEL_PATTERN); \
 if [ "$$#" -ne 1 ] || [ ! -f "$$1" ]; then \
@@ -194,6 +258,13 @@ build-cli: ## Build agent-sec-cli wheel with maturin (Rust + Python)
 		uv run --no-sync maturin build --release -i python3.11 --manylinux off
 	@$(call require_single_cli_wheel,$(CLI_WHEEL_BUILD_DIR)) \
 		cp -p "$$1" $(BUILD_DIR)/wheels/
+
+.PHONY: build-cli-v2
+build-cli-v2: ## Build V2 Rust CLI and daemon binaries
+	cd v2 && cargo build --release --locked --workspace
+	install -d -m 0755 $(V2_BIN_BUILD_DIR)
+	cp -p v2/target/release/agent-sec-cli v2/target/release/agent-sec-daemon \
+		$(V2_BIN_BUILD_DIR)/
 
 .PHONY: setup
 setup: ## Install all dependencies (including dev), create .venv
@@ -255,7 +326,11 @@ stage-component-manifest: ## Stage component.toml into BUILD_DIR
 		$(BUILD_DIR)/share/anolisa/components/sec-core/component.toml
 
 .PHONY: build-all
-build-all: build-sandbox build-cli build-openclaw-plugin build-hermes-plugin build-qwen-code-extension stage-codex-plugin stage-qoder-plugin stage-cosh-extension stage-skills stage-component-manifest ## Build all components
+build-all: $(call component_build_targets,build-cli) ## Build all components
+	@echo "📦 All artifacts collected to $(BUILD_DIR)/"
+
+.PHONY: build-all-v2
+build-all-v2: $(call component_build_targets,build-cli-v2) ## Build all components with the V2 Rust CLI/daemon
 	@echo "📦 All artifacts collected to $(BUILD_DIR)/"
 
 .PHONY: export-requirements
@@ -383,6 +458,8 @@ SYSTEMD_USER_UNIT_DIR ?= /usr/lib/systemd/user
 SYSTEMD_USER_UNIT_TEMPLATE ?= packaging/systemd/agent-sec-core.service.in
 SYSTEMD_SERVICE_BINDIR ?= /usr/bin
 SYSTEMD_SERVICE_DATADIR ?= /usr/share/anolisa
+SYSTEMD_SYSTEM_UNIT_DIR ?= /usr/lib/systemd/system
+SYSTEMD_SYSTEM_UNIT_TEMPLATE ?= packaging/systemd/agent-sec-core-v2.service.in
 
 .PHONY: install-sandbox
 install-sandbox: ## Install linux-sandbox binary only
@@ -414,6 +491,14 @@ install-cli-site: ## RPM: Copy staged site-packages to private dir + wrappers
 	install -d -m 0755 $(DESTDIR)/usr/bin
 	install -p -m 0755 scripts/agent-sec-cli-wrapper.sh $(DESTDIR)/usr/bin/agent-sec-cli
 	install -p -m 0755 scripts/agent-sec-daemon-wrapper.sh $(DESTDIR)/usr/bin/agent-sec-daemon
+
+.PHONY: install-cli-v2
+install-cli-v2: ## RPM: Install V2 Rust CLI and daemon binaries
+	install -d -m 0755 $(DESTDIR)/usr/bin
+	install -p -m 0755 $(V2_BIN_BUILD_DIR)/agent-sec-cli \
+		$(DESTDIR)/usr/bin/agent-sec-cli
+	install -p -m 0755 $(V2_BIN_BUILD_DIR)/agent-sec-daemon \
+		$(DESTDIR)/usr/bin/agent-sec-daemon
 
 .PHONY: install-cli-venv
 install-cli-venv: ## Create venv, install deps from uv.lock, install wheel, symlink
@@ -514,7 +599,23 @@ install-all-for-rpmbuild: HERMES_PLUGIN_DIR := $(RPM_HERMES_PLUGIN_DIR)
 install-all-for-rpmbuild: QWEN_CODE_EXTENSION_DIR := $(RPM_QWEN_CODE_EXTENSION_DIR)
 install-all-for-rpmbuild: CODEX_PLUGIN_DIR := $(RPM_CODEX_PLUGIN_DIR)
 install-all-for-rpmbuild: QODER_PLUGIN_DIR := $(RPM_QODER_PLUGIN_DIR)
-install-all-for-rpmbuild: install-cli-site install-cosh-hook install-codex-plugin install-qoder-plugin install-openclaw-plugin install-hermes-plugin install-qwen-code-extension install-skills install-component-manifest install-systemd-user ## Install all (RPM build)
+install-all-for-rpmbuild: install-cli-site $(RPM_INSTALL_COMMON_TARGETS) install-systemd-user ## Install all (RPM build)
+
+# V2 installs a system-scope unit; the V1 raw/RPM user unit remains separate.
+.PHONY: install-all-for-rpmbuild-v2
+install-all-for-rpmbuild-v2: OPENCLAW_PLUGIN_DIR := $(RPM_OPENCLAW_PLUGIN_DIR)
+install-all-for-rpmbuild-v2: HERMES_PLUGIN_DIR := $(RPM_HERMES_PLUGIN_DIR)
+install-all-for-rpmbuild-v2: QWEN_CODE_EXTENSION_DIR := $(RPM_QWEN_CODE_EXTENSION_DIR)
+install-all-for-rpmbuild-v2: CODEX_PLUGIN_DIR := $(RPM_CODEX_PLUGIN_DIR)
+install-all-for-rpmbuild-v2: QODER_PLUGIN_DIR := $(RPM_QODER_PLUGIN_DIR)
+install-all-for-rpmbuild-v2: install-cli-v2 $(RPM_INSTALL_COMMON_TARGETS) install-systemd-system ## Install all (V2 RPM build)
+
+.PHONY: install-systemd-system
+install-systemd-system: ## Stage V2 system unit
+	install -d -m 0755 $(DESTDIR)$(SYSTEMD_SYSTEM_UNIT_DIR)
+	sed -e 's|{bindir}|$(SYSTEMD_SERVICE_BINDIR)|g' $(SYSTEMD_SYSTEM_UNIT_TEMPLATE) \
+		> $(DESTDIR)$(SYSTEMD_SYSTEM_UNIT_DIR)/agent-sec-core.service
+	chmod 0644 $(DESTDIR)$(SYSTEMD_SYSTEM_UNIT_DIR)/agent-sec-core.service
 
 # =============================================================================
 # UNINSTALL

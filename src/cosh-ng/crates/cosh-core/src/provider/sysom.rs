@@ -21,11 +21,11 @@ use super::{ContentGenerator, GenerateConfig, GenerateStream, Message, ToolDecla
 
 use self::stream::sysom_event_stream;
 
+pub mod endpoint;
 mod stream;
 
 type HmacSha256 = Hmac<Sha256>;
 
-const DEFAULT_ENDPOINT: &str = "sysom.cn-hangzhou.aliyuncs.com";
 const API_PATH: &str = "/api/v1/copilot/generate_copilot_stream_response";
 const API_VERSION: &str = "2023-12-30";
 const API_ACTION: &str = "GenerateCopilotStreamResponse";
@@ -40,6 +40,43 @@ const INSTANCE_ID_CACHE_TTL_SECS: u64 = 3 * 3600;
 const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Read timeout for ECS metadata service.
 const METADATA_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// Connect timeout for the SysOM API.
+///
+/// Bounds connection setup so an unreachable endpoint surfaces as a prompt
+/// error instead of stalling on the protocol stack's own timeout, which was
+/// measured at 61 seconds from an ECS with no public egress.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Inactivity timeout for the SysOM API response.
+///
+/// A *total* request timeout is the wrong instrument: the response is a
+/// Server-Sent Events stream whose length belongs to the model, so a deadline
+/// would truncate healthy long completions. A read timeout applies per read and
+/// resets after each successful one, so it bounds a server that accepts the
+/// connection and then goes silent while leaving a steadily streaming response
+/// untouched.
+///
+/// Deliberately generous: the largest legitimate gap is time-to-first-token
+/// while the model is queued, and the goal is to turn an unbounded hang into a
+/// bounded failure rather than to police latency.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Build the HTTP client for the streaming API.
+///
+/// Both bounds are parameters so a test can assert the stalled-connection
+/// behaviour without waiting the production read timeout.
+fn build_streaming_client(
+    endpoint: &endpoint::ResolvedEndpoint,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<reqwest::Client, String> {
+    endpoint
+        .configure_client(reqwest::Client::builder())
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .build()
+        .map_err(|err| format!("failed to build HTTP client: {err}"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EcsAuthChallenge {
@@ -57,7 +94,13 @@ struct SysomCredentials {
 
 /// SysOM Provider that connects to Aliyun SysOM API with ACS3-HMAC-SHA256 signing.
 pub struct SysomProvider {
-    endpoint: String,
+    /// Explicit endpoint override from configuration; empty when unset.
+    ///
+    /// The effective host is resolved per request rather than here because
+    /// these constructors are synchronous yet run inside the tokio runtime: a
+    /// blocking reachability probe would occupy a worker thread. Resolution is
+    /// cached process-wide, so the probe still runs at most once.
+    configured_endpoint: String,
     credentials: RwLock<SysomCredentials>,
     is_sts: bool,
     cancelled: Arc<AtomicBool>,
@@ -65,11 +108,16 @@ pub struct SysomProvider {
 }
 
 impl SysomProvider {
-    pub fn new(access_key_id: &str, access_key_secret: &str, security_token: Option<&str>) -> Self {
+    pub fn new(
+        access_key_id: &str,
+        access_key_secret: &str,
+        security_token: Option<&str>,
+        configured_endpoint: &str,
+    ) -> Self {
         let is_sts = security_token.is_some();
         let instance_id = resolve_instance_id();
         Self {
-            endpoint: DEFAULT_ENDPOINT.to_string(),
+            configured_endpoint: configured_endpoint.to_string(),
             credentials: RwLock::new(SysomCredentials {
                 access_key_id: access_key_id.to_string(),
                 access_key_secret: access_key_secret.to_string(),
@@ -81,10 +129,10 @@ impl SysomProvider {
         }
     }
 
-    pub fn from_ecs_ram_role() -> Self {
+    pub fn from_ecs_ram_role(configured_endpoint: &str) -> Self {
         let instance_id = resolve_instance_id();
         Self {
-            endpoint: DEFAULT_ENDPOINT.to_string(),
+            configured_endpoint: configured_endpoint.to_string(),
             credentials: RwLock::new(SysomCredentials {
                 access_key_id: String::new(),
                 access_key_secret: String::new(),
@@ -94,11 +142,6 @@ impl SysomProvider {
             cancelled: Arc::new(AtomicBool::new(false)),
             instance_id,
         }
-    }
-
-    pub fn with_endpoint(mut self, endpoint: &str) -> Self {
-        self.endpoint = endpoint.to_string();
-        self
     }
 
     /// Build the JSON request body for the SysOM API.
@@ -263,14 +306,24 @@ impl SysomProvider {
     /// Send a streaming request using current credentials.
     async fn do_streaming_request(&self, body_bytes: &[u8]) -> Result<GenerateStream, String> {
         let creds = self.credentials.read().unwrap().clone();
-        let url = format!("https://{}{}", self.endpoint, API_PATH);
+        let resolved = endpoint::resolve(&self.configured_endpoint).await;
+        tracing::debug!(
+            host = %resolved.host,
+            origin = resolved.origin.as_str(),
+            "sysom endpoint"
+        );
+        let url = format!("{}{}", resolved.base_url(), API_PATH);
+        let client = build_streaming_client(&resolved, CONNECT_TIMEOUT, READ_TIMEOUT)?;
+        let host = resolved.host;
         let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let nonce = Uuid::new_v4().to_string();
         let hashed_payload = hex_sha256(body_bytes);
 
-        // Build headers for signing
+        // `host` feeds the signature, the URL and the wire header alike: the
+        // gateway recomputes the signature from the Host it receives, so the
+        // three must not diverge.
         let mut sign_headers: Vec<(String, String)> = vec![
-            ("host".to_string(), self.endpoint.clone()),
+            ("host".to_string(), host.clone()),
             ("x-acs-version".to_string(), API_VERSION.to_string()),
             ("x-acs-action".to_string(), API_ACTION.to_string()),
             ("x-acs-date".to_string(), timestamp.clone()),
@@ -293,11 +346,9 @@ impl SysomProvider {
         let authorization =
             self.sign_request("POST", API_PATH, &sign_headers, &hashed_payload, &creds);
 
-        // Build reqwest request
-        let client = reqwest::Client::new();
         let mut req = client
             .post(&url)
-            .header("host", &self.endpoint)
+            .header("host", &host)
             .header("x-acs-version", API_VERSION)
             .header("x-acs-action", API_ACTION)
             .header("x-acs-date", &timestamp)
@@ -314,11 +365,20 @@ impl SysomProvider {
                 .header("x-acs-security-token", token);
         }
 
+        // Report the request before it is encrypted; see `provider::observe` for
+        // why an out-of-process observer cannot read it off the wire.
+        super::observe::tap_request("POST", &url, body_bytes);
+
         let response = req
             .body(body_bytes.to_vec())
             .send()
             .await
             .map_err(|e| format!("HTTP request failed: {e}"))?;
+
+        // Announce the response before the status check, mirroring
+        // `openai_compat`: an error response must still be reported or the
+        // observer is left with a pending request that never completes.
+        super::observe::tap_response_head(response.status().as_u16(), "text/event-stream");
 
         if !response.status().is_success() {
             let status = response.status();
@@ -326,15 +386,25 @@ impl SysomProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unknown".to_string());
+            super::observe::tap_response_chunk(text.as_bytes());
             return Err(format!("SysOM API error {status}: {text}"));
         }
 
         let cancelled = Arc::clone(&self.cancelled);
         // Normalizing to owned bytes keeps the SSE state machine testable with a
         // plain in-memory stream instead of a live HTTP response.
-        let byte_stream = response
-            .bytes_stream()
-            .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(|e| e.to_string()));
+        //
+        // The tap sits here rather than inside `sysom_event_stream` because that
+        // function is also driven by in-memory streams in its tests, which would
+        // report fixture bytes as if they came off the network.
+        let byte_stream = response.bytes_stream().map(|chunk| {
+            chunk
+                .map(|bytes| {
+                    super::observe::tap_response_chunk(&bytes);
+                    bytes.to_vec()
+                })
+                .map_err(|e| e.to_string())
+        });
 
         Ok(sysom_event_stream(Box::pin(byte_stream), cancelled))
     }

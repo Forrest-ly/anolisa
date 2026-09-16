@@ -132,6 +132,14 @@ cargo run -p skillfs -- mount /path/to/skills /path/to/mountpoint --managed
 cargo run -p skillfs -- stop /path/to/mountpoint
 ```
 
+### Mount Configuration
+
+Use `skillfs mount --config /path/to/skillfs-mount.toml` with `mountpoint` and
+an ordered `sources` array to aggregate directories. Earlier sources win whole
+skill-name conflicts; multiple sources are read-only. Paths must be absolute.
+See the [configuration reference](../../docs/user-guide/en/runtime/skillfs.md#mount-configuration)
+for the TOML example, supported flags, and OpenClaw integration limits.
+
 ### Managed Mount Mode
 
 Default `mount`, including `--foreground`, keeps the original foreground
@@ -424,6 +432,17 @@ scripts/          build.sh, test.sh, and optional POSIX harness
 SkillFS can expose its FUSE view to a non-privileged workload from a privileged
 sidecar. This requires Kubernetes 1.29+, `/dev/fuse`, and permission to run the
 sidecar as privileged.
+
+The sidecar supervisor detects failed FUSE reads and remounts inside the
+container. Its recovery budget is configurable through `SKILLFS_SUPERVISOR_*`;
+see the sidecar guide below for defaults and recovery limits.
+
+For read-only installed skills, the guide also provides a Ledger profile that
+seeds a private writable source, scans before mounting, and masks installed
+copies from Cosh. Missing or invalid activation remains hidden.
+The profile uses `skillfs mount --read-only` to reject FUSE writes at the kernel
+boundary while Ledger keeps writing the separate private source.
+Ledger RPC probes gate startup and readiness and restart an unresponsive daemon.
 
 ```bash
 cd src/skillfs

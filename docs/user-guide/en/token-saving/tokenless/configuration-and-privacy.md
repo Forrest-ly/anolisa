@@ -62,6 +62,43 @@ tokenless stats disable
 
 An environment override still wins after these commands. For example, `TOKENLESS_STATS_ENABLED=0 tokenless stats enable` saves `true` to the file, but recording remains disabled for processes that keep the environment override.
 
+## Optional Git Diff context cropping
+
+Git Diff cropping is disabled by default. Set `TOKENLESS_DIFF_COMPRESSION_ENABLED=1`
+in the environment inherited by Tokenless or its host agent to enable it; unset the
+variable or set it to `0` to disable it. `1`, `true`, and `yes` enable it
+(case-insensitively). This option is independent of the general compression switch
+and is not a `config.json` field. With cropping enabled,
+`TOKENLESS_COMPRESSION_ENABLED=0` measures candidates but returns the original.
+
+Rust callers use `RuntimeConfig.diff_compression_enabled`; Python callers use
+`TokenlessConfig(diff_compression_enabled=True)` or the native `TokenlessRuntime`
+keyword of the same name. SDK options default to false and are explicit; this CLI
+environment variable does not override them.
+
+The compressor handles complete ordinary Git diffs received as successful command
+output. It requires a text replacement slot, an available Stash, and a supported
+recovery method. All additions, deletions, metadata, and up to two available context
+lines around changes are retained. Within each hunk, it may retain extra context
+when splitting would add more header overhead. It only adopts output when both
+characters decrease and the heuristic token estimate saves at least 16 tokens,
+including the notice and recovery instruction. This estimate uses no runtime
+tokenizer and does not guarantee a reduction for every model tokenizer.
+
+The emitted operation is `diff_reduction` and recoverability is `retrievable`, not
+`lossless`: unmodified context is omitted from the visible output. Follow the
+emitted shell or tool instruction to retrieve the received original while it is in
+Stash. Recovery requires an additional tool call. File reads and results already
+marked as RTK-optimized bypass this compressor; enabling it does not change RTK
+command rewriting. Unsupported or incomplete diffs pass through. Special file
+sections such as renames and binary summaries retain their received bytes; encoded
+binary patches pass through in full. Tokenless does not open host-persisted output
+files to complete truncated diffs or change the host's truncation limit.
+
+Local compression and original recovery have been verified on finite samples.
+Stable whole-Agent token savings have not been established, so this feature remains
+opt-in.
+
 ## Environment variables
 
 ### Common user variables
@@ -83,11 +120,15 @@ An environment override still wins after these commands. For example, `TOKENLESS
 | `TOKENLESS_AGENT_ID` | Agent identifier injected by an adapter |
 | `TOKENLESS_SESSION_ID` | Session identifier injected by an adapter |
 | `TOKENLESS_TOOL_USE_ID` | Tool-call identifier injected by an adapter |
+| `TOKENLESS_TRACEPARENT` | W3C trace context override stamped onto SLS records |
+| `TRACEPARENT` | Standard W3C trace context variable, injected by the launching host or adapter |
 | `TOKENLESS_TOOL_READY_SPEC` | Override the Tool Ready dependency specification |
 | `TOKENLESS_ENV_FIX_SCRIPT` | Override the environment repair script |
 | `TOKENLESS_PACKAGE_MANAGER` | Override package-manager detection, mainly for tests |
 
 Tool Ready is hard-disabled in this build. Its specification and repair-script overrides are retained for the dormant legacy implementation but have no runtime effect. They are subject to trusted-path validation and are not recommended for normal users.
+
+`TOKENLESS_TRACEPARENT` and the standard `TRACEPARENT` carry a W3C trace context for SLS records. Injecting one is the launcher's job: OpenTelemetry propagates W3C context through in-process carriers and does not export the active span as a process variable, so a host or adapter that wants correlation has to set one of these two variables in the environment it spawns Tokenless with. Tokenless only reads them. The override is read first, and an empty or unparsable override falls back to the standard variable so one typo cannot drop correlation for a whole session. Both are optional: when neither carries a usable context, records keep the previous shape and are written uncorrelated. The identity is stamped only onto the SLS JSONL — the local statistics database does not store it.
 
 Database path priority is:
 
@@ -144,7 +185,7 @@ TTL means that `retrieve` no longer returns an entry after one hour. Expired row
 
 ### SLS excludes original text
 
-Tokenless SLS JSONL includes the component, operation, session/tool-use identifiers, and character/token metrics. It does not include `before_text` or `after_text`. Identifiers can still be organizational runtime metadata and should follow the platform's log policy.
+Tokenless SLS JSONL includes the component, operation, session/tool-use identifiers, the host trace identity when one was propagated, and character/token metrics. It does not include `before_text` or `after_text`. Identifiers can still be organizational runtime metadata and should follow the platform's log policy.
 
 ## Guidance for sensitive workloads
 

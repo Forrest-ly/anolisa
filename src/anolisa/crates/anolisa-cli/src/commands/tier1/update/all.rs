@@ -852,6 +852,10 @@ mod tests {
     }
 
     impl PackageTransaction for FakeHost {
+        fn check_install(&self, _packages: &[&str]) -> Result<(), PackageTransactionError> {
+            panic!("this path must not preflight an install")
+        }
+
         fn install(&self, _packages: &[&str]) -> Result<(), PackageTransactionError> {
             panic!("merged update must not run a dnf install");
         }
@@ -1009,6 +1013,7 @@ mod tests {
                 &retry_host,
                 &retry_host,
                 true,
+                crate::test_support::raw_effects(),
             );
             Ok(application::member_application_outcome(outcome))
         };

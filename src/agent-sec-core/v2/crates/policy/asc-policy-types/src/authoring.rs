@@ -30,7 +30,10 @@ pub enum PolicyTemplate {
         /// Absolute file paths or bounded glob patterns selected by the user.
         files: Vec<String>,
     },
-    /// Protected files must not be removed or renamed out of the namespace.
+    /// Deny deletion operations targeting matched filesystem directory entries.
+    ///
+    /// This template does not cover rename, move, link, content mutation, or
+    /// other namespace-mutation operations.
     PreventFileDeletion {
         /// Absolute file paths or bounded glob patterns selected by the user.
         files: Vec<String>,

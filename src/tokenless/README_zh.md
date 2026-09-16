@@ -4,6 +4,12 @@
 
 LLM Token 优化工具包——content-aware 压缩 + 命令重写 + 环境失败诊断。Token-Less 是 [ANOLISA](../../README_zh.md) 的 Token 节省组件，通过多种互补策略最小化 LLM Token 消耗。
 
+随包提供的 RTK 0.49.0 保留原生 `grep -l` / `-m` 语义，保守处理 Pipeline 重写，
+并让 `sudo` 命令保持原样。RTK 恢复提示使用 `rtk recall`，保留的输出以宿主 OS 用户为作用域，
+不按 Tokenless 租户或 Session 隔离。
+Flag 迁移、Pipeline 行为和输出恢复详见
+[随包提供的 RTK 命令](../../docs/user-guide/zh/token-saving/tokenless/cli-reference.md#随包提供的-rtk-命令)。
+
 ## 核心能力
 
 | 能力 | 节省率示例 | 说明 |
@@ -11,6 +17,9 @@ LLM Token 优化工具包——content-aware 压缩 + 命令重写 + 环境失�
 | Schema 压缩 | 参考 fixture 47.3% | 压缩 OpenAI Function Calling 工具定义 |
 | Content-aware 响应压缩 | JSON 参考 fixture 无损节省 36.3% | 把成功 JSON 路由给 `JsonCompressor`；达到 15% 的无损候选优先，可恢复的 Record Array 使用 32 条基础预算 |
 | Build Log 压缩 | 取决于具体负载 | 清理终端控制输出，并缩减已识别 Cargo、pytest、npm/Jest、Go、Make/C 和通用命令日志中的重复常规进度，同时保留诊断、摘要、阶段和 Stack Trace |
+| 搜索路径共享 | 取决于工作负载 | API 搜索列表（含 Claude 原生 Grep）可共享连续记录的文件路径并保留全部已收到命中；默认开启，通过 `TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0` 或 SDK `search_path_sharing_enabled=False` 关闭；命令输出保持原路由 |
+| Git Diff 上下文裁剪 | 取决于工作负载 | 通过 `TOKENLESS_DIFF_COMPRESSION_ENABLED=1` 或 SDK `diff_compression_enabled=True` 启用；保留全部增删行，按 hunk 裁剪上下文并提供原文恢复。默认关闭，尚未证实稳定的 Agent 整轮 token 收益 |
+| CSV/TSV 表格压缩 | 取决于具体负载 | 压紧引号和记录分隔符时保留全部单元格；较大的表格可保留选定行，明确提示表格不完整，并支持取回字节一致的原文。需要文本替换能力；文件读取透传 |
 | TOON 上下文压缩 | 参考响应 17.0% | 将 JSON 编码为 TOON 格式 |
 | 命令重写 | 60–90% | 通过 RTK 过滤 CLI 输出（支持 70+ 命令） |
 | Tool Ready | 减少重试浪费 | 旧版调用前预检、自动修复与阻断；当前硬关闭 |
@@ -164,7 +173,7 @@ dsh --profile <profile>
 ### `compress` 压缩入口
 
 共享 Agent Hook 会向 `tokenless compress` 发送生命周期请求；只有成功且未旁路的
-PostTool JSON 和符合条件的命令输出 Build Log 会进入 Runtime 内部 Pipeline。Tool Error
+PostTool JSON、CSV/TSV 表格和符合条件的命令输出 Build Log 会进入 Runtime 内部 Pipeline。Tool Error
 旁路压缩、保留原始输出，再由 Core 追加环境诊断信息。
 
 PreTool 会保持已识别的 Cargo、pytest、npm/Jest、Go 和 Make 构建/测试命令不变，使其原生
@@ -302,6 +311,11 @@ make qwenpaw-install
 `<工作目录>/plugins/tokenless/`（`QWENPAW_WORKING_DIR`，否则 `COPAW_WORKING_DIR`，否则已存在的
 `~/.copaw`，否则 `~/.qwenpaw`），并按 `requirements.txt` 从对应 GitHub Release
 安装 `anolisa_tokenless` wheel。统计记录写入 `<workspace>/.tokenless`。
+
+在把 Bundle 交给 QwenPaw 之前，安装器会先探测这个 wheel URL，资产返回 `404` 时给出说明性报错并停止。
+离线或镜像网络可用 `ANOLISA_SKIP_WHEEL_PREFLIGHT=1` 跳过探测；
+`ANOLISA_TOKENLESS_PROBE_TIMEOUT` 用于设置单次探测的超时秒数（默认 15）。完整参考见
+[故障排查](../../docs/user-guide/zh/token-saving/tokenless/troubleshooting.md#qwenpaw-安装提示-sdk-wheel-不可用)。
 
 ### Trae (TraeCode) 安装
 
@@ -501,6 +515,23 @@ active 阶段的输出与输入内容完全一致时才会串成一条链，从�
 阶段的 Token。完整选项和度量限制见
 [Tokenless 效果度量](../../docs/user-guide/zh/token-saving/tokenless/measuring-savings.md)。
 
+## Trace 关联
+
+导出的 SLS 记录会带上产生它的宿主 span 的 trace 标识，AgentLoop
+这类可观测后端因此可以把 Token 节省量归因到具体 trace。两个可选
+环境变量负责传入该标识：
+
+- `TOKENLESS_TRACEPARENT` —— 面向 Adapter 的覆盖项，优先读取。
+- `TRACEPARENT` —— 标准 W3C 变量，覆盖项缺失、为空或无法解析时使用。
+
+注入是启动方的责任：OpenTelemetry 只在进程内 carrier 中保存 active
+span，不会导出到子进程，因此需要关联能力的宿主或 Adapter 必须
+在启动 Tokenless 前写入其中一个。没有可用上下文时记录结构不变，
+且该标识只写入 SLS JSONL，不会写入本地 `stats.db`。详见
+[Tokenless 效果度量](../../docs/user-guide/zh/token-saving/tokenless/measuring-savings.md)
+与
+[配置与数据隐私](../../docs/user-guide/zh/token-saving/tokenless/configuration-and-privacy.md)。
+
 ## 数据库位置
 
 Tokenless 默认将统计数据和可逆压缩数据分别存储在
@@ -559,7 +590,7 @@ tokenless env-check --tool Shell --fix
 - `crates/tokenless-ccr/` — 可逆压缩缓存（Compress-Cache-Retrieve）
 - `crates/tokenless-runtime/` — 生命周期 API 与 Runtime 内部的 `PostToolPipeline`
 - `crates/tokenless-protocol/` — 版本化 Adapter 契约与共享 `heuristic-v1` Token Estimator
-- `crates/tokenless-compressors/` — 已接入 PostTool 的 `JsonCompressor` 与 `BuildLogCompressor`
+- `crates/tokenless-compressors/` — 已接入 PostTool 的 `JsonCompressor`、`TabularCompressor` 与 `BuildLogCompressor`
 - `crates/tokenless-cli/` — CLI 二进制
 - `python/tokenless/` — 面向 CPython 3.11+ 的 PyO3 `anolisa_tokenless` 包
 - `python/agentscope/` — 独立的 AgentScope 框架集成与 Wheel 元数据

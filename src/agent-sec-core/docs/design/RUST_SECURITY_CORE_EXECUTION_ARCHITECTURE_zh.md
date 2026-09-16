@@ -307,7 +307,12 @@ Running  -> Completed | ProductFailed | CoreFailed | CallerDetached
 ```
 
 `CallerDetached` 只描述调用方不再等待，不能直接作为 backend 的最终执行结果。如果 work
-可能继续，supervisor 仍拥有它，并在真正完成后进入 `Finalizing`。
+可能继续且 daemon 仍在运行，supervisor 仍拥有它，并在真正完成后进入 `Finalizing`。
+
+SIGTERM/SIGINT 不是 `CallerDetached`：按 V1 兼容的 bounded drain，daemon 停止接收后只在
+配置的 drain deadline 内等待；deadline 后仍未完成的 task 可以被 abort，因而不保证产生
+最终 SecurityEvent。该进程退出边界由
+[`DAEMON_PROCESS_DEPLOYMENT_CONTRACT_zh.md`](DAEMON_PROCESS_DEPLOYMENT_CONTRACT_zh.md) 定义。
 
 ### 5.2 唯一 finalizer
 
@@ -334,8 +339,9 @@ route 失败是否产生 SecurityEvent 继续保持当前规则：未知 action 
 ### 5.3 invocation ownership
 
 daemon 中 accepted invocation 应由 supervisor 拥有，而不是由 socket handler future 的生存期
-隐式拥有。这样客户端 EOF、response timeout 或 task cancellation 不会让正在执行的 backend
-和最终 audit 无主。
+隐式拥有。这样**daemon 仍在运行期间**的客户端 EOF、response timeout 或 task cancellation
+不会让正在执行的 backend 和最终 audit 无主。该保证不跨越 V1 兼容的 bounded shutdown：drain
+截止后，尚未完成的 task 可以被 abort，最终 audit 是 best-effort 而非持久化交付保证。
 
 是否允许调用方 timeout 后 operation 继续、是否提供 status recovery、以及哪些 action 可以
 协作取消，必须由 `ActionSpec`/daemon `MethodSpec` 逐 action 冻结。没有 operation status 的
@@ -551,8 +557,9 @@ Tokio [`spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocki
 - 已开始的 blocking work 只能通过 backend 自己的 cooperative cancellation、外部进程终止
   或等待完成处理；
 - response timeout 后不能声称副作用未发生；
-- supervisor 必须保留 operation ownership 和最终 audit；
-- shutdown 要区分停止接收、等待 cooperative task、处理不可中断 work 和最终超时。
+- daemon 仍在运行时 supervisor 必须保留 operation ownership 和最终 audit；
+- shutdown 要区分停止接收、等待 cooperative task、处理不可中断 work 和最终超时；V1 兼容的
+  bounded drain 截止后允许 abort，不能承诺该边界外仍有最终 audit。
 
 这也是不建议直接把通用 Tower timeout 包在整个 core lifecycle 外的原因：Tower
 [`Service`](https://docs.rs/tower/latest/tower/trait.Service.html) 的 response future 被丢弃不
@@ -561,9 +568,9 @@ Tokio [`spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocki
 
 ## 10. Adapter 边界
 
-### 10.1 asc-cli 与 protocol client
+### 10.1 agent-sec-cli 与 protocol client
 
-asc-cli 是 Rust daemon client，只负责：
+agent-sec-cli 是 Rust daemon client，只负责：
 
 1. 解析 CLI 参数和终端输入；
 2. 构造版本化 RPC request 和 trace carrier；
@@ -571,10 +578,10 @@ asc-cli 是 Rust daemon client，只负责：
 4. 把 response 映射为 supported CLI 输出和 exit code；
 5. 在 daemon unavailable/version mismatch 时返回稳定错误。
 
-asc-cli 不构造 Principal、不直读 SQLite、不启动 daemon、不安装 event writer，也不通过
+agent-sec-cli 不构造 Principal、不直读 SQLite、不启动 daemon、不安装 event writer，也不通过
 PyO3、Python backend 或另一套 local executor 执行业务 action。
 
-### 10.2 asc-daemon adapter
+### 10.2 asc-daemon-handler inbound adapter
 
 daemon handler：
 
@@ -599,6 +606,9 @@ module/crate 边界必须落在仓库迁移总计划定义的目标 workspace �
 ```text
 apps/asc-daemon/                         # process/composition root
 apps/asc-cli/                            # daemon client
+crates/daemon/asc-daemon-protocol/       # versioned wire contracts
+crates/daemon/asc-daemon-service/        # protocol-independent UDS transport
+crates/daemon/asc-daemon-handler/        # inbound protocol/application adapter
 crates/daemon/asc-daemon-core/           # application use cases
 crates/action/asc-action-types/          # ActionId/request/result
 crates/action/asc-evidence-types/        # Evidence/Attribute contracts
@@ -676,7 +686,7 @@ daemon handler 只接已冻结的 ActionSpec/MethodSpec，并验证 timeout、di
 | RSCE-013 | transport/binding、action schema 和 domain validation 的责任及 error layer 与 oracle 一致 |
 | RSCE-014 | V2 只接受标准 `traceparent/tracestate`；不存在 AgentSec 自定义 trace ID 生成、fallback 或解析路径 |
 | RSCE-015 | daemon request、security invocation 和 capability span 都有有效 OTel TraceId/SpanId，父子关系可验证 |
-| RSCE-020 | asc-cli 不执行 local fallback、不直读 SQLite、不构造自报 Principal；daemon unavailable 返回稳定错误 |
+| RSCE-020 | agent-sec-cli 不执行 local fallback、不直读 SQLite、不构造自报 Principal；daemon unavailable 返回稳定错误 |
 | RSCE-021 | Action Slice 在 system daemon 上以两个 UID 验证 owner isolation 和服务端 QueryScope |
 | RSCE-016 | session/run/call/tool-call/action/backend/policy/verdict 只作为有界 AgentSec semantic attributes，不替代 OTel identity |
 | RSCE-017 | sampling、无 exporter、Collector/export failure 不改变 ActionResult，且每次已路由 invocation 的 SecurityEvent 仍按契约尝试落盘 |

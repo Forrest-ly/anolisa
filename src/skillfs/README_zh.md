@@ -123,6 +123,13 @@ cargo run -p skillfs -- mount /path/to/skills /path/to/mountpoint --managed
 cargo run -p skillfs -- stop /path/to/mountpoint
 ```
 
+### 挂载配置
+
+使用 `skillfs mount --config /path/to/skillfs-mount.toml`，通过 `mountpoint` 和
+有序 `sources` 数组聚合目录。同名 skill 整体选用较早的来源，多源挂载只读。
+路径必须为绝对路径。TOML 示例、支持的参数和 OpenClaw 接入限制见
+[配置参考](../../docs/user-guide/zh/runtime/skillfs.md#挂载配置)。
+
 ### Managed Mount 模式
 
 默认 `mount`（包括 `--foreground`）保持原有前台行为：进程阻塞，
@@ -384,6 +391,16 @@ scripts/          build.sh、test.sh 与可选 POSIX harness
 
 SkillFS 可以通过特权 Sidecar 向非特权工作负载提供 FUSE view。部署需要
 Kubernetes 1.29+、`/dev/fuse`，并允许 Sidecar 使用特权模式。
+
+Sidecar supervisor 检测 FUSE 读取失败，并在容器内重新挂载。可通过
+`SKILLFS_SUPERVISOR_*` 配置恢复预算；默认值和恢复边界见下方 Sidecar 用户指南。
+
+对于只读安装的 Skill，指南还提供 Ledger 部署示例，将初始内容复制到私有可写
+源目录，在挂载前扫描，并对 Cosh 隔离安装包原始目录。缺失或无效的 activation
+仍保持隐藏。
+该示例通过 `skillfs mount --read-only` 在内核边界拒绝 FUSE 写入，Ledger 仍可写入
+独立的私有源目录。
+Ledger RPC 探针控制启动与就绪状态，并在 daemon 无响应时触发重启。
 
 ```bash
 cd src/skillfs

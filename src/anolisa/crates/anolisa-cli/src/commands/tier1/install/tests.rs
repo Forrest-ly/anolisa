@@ -65,6 +65,37 @@ pub fn handle_with_fake_rpm(args: InstallArgs, ctx: &CliContext) -> Result<(), C
     handle_one_with_query(component, args, ctx, &FakeQuery::default()).map(|_| ())
 }
 
+pub fn handle_with_effects(
+    args: InstallArgs,
+    ctx: &CliContext,
+    effects: RawEffectFactories<'_>,
+) -> Result<Vec<String>, CliError> {
+    let component = args.component.as_deref().expect("single-component test");
+    let mut reporter = crate::progress::Activity::start(
+        crate::progress::feedback_for_stderr(ctx.json, ctx.quiet),
+        "test install",
+    );
+    let outcome = application::run_with_dependencies(
+        application::InstallRequest {
+            component,
+            args: &args,
+            intent: execution_intent(ctx),
+        },
+        ctx,
+        &anolisa_env::EnvService::detect(),
+        &RpmdbProbe::absent(),
+        &FakeQuery::default(),
+        &NoTxn,
+        false,
+        &Default::default(),
+        &mut reporter,
+        effects,
+    )?;
+    let warnings = outcome.warnings().to_vec();
+    render_outcome(ctx, outcome)?;
+    Ok(warnings)
+}
+
 pub fn toml_string_array(values: &[&str]) -> String {
     let quoted: Vec<String> = values.iter().map(|value| format!("\"{value}\"")).collect();
     format!("[{}]", quoted.join(", "))
@@ -117,6 +148,22 @@ pub fn build_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
     }
     let enc = tar.into_inner().expect("finish tar");
     enc.finish().expect("finish gzip")
+}
+
+/// Replace the single artifact in a local fixture and keep its digest authoritative.
+pub fn replace_repo_artifact(root: &Path, component: &str, artifact: &[u8]) {
+    let artifact_path = root.join("v1").join(format!("{component}.tar.gz"));
+    let old = std::fs::read(&artifact_path).expect("old artifact");
+    let index_path = root.join("v1/index.toml");
+    let index = std::fs::read_to_string(&index_path).expect("index");
+    let old_digest = format!("{:x}", Sha256::digest(old));
+    assert!(index.contains(&old_digest));
+    std::fs::write(artifact_path, artifact).expect("artifact");
+    std::fs::write(
+        index_path,
+        index.replace(&old_digest, &format!("{:x}", Sha256::digest(artifact))),
+    )
+    .expect("index digest");
 }
 
 pub fn build_component_artifact(component: &str, version: &str, modes: &[&str]) -> Vec<u8> {
@@ -694,6 +741,10 @@ sha256 = "{sha}"
 pub struct NoTxn;
 
 impl PackageTransaction for NoTxn {
+    fn check_install(&self, _packages: &[&str]) -> Result<(), PackageTransactionError> {
+        Ok(())
+    }
+
     fn install(&self, _packages: &[&str]) -> Result<(), PackageTransactionError> {
         panic!("adopt-path test reached a delegated dnf install");
     }
@@ -760,6 +811,8 @@ pub struct FakeInstaller {
     pub available: Vec<PackageInfo>,
     /// `false` makes the dnf install transaction fail.
     pub install_succeeds: bool,
+    pub preflight_failure_on_call: Option<usize>,
+    pub preflight_calls: Cell<usize>,
     pub installed: RefCell<Option<PackageInfo>>,
     pub install_calls: Cell<usize>,
     /// Package spec(s) each `install` call received, joined per call, so tests
@@ -795,6 +848,8 @@ impl FakeInstaller {
             origin: None,
             available: Vec::new(),
             install_succeeds: true,
+            preflight_failure_on_call: None,
+            preflight_calls: Cell::new(0),
             installed: RefCell::new(None),
             install_calls: Cell::new(0),
             install_specs: RefCell::new(Vec::new()),
@@ -988,6 +1043,23 @@ impl PackageQuery for FakeInstaller {
 }
 
 impl PackageTransaction for FakeInstaller {
+    fn check_install(&self, packages: &[&str]) -> Result<(), PackageTransactionError> {
+        self.preflight_calls.set(self.preflight_calls.get() + 1);
+        assert_eq!(
+            packages,
+            &[self.expected_install.as_deref().unwrap_or(&self.package)]
+        );
+        if self.preflight_failure_on_call == Some(self.preflight_calls.get()) {
+            return Err(PackageTransactionError::TransactionFailed {
+                command: "dnf".to_string(),
+                operation: "install preflight".to_string(),
+                code: Some(1),
+                stderr: "installed cosh-ng conflicts with copilot-shell".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn install(&self, packages: &[&str]) -> Result<(), PackageTransactionError> {
         self.install_calls.set(self.install_calls.get() + 1);
         self.install_specs.borrow_mut().push(packages.join(","));

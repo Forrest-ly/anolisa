@@ -503,13 +503,13 @@ pub(super) fn basename(program: &str) -> &str {
         .unwrap_or(program)
 }
 
-/// Post-processing for assessments whose command carried stripped
-/// null-suppression redirections (issue #1667): append the informational
-/// reason and keep the execution boundary unchanged. Risk itself is fully
-/// decided by the shape/segment assessment paths.
+/// Retains a stderr-only argv grant; other output suppression needs approval.
 pub(super) fn apply_null_redirection_policy(result: &mut CommandAssessment) {
     result.reasons.push("output-suppressed");
     result.reasons = dedupe_reasons(std::mem::take(&mut result.reasons));
+    if result.auto_allow == Some(AutoAllowEvidence::StderrSuppressedReadonly) {
+        return;
+    }
     if result.execution == ExecutionDecision::AutoAllow {
         result.execution = ExecutionDecision::AskUser;
     }

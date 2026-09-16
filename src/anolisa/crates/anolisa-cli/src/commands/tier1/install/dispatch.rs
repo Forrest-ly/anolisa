@@ -58,13 +58,14 @@ use super::application::{
     ApplicationFailure, InstallApplicationOutcome, InstallChange, InstallSubject,
 };
 use super::owned_ops::{
-    RawInstallOps, ValidatedInstall, installed_version_label, validate_component_conflict,
-    validate_owned_install,
+    RawEffectFactories, RawInstallOps, ValidatedInstall, installed_version_label,
+    validate_component_conflict, validate_owned_install,
 };
 use super::raw::{load_dry_run_install_contract, resolve_raw};
 use super::render::repo_config_err;
 use super::rpm::{
-    PinError, RpmTarget, resolve_pinned_candidate, rpm_package_candidates_with_index,
+    PinError, RpmTarget, check_rpm_install, resolve_pinned_candidate,
+    rpm_package_candidates_with_index,
 };
 use super::types::{RawRepositoryOrigin, RawResolution, ResolveInputs};
 use super::{ANOLISA_RPM_REPO_ID, COMMAND, InstallArgs};
@@ -604,6 +605,18 @@ pub(crate) fn plan_component(
         }
     };
 
+    if let ProviderTarget::Delegated {
+        package, artifact, ..
+    } = &request.target
+        && matches!(route, PlannedRoute::Delegated { .. })
+    {
+        check_rpm_install(
+            &provider,
+            &[artifact.as_deref().unwrap_or(package)],
+            &command,
+        )?;
+    }
+
     Ok(PlannedComponent {
         command,
         component,
@@ -633,6 +646,7 @@ pub(super) fn execute_planned(
     is_root: bool,
     planned_components: &HashSet<String>,
     reporter: &mut dyn ProgressReporter,
+    effects: RawEffectFactories<'_>,
 ) -> Result<InstallApplicationOutcome, ApplicationFailure> {
     let PlannedComponent {
         command,
@@ -793,6 +807,7 @@ pub(super) fn execute_planned(
                 native_package: native_package.as_deref(),
                 degraded_rpmdb: (!missing_rpm_tooling_is_fatal(env, rpmdb)).then_some(rpmdb),
             },
+            effects,
         );
     }
 
@@ -818,6 +833,7 @@ pub(super) fn execute_planned(
             index_base_override: index_base_override.as_deref(),
             is_root,
         },
+        effects,
     )
 }
 
@@ -1249,6 +1265,7 @@ fn install_applied(
     command: &str,
     reporter: &mut dyn ProgressReporter,
     apply: InstallApply<'_>,
+    effects: RawEffectFactories<'_>,
 ) -> Result<InstallApplicationOutcome, ApplicationFailure> {
     if let InstallApply::Delegated {
         repo_config,
@@ -1300,6 +1317,13 @@ fn install_applied(
         command,
     )?;
 
+    if let ProviderTarget::Delegated {
+        package, artifact, ..
+    } = &request.target
+    {
+        check_rpm_install(provider, &[artifact.as_deref().unwrap_or(package)], command)?;
+    }
+
     let evidence = JournalEvidence::new(journal_dir, &store.operations);
     let mut journal_gate = LockedJournalGate::load(&lock, evidence, command)?;
     let mut journal = journal_gate.begin(COMMAND, target, state_path.to_path_buf(), command)?;
@@ -1317,6 +1341,7 @@ fn install_applied(
             let (result, retained_note) = {
                 let mut ops = RawInstallOps::new(
                     ctx,
+                    effects,
                     layout,
                     target.to_string(),
                     scope,
@@ -2146,6 +2171,7 @@ mod tests {
             true,
             &HashSet::new(),
             &mut reporter,
+            crate::test_support::raw_effects(),
         )
         .expect("delegated install");
 

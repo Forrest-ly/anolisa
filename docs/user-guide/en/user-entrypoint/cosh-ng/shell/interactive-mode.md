@@ -22,6 +22,18 @@ Integration is selected at startup. Enhanced is the default. Set
 `shell.integration = "native"` in the user config for persistent hook-free
 sessions, or use the environment variable for one launch.
 
+For command or redirected-stdin execution, place `--isolated` before shell-owned
+options: `cosh --isolated -c '<command>'`. Bash skips startup files and removes
+`BASH_ENV` and `ENV` from its environment. Bash login invocations (`--login`,
+`-l`/`+l`, combined forms such as `-lc`, or login argv[0] such as `-cosh`) are
+rejected before shell startup with status 2: Bash cannot disable `.bash_logout`
+independently. Use a non-login invocation for isolated commands. Command and
+script arguments that happen to contain login flags are preserved.
+
+On this exec path, isolated Zsh accepts no shell-owned arguments; otherwise
+Cosh returns status 2 before starting Zsh. Interactive TUI startup continues
+to use its existing isolation handling.
+
 ## Input and editing
 
 - Native integration sends every input byte to the foreground bash or zsh.
@@ -63,6 +75,27 @@ Run `/agent` when the configured runtime is cosh-core. The Agent Composer opens
 as a multiline editor without changing how later shell input is routed. Enter
 sends the request, `Shift+Enter` adds a line, and `Esc` cancels it and restores
 the shell prompt.
+
+Type `/` as the first token to browse public slash commands. Continue typing to
+filter by prefix (`/ho` suggests `/hooks`); Up/Down selects a candidate and
+scrolls through the six-row list. Tab replaces the command token and adds a
+space for arguments. When a single-line draft contains only the command token,
+Enter accepts and executes the selected candidate (the first candidate by
+default). Drafts with arguments or multiple lines are submitted as written.
+Esc cancels the Composer, including when the list is open.
+Slash commands use the same local command handlers and confirmation cards as
+at the shell prompt. A command submission ends the Composer: its interactive
+card takes over input, or the shell prompt returns when the command finishes.
+Unknown command names display a local error instead of starting an Agent turn.
+
+`/skill:<name>` still selects a Skill for an Agent request; `/skills` manages
+Skills. Existing absolute paths such as `/tmp` and `/etc`, and paths containing
+another slash such as `/tmp/file`, remain Agent text. Bare `/` opens the command
+menu; exact registered command names take precedence over same-named paths.
+Prefix a request with `??` to discuss a slash command literally,
+for example `?? /help explain this command`. Commands in later tokens do not
+activate the menu. Tabs and newlines inside bracketed paste remain text.
+Ordinary shell prompts retain their native path completion.
 
 The first token may select one Skill, and any later whitespace-separated token
 that starts with `@` requests a file or directory from the current workspace:

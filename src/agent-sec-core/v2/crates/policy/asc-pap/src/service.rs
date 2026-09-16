@@ -6,10 +6,8 @@ use asc_policy_types::authoring::{PolicyTemplate, TemplateEnvelope};
 use asc_policy_types::binding::{BindingStatus, BindingView, PreparedBinding};
 use asc_policy_types::error::ValidationError;
 use asc_policy_types::identifiers::PolicyId;
-use asc_policy_types::policy::PreparedPolicy;
-use asc_policy_types::scope::{PreparedScope, ScopeSelector, ScopeTemplate};
-use serde::Serialize;
-use sha2::{Digest as _, Sha256};
+use asc_policy_types::policy::{PreparedPolicy, validate_policy_name};
+use asc_policy_types::scope::{PreparedScope, ScopeSelector};
 use uuid::Uuid;
 
 use crate::compiler::PolicyCompiler;
@@ -30,6 +28,7 @@ enum WriteTarget<'a> {
 pub struct PapService<R, C> {
     repository: Arc<R>,
     compiler: Arc<C>,
+    enqueuer: Option<Arc<dyn crate::BindingReconcileEnqueuer>>,
 }
 
 impl<R, C> Clone for PapService<R, C> {
@@ -37,6 +36,7 @@ impl<R, C> Clone for PapService<R, C> {
         Self {
             repository: Arc::clone(&self.repository),
             compiler: Arc::clone(&self.compiler),
+            enqueuer: self.enqueuer.clone(),
         }
     }
 }
@@ -51,7 +51,66 @@ where
         Self {
             repository,
             compiler,
+            enqueuer: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_reconcile_enqueuer(
+        mut self,
+        enqueuer: Arc<dyn crate::BindingReconcileEnqueuer>,
+    ) -> Self {
+        self.enqueuer = Some(enqueuer);
+        self
+    }
+    fn check_ready(&self) -> Result<(), PapError> {
+        self.enqueuer.as_ref().map_or(Ok(()), |e| e.check_ready())
+    }
+    fn notify(&self, mut binding: BindingView) -> Result<BindingView, PapError> {
+        let Some(enqueuer) = &self.enqueuer else {
+            return Ok(binding);
+        };
+        // Terminal/running no-ops need no admission and must never be failed.
+        if !matches!(
+            binding.status.phase,
+            BindingStatus::PendingApply | BindingStatus::PendingDelete
+        ) {
+            return Ok(binding);
+        }
+        let Err(reason) = enqueuer.enqueue(&binding.spec.binding_id) else {
+            return Ok(binding);
+        };
+        match self.repository.fail_pending_binding(&binding, reason) {
+            Ok(true) => {
+                // Return the snapshot confirmed by the conditional write, without
+                // a second read that could observe a newer request or fail.
+                binding.status.phase = match binding.status.phase {
+                    BindingStatus::PendingApply => BindingStatus::ApplyFailed,
+                    BindingStatus::PendingDelete => BindingStatus::DeleteFailed,
+                    _ => unreachable!("only pending requests notify"),
+                };
+                binding.status.error = Some(reason.failure());
+                return Ok(binding);
+            }
+            Ok(false) => match self.repository.get_binding(&binding.spec.binding_id) {
+                Ok(current)
+                    if current.spec.binding_revision != binding.spec.binding_revision
+                        || current.status != binding.status =>
+                {
+                    return Ok(current);
+                }
+                Err(PapError::NotFound) => return Err(PapError::NotFound),
+                // Do not retry an old rejection against a fresh pending request.
+                // A failed reread also cannot confirm termination.
+                _ => {}
+            },
+            Err(_) => {}
+        }
+        Err(PapError::SchedulingRejected {
+            id: binding.spec.binding_id,
+            revision: binding.spec.binding_revision,
+            reason,
+        })
     }
 
     /// Creates one Policy identity from an authored template.
@@ -90,7 +149,8 @@ where
         policy_name: &str,
         template: &PolicyTemplate,
     ) -> Result<PreparedPolicy, PapError> {
-        validate_policy_name(policy_name)?;
+        validate_policy_name(policy_name)
+            .map_err(|message| PapError::InvalidPolicyName(message.to_owned()))?;
         let (update_existing, mut selected_id) = match target {
             WriteTarget::Create => (false, generated_resource_id()?),
             WriteTarget::Update(id) => (true, id.clone()),
@@ -191,10 +251,7 @@ where
         target: WriteTarget<'_>,
         selector: &ScopeSelector,
     ) -> Result<PreparedScope, PapError> {
-        validate_authored_selector(selector)?;
-        let template = ScopeTemplate::execution_domain_default();
-        template.validate().map_err(PapError::InvalidScope)?;
-        let template_digest = json_digest(&(selector, &template))?;
+        selector.validate().map_err(PapError::InvalidScope)?;
         let (update_existing, mut selected_id) = match target {
             WriteTarget::Create => (false, generated_resource_id()?),
             WriteTarget::Update(id) => (true, id.clone()),
@@ -211,7 +268,6 @@ where
             }
             if let Some(current) = state.as_ref().and_then(|value| value.current.as_ref())
                 && &current.selector == selector
-                && current.template == template
             {
                 return Ok(current.clone());
             }
@@ -222,10 +278,9 @@ where
                 scope_id: selected_id.clone(),
                 revision,
                 selector: selector.clone(),
-                template: template.clone(),
-                template_digest: template_digest.clone(),
             };
-            candidate.validate().map_err(PapError::InvalidScope)?;
+            // The selector was validated before any repository access; the
+            // remaining fields are already validated identifier/revision types.
             match self.repository.put_scope(&candidate) {
                 Err(PapError::Conflict) => {
                     if !update_existing {
@@ -298,11 +353,11 @@ where
     ///
     /// Policy and Scope references are resolved to complete immutable snapshots.
     /// An identical spec is idempotent while Apply is pending, running, or
-    /// complete. Every other accepted Apply intent receives the next
-    /// never-reused revision and atomically replaces the current Binding record.
-    /// Changed desired state is rejected while Apply or Delete is running.
-    /// This PAP-only phase leaves accepted work in `PENDING_APPLY` and does not
-    /// translate or dispatch the Binding.
+    /// complete. Same-spec retry after `ApplyFailed` keeps the revision and target
+    /// responsibility; only changed specs receive the next revision. Changed specs are
+    /// rejected while Applying, and every UPDATE is rejected after Delete intent.
+    /// Admission returns `PENDING_APPLY` and notifies the configured runtime;
+    /// translation and target I/O execute outside the request.
     ///
     /// # Errors
     /// Returns not-found, validation, operation-in-progress, conflict, revision,
@@ -332,6 +387,7 @@ where
         scope_id: &ResourceId,
         scope_revision: Revision,
     ) -> Result<BindingView, PapError> {
+        self.check_ready()?;
         let (update_existing, mut selected_id) = match target {
             WriteTarget::Create => (false, generated_resource_id()?),
             WriteTarget::Update(id) => (true, id.clone()),
@@ -349,7 +405,13 @@ where
                 Err(error) => return Err(error),
             };
             if let Some(current) = current.as_ref() {
-                if current.status == BindingStatus::Deleting {
+                if matches!(
+                    current.status.phase,
+                    BindingStatus::PendingDelete
+                        | BindingStatus::Deleting
+                        | BindingStatus::DeleteFailed
+                        | BindingStatus::Deleted
+                ) {
                     return Err(PapError::OperationInProgress);
                 }
                 if current.status == BindingStatus::Applying {
@@ -358,7 +420,7 @@ where
                         && current.spec.scope.scope_id == *scope_id
                         && current.spec.scope.revision == scope_revision;
                     return if identical_reference {
-                        Ok(current.clone())
+                        self.notify(current.clone())
                     } else {
                         Err(PapError::OperationInProgress)
                     };
@@ -376,13 +438,17 @@ where
                         .request_apply()
                         .map_err(|_| PapError::OperationInProgress)?;
                     if next_status == current.status {
-                        return Ok(current.clone());
+                        return self.notify(current.clone());
                     }
                 }
             }
 
-            let revision =
-                next_revision(current.as_ref().map(|value| value.spec.binding_revision))?;
+            let revision = match current.as_ref() {
+                Some(current) if current.spec.policy == policy && current.spec.scope == scope => {
+                    current.spec.binding_revision
+                }
+                _ => next_revision(current.as_ref().map(|value| value.spec.binding_revision))?,
+            };
             let spec = PreparedBinding {
                 binding_id: selected_id.clone(),
                 binding_revision: revision,
@@ -392,16 +458,15 @@ where
             let initial_status = BindingStatus::PendingApply;
             let binding = binding_view(spec, initial_status)?;
 
-            // TODO(policy-reconciliation): atomically persist a durable reconcile intent with this
-            // current Binding replacement before any Adapter worker is introduced. No outbox or
-            // dispatch is intentionally performed here.
-            match self.repository.update_binding(&binding) {
+            // The conditional write saves pending intent and clears its previous error.
+            // Notify only after this write succeeds; rejection is terminalized conditionally by PAP.
+            match self.repository.update_binding(current.as_ref(), &binding) {
                 Err(PapError::Conflict) => {
                     if !update_existing {
                         selected_id = generated_resource_id()?;
                     }
                 }
-                result => return result,
+                result => return result.and_then(|binding| self.notify(binding)),
             }
         }
         Err(PapError::Conflict)
@@ -421,7 +486,7 @@ where
                         && binding.spec.policy.revision == policy_revision
                 })
                 .map(|binding| binding.spec.policy.clone())
-                .ok_or(PapError::NotFound),
+                .ok_or(PapError::ReferencedPolicyRevisionNotFound),
             Err(error) => Err(error),
         }
     }
@@ -440,7 +505,7 @@ where
                         && binding.spec.scope.revision == scope_revision
                 })
                 .map(|binding| binding.spec.scope.clone())
-                .ok_or(PapError::NotFound),
+                .ok_or(PapError::ReferencedScopeRevisionNotFound),
             Err(error) => Err(error),
         }
     }
@@ -462,35 +527,28 @@ where
         self.repository.list_bindings(limit, offset)
     }
 
-    /// Accepts Delete intent as a new Binding revision.
-    ///
-    /// The status enters `PENDING_DELETE`; repeated deletion is idempotent while
-    /// pending, running, or complete. Any other accepted Delete intent allocates
-    /// the next revision and atomically replaces the current Binding record.
-    /// Delete cannot interrupt a running Apply. The complete current spec remains
-    /// available for target-side detach.
+    /// Accepts irreversible Delete intent at the current spec/revision.
+    /// Pending/running deletion is idempotent. `DeleteFailed` retries with a fresh
+    /// retry budget. Spec and target records remain until the reconciler confirms
+    /// every target absent and physically removes the aggregate. This returns the
+    /// accepted `PENDING_DELETE` view without waiting for remote cleanup.
     ///
     /// # Errors
-    /// Returns not-found, operation-in-progress, conflict, validation, revision,
-    /// or persistence errors.
+    /// Returns not-found, conflict or persistence errors.
     pub fn delete_binding(&self, id: &ResourceId) -> Result<BindingView, PapError> {
+        self.check_ready()?;
         for _ in 0..MAX_WRITE_ATTEMPTS {
             let current = self.repository.get_binding(id)?;
-            let next_status = current
-                .status
-                .request_delete()
-                .map_err(|_| PapError::OperationInProgress)?;
+            let next_status = current.status.request_delete();
             if next_status == current.status {
-                return Ok(current);
+                return self.notify(current);
             }
-            let mut spec = current.spec;
-            spec.binding_revision = next_revision(Some(spec.binding_revision))?;
-            let binding = binding_view(spec, next_status)?;
+            let binding = binding_view(current.spec.clone(), next_status)?;
 
-            // TODO(policy-reconciliation): persist a durable Detach intent in the same
-            // transaction as this current Binding replacement.
-            match self.repository.update_binding(&binding) {
-                Ok(binding) => return Ok(binding),
+            // Preserve cleanup responsibility while atomically admitting Delete.
+            // The daemon will notify its worker only after this write commits.
+            match self.repository.update_binding(Some(&current), &binding) {
+                Ok(binding) => return self.notify(binding),
                 Err(PapError::Conflict) => {}
                 Err(error) => return Err(error),
             }
@@ -530,52 +588,25 @@ where
         canonical_policy
             .validate()
             .map_err(PapError::InvalidPolicy)?;
-        let candidate = PreparedPolicy {
+        // Name was checked at admission; the checks above validate every
+        // remaining PreparedPolicy invariant with PAP's compiler error paths.
+        Ok(PreparedPolicy {
             policy_id: policy_id.clone(),
             policy_name: policy_name.to_owned(),
             revision,
             template: template.clone(),
             canonical_policy,
-            template_digest: json_digest(template)?,
-        };
-        candidate.validate().map_err(PapError::InvalidPolicy)?;
-        Ok(candidate)
+        })
     }
 }
 
 fn binding_view(spec: PreparedBinding, status: BindingStatus) -> Result<BindingView, PapError> {
-    let view = BindingView { spec, status };
+    let view = BindingView {
+        spec,
+        status: status.into(),
+    };
     view.validate().map_err(PapError::InvalidBinding)?;
     Ok(view)
-}
-
-fn validate_policy_name(value: &str) -> Result<(), PapError> {
-    if value.trim().is_empty() {
-        return Err(PapError::InvalidPolicyName(
-            "must contain a visible character".to_owned(),
-        ));
-    }
-    if value.len() > 256 {
-        return Err(PapError::InvalidPolicyName(
-            "must not exceed 256 bytes".to_owned(),
-        ));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(PapError::InvalidPolicyName(
-            "must not contain control characters".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_authored_selector(selector: &ScopeSelector) -> Result<(), PapError> {
-    if matches!(selector, ScopeSelector::LegacyExecutionDomain { .. }) {
-        return Err(PapError::InvalidScope(ValidationError::new(
-            "selector.kind",
-            "legacy execution-domain selectors cannot be authored",
-        )));
-    }
-    selector.validate().map_err(PapError::InvalidScope)
 }
 
 fn validate_limit(limit: u32) -> Result<(), PapError> {
@@ -598,9 +629,4 @@ fn next_revision(current: Option<Revision>) -> Result<Revision, PapError> {
 fn generated_resource_id() -> Result<ResourceId, PapError> {
     ResourceId::new(Uuid::new_v4().to_string())
         .map_err(|error| PapError::InvalidIdentifier(error.to_string()))
-}
-
-fn json_digest<T: Serialize>(value: &T) -> Result<String, PapError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| PapError::Serialization)?;
-    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }

@@ -45,7 +45,11 @@ Trae 当前使用下文说明的随附生命周期脚本，本版本尚未把它
 |------|--------------------|
 | JSON | 无损结构清理；文本替换槽还会考虑 TOON |
 | 需要 Record Reduction 或字符串、数组、深度截断的 JSON | 仅在 Marker 命令恢复可用时应用；否则以 `recoverability_unavailable` 拒绝候选 |
-| 构建/测试/包管理日志、长纯文本、Diff、Stack Trace、HTML、搜索结果、表格、源码、Unknown | 对应领域 Compressor 接入前原样透传 |
+| 来自命令输出的构建/测试/包管理日志 | 终端输出清理与常规进度缩减；每段省略都带有就地取回标记 |
+| 宿主支持文本替换时的 CSV/TSV 表格 | 整表压紧；数据行超过 32 行的表格在 Stash 支持的恢复可用时可做行缩减 |
+| 路径共享开启且宿主支持文本替换时的 API 搜索结果列表 | 无损搜索路径共享；保留全部已收到命中 |
+| 显式开启 `TOKENLESS_DIFF_COMPRESSION_ENABLED`（默认关闭）且宿主支持文本替换时，来自命令输出的 Git Diff | 按 Hunk 选择裁剪未变更上下文；保留全部变更行，完整原文经 Stash 可取回，收益过小的候选会被拒绝 |
+| 长纯文本、Stack Trace、HTML、源码、Unknown | 对应领域 Compressor 接入前原样透传 |
 
 内容检测、PostTool 200 字符门禁、基于工具来源的阈值、诊断、TOON 选择和最终接受均属于
 Core 策略。Hook 只把宿主对象映射为 v2 字段；它可以跳过明显不是 JSON 的 Skill 文件，避免
@@ -140,6 +144,8 @@ Core 决定。即使压缩关闭，DSH 原始失败和结构化命令失败仍�
 后续 Waterfall Listener 替换 Canonical `value` 后，Tokenless 只检查该替换值，且不会对其
 应用内容压缩。
 
+完整触发条件（压缩开关、最小响应长度、受支持的压缩域、严格变小保护）与阈值含义见[用户手册 · 压缩的触发条件与阈值](user-manual.md#压缩的触发条件与阈值)。
+
 ## 通过 anolisa 管理（推荐）
 
 这些命令需要 ANOLISA 组件记录。如果 Tokenless 是通过 YUM 直接安装的，
@@ -193,6 +199,13 @@ anolisa adapter enable tokenless dsh \
 DeepSeek Harness 按 profile 管理，因此必须至少提供一个 `--profile`。每个名称应与
 `dsh --profile <profile>` 使用的名称一致，不带 profile 的通用命令会被拒绝。
 后续 enable 或 re-enable 必须再次列出需要保留的全部 profile。
+
+执行 OpenClaw adapter enable 或 tokenless 的 OpenClaw `install.sh` 即同意
+插件声明的能力。两个入口仅在 `plugins install --help` 列出完整的
+`--accept-capabilities` 参数时传递它，以兼容旧版宿主。独立的 `install.sh`
+也只在安装器仍声明该参数有效时传递 `--dangerously-force-unsafe-install`；
+将其列为 deprecated no-op 的宿主（OpenClaw 2026.6.5+）不再收到该参数，
+安全扫描改由 `security.installPolicy` 决定。
 
 对于 OpenClaw，anolisa 会先尝试普通安装，默认不会加入 unsafe-install 覆盖参数。如果 OpenClaw 的安全扫描拒绝此 Plugin，应先阅读其报告；确认接受风险后，才显式重试：
 
@@ -257,7 +270,7 @@ bash ~/.local/share/anolisa/adapters/tokenless/<framework>/scripts/uninstall.sh
 
 脚本会调用框架自身的 Plugin/Extension 机制；按照脚本输出完成重启。安装脚本缺失、失败或框架版本不兼容时，优先改用 anolisa 管理的安装方式。
 
-OpenClaw 安装脚本会带 `--dangerously-force-unsafe-install` 调用 `plugins install`，因为 Plugin 通过 Node.js 子进程 API 启动 `tokenless` 和 `rtk` 二进制。运行前应审查已安装的 Adapter 源码和 OpenClaw 安全策略。如果策略不允许该覆盖参数，就不要安装此 Plugin。
+在安装器仍执行安全扫描的宿主上，OpenClaw 安装脚本会带 `--dangerously-force-unsafe-install` 调用 `plugins install`，因为 Plugin 通过 Node.js 子进程 API 启动 `tokenless` 和 `rtk` 二进制；将该参数列为 deprecated no-op 的宿主不再收到该参数，安全扫描由 `security.installPolicy` 决定。运行前应审查已安装的 Adapter 源码和 OpenClaw 安全策略。如果策略不允许该覆盖参数，就不要安装此 Plugin。
 
 ### npm + cosh
 
@@ -281,7 +294,7 @@ Extension 在启动时发现。启用后重启 cosh，并运行一个 Shell 工�
 
 ### OpenClaw
 
-安装脚本会使用上文说明的 OpenClaw unsafe-install 覆盖参数。确认风险并安装后，重启 Gateway。Plugin 代码默认启用响应压缩和 RTK 重写，默认关闭 TOON。由于底层检查已硬关闭，Plugin 的 Tool Ready 选项当前不会生效。
+安装脚本会在旧版宿主上使用上文说明的 OpenClaw unsafe-install 覆盖参数。确认风险并安装后，重启 Gateway。Plugin 代码默认启用响应压缩和 RTK 重写，默认关闭 TOON。由于底层检查已硬关闭，Plugin 的 Tool Ready 选项当前不会生效。
 
 ### Hermes
 

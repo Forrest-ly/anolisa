@@ -230,7 +230,7 @@ agentsight interruption --db /path/to/interruption_events.db list --last 48
 | `/api/sessions` | GET | 会话列表 |
 | `/api/sessions/search` | POST | 语义会话搜索（复用优化 LLM，Body: `{"query","candidates":[{session_id,first_message,last_message,project}]}`，候选 ≤200、≤5 跳过 LLM） |
 | `/api/sessions/{id}/traces` | GET | 会话下的 trace |
-| `/api/traces/{id}` | GET | trace 详情 |
+| `/api/traces/{id}` | GET | 单次调用详情（按 per-call response_id 查询，非 conversation_id） |
 | `/api/conversations/{id}` | GET | conversation 事件详情 |
 | `/api/agent-names` | GET | Agent 名称列表 |
 | `/api/timeseries` | GET | 时序 Token 统计 |
@@ -269,7 +269,7 @@ React + TypeScript + Webpack + Tailwind CSS，位于 `dashboard/`。开发: `npm
 
 ## 10. Configuration
 
-`AgentsightConfig`（`src/config.rs`），关键环境变量：SLS_*（阿里云日志服务导出）、`AGENTSIGHT_TOKENIZER_PATH`、`AGENTSIGHT_CHROME_TRACE`、`RUST_LOG`、`AGENTSIGHT_SSL_REATTACH_TTL_SECS`（SSL uprobe 陈旧重挂载 TTL，默认 300 秒；用于内核静默注销 uprobe consumer 的 serverless/overlayfs 场景，如 ACS；设为 `0` 表示每次匹配进程都强制重挂载，仅供测试）。
+`AgentsightConfig`（`src/config.rs`），关键环境变量：SLS_*（阿里云日志服务导出）、`AGENTSIGHT_TOKENIZER_PATH`、`AGENTSIGHT_CHROME_TRACE`、`RUST_LOG`、`AGENTSIGHT_SSL_REATTACH_TTL_SECS`（SSL uprobe 陈旧重挂载 TTL，默认 30 秒；用于内核静默注销 uprobe consumer 的 serverless/overlayfs 场景，如 ACS；设为 `0` 表示每次匹配进程都强制重挂载，仅供测试）。
 
 ### 配置文件加载语义
 

@@ -26,6 +26,11 @@ Skills follow the skip contract described under
 [Packaged read-only system Skills](#packaged-read-only-system-skills); key
 initialization still completes.
 
+`init --no-baseline` initializes keys without scanning Skills. Repeated initialization
+reuses the key pair and returns `keyCreated: false` and `key: null`; newly created
+key details are returned in `key` with `keyCreated: true`. `init --force-keys`
+replaces the pair and archives the previous public key for signature verification.
+
 Key locations:
 
 | File | Path | Permissions |
@@ -153,6 +158,15 @@ No per-Skill scanner result, manifest, snapshot, or `.skill-meta` state is
 written for the skipped item, while global key initialization keeps its normal
 behavior. An explicit `scan <dir>` remains strict: it exits `1` and points the
 caller to `analyze` for read-only findings.
+
+The same batch skip also applies to host-backed Skills directly under
+`$XDG_DATA_HOME/anolisa/skills/` (default `~/.local/share/anolisa/skills/`), with
+`reasonCode=readonly_default_skill`, when ledger state is not writable and the
+Skill is not covered by `managedSkillDirs`. This includes image-provided raw
+user Skills made read-only to the runtime user. Writable raw user Skills are
+scanned normally; skipped Skills are not added to `managedSkillDirs`.
+Explicit scans and writes to managed user Skills still fail on permission
+errors. SkillFS backing and resolver errors remain errors.
 
 `check` and `status` are unchanged. A skipped Skill with no prior ledger
 artifacts returns `none`, and aggregate health can remain `unscanned`. These
@@ -459,7 +473,17 @@ Codex and Qoder CLI are low-level integrity gates that run `skill-ledger check <
 
 All six adapters enable Skill Ledger by default. Hermes uses policy `observe`; the other adapters retain policy `ask`. copilot-shell, Codex, Qoder CLI, and Qwen Code register their corresponding hook boundaries in their default manifests. OpenClaw and Hermes can also take capability configuration, while `SKILL_LEDGER_MODE` remains the deployment-level override. Apart from the explicitly documented Qoder CLI low-level gate above, the other compatibility hooks remain fail-open when the CLI infrastructure misbehaves, avoiding blocked Skill loads.
 
-The copilot-shell hook currently covers three directory classes — project / user / system: `<cwd>/.copilot-shell/skills/`, `~/.copilot-shell/skills/`, and the RPM and raw-install system roots `/usr/share/anolisa/skills/` and `/usr/local/share/anolisa/skills/`. Skills from custom, extension, remote, or other paths make the hook fail open and skip the skill-ledger check; the OpenClaw plugin extracts the Skill directory from the `SKILL.md` path it reads.
+The built-in Ledger discovery entries also include the raw user root.
+For this root, an unset, empty, relative, or dot-segment `XDG_DATA_HOME` uses
+`~/.local/share`, matching ANOLISA and cosh. `enableDefaultSkillDirs=false`
+also disables this built-in entry. The hook keeps the existing policy and
+unmanaged-skill behavior; recognizing a directory does not certify its contents.
+
+`agent-sec-cli capabilities --agent cosh --capability skill-ledger --output json`
+reports the effective XDG data-root setting without resolving the user's home
+or reading Agent configuration. Its fallback is displayed as `~/.local/share`.
+
+The copilot-shell hook currently covers three directory classes — project / user / system: `<cwd>/.copilot-shell/skills/`, `~/.copilot-shell/skills/`, the raw user root `$XDG_DATA_HOME/anolisa/skills/` (default `~/.local/share/anolisa/skills/`), and the RPM and raw-install system roots `/usr/share/anolisa/skills/` and `/usr/local/share/anolisa/skills/`. Skills from custom, extension, remote, or other paths make the hook fail open and skip the skill-ledger check; the OpenClaw plugin extracts the Skill directory from the `SKILL.md` path it reads.
 
 For batch certification or post-install certification, complete directory resolution and certification before letting the Agent read uncertified Skill content: avoid proactively reading an uncertified Skill's `SKILL.md` or auxiliary files before batch certification; after a successful install, locate the final local directory, confirm it contains `SKILL.md`, then run quick-scan certification.
 
@@ -564,6 +588,15 @@ Default directories are enabled by default; `managedSkillDirs` holds directories
 - `"path/to/skill"` — a single Skill directory (must also contain `SKILL.md`)
 
 Non-existent directories are silently ignored. Additionally, running `scan` or `certify` on a Skill auto-appends unregistered directories to the config for later `--all` batch operations. `check` is a read-only status query and never writes config.
+
+For direct children of the raw user root `$XDG_DATA_HOME/anolisa/skills/` (default
+`~/.local/share/anolisa/skills/`), auto-remember records only the individual Skill
+path, even when sibling Skills exist. Scanning a writable Skill therefore does
+not add its read-only siblings to `managedSkillDirs`. Other roots retain the
+existing parent-glob heuristic. Existing configuration entries are not rewritten:
+an existing glob still makes covered user Skills managed and keeps write failures
+strict. If you confirm that a raw-root glob was unintentionally added, replace it
+with the individual paths you intend to manage, preserving any intentional coverage.
 
 #### Scheduled Default Quick Scans
 
@@ -674,10 +707,11 @@ Per-version verification: schema → hash integrity → signature validity → s
 | `agent-sec-cli skill-ledger audit <dir>` | Deep-verify the version chain |
 | `agent-sec-cli skill-ledger list-scanners` | List registered scanners |
 
-`decide` is the only supported command for recording a per-Skill user decision.
-The former hidden `set-policy` placeholder was never implemented and has been
-removed; invoking it is now an unknown-command usage error with exit code 2.
-`rotate-keys` remains a hidden, reserved interface: invoking it reports
+`activationPolicy` and `show/export --policy` accept `pass_warn_only`. Use
+`list-scanners` to find registered names for `init/scan --scanners` and
+`certify --scanner`; custom scanners can be registered in `config.json`.
+
+`rotate-keys` is visible in help and is not implemented: invoking it reports
 `not implemented` on stderr, exits non-zero, and does not change `key.enc`,
 `key.pub`, or the keyring.
 

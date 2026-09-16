@@ -79,7 +79,8 @@ from hook_utils import (
 # Shell tool envelopes carry the log in one dominant text field. Unwrapping
 # is worth a rebuilt envelope only when that field is large enough for the
 # build/log engine to bite (its own gates start at 30 lines / 200 chars;
-# 2000 chars keeps the rewrap machinery out of trivial outputs).
+# 2000 chars keeps the rewrap machinery out of trivial outputs). Bash Git
+# diffs also need the text slot below this gate; Core decides their benefit.
 _SHELL_TEXT_FIELDS = ("stdout", "stderr")
 _SHELL_UNWRAP_MIN_CHARS = 2_000
 
@@ -147,7 +148,10 @@ def _shell_text_field(tool_name: str, envelope) -> tuple | None:
         value = envelope.get(name)
         if (
             isinstance(value, str)
-            and len(value) >= _SHELL_UNWRAP_MIN_CHARS
+            and (
+                len(value) >= _SHELL_UNWRAP_MIN_CHARS
+                or (tool_name == "Bash" and name == "stdout" and value.startswith("diff --git "))
+            )
             and (best is None or len(value) > len(best[1]))
         ):
             best = (name, value)
@@ -275,9 +279,26 @@ def main() -> None:
     # instead of log-blind JSON; ensure_ascii=False matches the entry
     # point's normalization, so size gates measure Unicode characters on
     # both sides.
-    shell_field = _shell_text_field(tool_name, model_visible_before)
-    if shell_field is not None:
-        content = shell_field[1]
+    text_field = _shell_text_field(tool_name, model_visible_before)
+    tool_input = input_data.get("tool_input", {})
+    grep_content = (
+        agent_id == _CLAUDE_AGENT_ID
+        and tool_name == "Grep"
+        and isinstance(model_visible_before, dict)
+        and model_visible_before.get("mode") == "content"
+        and isinstance(model_visible_before.get("content"), str)
+        and isinstance(tool_input, dict)
+        and not any(
+            tool_input.get(flag)
+            for flag in ("-A", "-B", "-C", "context")
+        )
+    )
+    if grep_content:
+        # Native Grep has a text slot inside its schema-checked output object.
+        # Context queries retain their existing route until that format is supported.
+        text_field = ("content", model_visible_before["content"])
+    if text_field is not None:
+        content = text_field[1]
     elif isinstance(model_visible_before, str):
         content = model_visible_before
     elif isinstance(model_visible_before, (dict, list)):
@@ -292,12 +313,12 @@ def main() -> None:
     elif agent_id in {_QODER_AGENT_ID, _OPENCODE_AGENT_ID}:
         can_replace = True
         # An unwrapped shell field is plain text regardless of its envelope.
-        replace_with_text = shell_field is not None or not isinstance(
+        replace_with_text = text_field is not None or not isinstance(
             tool_response_raw, (dict, list)
         )
     elif agent_id == _CLAUDE_AGENT_ID:
         can_replace = _claude_supports_replacement()
-        replace_with_text = shell_field is not None or not isinstance(
+        replace_with_text = text_field is not None or not isinstance(
             tool_response_raw, (dict, list)
         )
         if not can_replace:
@@ -312,7 +333,10 @@ def main() -> None:
         replace_with_text = True
 
     # 9. Map host facts into the required lifecycle fields.
-    if tool_name in SKIP_TOOLS:
+    if grep_content:
+        # A filtered match listing is a tool response, not an authoritative file copy.
+        content_origin = "api_response"
+    elif tool_name in SKIP_TOOLS:
         content_origin = "file_content"
     elif tool_name in SHELL_TOOLS:
         content_origin = "command_output"
@@ -320,6 +344,30 @@ def main() -> None:
         content_origin = "api_response"
     raw_status = str(input_data.get("status", "")).lower()
     shell_process_result = model_visible_before if isinstance(model_visible_before, dict) else None
+    if (
+        shell_process_result is None
+        and tool_name in SHELL_TOOLS
+        and isinstance(model_visible_before, str)
+    ):
+        # Some hosts hand shell output over as text instead of a dict:
+        # cosh-core's wrap_tool_response always wraps the raw output into a
+        # string llmContent, and copilot-shell delivers a plain string
+        # envelope. Either way the PostToolUse payload carries no is_error
+        # or status marker. A JSON shell envelope inside that text keeps its
+        # exit_code / stderr / error fields, so parse it for error
+        # detection — v1 classified these hook-side; under Protocol v2
+        # the hook must supply the status and Core owns the diagnosis.
+        # Deliberately NOT gated on cosh_ng_detected: the classification is
+        # host-agnostic by design (restoring it for every host is the point
+        # of this change), so do not add a Cosh-NG condition here.
+        # TestCopilotShellEnvelopeClassification in
+        # tests/test_cosh_ng_compat.py pins the contract for a host running
+        # without any Cosh-NG marker.
+        parsed_envelope = try_parse_json(model_visible_before)
+        if isinstance(parsed_envelope, str):
+            parsed_envelope = try_parse_json(parsed_envelope)
+        if isinstance(parsed_envelope, dict):
+            shell_process_result = parsed_envelope
     shell_process_error = (
         tool_name in SHELL_TOOLS
         and shell_process_result is not None
@@ -349,10 +397,10 @@ def main() -> None:
     # Shell envelopes often carry a large stdout alongside the actual failure
     # in a short stderr. Error results are never replaced, so send the error
     # stream to Core for diagnosis while the host keeps the original envelope.
-    if status == "error" and tool_name in SHELL_TOOLS and isinstance(model_visible_before, dict):
+    if status == "error" and tool_name in SHELL_TOOLS and shell_process_result is not None:
         error_parts = []
         for field in ("stderr", "error"):
-            value = model_visible_before.get(field)
+            value = shell_process_result.get(field)
             if isinstance(value, str) and value.strip():
                 error_parts.append(value)
         if error_parts:
@@ -395,13 +443,13 @@ def main() -> None:
         _emit_attribution_or_skip(env_attribution)
 
     # 11. Envelope construction — dispatch by agent runtime. An unwrapped
-    # shell field is re-injected into a same-shaped envelope: the compressed
+    # text field is re-injected into a same-shaped envelope: the compressed
     # text replaces exactly the field that was sent, every other field stays
     # byte-identical.
     rewrapped = None
-    if shell_field is not None:
+    if text_field is not None:
         rewrapped = dict(model_visible_before)
-        rewrapped[shell_field[0]] = output_text
+        rewrapped[text_field[0]] = output_text
 
     if cosh_ng_detected:
         hook_specific = {

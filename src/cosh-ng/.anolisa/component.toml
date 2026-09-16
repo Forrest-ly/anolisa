@@ -1,6 +1,6 @@
 [component]
 name = "cosh-ng"
-version = "0.23.0"
+version = "0.24.1"
 layer = "runtime"
 domain = "tools"
 display_name = "cosh-ng"
@@ -75,6 +75,11 @@ source = "share/anolisa/cosh-ng/cosh-gateway@.service.in"
 target = "{unitdir}/cosh-gateway@.service"
 mode = "0644"
 render = "anolisa-paths-v1"
+
+[[component.layout.files]]
+source = "share/anolisa/skills/manage-task-checkpoints/SKILL.md"
+target = "{datadir}/anolisa/skills/manage-task-checkpoints/SKILL.md"
+mode = "0644"
 
 [[component.layout.files]]
 source = "share/doc/cosh-ng/LICENSE"

@@ -3,6 +3,9 @@ pub mod adapter;
 #[path = "agent/public.rs"]
 pub mod agent;
 mod command;
+#[cfg(test)]
+#[path = "tools/command_risk_quoted_tests.rs"]
+mod command_risk_quoted_tests;
 #[allow(dead_code, unused_imports)]
 mod config;
 #[allow(dead_code, unused_imports)]
@@ -39,8 +42,14 @@ mod path_prompt_tests;
 #[allow(dead_code)]
 #[path = "question/public.rs"]
 mod question;
+#[cfg(test)]
+#[path = "ui/question_presentation_tests.rs"]
+mod question_presentation_tests;
 #[path = "raw_input/public.rs"]
 pub mod raw_input;
+#[cfg(test)]
+#[path = "tools/readonly_rules/traversal_tests.rs"]
+mod readonly_traversal_tests;
 #[path = "shell_host/public.rs"]
 pub mod shell_host;
 #[allow(dead_code)]
