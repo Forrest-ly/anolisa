@@ -299,7 +299,7 @@ debug, trace, traces, stack, stacktrace, logs, logging
 
 Stash 会保存 Record Reduction 使用的完整原始数组、被截断的字符串、其他截断数组中被丢弃的中间段和深层子树。尾部元素直接保留在输出中，不进入 Stash。黑名单字段、`null` 和空值会直接移除，不会生成取回标记。
 
-大多数 Adapter 会覆盖这些独立 CLI 默认值。共享 Shell 策略使用 `65536`、`128`、`8`；其他结构化工具策略使用 `1048576`、`65536`、`32`。内容读取类工具会被跳过。详见[Agent 集成 · Adapter 处理规则](framework-integration.md#adapter-处理规则)。
+大多数 Adapter 会覆盖这些独立 CLI 默认值。共享 Shell 策略使用 `65536`、`128`、`8`；其他结构化工具策略使用 `1048576`、`65536`、`32`。内容读取类工具会被跳过。详见[Agent 集成 · Adapter 处理规则](framework-integration.md#adapter-处理规则)和[用户手册 · 压缩的触发条件与阈值](user-manual.md#压缩的触发条件与阈值)。
 
 ## `compress-toon` 与 `decompress-toon`
 
@@ -422,6 +422,8 @@ tokenless stats summary --compare <baseline-session> <active-session>
 ```
 
 Session ID 不存在时以非零退出码失败，而不是输出 0% 对比，行为与 `stats diff --session` 一致。`stats summary --limit` 必须为正整数；`--limit 0` 会在解析阶段被拒绝，行为与 `stats diff --limit` 一致。
+
+`stats summary --json` 的百分比字段（`chars_saved_percent`、`tokens_saved_percent`）与 `--compare --json` 的 `saved_percent` 都按节省量除以原始未压缩量计算；summary 与 compare 字段会把节省量钳制为 0，而 `stats diff --json` 保留负值。详见[效果度量 → 节省率字段定义](measuring-savings.md#节省率字段定义)。
 
 查看单条记录，或一次工具调用中可确认衔接的阶段：
 

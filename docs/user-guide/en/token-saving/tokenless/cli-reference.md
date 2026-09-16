@@ -314,7 +314,7 @@ Field matching and truncation change the response representation seen by the mod
 
 Stash applies to complete original arrays used by record reduction, truncated strings, the dropped middle segment of other truncated arrays, and deep subtrees. Tail items are kept inline, not stashed. Blacklisted fields, `null`, and empty values are removed without a retrieval marker.
 
-Most adapters override these standalone defaults. Their shared shell profile uses `65536`, `128`, and `8`; the other-structured-tool profile uses `1048576`, `65536`, and `32`. Content-retrieval tools are skipped. See [Agent integration · Adapter processing rules](framework-integration.md#adapter-processing-rules).
+Most adapters override these standalone defaults. Their shared shell profile uses `65536`, `128`, and `8`; the other-structured-tool profile uses `1048576`, `65536`, and `32`. Content-retrieval tools are skipped. See [Agent integration · Adapter processing rules](framework-integration.md#adapter-processing-rules) and [User manual · Compression trigger conditions and thresholds](user-manual.md#compression-trigger-conditions-and-thresholds).
 
 ## `compress-toon` and `decompress-toon`
 
@@ -439,6 +439,8 @@ tokenless stats summary --compare <baseline-session> <active-session>
 ```
 
 A missing session ID fails with a non-zero exit instead of a 0% comparison, matching `stats diff --session`. `stats summary --limit` must be a positive integer; `--limit 0` is rejected at parse time, matching `stats diff --limit`.
+
+The percentage fields in `stats summary --json` (`chars_saved_percent`, `tokens_saved_percent`) and in `--compare --json` (`saved_percent`) are all computed as a saved amount divided by the original, uncompressed amount; the summary and compare fields clamp the saved amount to zero while `stats diff --json` keeps negative values. See [Measuring savings → Saving-rate field definitions](measuring-savings.md#saving-rate-field-definitions).
 
 Inspect one record or the verified stages of one tool call:
 
