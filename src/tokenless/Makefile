@@ -247,10 +247,34 @@ test-tokenless:
 	@echo "==> Testing tokenless..."
 	cargo test --workspace -- --test-threads=1
 
-test-hooks:
-	@echo "==> Testing copilot-shell hooks..."
+# Declared separately from the .PHONY list at the top of this file on purpose:
+# that list is extended by other components' targets as well, and a shared line
+# is a merge conflict waiting to happen.
+.PHONY: test-hook-scripts
+
+# The two suites below are the only members of `test-hooks` that CI can run:
+# tests/run-all-tests.sh drives the release binary installed on PATH on purpose
+# (see the note above its test 5.0b), so `test-hooks` as a whole needs an
+# installed tokenless and stays a developer-machine target. No workflow calls
+# it -- grepping .github/ for test-hooks and for the two file names returns
+# nothing -- so two contracts only ever ran on developer machines: run-hook.sh
+# must resolve a hook from its own adapter tree before the FHS and
+# home-directory fallbacks, and tool_ready_hook.sh must keep its hard bypass so
+# the dormant legacy four-phase flow (which runs any readable env-fix script)
+# stays unreachable. Both suites are plain bash over a mktemp sandbox with
+# generated fixtures -- no cargo build output, node, jq, rtk, python3 or
+# network, verified by running them under a PATH that holds only bash and
+# coreutils -- so they cost well under a second. They ride on
+# `test-integration` for the same reason test-claude-code-detect and
+# test-toon-cleanup do: that is the hook-contract target the Test tokenless job
+# already calls, so the pair reaches CI with no workflow edit and no new setup.
+test-hook-scripts:
+	@echo "==> Testing tokenless hook scripts (no external dependencies)..."
 	bash tests/test-run-hook-install-scope.sh
 	bash tests/test-tool-ready-readable-fixer.sh
+
+test-hooks: test-hook-scripts
+	@echo "==> Testing copilot-shell hooks..."
 	bash tests/run-all-tests.sh
 
 test-claude-code-detect:
@@ -264,17 +288,18 @@ test-claude-code-detect:
 # goldens would go unenforced while the job still reported green. make runs the
 # prerequisite once even though the aggregate `test` target lists both names.
 #
-# The two shell suites ride along for the same reason: they are members of the
+# The shell suites ride along for the same reason: they are members of the
 # `make test` aggregate that no workflow ever called (grepping .github/ for the
-# targets and for test-claude-code-detect-retry.sh / test-toon-cleanup.sh
-# returns nothing), so detect.sh's first-run plugin re-list retry and the
-# stale-toon ownership rules in install-helpers/uninstall only ran on developer
-# machines. Both are plain bash plus recursive make over a mktemp sandbox with
-# stub binaries -- no cargo, node or jq, and no rtk build -- so they cost about
-# a second and are safe to run ahead of the Python contract below. They cannot
+# targets and for the script names behind them returns nothing), so detect.sh's
+# first-run plugin re-list retry, the stale-toon ownership rules in
+# install-helpers/uninstall and the hook-script pair above only ran on developer
+# machines. All of them are plain bash over a mktemp sandbox with stub binaries
+# (the two older ones also recurse into make) -- no cargo, node or jq, and no
+# rtk build -- so they cost about a second and are safe to run ahead of the
+# Python contract below. They cannot
 # go on `test-rtk-integration` instead: that target's own recipe is what fetches
 # and builds the vendored rtk, and this one runs earlier in the CI job.
-test-integration: test-hook-parity test-claude-code-detect test-toon-cleanup
+test-integration: test-hook-parity test-claude-code-detect test-toon-cleanup test-hook-scripts
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_compress_response_hook.py
 	python3 tests/test_codex_response_diagnostics.py
@@ -656,6 +681,7 @@ help:
 	@echo "  test              Run all tests"
 	@echo "  test-rtk-integration  Build pinned RTK and test its Tokenless patches"
 	@echo "  test-benchmark-rtk-probe  Test the L1 runner's bounded rtk --version probe"
+	@echo "  test-hook-scripts  Test the dependency-free hook bash suites (run in CI)"
 	@echo "  lint              Run clippy checks"
 	@echo "  fmt               Format code"
 	@echo "  clean             Clean build artifacts"
