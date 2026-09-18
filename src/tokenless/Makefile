@@ -351,6 +351,10 @@ test-hook-parity:
 # four platforms, so running it there would leave fabricated tarballs beside
 # the real ones. The suite backs up and restores any existing
 # target/npm-prebuilt, needs no cargo build, and finishes in about 20 seconds.
+#
+# Under `make -j` the suite must not run beside the two plugin builds whose
+# directories it rewrites through its own recursive make; test-npm-package
+# declares them as prerequisites for exactly that reason.
 test-adapters: build-openclaw-plugin build-dsh-plugin test-npm-package
 	@echo "==> Testing OpenClaw adapter installer..."
 	bash tests/test-openclaw-adapter-install.sh
@@ -418,7 +422,19 @@ stage-raw:
 test-raw-package:
 	@bash tests/test-package-raw.sh
 
-test-npm-package:
+# tests/test-package-npm-prebuilt.sh drives npm/scripts/package-npm.js, whose
+# buildAdapters() recursively runs `make build-openclaw-plugin build-dsh-plugin`.
+# Both are phony and always rebuild, and the openclaw step rewrites
+# adapters/tokenless/openclaw/{node_modules,dist} (`npm ci`, then `npm run clean`
+# + `tsc`). Left as a bare recipe, this target is free to run beside a sibling
+# prerequisite that builds the same plugin, so one build's `tsc` reads
+# node_modules/typescript/lib/*.d.ts while the other's `npm ci` is deleting it
+# (TS6053 + TS2318, `make -j4 test-adapters` exits 2). Declaring the two builds
+# as prerequisites serializes them: make builds them once, then runs the suite
+# alone, and the recursive make just rebuilds the same artifacts. This ordering
+# also protects the `test` aggregate, where the suite and test-adapters share a
+# single deduplicated instance. Keep it if the suite is attached elsewhere.
+test-npm-package: build-openclaw-plugin build-dsh-plugin
 	@bash tests/test-package-npm-prebuilt.sh
 
 test-toon-cleanup:
