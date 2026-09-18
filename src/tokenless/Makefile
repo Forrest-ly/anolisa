@@ -319,7 +319,39 @@ test-hook-parity:
 	cargo build -p tokenless-cli
 	python3 tests/test_hook_parity.py
 
-test-adapters: build-openclaw-plugin build-dsh-plugin
+# The npm channel's packaging contract suite is a member of the `test`
+# aggregate that no workflow calls. The raw channel's sibling suite is invoked
+# directly by the Tokenless prebuilt workflow, but grepping every file under
+# .github/ for `test-npm-package` and for test-package-npm-prebuilt.sh returns
+# nothing, so tests/test-package-npm-prebuilt.sh only ever ran on developer
+# machines. (The one other uncovered member, test-hooks, stays out: its
+# run-all-tests.sh deliberately drives an installed release binary on PATH, and
+# no CI job installs tokenless.)
+#
+# The npm suite is the sole automated guard on npm/scripts/package-npm.js --
+# the script that produces the tarballs `make npm-publish` pushes -- covering
+# arch validation of the prebuilt binaries, the GLIBC 2.17 baseline warning,
+# the --target selector aliases, exclusion of legacy agentscope build output,
+# materialization of the claude-code and qwencode run-hook.sh dispatchers
+# (`npm pack` silently drops symlinks, which would publish a plugin with no
+# hooks), the rule that platform packages declare no `bin` (a collision makes
+# npm remove every conflicting .bin link), the root package's
+# optionalDependencies, and the dsh bundle contract. A regression in any of
+# those ships broken installs behind a green build.
+#
+# It rides on this target because it needs node/npm and python3, and "Test
+# adapter installers" is the first target the Test tokenless job calls after
+# actions/setup-node -- test-integration runs earlier, while node is still
+# unset. The pairing is also substantive rather than merely convenient: the
+# packer rebuilds and bundles exactly the openclaw and dsh artifacts this
+# target already builds, and the suite asserts they survive `npm pack` intact.
+# It is deliberately not attached to `npm-package` instead: that target is the
+# real packaging entry point whose npm/dist output the job's smoke test
+# installs, and this suite fabricates its own prebuilt binaries and packs all
+# four platforms, so running it there would leave fabricated tarballs beside
+# the real ones. The suite backs up and restores any existing
+# target/npm-prebuilt, needs no cargo build, and finishes in about 20 seconds.
+test-adapters: build-openclaw-plugin build-dsh-plugin test-npm-package
 	@echo "==> Testing OpenClaw adapter installer..."
 	bash tests/test-openclaw-adapter-install.sh
 	@echo "==> Testing openclaw Protocol v2 lifecycle..."
