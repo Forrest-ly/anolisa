@@ -566,6 +566,27 @@ build_tokenless() {
         warn "No version specified for tokenless, using default: ${version}"
     fi
 
+    # `make stamp-adapter-templates` pins the QwenPaw SDK wheel from Cargo.toml
+    # -- not from the RPM Version resolved above -- so that version needs a
+    # published release before anything is packaged. Otherwise the RPM ships a
+    # bundle whose install.sh can only fail with HTTP 404 on the pinned wheel
+    # (GH-3288, then GH-3390 one version later). Set
+    # ANOLISA_ALLOW_UNPUBLISHED_WHEEL=1 to package anyway (offline mirror, local
+    # smoke build); an unreachable registry is already advisory in the gate, so
+    # a network outage cannot turn into a build failure here.
+    if [ "${ANOLISA_ALLOW_UNPUBLISHED_WHEEL:-0}" = "1" ]; then
+        warn "ANOLISA_ALLOW_UNPUBLISHED_WHEEL=1: skipping the release-readiness gate"
+    elif ! command -v python3 &>/dev/null; then
+        warn "python3 not found: cannot verify that the tokenless release assets are published"
+    else
+        log "Checking that the tokenless release assets are published..."
+        if ! python3 "${TOKEN_DIR}/scripts/check-release-readiness.py" \
+                --source-dir "$TOKEN_DIR" --require assets; then
+            err "Refusing to package tokenless: its release assets are not published"
+            return 1
+        fi
+    fi
+
     local pkg_name
     pkg_name=$(parse_spec_name "$spec_in")
     local tarball_name="${pkg_name}-${version}.tar.gz"

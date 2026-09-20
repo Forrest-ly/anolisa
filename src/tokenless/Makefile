@@ -290,6 +290,10 @@ test-integration: test-hook-parity test-claude-code-detect test-toon-cleanup
 	python3 tests/test_release_regression_probe.py
 	python3 tests/test_qwenpaw_plugin.py
 	python3 tests/test_cosh_ng_compat.py
+	# The packaging gate runs against a stub GitHub API, never the real one: it
+	# decides whether a version may be packaged, and a live lookup here would
+	# make the suite depend on the registry it is supposed to police.
+	python3 tests/test_release_readiness.py
 
 # The L1 runner records an `rtk_version` in benchmark_identity.json through a
 # best-effort probe that must never stall the suite: a bare `$RTK_BIN` is
