@@ -386,7 +386,34 @@ test-hook-parity:
 # Under `make -j` the suite must not run beside the two plugin builds whose
 # directories it rewrites through its own recursive make; test-npm-package
 # declares them as prerequisites for exactly that reason.
-test-adapters: build-openclaw-plugin build-dsh-plugin test-npm-package
+#
+# The three install-route suites behind `test-install-methods` are the remaining
+# members of the `test` aggregate that no workflow called: grepping .github/ for
+# test-install-script, test-install-docs and test-npm-postinstall returns
+# nothing. They are the only automated guard on scripts/install.sh and
+# scripts/uninstall.sh -- the receipt, the staged rollback and the ownership
+# marker that decides what an uninstall may delete -- on the assertions that keep
+# the four public install routes and their docs agreeing, and on the npm
+# postinstall that shares ~/.local/share/anolisa/adapters/tokenless with the
+# anolisa CLI. A regression in the route both READMEs point a first-time user at
+# therefore reached a release with this job green.
+#
+# They ride here for the same reason the npm suite does, and the reason is again
+# node: test-npm-postinstall drives the real postinstall.js and skips itself when
+# no interpreter can run it, so attaching the group to test-integration -- which
+# the job runs before actions/setup-node -- would have left the postinstall
+# contract silently unenforced while the step still reported success. The pairing
+# is substantive as well: the installer and the postinstall both write the shared
+# adapter tree these lifecycle suites exercise, and the doc suite reads the
+# adapter scripts they install. All three are offline bash over a mktemp sandbox
+# (curl, npm and cargo are stubs inside them, and the jq-less scenarios are
+# deliberate), need no cargo or rtk build, and touch the repo tree read-only --
+# so unlike test-npm-package they share no directory with the plugin builds and
+# add nothing to serialize under `make -j`. They cost about a minute in total,
+# dominated by the installer suite, and they are listed after test-npm-package so
+# a plugin build or packaging failure still reports as itself.
+test-adapters: build-openclaw-plugin build-dsh-plugin test-npm-package \
+	test-install-methods
 	@echo "==> Testing OpenClaw adapter installer..."
 	bash tests/test-openclaw-adapter-install.sh
 	@echo "==> Testing openclaw Protocol v2 lifecycle..."
@@ -475,6 +502,11 @@ test-toon-cleanup:
 # that describe it. Offline: curl, npm and cargo are stubbed by the test.
 # test-npm-postinstall runs the real npm/scripts/postinstall.js and skips when no
 # interpreter can run it.
+#
+# Declared as a prerequisite of test-adapters so the three suites reach the Test
+# tokenless job; the block above that rule records why they ride there rather
+# than beside test-integration. `make test` still runs them exactly once: make
+# dedups a target that two members of the same aggregate both depend on.
 test-install-methods: test-npm-postinstall test-install-script test-install-docs
 
 # Joined to the `test` aggregate by a second, prerequisite-only rule instead of by
