@@ -97,6 +97,9 @@
 #      attempt: the resources it points at are kept, a pre-existing Qwen
 #      registration and unrelated Claude config survive untouched, and no source
 #      build is started.
+#  38. codex's "not installed" residue line is what a *successful* `plugin remove`
+#      looks like, so it must not be read as a registration that survived: the
+#      uninstall completes, and a refusal still fails closed over the same listing.
 
 set -euo pipefail
 
@@ -494,6 +497,9 @@ STUB
 # through a deregistration that the framework refuses. CODEX_STUB_REMOVE_FAILS=1
 # makes `plugin remove` exit non-zero *and leave the plugin listed*, which is what
 # a refusing CLI looks like from outside; without it the removal takes effect.
+# A successful removal is not the same as an empty listing either: since 0.154.0
+# codex keeps answering `plugin list` with a "not installed" line for a plugin it
+# has already removed, for as long as the marketplace advertising it is registered.
 cat > "$STUB_DIR/codex" <<'STUB'
 #!/usr/bin/env bash
 state="${CODEX_STUB_STATE:-$HOME/.codex-stub}"
@@ -506,7 +512,11 @@ case "$1 $2" in
       echo "codex: error: cannot read the plugin list" >&2
       exit 1
     fi
-    [ -f "$state/plugin" ] && echo "tokenless@anolisa-tokenless   enabled"
+    if [ -f "$state/plugin" ]; then
+      echo "tokenless@anolisa-tokenless   enabled"
+    elif [ -f "$state/marketplace" ]; then
+      echo "tokenless@anolisa-tokenless   not installed   $state/marketplace"
+    fi
     exit 0 ;;
   "plugin remove")
     if [ "${CODEX_STUB_REMOVE_FAILS:-0}" = "1" ]; then
@@ -3209,5 +3219,62 @@ assert_file "the adapter resources that registration points at are kept" \
   "$S56_ADAPTERS/claude-code/.claude-plugin/plugin.json"
 assert_file "and the adapter tree itself is kept" \
   "$S56_ADAPTERS/claude-code/scripts/uninstall.sh"
+
+# =============================================================================
+# Scenario 57 — codex's "not installed" residue is a removal, not a survivor
+# =============================================================================
+# Since 0.154.0 codex answers `plugin list` with "tokenless@anolisa-tokenless
+# not installed" after `plugin remove` succeeded, and keeps that line until the
+# marketplace advertising the plugin is removed too — which the adapter script
+# only does next. Matching the listing on the plugin name alone read the residue as
+# a registration that survived, so a successful deregistration reported failure:
+# the marketplace directory, the adapter resources and the receipt were all kept
+# and `tokenless uninstall` could never complete, however often it was re-run.
+run_script "$INSTALL_SH" codex-residue "TOKENLESS_VERSION=$FAKE_VERSION"
+assert_eq "install with a Codex adapter in the tree exits 0" "$RUN_STATUS" "0"
+S57_ADAPTERS="$TEST_DIR/codex-residue/home/.local/share/anolisa/adapters/tokenless"
+cp -R "$TOKENLESS_ROOT/adapters/tokenless/codex" "$S57_ADAPTERS/codex"
+S57_STATE="$TEST_DIR/codex-residue/home/.codex-stub"
+mkdir -p "$S57_STATE"
+: > "$S57_STATE/plugin"
+: > "$S57_STATE/marketplace"
+S57_MARKET="$TEST_DIR/codex-residue/home/.local/share/anolisa/codex-marketplace"
+mkdir -p "$S57_MARKET/tokenless"
+
+run_script "$UNINSTALL_SH" codex-residue
+assert_eq "uninstall exits 0 although the listing still names the plugin" "$RUN_STATUS" "0"
+assert_not_contains "does not read the residue as a surviving registration" \
+  "$RUN_OUTPUT" "still lists the tokenless plugin"
+assert_not_contains "does not keep the marketplace directory over it" \
+  "$RUN_OUTPUT" "Keeping marketplace directory"
+assert_contains "reports the Codex adapter deregistered" "$RUN_OUTPUT" \
+  "Deregistered the codex adapter"
+assert_no_file "removes the marketplace directory nothing points into" "$S57_MARKET"
+assert_no_file "removes the adapter resources" "$S57_ADAPTERS"
+assert_no_file "removes the receipt" "$(receipt_of codex-residue)"
+
+# The residue must not become a way to skip a removal that really did fail: with
+# the CLI refusing, the plugin stays listed as *enabled* and the run still fails
+# closed — which is the behaviour scenario 29 asserts, now over the same stub.
+# A re-run over the half-deregistered state the residue describes (plugin gone,
+# marketplace still registered) finishes instead of reporting a failure it cannot
+# act on, and does not ask codex to remove a plugin that is no longer installed.
+S57_HOME="$TEST_DIR/codex-residue-rerun/home"
+S57_RERUN_STATE="$S57_HOME/.codex-stub"
+mkdir -p "$S57_RERUN_STATE" "$S57_HOME/.local/share/anolisa/codex-marketplace/tokenless"
+: > "$S57_RERUN_STATE/marketplace"
+RUN_OUTPUT="$(
+  env -i \
+    PATH="$STUB_DIR:/usr/local/bin:/usr/bin:/bin" \
+    HOME="$S57_HOME" \
+    SHELL=/bin/bash \
+    TOKENLESS_DEREGISTER_ONLY=1 \
+    bash "$TOKENLESS_ROOT/adapters/tokenless/codex/scripts/uninstall.sh" 2>&1
+)" && RUN_STATUS=0 || RUN_STATUS=$?
+assert_eq "a re-run over the residue-only state exits 0" "$RUN_STATUS" "0"
+assert_not_contains "does not re-remove a plugin codex no longer has installed" \
+  "$RUN_OUTPUT" "Removing codex plugin"
+assert_no_file "the re-run removes the marketplace directory" \
+  "$S57_HOME/.local/share/anolisa/codex-marketplace"
 
 echo "install-script test passed"

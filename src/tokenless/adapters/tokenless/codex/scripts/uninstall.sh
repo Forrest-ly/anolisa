@@ -65,15 +65,35 @@ codex_list() {  # codex_list <args...> -> prints the listing, status = CLI statu
     "$CODEX_BIN" "$@" 2>/dev/null
 }
 
+# codex_plugin_registered <listing> -> 0 while a live tokenless entry survives.
+# codex-cli 0.154.0 keeps listing a plugin it has already removed: `plugin remove`
+# leaves a "tokenless@anolisa-tokenless  not installed" line behind, and that line
+# only disappears together with the marketplace it was advertised through — which
+# this script removes *after* the plugin. Reading the residue as "still registered"
+# is the opposite error from the one the re-ask guards against, and not a harmless
+# one: the caller keeps the adapter resources and the receipt, so the uninstall can
+# never finish. The residue is therefore excluded, while every other status word
+# still counts as registered — an unrecognised state stays a failure rather than
+# quietly becoming a success.
+codex_plugin_registered() {
+    local line
+    while IFS= read -r line; do
+        if [[ "$line" == *tokenless* && "$line" != *"not installed"* ]]; then
+            return 0
+        fi
+    done <<<"$1"
+    return 1
+}
+
 if [[ -n "$CODEX_BIN" ]]; then
     if plugin_listing="$(codex_list plugin list)"; then
-        if printf '%s\n' "$plugin_listing" | grep -q "tokenless"; then
+        if codex_plugin_registered "$plugin_listing"; then
             echo "[tokenless] Removing codex plugin 'tokenless@${MARKETPLACE_NAME}'..."
             "$CODEX_BIN" plugin remove "tokenless@${MARKETPLACE_NAME}" 2>&1 || true
             # The removal status is swallowed on purpose — "was not registered" and
             # "refused" both come back non-zero — so re-ask instead of trusting it.
             if after_listing="$(codex_list plugin list)"; then
-                if printf '%s\n' "$after_listing" | grep -q "tokenless"; then
+                if codex_plugin_registered "$after_listing"; then
                     echo "[tokenless] ERROR: codex still lists the tokenless plugin after 'plugin remove'." >&2
                     DEREGISTER_FAILED=1
                 fi
