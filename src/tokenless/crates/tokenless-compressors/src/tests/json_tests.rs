@@ -942,3 +942,33 @@ fn toon_round_trips_the_edge_cases_the_upgrade_fixes() {
         );
     }
 }
+
+/// toon-format 0.5 quoted every scalar holding a hyphen anywhere, because its
+/// structural-character set included `-`; 0.7 quotes only what the spec
+/// requires, a leading hyphen being the list-item marker. That is why the
+/// response-hook goldens shrank on the upgrade. Pin both halves of the rule:
+/// an interior hyphen stays bare, a scalar holding the delimiter stays quoted,
+/// and the round trip keeps every value exact.
+#[test]
+fn toon_quotes_only_the_scalars_the_spec_requires() {
+    let value = serde_json::json!({
+        "results": [
+            "entry-000 status=ok elapsed=0ms",
+            "64 items omitted. If needed, run in shell: tokenless retrieve f342",
+        ]
+    });
+    let candidate = toon_candidate(&value, 0).expect("a string list stays convertible");
+    assert!(
+        candidate.contains("entry-000 status=ok elapsed=0ms,"),
+        "an interior hyphen must not force quotes: {candidate:?}"
+    );
+    assert!(
+        candidate.contains("\"64 items omitted."),
+        "a scalar holding the delimiter must stay quoted: {candidate:?}"
+    );
+    assert_eq!(
+        toon_format::decode_default::<Value>(&candidate).unwrap(),
+        value,
+        "encoding was {candidate:?}"
+    );
+}

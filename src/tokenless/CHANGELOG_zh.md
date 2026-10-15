@@ -9,6 +9,12 @@ Tokenless 的所有重要变更都会记录在此文件中。
 
 ## [未发布]
 
+### 变更
+
+- TOON 编解码器升级到 toon-format 0.7.0（TOON v4.4）：包含嵌套对象的记录数组与以记录 id 为键的映射会编码为分组表格与键控表格，不再退回 JSON；空列表的写法由零长度表头 `items[0]` 变为 `items: []`（[#7751](https://github.com/agentic-os-org/ANOLISA/pull/7751)）。
+- TOON 只在规范要求时为字符串标量加引号：值中间的连字符不再触发 JSON 风格引号，含连字符的载荷编码更小；包含分隔符、冒号或以连字符开头的标量仍然加引号，且候选仍必须解码回完全相同的 JSON 树才会替换 JSON（[#7751](https://github.com/agentic-os-org/ANOLISA/pull/7751)）。
+- 0.7.0 产出的 TOON 文本无法被基于 toon-format 0.5.0 构建的 tokenless 读取，因此显式的 `compress-toon` / `decompress-toon` 管道需要两端一起升级；已持久化的内容不受影响，Stash 中保存的一直是 JSON 而非 TOON（[#7751](https://github.com/agentic-os-org/ANOLISA/pull/7751)）。
+
 ## [0.8.7] - 2026-10-15
 
 ### 修复

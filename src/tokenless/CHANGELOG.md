@@ -9,6 +9,12 @@ Releases from 0.7.2 onward follow
 
 ## [Unreleased]
 
+### Changed
+
+- The TOON codec now runs on toon-format 0.7.0 (TOON v4.4): record arrays holding a nested object and maps keyed by record id encode as grouped and keyed tables instead of falling back to JSON, and an empty list spells as `items: []` rather than the zero-length header `items[0]` ([#7751](https://github.com/agentic-os-org/ANOLISA/pull/7751)).
+- TOON quotes a string scalar only where the spec requires it, so a hyphen inside a value no longer forces JSON-style quotes and hyphenated payloads encode smaller; a scalar holding the delimiter, a colon or a leading hyphen stays quoted, and a candidate still replaces JSON only after decoding back to the exact same tree ([#7751](https://github.com/agentic-os-org/ANOLISA/pull/7751)).
+- TOON text emitted by 0.7.0 is not readable by a tokenless built against toon-format 0.5.0, so an explicit `compress-toon` / `decompress-toon` pipeline must upgrade both ends together; persisted state is unaffected because the stash holds JSON, not TOON ([#7751](https://github.com/agentic-os-org/ANOLISA/pull/7751)).
+
 ## [0.8.7] - 2026-10-15
 
 ### Fixed
