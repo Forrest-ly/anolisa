@@ -324,11 +324,21 @@ Session，再传入启用 Tokenless 的 Session。
 Schema 压缩使用宿主提供给模型的 JSON Schema，并保留运行时参数校验器。
 仅提供运行时校验器的宿主会跳过 Schema 压缩；响应压缩和命令重写仍然可用。
 
-OpenCode 适配器通过 `tool.execute.before/after` 原生插件事件注册已硬关闭的 Tool Ready、
-RTK 命令重写和响应/TOON 压缩，并通过 `tool.definition` 压缩工具 Schema。
+同一个 `plugin.js` 同时服务两代宿主：OpenCode 2 读取其 default 定义（`id` + `setup`），
+OpenCode 1.4 及更新版本读取同一导出对象的 `server()` 入口，更早的 OpenCode 1 版本读取具名导出
+`TokenlessPlugin`。命令重写和 Shell 失败证据按共享 Hook 归类的 Shell 工具族匹配
+（OpenCode 1 的内建 Shell Tool 叫 `bash`，OpenCode 2 叫 `shell`），而不是只认某一代宿主的拼写。
+
+OpenCode 适配器注册已硬关闭的 Tool Ready、RTK 命令重写和响应/TOON 压缩：OpenCode 1 使用
+`tool.execute.before/after` 原生插件事件并通过 `tool.definition` 压缩工具 Schema，
+OpenCode 2 使用 `tool` 域的 `execute.before` / `execute.after` Hook，并通过 `session` 域的
+`context` Hook 压缩本次请求实际发出的工具声明。
 压缩后的响应会替换原始模型可见输出，避免重复占用上下文。
 响应中包含 Retrieve Marker 时，模型可以通过已有 Shell Tool 执行其中的
 `tokenless retrieve` 命令；成功的恢复结果会绕过压缩并原样返回。
+
+Schema 路径在两代宿主上都会注册。由于共享的 BeforeModel 请求没有声明 Marker 授权的恢复路径，
+Core 目前原样返回工具声明；一旦声明了恢复路径，该注册即刻生效。
 
 通过 ANOLISA 启用已安装的插件，然后重启 OpenCode：
 
