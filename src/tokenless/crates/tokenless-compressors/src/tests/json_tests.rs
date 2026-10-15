@@ -863,3 +863,82 @@ fn record_reduction_keeps_retained_numbers_exact() {
         assert_eq!(row["detail"]["value"].to_string(), literal);
     }
 }
+
+/// The shapes toon-format 0.7 encodes compactly and 0.5 expanded past compact
+/// JSON: records with a nested object, and a map keyed by record id. With 0.5
+/// both encodings were larger than the JSON they replace, so `toon_candidate`
+/// rejected them and the host kept JSON.
+fn toon_upgrade_shapes() -> [Value; 2] {
+    let nested: Value = serde_json::json!({
+        "users": (0..1000)
+            .map(|index| serde_json::json!({
+                "id": index,
+                "profile": {"name": format!("user{index}"), "active": true}
+            }))
+            .collect::<Vec<_>>()
+    });
+    let keyed: Value = serde_json::json!({
+        "users": (0..1000)
+            .map(|index| {
+                (
+                    format!("u{index}"),
+                    serde_json::json!({"name": format!("user{index}"), "active": true}),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>()
+    });
+    [nested, keyed]
+}
+
+#[test]
+fn toon_beats_compact_json_on_nested_and_keyed_records() {
+    for value in toon_upgrade_shapes() {
+        let compact = serde_json::to_string(&value).unwrap();
+        let candidate = toon_candidate(&value, 0).unwrap_or_else(|| {
+            panic!("TOON rejected a shape it must encode: {}", &compact[..80])
+        });
+        assert!(
+            candidate.chars().count() < compact.chars().count(),
+            "TOON {} chars is not smaller than JSON {} chars",
+            candidate.chars().count(),
+            compact.chars().count()
+        );
+        assert_eq!(toon_format::decode_default::<Value>(&candidate).unwrap(), value);
+    }
+}
+
+#[test]
+fn toon_keeps_the_new_nested_and_keyed_forms_exact() {
+    let nested = toon_candidate(&toon_upgrade_shapes()[0], 0).unwrap();
+    assert!(
+        nested.starts_with("users[1000]{id,profile{name,active}}:"),
+        "unexpected nested form: {}",
+        nested.lines().next().unwrap_or_default()
+    );
+    let keyed = toon_candidate(&toon_upgrade_shapes()[1], 0).unwrap();
+    assert!(
+        keyed.starts_with("users[1000:]{name,active}:"),
+        "unexpected keyed form: {}",
+        keyed.lines().next().unwrap_or_default()
+    );
+}
+
+#[test]
+fn toon_round_trips_the_edge_cases_the_upgrade_fixes() {
+    for value in [
+        // An array of empty objects lost its length on a 0.5 round trip.
+        serde_json::json!({"items": [{}, {}]}),
+        // A large exponent came back as a string instead of a number.
+        serde_json::json!({"big": 1e20}),
+        // Non-ASCII and dotted keys must survive quoting.
+        serde_json::json!({"ключ": {"a.b": 1, "键": "值"}}),
+    ] {
+        let candidate = toon_candidate(&value, 0)
+            .unwrap_or_else(|| panic!("TOON rejected {value}"));
+        assert_eq!(
+            toon_format::decode_default::<Value>(&candidate).unwrap(),
+            value,
+            "encoding was {candidate:?}"
+        );
+    }
+}

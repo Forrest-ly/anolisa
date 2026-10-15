@@ -477,9 +477,10 @@ result=$(printf '%s' '{"pi":3.14159,"neg":-42}' | tokenless compress-toon "${TOO
 assert_contains "$result" "pi: 3.14159" "float encodes"
 assert_contains "$result" "neg: -42" "negative number encodes"
 
-# Empty array
+# Empty array. toon-format 0.7 spells an empty list as `items: []`; 0.5 emitted
+# the zero-length tabular header `items[0]`.
 result=$(printf '%s' '{"items":[],"keep":1}' | tokenless compress-toon "${TOON_FORCE[@]}" 2>/dev/null)
-assert_contains "$result" "items[0]" "empty array encodes"
+assert_contains "$result" "items: []" "empty array encodes"
 
 scenario "1.6 file input/output"
 

@@ -439,7 +439,7 @@ Schema、字符串、深度、普通数组和 BuildLog 的省略提示使用同�
 | Qoder 插件配置 | `adapters/tokenless/qoder/hooks/hooks.json` |
 | Claude Code 插件 | `adapters/tokenless/claude-code/hooks/run-hook.sh` |
 | Codex 响应诊断 Hook | `adapters/tokenless/codex/scripts/response-diagnostics` |
-| TOON 编解码器（crates.io toon-format） | `toon-format` crate v0.4.6 |
+| TOON 编解码器（crates.io toon-format） | `toon-format` crate v0.7.0 |
 | JSON 压缩测试 | `crates/tokenless-compressors/src/tests/json_tests.rs` |
 | Build Log 压缩测试与 Fixture | `crates/tokenless-compressors/src/tests/build_log_tests.rs`、`crates/tokenless-compressors/tests/fixtures/build_logs/` |
 | PostTool 集成测试 | `crates/tokenless-runtime/src/entry.rs` |
