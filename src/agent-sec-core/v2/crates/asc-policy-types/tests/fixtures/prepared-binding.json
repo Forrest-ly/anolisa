@@ -1,0 +1,55 @@
+{
+  "bindingId": "10000000-0000-4000-8000-000000000001",
+  "bindingRevision": 7,
+  "policy": {
+    "policyId": "00000000-0000-4000-8000-000000000002",
+    "policyName": "prevent deletion",
+    "revision": 1,
+    "template": {
+      "specVersion": "0.1",
+      "rules": [
+        {
+          "effect": "block",
+          "category": "file",
+          "action": "write",
+          "target": {
+            "type": "file",
+            "path": "/etc/agent/config.yaml"
+          },
+          "where": {
+            "operation": {
+              "eq": "delete"
+            }
+          }
+        },
+        {
+          "effect": "block",
+          "category": "file",
+          "action": "write",
+          "target": {
+            "type": "file",
+            "path": "/workspace/important/**"
+          },
+          "where": {
+            "operation": {
+              "eq": "delete"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "scope": {
+    "scopeId": "20000000-0000-4000-8000-000000000001",
+    "selector": {
+      "kind": "pid",
+      "pid": 4242
+    },
+    "process": {
+      "bootId": "11111111-2222-4333-8444-555555555555",
+      "pidNamespace": "pid:[42]",
+      "pid": 4242,
+      "startTime": 987654
+    }
+  }
+}

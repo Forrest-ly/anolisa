@@ -1,13 +1,16 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nix::libc;
 use nix::pty::Winsize;
 
 use crate::input::InputClassifier;
+use crate::raw_input::RawInputMode;
 use crate::types::{ShellEnvironmentSnapshot, ShellEvent};
 
+use super::login_effect::LoginEffectGuard;
 use super::raw_relay::interactive_sentinel::InputWaitStatus;
 use super::transcript::TranscriptRetention;
 
@@ -141,6 +144,83 @@ impl ShellEnvironmentObserver {
     }
 }
 
+/// One-shot request to retire the live input capture because its card was torn
+/// down and rebuilt from scratch.
+///
+/// Producer is the runtime controller, which is the only place that knows a
+/// presentation was invalidated; consumer is the relay, which owns the input mode
+/// and already holds its lock across the observer pass. It has to be a flag rather
+/// than a direct call for two reasons: the controller runs *inside* that lock, so
+/// locking the mode again would deadlock, and the mode machine deliberately keeps
+/// the generation when an identical capture is re-issued, so nothing else retires
+/// it. Keystrokes read against the retired presentation are then rejected by the
+/// existing generation quarantine instead of resolving a card the user can no
+/// longer see.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CaptureRepresentationReset {
+    requested: Arc<AtomicBool>,
+    viewport_changed: Arc<AtomicBool>,
+    committed_emit: Arc<AtomicBool>,
+    pub(crate) display_handoff: Arc<Mutex<Option<String>>>,
+    pub(crate) display_failed: Arc<AtomicBool>,
+}
+
+impl CaptureRepresentationReset {
+    /// Records that the current capture's card was rebuilt.
+    pub(crate) fn signal(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// Takes the request, leaving it clear. Returns whether one was pending.
+    pub(crate) fn consume(&self) -> bool {
+        self.requested.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn notify_resize(&self) {
+        self.viewport_changed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_resize(&self) -> bool {
+        self.viewport_changed.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn permit_committed_emit(&self) {
+        self.committed_emit.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn has_committed_emit(&self) -> bool {
+        self.committed_emit.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn take_committed_emit(&self) -> bool {
+        self.committed_emit.swap(false, Ordering::AcqRel)
+    }
+}
+
+/// Retires a live or submitted capture so the same card can be re-presented
+/// under a new generation. Returns `true` when an old capture was retired.
+///
+/// Parking in `Hold` rather than draining is what makes it safe: `Hold` reports
+/// held input and returns without writing to the PTY
+/// (`raw_input/spawn/capture.rs:172-176`), and the next `CaptureInput` for the same
+/// card then mints a fresh generation through the mode machine's non-`Capture` arm
+/// (`raw_input/mode.rs:144-149`). Re-issuing an identical capture deliberately
+/// preserves the generation otherwise, so a focus repaint cannot orphan input.
+/// `abandon_active_capture` cannot serve here: it drains to
+/// `PostCaptureOwner::MainPrompt`, which would replay a still-Pending approval's
+/// quarantined bytes into Bash, and a later `CaptureInput` for the same capture is
+/// ignored while `Draining`, leaving the rebuilt card deaf.
+pub(crate) fn retire_capture_for_representation(mode: &mut RawInputMode) -> bool {
+    if !matches!(
+        mode,
+        RawInputMode::Capture { .. } | RawInputMode::Submitted { .. }
+    ) {
+        return false;
+    }
+    *mode = RawInputMode::Hold;
+    true
+}
+
 #[derive(Debug, Clone)]
 pub struct ShellHostConfig {
     pub session_id: String,
@@ -152,11 +232,27 @@ pub struct ShellHostConfig {
     pub input_classifier: InputClassifier,
     /// Chooses transparent Shell ownership or marker integration.
     pub integration: ShellIntegration,
+    /// Emits the `◇ `/`◌ ` ownership status line above Enhanced prompts.
+    /// Off by default; only meaningful when `integration` uses markers.
+    pub status_symbols: bool,
     /// Controls whether user startup files are loaded. This remains
     /// orthogonal to `integration`: isolated sessions can run with or without
     /// Cosh marker hooks.
     pub native_mode: bool,
     pub login_shell: bool,
+    /// #R2: when a login + Enhanced + non-isolated session runs, launch the
+    /// inner Bash with a real login identity (`argv0="-bash" --posix` + `$ENV`
+    /// inject) instead of the interactive-but-non-login `--rcfile <marker>`.
+    /// The `shell.login_identity` config default is now `on` (flip-on gate
+    /// passed). This struct default stays `false`: the runtime always sets it
+    /// from `CoshConfig` (`controller::bootstrap`), so the conservative struct
+    /// default only affects direct construction such as unit tests.
+    pub login_identity: bool,
+    /// #R2: whether the inner Bash can safely use the posix `$ENV` marker path.
+    /// Bash < 4 does not source it, while posix startup drops exported functions
+    /// whose names are not shell identifiers; either condition falls back to
+    /// `--rcfile`. Defaults `true`; the runtime overwrites it after probing.
+    pub bash_login_env_posix: bool,
     /// Routes exact slash-control submissions through Bash Readline so they
     /// enter native history without reaching shell parsing (issue #2912).
     /// Defaults from `COSH_SLASH_VIA_SHELL` (on unless "0"); disabling keeps
@@ -169,6 +265,10 @@ pub struct ShellHostConfig {
     /// the `shell.input_wait_timeout_secs` interrupt. Clone the handle
     /// before handing the config to the runner.
     pub(crate) input_wait_status: InputWaitStatus,
+    /// Retires the live input capture when a card presentation is rebuilt. The
+    /// relay consumes it; the runtime controller signals it. Clone the handle
+    /// before handing the config to the runner.
+    pub(crate) capture_representation_reset: CaptureRepresentationReset,
     /// #2025/#2161: language for the relay-rendered input-wait hint card.
     pub(crate) hint_language: crate::config::Language,
     /// #2179: panel-family renderer for the hint card; when absent the
@@ -181,6 +281,7 @@ pub struct ShellHostConfig {
     pub(super) shell_environment_observer: Option<ShellEnvironmentObserver>,
     pub(super) shell_history_file_observer: Option<ShellHistoryFileObserver>,
     pub(super) transcript_retention: TranscriptRetention,
+    login_effect_guard: LoginEffectGuard,
 }
 
 impl ShellHostConfig {
@@ -195,12 +296,16 @@ impl ShellHostConfig {
             winsize,
             input_classifier: InputClassifier::default(),
             integration: ShellIntegration::Enhanced,
+            status_symbols: false,
             native_mode: true,
             login_shell: false,
+            login_identity: false,
+            bash_login_env_posix: true,
             slash_via_shell: slash_via_shell_default(),
             env_overrides: Vec::new(),
             raw_action_watchdog: Duration::from_secs(120),
             input_wait_status: InputWaitStatus::default(),
+            capture_representation_reset: CaptureRepresentationReset::default(),
             hint_language: crate::config::Language::default(),
             hint_card_renderer: None,
             input_wait_timeout_secs: 120,
@@ -208,11 +313,17 @@ impl ShellHostConfig {
             shell_environment_observer: None,
             shell_history_file_observer: None,
             transcript_retention: TranscriptRetention::Full,
+            login_effect_guard: LoginEffectGuard::new(),
         }
     }
 
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env_overrides.push((key.into(), value.into()));
+        self
+    }
+
+    pub fn with_status_symbols(mut self, enabled: bool) -> Self {
+        self.status_symbols = enabled;
         self
     }
 
@@ -229,6 +340,11 @@ impl ShellHostConfig {
 
     pub(crate) fn set_assistance_control(&mut self, control: crate::input::AssistanceControl) {
         self.assistance_control = Some(control);
+    }
+
+    /// Returns a clone sharing this host's login-effect state.
+    pub(crate) fn login_effect_guard(&self) -> LoginEffectGuard {
+        self.login_effect_guard.clone()
     }
 
     /// Installs the input-wait hint card frame renderer (#2196 review):

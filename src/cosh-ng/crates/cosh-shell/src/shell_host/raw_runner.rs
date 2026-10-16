@@ -373,7 +373,8 @@ where
     session
         .parser
         .set_shell_path_command_names(input_classifier.shell_path_command_names());
-    let mut prompt_presentation = PromptPresentation::new(config.integration.uses_markers());
+    let mut prompt_presentation =
+        PromptPresentation::new(config.integration.uses_markers() && config.status_symbols);
     // Attach the gate before startup output consumes the first prompt_ready marker.
     let main_prompt_gate = MainPromptGate::default();
     session
@@ -477,6 +478,7 @@ where
         bounded_bash_handoff,
         watchdog.as_ref(),
         &config.input_wait_status,
+        &config.capture_representation_reset,
         &crate::i18n::I18n::new(config.hint_language),
         config.input_wait_timeout_secs,
         config.hint_card_renderer.as_ref(),

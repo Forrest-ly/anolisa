@@ -60,7 +60,7 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
             "选择建议模式、自动分析或关闭主动介入；控制被动建议与失败命令 Insight"
         }
         MessageId::HelpSummaryModeRouting => "选择未知自然语言输入是否可以路由给 Agent",
-        MessageId::HelpSummaryAgent => "组稿一次性 Agent 请求",
+        MessageId::HelpSummaryAgent => "编写一次性 Agent 请求",
         MessageId::HelpSummaryExplain => "分析上一个失败命令",
         MessageId::HelpSummaryCancel => "取消正在运行的 Agent 工作",
         MessageId::HelpSummaryDetails => "查看审批或活动详情",
@@ -110,7 +110,7 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
         MessageId::HelpGroupSessions => "会话",
         MessageId::HelpSummarySession => "查找、恢复和清理智能体会话",
         MessageId::HelpSummaryTask => "委托并查看本机持久 Agent Task",
-        MessageId::HelpGroupRegistry => "Registry",
+        MessageId::HelpGroupRegistry => "注册表",
         MessageId::HelpSummaryExtensions => "列出/管理 cosh-core 扩展",
         MessageId::HelpSummarySkills => "列出/查看 cosh-core 技能",
         MessageId::HelpSummaryMcp => "管理 MCP 服务器",
@@ -164,6 +164,19 @@ pub(super) fn message(id: MessageId) -> Option<&'static str> {
         MessageId::SlashHooksAgentUnavailable => "(cosh-core 后端不可用)",
         MessageId::SlashExtensionsEmptyBody => "未安装扩展。",
         MessageId::SlashSkillsEmptyBody => "未发现技能。",
+        MessageId::HelpSummaryBug => "生成预填好的 GitHub 问题反馈",
+        MessageId::SlashBugTitle => "反馈问题",
+        MessageId::SlashBugLinkLine => {
+            "打开下方链接即可提交预填好的问题反馈，提交前请检查内容。"
+        }
+        MessageId::SlashBugFormLine => "请在表单中补充问题现象和复现步骤。",
+        MessageId::SlashBugLogsLine => {
+            "日志：可查看 {path} 下最新的日志文件，确认后将相关内容贴到问题中；粘贴前请删除 token、密钥和内网地址。"
+        }
+        MessageId::SlashBugOpenedLine => "正在浏览器中打开链接。",
+        MessageId::SlashBugCopyLine => {
+            "当前环境无法打开浏览器，请将链接复制到本地电脑的浏览器中打开。"
+        }
         _ => return None,
     })
 }

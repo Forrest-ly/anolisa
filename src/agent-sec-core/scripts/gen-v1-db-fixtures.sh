@@ -24,7 +24,7 @@
 set -euo pipefail
 
 CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FIXTURE_DIR="$CORE_DIR/v2/crates/data/persistence/asc-persistence-sqlite/tests/fixtures/v1"
+FIXTURE_DIR="$CORE_DIR/v2/crates/asc-persistence-sqlite/tests/fixtures/v1"
 V1_PROBE="$CORE_DIR/tests/compat/v1_db_probe.py"
 
 export TZ=UTC

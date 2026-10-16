@@ -1,0 +1,358 @@
+{
+  "schemaVersion": 1,
+  "dynamicValues": {
+    "request_id": "a fresh UUID returned by the daemon for each response",
+    "policy_id": "the UUID returned by create Policy and reused by later steps",
+    "scope_id": "the UUID returned by create Scope and reused by later steps"
+  },
+  "objects": {
+    "policyV1": {
+      "policyId": "${policy_id}",
+      "policyName": "protect-important-files-v1",
+      "revision": 1,
+      "template": {
+        "specVersion": "0.1",
+        "rules": [
+          {
+            "effect": "block",
+            "category": "file",
+            "action": "write",
+            "target": {
+              "type": "file",
+              "path": "/etc/agent/config.yaml"
+            },
+            "where": {
+              "operation": {
+                "eq": "delete"
+              }
+            }
+          },
+          {
+            "effect": "block",
+            "category": "file",
+            "action": "write",
+            "target": {
+              "type": "file",
+              "path": "/workspace/important/**"
+            },
+            "where": {
+              "operation": {
+                "eq": "delete"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "policyV2": {
+      "policyId": "${policy_id}",
+      "policyName": "protect-important-files-v2",
+      "revision": 2,
+      "template": {
+        "specVersion": "0.1",
+        "rules": [
+          {
+            "effect": "block",
+            "category": "file",
+            "action": "write",
+            "target": {
+              "type": "file",
+              "path": "/srv/data"
+            },
+            "where": {
+              "operation": {
+                "eq": "delete"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "scopeV1": {
+      "scopeId": "${scope_id}",
+      "selector": {
+        "kind": "process",
+        "match": {
+          "processName": "no-such-agent"
+        }
+      },
+      "policySnapshots": [
+        {
+          "$ref": "policyV1"
+        }
+      ],
+      "status": "ACTIVE"
+    }
+  },
+  "steps": [
+    {
+      "name": "create-policy",
+      "request": {
+        "method": "policy.templates.create",
+        "params": {
+          "policyName": "protect-important-files-v1",
+          "template": {
+            "specVersion": "0.1",
+            "rules": [
+              {
+                "effect": "block",
+                "category": "file",
+                "action": "write",
+                "target": {
+                  "type": "file",
+                  "path": "/etc/agent/config.yaml"
+                },
+                "where": {
+                  "operation": {
+                    "eq": "delete"
+                  }
+                }
+              },
+              {
+                "effect": "block",
+                "category": "file",
+                "action": "write",
+                "target": {
+                  "type": "file",
+                  "path": "/workspace/important/**"
+                },
+                "where": {
+                  "operation": {
+                    "eq": "delete"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "captures": [
+        {
+          "name": "policy_id",
+          "pointer": "/result/policyId",
+          "format": "uuid"
+        }
+      ],
+      "expectedResponse": {
+        "requestId": "${request_id}",
+        "result": {
+          "$ref": "policyV1"
+        }
+      }
+    },
+    {
+      "name": "create-scope",
+      "request": {
+        "method": "policy.scopes.create",
+        "params": {
+          "selector": {
+            "kind": "process",
+            "match": {
+              "processName": "no-such-agent"
+            }
+          },
+          "policyTemplates": [
+            {
+              "policyId": "${policy_id}",
+              "policyRevision": 1
+            }
+          ]
+        }
+      },
+      "captures": [
+        {
+          "name": "scope_id",
+          "pointer": "/result/scopeId",
+          "format": "uuid"
+        }
+      ],
+      "expectedResponse": {
+        "requestId": "${request_id}",
+        "result": {
+          "$ref": "scopeV1"
+        }
+      }
+    },
+    {
+      "name": "update-policy",
+      "request": {
+        "method": "policy.templates.update",
+        "params": {
+          "policyId": "${policy_id}",
+          "policyName": "protect-important-files-v2",
+          "template": {
+            "specVersion": "0.1",
+            "rules": [
+              {
+                "effect": "block",
+                "category": "file",
+                "action": "write",
+                "target": {
+                  "type": "file",
+                  "path": "/srv/data"
+                },
+                "where": {
+                  "operation": {
+                    "eq": "delete"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "captures": [],
+      "expectedResponse": {
+        "requestId": "${request_id}",
+        "result": {
+          "$ref": "policyV2"
+        }
+      }
+    },
+    {
+      "name": "get-policy",
+      "request": {
+        "method": "policy.templates.get",
+        "params": {
+          "id": "${policy_id}",
+          "revision": 2
+        }
+      },
+      "captures": [],
+      "expectedResponse": {
+        "requestId": "${request_id}",
+        "result": {
+          "$ref": "policyV2"
+        }
+      }
+    },
+    {
+      "name": "list-policies",
+      "request": {
+        "method": "policy.templates.list",
+        "params": {
+          "limit": 10,
+          "offset": 0
+        }
+      },
+      "captures": [],
+      "expectedResponse": {
+        "requestId": "${request_id}",
+        "result": {
+          "items": [
+            {
+              "$ref": "policyV2"
+            }
+          ],
+          "total": 1
+        }
+      }
+    },
+    {
+      "name": "get-scope",
+      "request": {
+        "method": "policy.scopes.get",
+        "params": {
+          "id": "${scope_id}"
+        }
+      },
+      "captures": [],
+      "expectedResponse": {
+        "requestId": "${request_id}",
+        "result": {
+          "$ref": "scopeV1"
+        }
+      }
+    },
+    {
+      "name": "list-scopes",
+      "request": {
+        "method": "policy.scopes.list",
+        "params": {
+          "limit": 10,
+          "offset": 0
+        }
+      },
+      "captures": [],
+      "expectedResponse": {
+        "requestId": "${request_id}",
+        "result": {
+          "items": [
+            {
+              "$ref": "scopeV1"
+            }
+          ],
+          "total": 1
+        }
+      }
+    },
+    {
+      "name": "list-bindings",
+      "request": {
+        "method": "policy.bindings.list",
+        "params": {
+          "limit": 10,
+          "offset": 0
+        }
+      },
+      "captures": [],
+      "expectedResponse": {
+        "requestId": "${request_id}",
+        "result": {
+          "items": [],
+          "total": 0
+        }
+      }
+    },
+    {
+      "name": "delete-policy",
+      "request": {
+        "method": "policy.templates.delete",
+        "params": {
+          "id": "${policy_id}",
+          "revision": 2
+        }
+      },
+      "captures": [],
+      "expectedResponse": {
+        "requestId": "${request_id}",
+        "result": {
+          "$ref": "policyV2"
+        }
+      }
+    },
+    {
+      "name": "retry-scope",
+      "request": {
+        "method": "policy.scopes.retry",
+        "params": {
+          "id": "${scope_id}"
+        }
+      },
+      "captures": [],
+      "expectedResponse": {
+        "requestId": "${request_id}",
+        "result": {
+          "$ref": "scopeV1"
+        }
+      }
+    },
+    {
+      "name": "delete-scope",
+      "request": {
+        "method": "policy.scopes.delete",
+        "params": {
+          "id": "${scope_id}"
+        }
+      },
+      "captures": [],
+      "expectedResponse": {
+        "requestId": "${request_id}",
+        "result": {
+          "scopeId": "${scope_id}",
+          "completed": true
+        }
+      }
+    }
+  ]
+}

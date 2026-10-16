@@ -1,0 +1,387 @@
+{
+  "schemaVersion": 1,
+  "generatedValues": {"resource_id_129": "129 ASCII identifier bytes", "policy_name_257": "257 policy-name bytes", "path_4097": "4097 absolute-path bytes"},
+  "dynamicValues": {"existing_policy_id": "the UUID returned by the fixture setup Policy"},
+  "cases": [
+    {
+      "name": "create policy with an empty policy name",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy name: must contain a visible character"}
+    },
+    {
+      "name": "update policy with a whitespace-only policy name",
+      "request": {"method": "policy.templates.update", "params": {"policyId": "${existing_policy_id}", "policyName": "   ", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy name: must contain a visible character"}
+    },
+    {
+      "name": "create policy with an oversized policy name",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "${policy_name_257}", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy name: must not exceed 256 bytes"}
+    },
+    {
+      "name": "update policy with a control character in its name",
+      "request": {"method": "policy.templates.update", "params": {"policyId": "${existing_policy_id}", "policyName": "invalid\nname", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy name: must not contain control characters"}
+    },
+    {
+      "name": "create scope selector without kind",
+      "request": {"method": "policy.scopes.create", "params": {"selector": {"pid": 1}}},
+      "expectedError": {"code": "invalid_request", "message": "missing field `kind`"}
+    },
+    {
+      "name": "update scope with an unknown selector kind",
+      "request": {"method": "policy.scopes.update", "params": {"scopeId": "missing-scope", "selector": {"kind": "unknown", "pid": 1}}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "create PID scope without a PID",
+      "request": {"method": "policy.scopes.create", "params": {"selector": {"kind": "pid"}}},
+      "expectedError": {"code": "invalid_request", "message": "missing field `pid`"}
+    },
+    {
+      "name": "update cgroup scope without a cgroup ID",
+      "request": {"method": "policy.scopes.update", "params": {"scopeId": "missing-scope", "selector": {"kind": "cgroup_id"}}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "create PID scope with an unknown field",
+      "request": {"method": "policy.scopes.create", "params": {"selector": {"kind": "pid", "pid": 1, "unexpected": true}}},
+      "expectedError": {"code": "invalid_request", "message": "unknown field `unexpected`, expected `pid`"}
+    },
+    {
+      "name": "create scope with zero PID",
+      "request": {"method": "policy.scopes.create", "params": {"selector": {"kind": "pid", "pid": 0}}},
+      "expectedError": {"code": "invalid_request", "message": "invalid selector at pid: must be positive"}
+    },
+    {
+      "name": "update scope with zero cgroup ID",
+      "request": {"method": "policy.scopes.update", "params": {"scopeId": "missing-scope", "selector": {"kind": "cgroup_id", "cgroupId": 0}}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "create scope with a negative PID",
+      "request": {"method": "policy.scopes.create", "params": {"selector": {"kind": "pid", "pid": -1}}},
+      "expectedError": {"code": "invalid_request", "message": "invalid value: integer `-1`, expected u32"}
+    },
+    {
+      "name": "create scope with an overflowing PID",
+      "request": {"method": "policy.scopes.create", "params": {"selector": {"kind": "pid", "pid": 4294967296}}},
+      "expectedError": {"code": "invalid_request", "message": "invalid value: integer `4294967296`, expected u32"}
+    },
+    {
+      "name": "create scope with a fractional PID",
+      "request": {"method": "policy.scopes.create", "params": {"selector": {"kind": "pid", "pid": 1.5}}},
+      "expectedError": {"code": "invalid_request", "message": "invalid type: floating point `1.5`, expected u32"}
+    },
+    {
+      "name": "create scope with a string PID",
+      "request": {"method": "policy.scopes.create", "params": {"selector": {"kind": "pid", "pid": "one"}}},
+      "expectedError": {"code": "invalid_request", "message": "invalid type: string \"one\", expected u32"}
+    },
+    {
+      "name": "create scope with a null PID",
+      "request": {"method": "policy.scopes.create", "params": {"selector": {"kind": "pid", "pid": null}}},
+      "expectedError": {"code": "invalid_request", "message": "invalid type: null, expected u32"}
+    },
+    {
+      "name": "create PID scope with a cgroup field",
+      "request": {"method": "policy.scopes.create", "params": {"selector": {"kind": "pid", "pid": 1, "cgroupId": 1}}},
+      "expectedError": {"code": "invalid_request", "message": "unknown field `cgroupId`, expected `pid`"}
+    },
+    {
+      "name": "update cgroup scope with a PID field",
+      "request": {"method": "policy.scopes.update", "params": {"scopeId": "missing-scope", "selector": {"kind": "cgroup_id", "cgroupId": 1, "pid": 1}}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "update scope with a negative cgroup ID",
+      "request": {"method": "policy.scopes.update", "params": {"scopeId": "missing-scope", "selector": {"kind": "cgroup_id", "cgroupId": -1}}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "update scope with an overflowing cgroup ID",
+      "request": {"method": "policy.scopes.update", "params": {"scopeId": "missing-scope", "selector": {"kind": "cgroup_id", "cgroupId": 18446744073709551616}}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "update scope with a fractional cgroup ID",
+      "request": {"method": "policy.scopes.update", "params": {"scopeId": "missing-scope", "selector": {"kind": "cgroup_id", "cgroupId": 1.5}}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "update scope with a string cgroup ID",
+      "request": {"method": "policy.scopes.update", "params": {"scopeId": "missing-scope", "selector": {"kind": "cgroup_id", "cgroupId": "one"}}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "update scope with a null cgroup ID",
+      "request": {"method": "policy.scopes.update", "params": {"scopeId": "missing-scope", "selector": {"kind": "cgroup_id", "cgroupId": null}}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "create scope with a legacy selector",
+      "request": {"method": "policy.scopes.create", "params": {"selector": {"kind": "legacy_execution_domain", "executionDomainId": "legacy-domain"}}},
+      "expectedError": {"code": "invalid_request", "message": "unknown variant `legacy_execution_domain`, expected one of `pid`, `process`, `cgroup_id`"}
+    },
+    {
+      "name": "update scope with a legacy selector",
+      "request": {"method": "policy.scopes.update", "params": {"scopeId": "missing-scope", "selector": {"kind": "legacy_execution_domain", "executionDomainId": "legacy-domain"}}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "update a missing policy",
+      "request": {"method": "policy.templates.update", "params": {"policyId": "missing-policy", "policyName": "valid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "not_found", "message": "policy was not found"}
+    },
+    {
+      "name": "get a missing policy revision",
+      "request": {"method": "policy.templates.get", "params": {"id": "missing-policy", "revision": 1}},
+      "expectedError": {"code": "not_found", "message": "policy revision was not found"}
+    },
+    {
+      "name": "delete a missing policy revision",
+      "request": {"method": "policy.templates.delete", "params": {"id": "missing-policy", "revision": 1}},
+      "expectedError": {"code": "not_found", "message": "policy revision was not found"}
+    },
+    {
+      "name": "update a missing scope",
+      "request": {"method": "policy.scopes.update", "params": {"scopeId": "missing-scope", "selector": {"kind": "pid", "pid": 1}}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "get a missing scope revision",
+      "request": {"method": "policy.scopes.get", "params": {"id": "missing-scope", "revision": 1}},
+      "expectedError": {"code": "invalid_request", "message": "unknown field `revision`, expected `id`"}
+    },
+    {
+      "name": "delete a missing scope revision",
+      "request": {"method": "policy.scopes.delete", "params": {"id": "missing-scope", "revision": 1}},
+      "expectedError": {"code": "invalid_request", "message": "unknown field `revision`, expected `id`"}
+    },
+    {
+      "name": "create binding with a missing policy revision",
+      "request": {"method": "policy.bindings.create", "params": {"policyId": "missing-policy", "policyRevision": 1, "scopeId": "missing-scope", "scopeRevision": 1}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "create binding with a missing scope revision",
+      "request": {"method": "policy.bindings.create", "params": {"policyId": "${existing_policy_id}", "policyRevision": 1, "scopeId": "missing-scope", "scopeRevision": 1}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "update a missing binding",
+      "request": {"method": "policy.bindings.update", "params": {"bindingId": "missing-binding", "policyId": "missing-policy", "policyRevision": 1, "scopeId": "missing-scope", "scopeRevision": 1}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "get a missing binding",
+      "request": {"method": "policy.bindings.get", "params": {"id": "missing-binding"}},
+      "expectedError": {"code": "not_found", "message": "binding was not found"}
+    },
+    {
+      "name": "delete a missing binding",
+      "request": {"method": "policy.bindings.delete", "params": {"id": "missing-binding"}},
+      "expectedError": {"code": "unknown_method", "message": "daemon method is not implemented"}
+    },
+    {
+      "name": "list policies with zero limit",
+      "request": {"method": "policy.templates.list", "params": {"limit": 0, "offset": 0}},
+      "expectedError": {"code": "invalid_request", "message": "limit must be between 1 and 1000"}
+    },
+    {
+      "name": "list scopes above the maximum limit",
+      "request": {"method": "policy.scopes.list", "params": {"limit": 1001, "offset": 0}},
+      "expectedError": {"code": "invalid_request", "message": "limit must be between 1 and 1000"}
+    },
+    {
+      "name": "list bindings with a negative offset",
+      "request": {"method": "policy.bindings.list", "params": {"limit": 1, "offset": -1}},
+      "expectedError": {"code": "invalid_request", "message": "invalid value: integer `-1`, expected u32"}
+    },
+    {
+      "name": "retry-scope-missing-id",
+      "request": {"method": "policy.scopes.retry", "params": {}},
+      "expectedError": {"code": "invalid_request", "message": "missing field `id`"}
+    },
+    {
+      "name": "legacy fixed-kind template is rejected",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"kind": "prevent_file_deletion", "files": ["/valid"]}}},
+      "expectedError": {"code": "invalid_request", "message": "unknown field `kind`, expected one of `specVersion`, `description`, `rules`"}
+    },
+    {
+      "name": "missing format version",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_request", "message": "missing field `specVersion`"}
+    },
+    {
+      "name": "missing rules",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1"}}},
+      "expectedError": {"code": "invalid_request", "message": "missing field `rules`"}
+    },
+    {
+      "name": "rules must be an array",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": "bad"}}},
+      "expectedError": {"code": "invalid_request", "message": "invalid type: string \"bad\", expected a sequence"}
+    },
+    {
+      "name": "unknown template field",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}], "unexpected": true}}},
+      "expectedError": {"code": "invalid_request", "message": "unknown field `unexpected`, expected one of `specVersion`, `description`, `rules`"}
+    },
+    {
+      "name": "empty rules",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": []}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules: requires 1..1024 rules"}
+    },
+    {
+      "name": "unknown format version",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "99", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.specVersion: only 0.1 is supported"}
+    },
+    {
+      "name": "description type",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}], "description": 1}}},
+      "expectedError": {"code": "invalid_request", "message": "invalid type: integer `1`, expected a string"}
+    },
+    {
+      "name": "invalid file target ''",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": ""}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target.path: path must be absolute and contain no NUL, home expansion, or environment variables"}
+    },
+    {
+      "name": "invalid file target 'relative/path'",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "relative/path"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target.path: path must be absolute and contain no NUL, home expansion, or environment variables"}
+    },
+    {
+      "name": "invalid file target '/invalid\\x00path'",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/invalid\u0000path"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target.path: path must be absolute and contain no NUL, home expansion, or environment variables"}
+    },
+    {
+      "name": "invalid file target '/home/~/invalid'",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/home/~/invalid"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target.path: path must be absolute and contain no NUL, home expansion, or environment variables"}
+    },
+    {
+      "name": "invalid file target '/$INVALID'",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/$INVALID"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target.path: path must be absolute and contain no NUL, home expansion, or environment variables"}
+    },
+    {
+      "name": "invalid file target '${path_4097}'",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "${path_4097}"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target.path: path exceeds 4096 bytes"}
+    },
+    {
+      "name": "invalid file target '/invalid/'",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/invalid/"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target.path: path must not have a trailing separator"}
+    },
+    {
+      "name": "invalid file target '/invalid//path'",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/invalid//path"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target.path: path contains repeated separators"}
+    },
+    {
+      "name": "invalid file target '/invalid/./path'",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/invalid/./path"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target.path: path contains a dot segment"}
+    },
+    {
+      "name": "invalid file target '/invalid/../path'",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/invalid/../path"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target.path: path contains a dot segment"}
+    },
+    {
+      "name": "invalid file target '/invalid/[ab]*'",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/invalid/[ab]*"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target.path: glob supports only *, ?, and whole-segment **"}
+    },
+    {
+      "name": "invalid file target '/invalid/pre**post'",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/invalid/pre**post"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target.path: ** must occupy a complete path segment"}
+    },
+    {
+      "name": "category mismatch",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "network", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].target: resource type must match category; only file targets are defined"}
+    },
+    {
+      "name": "unknown effect",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "warn", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_request", "message": "unknown variant `warn`, expected one of `block`, `allow`, `require_confirmation`"}
+    },
+    {
+      "name": "unknown action",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "connect", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_request", "message": "unknown variant `connect`, expected one of `read`, `write`, `exec`"}
+    },
+    {
+      "name": "missing target path",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_request", "message": "missing field `path`"}
+    },
+    {
+      "name": "target path type",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": 1}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_request", "message": "invalid type: integer `1`, expected a string"}
+    },
+    {
+      "name": "unknown target type",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "network", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_request", "message": "unknown variant `network`, expected `file`"}
+    },
+    {
+      "name": "target is not an object",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": 1, "where": {"operation": {"eq": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_request", "message": "invalid type: integer `1`, expected internally tagged enum Resource"}
+    },
+    {
+      "name": "reason type",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}, "because": 1}]}}},
+      "expectedError": {"code": "invalid_request", "message": "invalid type: integer `1`, expected a string"}
+    },
+    {
+      "name": "unknown rule field",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "delete"}}, "extra": true}]}}},
+      "expectedError": {"code": "invalid_request", "message": "unknown field `extra`, expected one of `effect`, `category`, `action`, `target`, `where`, `previous`, `because`"}
+    },
+    {
+      "name": "empty conjunction",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"and": []}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].where: logical groups must not be empty"}
+    },
+    {
+      "name": "operation numeric operand",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": 1}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].where.operation: invalid operator or operand type for attribute"}
+    },
+    {
+      "name": "operation unknown enum",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"eq": "unlink"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].where.operation: invalid operator or operand type for attribute"}
+    },
+    {
+      "name": "operation invalid comparison",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"gt": "delete"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].where.operation: invalid operator or operand type for attribute"}
+    },
+    {
+      "name": "membership mixed operand types",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"operation": {"in": ["delete", 1]}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].where.operation: invalid operator or operand type for attribute"}
+    },
+    {
+      "name": "attribute wrong action",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"cwd": {"eq": "/workspace"}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].where.cwd: attribute is not defined for this action"}
+    },
+    {
+      "name": "negative unsigned operand",
+      "request": {"method": "policy.templates.create", "params": {"policyName": "invalid", "template": {"specVersion": "0.1", "rules": [{"effect": "block", "category": "file", "action": "write", "target": {"type": "file", "path": "/valid"}, "where": {"mode": {"eq": -1}}}]}}},
+      "expectedError": {"code": "invalid_argument", "message": "invalid policy: template.rules[0].where.mode: invalid operator or operand type for attribute"}
+    }
+  ]
+}

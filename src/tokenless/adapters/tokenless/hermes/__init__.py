@@ -117,7 +117,7 @@ _HOOK_UTILS_CALL_SHAPES: tuple[tuple[str, tuple[Any, ...], dict[str, Any]], ...]
     #                           content_origin, output_optimization,
     #                           result_kind=..., recovery=..., session_id=...,
     #                           tool_use_id=..., replace_output=True,
-    #                           replace_with_text=True)
+    #                           replace_with_text=True, command=...)
     (
         "build_post_tool_request",
         ("", "", "", "", "", ""),
@@ -128,6 +128,7 @@ _HOOK_UTILS_CALL_SHAPES: tuple[tuple[str, tuple[Any, ...], dict[str, Any]], ...]
             "tool_use_id": "",
             "replace_output": True,
             "replace_with_text": True,
+            "command": None,
         },
     ),
     # Both hooks: run_compress(tokenless_bin, request, timeout, operation)
@@ -188,8 +189,8 @@ def _check_api_compat(candidate_dir: str) -> str | None:
     saved = sys.modules.pop("hook_utils", None)
     try:
         import hook_utils as _trial  # type: ignore[import-not-found]
-        missing = [s for s in _HOOK_UTILS_REQUIRED_SYMBOLS
-                   if not hasattr(_trial, s)]
+
+        missing = [s for s in _HOOK_UTILS_REQUIRED_SYMBOLS if not hasattr(_trial, s)]
         if missing:
             _restore_cached_hook_utils(saved)
             return f"API mismatch: missing {', '.join(missing)}"
@@ -208,7 +209,6 @@ def _check_api_compat(candidate_dir: str) -> str | None:
         return f"import failed: {exc}"
     finally:
         sys.path.pop(0)
-
 
 
 def _resolve_hook_utils() -> tuple[str, list[str]]:
@@ -363,7 +363,7 @@ def _protocol_status(status: Any, result: str) -> str | None:
     return "error" if isinstance(parsed, dict) and parsed.get("error") else "success"
 
 
-def _content_origin(tool_name: str) -> str:
+def _content_origin(tool_name: str, args: Any) -> str:
     if tool_name in _SKIP_TOOLS:
         return "file_content"
     if tool_name in _SHELL_TOOLS:
@@ -483,11 +483,17 @@ def on_transform_tool_result(
     # Hermes's terminal tool returns a JSON envelope whose `output` field is
     # the model-visible command output. Compress that field so structured JSON
     # produced by the command remains visible to JsonCompressor, then restore
-    # the host envelope below. Other tools already expose their model-bound
-    # result directly and must keep the existing path.
+    # the host envelope below. Failed or stopped calls keep the whole result:
+    # Hermes can put their only diagnostic in `error` while `output` is empty.
     shell_envelope = None
     content = result
-    if tool_name in _SHELL_TOOLS:
+    content_origin = _content_origin(tool_name, args)
+    # Core reports a plain file print (`cat page.html`) as file_read from the
+    # command line, so the page stays verbatim while data still compresses.
+    command = None
+    if content_origin == "command_output" and isinstance(args, dict):
+        command = args.get("command")
+    if protocol_status == "success" and tool_name in _SHELL_TOOLS:
         try:
             parsed_result = json.loads(result)
         except json.JSONDecodeError:
@@ -501,7 +507,7 @@ def on_transform_tool_result(
         AGENT_ID,
         tool_name,
         protocol_status,
-        _content_origin(tool_name),
+        content_origin,
         output_optimization,
         result_kind="retrieve" if retrieve_result else "tool",
         recovery={
@@ -520,6 +526,7 @@ def on_transform_tool_result(
         tool_use_id=str(tool_call_id),
         replace_output=True,
         replace_with_text=True,
+        command=command if isinstance(command, str) else None,
     )
     response = run_compress(tokenless_bin, request, _COMPRESS_TIMEOUT_SECONDS, "post_tool")
     if not isinstance(response, dict):

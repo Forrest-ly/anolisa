@@ -60,19 +60,20 @@ An installation in the other scope does not make the selected scope
 "already installed." Reinstalling or changing an existing record is handled
 by lifecycle planning rather than silently overwriting it.
 
-RPM installs, including `--dry-run` and merged `--all` plans, ask DNF to
-resolve dependencies and package conflicts before creating recovery journals.
-The check uses the same repositories and version pins as the install. It may
-refresh repository metadata but does not download packages or change rpmdb.
-DNF 4 requires root for this check:
+RPM installs support Yum 3 and DNF 4. ANOLISA prefers yum and uses dnf when
+yum is absent. Use `sudo` to check dependencies and conflicts before installing:
 
 ```bash
 sudo anolisa --install-mode system --dry-run install cosh --backend rpm
 ```
 
-A conflict fails the command without leaving a pending operation. Resolve the
-reported conflict before retrying. A successful check does not guarantee that
-a later download, scriptlet, or transaction will succeed.
+This check does not install or change packages. Resolve any reported conflicts
+before retrying; a successful check does not guarantee the later installation
+will succeed. If a requested version conflicts with system restrictions such
+as a version lock, the command fails without substituting another version.
+
+If ANOLISA cannot identify the system's package manager, follow the reported
+instructions to install missing dependencies manually, then retry.
 
 ### uninstall
 
@@ -213,11 +214,87 @@ anolisa adapter disable <component> [framework]
 anolisa adapter status [component]
 ```
 
-For OpenClaw plugins, executing `adapter enable` accepts the plugin's declared
-capabilities. ANOLISA adds `--accept-capabilities` only when the installer's
-help advertises it, including in the dry-run plan. Capability consent does
-not authorize `--allow-unsafe-plugin-install`; a consent rejection is reported
+For OpenClaw plugins, `adapter enable` accepts the plugin's declared capabilities
+by default. ANOLISA adds `--accept-capabilities` to installation and activation
+only when the corresponding command's help advertises it. To withhold these
+automatic grants, use:
+
+```bash
+anolisa adapter enable tokenless openclaw --no-accept-capabilities
+anolisa --dry-run adapter enable tokenless openclaw --no-accept-capabilities
+```
+
+The dry-run plan shows both commands without the consent flag. This option is
+only valid for an OpenClaw plugin adapter; other frameworks and skill-only
+adapters reject it. It does not revoke capabilities already authorized in
+OpenClaw, and hosts without the consent flag continue to apply their own policy.
+Environment settings such as `ANOLISA_ACCEPT_CAPABILITIES` or
+`AGENT_MEMORY_ACCEPT_CAPABILITIES` do not configure `adapter enable`; use the
+CLI option for this entry point.
+
+If OpenClaw requires a new grant, its refusal remains an execution failure
+(`EXECUTION_FAILED`, exit code 1) and the adapter receipt is kept for cleanup
+with `anolisa adapter disable tokenless openclaw`. Review the reported
+capabilities before authorizing them separately. Capability consent does not
+authorize `--allow-unsafe-plugin-install`; a consent rejection is reported
 separately from a plugin-safety rejection.
+
+For OpenCode, manage an installed Tokenless plugin with:
+
+```bash
+anolisa adapter enable tokenless opencode
+anolisa adapter status tokenless
+anolisa adapter disable tokenless opencode
+```
+
+The driver finds `opencode` on PATH, or uses `OPENCODE_BIN`. It registers the
+manifest's `.js` or `.ts` entry as `plugins/<plugin_id>.<extension>` under
+`OPENCODE_CONFIG_DIR`, otherwise `XDG_CONFIG_HOME/opencode`, otherwise
+`~/.config/opencode`. Custom directory values must be absolute. Keep the same
+directory configuration for later status and disable commands; if it changes,
+restore the original environment before retrying cleanup. Project-local plugin
+installation and npm plugin management are outside this driver's scope.
+
+Enable adopts an existing symlink to the same plugin source, including one
+created by Tokenless's standalone installer. Relative links must resolve lexically to the
+recorded source path; directory aliases are rejected so cleanup remains possible after
+package removal. After adoption, disable removes
+that link. A conflicting file, directory, or different symlink is preserved;
+failed cleanup keeps the receipt so it can be retried after resolving the conflict.
+Same-path upgrades replace the entry atomically. If enable or disable is interrupted,
+retry the command with the same configuration to recover pending changes. If an error
+reports a preserved entry, keep its recovery directory, resolve the conflicting public
+path, and retry; recovery also restores displaced directories. Complete ANOLISA disable and
+recovery before switching back to a standalone installer, which does not process these journals.
+The configuration directory's filesystem must support atomic exchange and non-overwriting
+rename for replacement and cleanup. If it does not, the operation fails; resolving a pathname
+conflict alone will not add the missing filesystem support.
+If the old installer used `TOKENLESS_OPENCODE_CONFIG_DIR`, set
+`OPENCODE_CONFIG_DIR` to that same directory before enabling through ANOLISA.
+
+Restart OpenCode after enabling or disabling. Status verifies the link and
+package source and preserves `cleanup_failed` when enable was interrupted or cleanup still
+needs a retry, even if the active link matches. Retry enable or complete disable to resolve it. Runtime loading is reported as `unknown`; an existing link
+does not prove a running OpenCode process loaded it. `--dry-run` previews the
+operation without modifying plugin files or receipts.
+
+#### QwenWorkCN (macOS local mode)
+
+```bash
+anolisa --dry-run adapter enable tokenless qwenwork
+anolisa adapter enable tokenless qwenwork
+anolisa adapter status tokenless
+anolisa adapter disable tokenless qwenwork
+```
+
+The driver sideloads receipt-owned files and never changes desktop activation.
+Restart QwenWorkCN after enable/disable and open a new local session. Status reports
+loading and activation as `unknown`; file presence alone is not proof of activation.
+Keep the same `TOKENLESS_QWENWORK_HOME` for subsequent operations;
+`TOKENLESS_QWENWORK_APP` overrides the detected application bundle. Existing
+script installations must be removed with their original uninstaller before CLI
+enable. Modified and unrelated files are preserved. See [QwenWork integration](../token-saving/tokenless/framework-integration.md#qwenwork-macos-local-mode)
+for dependencies, migration, and the validated 1.2.5 version scope.
 
 ### logs and bug reports
 
@@ -227,10 +304,34 @@ Inspect component logs or generate a diagnostic bundle:
 anolisa logs <component>
 anolisa logs <component> --limit 50
 anolisa logs <component> --severity warn
+anolisa logs <component> --since '2026-10-01T00:30:00Z'
 anolisa bug
 ```
 
 `--level` is an alias for `--severity`.
+
+`--since` accepts an inclusive RFC3339 lower bound. Time-zone offsets and
+fractional seconds are compared as instants: `2026-10-01T08:30:00+08:00` and
+`2026-10-01T00:30:00Z` select the same time window. `--limit` keeps the most recent
+matching entries in append order.
+
+An invalid `--since` value returns `INVALID_ARGUMENT`. Records whose `started_at`
+cannot be parsed as RFC3339 do not match a time filter; omit `--since` to inspect
+them. Malformed JSON remains a query error. These queries do not modify the log.
+
+With `--component cosh-ng`, `anolisa bug` also asks the installed
+`cosh-shell` binary to export its sanitized diagnostic bundle to a fresh
+private path (`0600`, never overwritten) and summarizes the bundle's health
+finding IDs and manifest in the report. The binary is resolved from the
+cosh-ng installation's private libexec locations (the raw contract's
+directory and the RPM's `/usr/libexec` path), with `COSH_SHELL_BIN` as an
+override and PATH as a development fallback; the printed manual and
+reproduction commands use the resolved absolute path so they stay runnable.
+The bundle is written below the calling user's own state root —
+even when diagnosing a system-scope installation — and is never uploaded;
+review it locally before attaching it to an issue. If no bundle can be
+produced, the report says so explicitly and prints the manual
+`cosh-shell diagnostics export` command instead.
 
 ---
 
@@ -305,6 +406,12 @@ index cache and no stale-index fallback, so an unreachable repository fails the
 command instead of resolving against older data. `cache_ttl_secs` and
 `offline_fallback` were never wired up; configs that still set them keep
 parsing, but the values are ignored.
+
+For RPM repositories that require a proxy or a private CA, set `proxy`,
+`proxy_username`, `proxy_password`, or `sslcacert` directly in `[main]` of
+`/etc/yum.conf` (or `/etc/dnf/dnf.conf` when the former is absent).
+Without explicit settings, ANOLISA uses environment proxies (`http_proxy`,
+`https_proxy`, `all_proxy`, `no_proxy`) and the system's trusted certificates.
 
 CLI flags override the operation being run; there is no `[install] mode`
 setting.
