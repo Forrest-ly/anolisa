@@ -79,6 +79,20 @@ impl AuditEntry {
     }
 }
 
+/// True when a search tool's audit payload is a sanitized query marker
+/// (`len=<digits>`) rather than a recorded query.
+///
+/// `memory_search` redacts the query text and logs only its byte length, so
+/// audit readers must treat the marker as "no query recorded": the original
+/// text is unrecoverable, and persisting the marker yields junk interest facts
+/// and profile topics. Legacy rows and `mem_grep` paths still carry real text.
+pub fn is_sanitized_query_marker(payload: &str) -> bool {
+    let Some(digits) = payload.strip_prefix("len=") else {
+        return false;
+    };
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Append-only JSONL logger with a held file handle.
 ///
 /// Each `log()` call writes to a persistent `File` handle guarded by a
@@ -164,5 +178,18 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(v["error"], "nope");
+    }
+
+    #[test]
+    fn recognizes_sanitized_query_markers() {
+        assert!(is_sanitized_query_marker("len=14"));
+        assert!(is_sanitized_query_marker("len=0"));
+        // Recorded queries and grep paths are text, however short or odd.
+        assert!(!is_sanitized_query_marker("rust ownership"));
+        assert!(!is_sanitized_query_marker("notes/"));
+        assert!(!is_sanitized_query_marker("len="));
+        assert!(!is_sanitized_query_marker("len=1.4"));
+        assert!(!is_sanitized_query_marker("len=14 bytes"));
+        assert!(!is_sanitized_query_marker(""));
     }
 }

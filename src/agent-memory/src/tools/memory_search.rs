@@ -79,6 +79,9 @@ pub fn memory_search(
                 .iter()
                 .map(|h| h.snippet.len() as u64 / 4 + h.path.len() as u64 / 4)
                 .sum();
+            // Audit contract: `path` carries the redacted query marker
+            // (`len=<bytes>`), never the query text. Readers skip it via
+            // `audit::is_sanitized_query_marker`.
             svc.audit_log(
                 AuditEntry::new(TOOL)
                     .path(format!("bm25:len={}", query.len()))

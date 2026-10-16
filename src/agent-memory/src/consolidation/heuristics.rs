@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::audit::AuditEntry;
+use crate::audit::{AuditEntry, is_sanitized_query_marker};
 use crate::config::ConsolidationConfig;
 
 use super::fact::{ConsolidatedFact, FactCategory};
@@ -189,6 +189,12 @@ fn rule_interest(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<Consolida
         if e.tool == "memory_search" || e.tool == "mem_grep" {
             // Extract the query from the path field (format: "mode:query" or "bm25:query")
             let query = extract_search_query(&e.path);
+            // Sanitized rows carry only the query length, so there is no topic
+            // to record — turning the marker into a fact would persist noise
+            // that memory_search then serves back forever.
+            if is_sanitized_query_marker(&query) {
+                continue;
+            }
             if query.len() > 3 {
                 let title = format!("搜索: {query}");
                 let content = format!("Agent 通过 `{}` 搜索了 `{}`。", e.tool, query);
@@ -492,6 +498,46 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].category, FactCategory::Interest);
         assert!(facts[0].title.contains("rust ownership"));
+    }
+
+    #[test]
+    fn interest_rule_skips_sanitized_search_markers() {
+        // Every shape `memory_search` writes since query sanitization, incl.
+        // the hybrid-fallback variant and the embedding-failure row.
+        let entries = vec![
+            make_entry("memory_search", "bm25:len=14", true, None),
+            make_entry("memory_search", "hybrid:len=9", true, None),
+            make_entry(
+                "memory_search",
+                "bm25(fallback from hybrid):len=9",
+                true,
+                None,
+            ),
+            make_entry(
+                "memory_search",
+                "embed:len=14",
+                false,
+                Some("embedding failed"),
+            ),
+        ];
+        let facts = rule_interest(&entries, "sid");
+        let titles: Vec<&str> = facts.iter().map(|f| f.title.as_str()).collect();
+        assert!(
+            facts.is_empty(),
+            "sanitized search markers must not become interest facts: {titles:?}"
+        );
+    }
+
+    #[test]
+    fn interest_rule_keeps_recorded_queries() {
+        // Legacy audit rows (recorded query) and mem_grep paths are unchanged.
+        let entries = vec![
+            make_entry("memory_search", "bm25:rust ownership", true, None),
+            make_entry("mem_grep", "notes/", true, None),
+        ];
+        let facts = rule_interest(&entries, "sid");
+        let titles: Vec<&str> = facts.iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(titles, ["搜索: rust ownership", "搜索: notes/"]);
     }
 
     #[test]

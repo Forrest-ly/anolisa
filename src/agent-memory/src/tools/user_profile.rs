@@ -15,7 +15,7 @@ use std::path::Path;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::audit::AuditEntry;
+use crate::audit::{AuditEntry, is_sanitized_query_marker};
 use crate::error::Result;
 use crate::service::MemoryService;
 
@@ -146,9 +146,11 @@ fn analyze_session_logs(dir: &Path, profile: &mut UserProfile) -> Result<()> {
             if tool == "memory_search" || tool == "mem_grep" {
                 // Extract query from path field (format: "mode:query")
                 if let Some(query) = path_str.split(':').nth(1) {
-                    let query = query.trim().to_lowercase();
-                    if query.len() > 3 {
-                        *search_topics.entry(query).or_insert(0) += 1;
+                    let query = query.trim();
+                    // A sanitized row records only the query length; counting it
+                    // would surface a meaningless "interested in: len=N" topic.
+                    if query.len() > 3 && !is_sanitized_query_marker(query) {
+                        *search_topics.entry(query.to_lowercase()).or_insert(0) += 1;
                     }
                 }
             }
@@ -393,6 +395,30 @@ mod tests {
         let content = "Just plain text.";
         let body = extract_body(content);
         assert_eq!(body, "Just plain text.");
+    }
+
+    #[test]
+    fn session_log_reader_counts_only_recorded_queries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("2026-10-03.jsonl");
+        let rows = [
+            r#"{"ts":"2026-10-03T01:00:00Z","tool":"memory_search","path":"bm25:len=9","ok":true}"#,
+            r#"{"ts":"2026-10-03T01:01:00Z","tool":"memory_search","path":"hybrid:len=9","ok":true}"#,
+            r#"{"ts":"2026-10-03T01:02:00Z","tool":"memory_search","path":"bm25:rust ownership","ok":true}"#,
+            r#"{"ts":"2026-10-03T01:03:00Z","tool":"memory_search","path":"bm25:rust ownership","ok":true}"#,
+        ];
+        std::fs::write(&log, rows.join("\n") + "\n").unwrap();
+
+        let mut profile = UserProfile::default();
+        analyze_session_logs(tmp.path(), &mut profile).unwrap();
+
+        let topics: Vec<&str> = profile
+            .context
+            .iter()
+            .map(|e| e.description.as_str())
+            .collect();
+        assert_eq!(topics, ["interested in: rust ownership"]);
+        assert_eq!(profile.tool_calls_analyzed, rows.len());
     }
 
     #[test]
