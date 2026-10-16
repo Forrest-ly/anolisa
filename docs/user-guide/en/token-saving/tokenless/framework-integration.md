@@ -464,10 +464,13 @@ parameter validator. Hosts that expose only a runtime validator skip schema comp
 response compression and command rewriting remain available.
 
 One `plugin.js` serves both host generations. OpenCode 2 loads its default definition
-(`id` + `setup`), OpenCode 1.4 and newer load the same export's `server()` entrypoint, and
-older OpenCode 1 releases load the named `TokenlessPlugin` export. Command rewriting and shell
-failure evidence match the shell tool family the shared hooks classify — OpenCode 1 names its
-built-in shell tool `bash`, OpenCode 2 names it `shell` — instead of a single host spelling.
+(`id` + `setup`), and OpenCode 1.3.4 and newer load the same export's `server()` entrypoint.
+OpenCode 1.0.0 through 1.3.3 are not supported: their plugin loader calls every module export as
+a plugin function, which the object default export OpenCode 2 requires cannot satisfy. The two
+loader contracts are mutually exclusive, so the supported range starts at 1.3.4, the first
+release that reads an object default export. Command rewriting and shell failure evidence match
+the shell tool family the shared hooks classify — OpenCode 1 names its built-in shell tool
+`bash`, OpenCode 2 names it `shell` — instead of a single host spelling.
 
 OpenCode 2 registers the same three paths as the `tool` hooks `execute.before` and
 `execute.after` plus the `session` hook `context`, which carries the tool declarations of the

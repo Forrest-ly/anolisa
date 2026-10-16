@@ -15,6 +15,10 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import definition, { TokenlessPlugin } from "../adapters/tokenless/opencode/plugin.js";
+// The plugin is loaded straight from `plugins/tokenless.js`, so the module's
+// export shape is part of the supported-version contract: the namespace import
+// is what every host loader below is fed.
+import * as pluginModule from "../adapters/tokenless/opencode/plugin.js";
 
 const sandbox = mkdtempSync(join(tmpdir(), "tokenless-opencode-v2-"));
 const runner = join(sandbox, "run-hook.sh");
@@ -189,7 +193,11 @@ try {
   await host.fire("tool", "execute.after", stringEvent);
   assert.equal(stringEvent.result.content, "[tokenless:env] warning\ncompressed-response");
 
+  // Content parts are ordered model input. An interleaved result keeps every
+  // part where the host put it: the two texts are separate slots, so the second
+  // one is never moved ahead of the file part.
   const filePart = { type: "file", uri: "file:///tmp/report.csv", mime: "text/csv" };
+  const compressed = "[tokenless:env] warning\ncompressed-response";
   const partsEvent = {
     tool: "shell",
     sessionID: "ses_v2",
@@ -205,19 +213,70 @@ try {
       metadata: { exit: 0 },
     },
   };
+  const partsBefore = recordsFor("compress_response_hook.py").length;
   await host.fire("tool", "execute.after", partsEvent);
   assert.deepEqual(partsEvent.result.content, [
-    {
-      type: "text",
-      text: "[tokenless:env] warning\ncompressed-response",
-    },
+    { type: "text", text: compressed },
     filePart,
+    { type: "text", text: compressed },
   ]);
-  const partsPayload = recordsFor("compress_response_hook.py").find(
-    (record) => record.payload.tool_call_id === "call_parts",
+  assert.equal(
+    partsEvent.result.content[1],
+    filePart,
+    "the file part keeps both its position and its identity",
   );
-  assert.equal(partsPayload.payload.tool_response, "first text part\nsecond text part");
-  assert.notEqual(partsPayload.payload.is_error, true, "exit 0 is not a failure");
+  const partsCalls = recordsFor("compress_response_hook.py").slice(partsBefore);
+  assert.deepEqual(
+    partsCalls.map((record) => record.payload.tool_response),
+    ["first text part", "second text part"],
+    "each text run is compressed in its own slot, in host order",
+  );
+  assert.ok(
+    partsCalls.every((record) => record.payload.is_error !== true),
+    "exit 0 is not a failure",
+  );
+
+  // Adjacent text parts are one run: still a single hook call, collapsed into
+  // the run's first position, which cannot reorder anything.
+  const runEvent = {
+    tool: "read",
+    sessionID: "ses_v2",
+    id: "call_run",
+    input: {},
+    status: "completed",
+    result: {
+      content: [
+        { type: "text", text: "run part one" },
+        { type: "text", text: "run part two" },
+        filePart,
+      ],
+      metadata: {},
+    },
+  };
+  const runBefore = recordsFor("compress_response_hook.py").length;
+  await host.fire("tool", "execute.after", runEvent);
+  assert.deepEqual(runEvent.result.content, [{ type: "text", text: compressed }, filePart]);
+  const runCalls = recordsFor("compress_response_hook.py").slice(runBefore);
+  assert.equal(runCalls.length, 1, "one adjacent text run costs one hook call");
+  assert.equal(runCalls[0].payload.tool_response, "run part one\nrun part two");
+
+  // A result with no text part has nothing model-visible to replace.
+  const fileOnlyEvent = {
+    tool: "read",
+    sessionID: "ses_v2",
+    id: "call_file_only",
+    input: {},
+    status: "completed",
+    result: { content: [filePart], metadata: {} },
+  };
+  const fileOnlyBefore = recordsFor("compress_response_hook.py").length;
+  await host.fire("tool", "execute.after", fileOnlyEvent);
+  assert.deepEqual(fileOnlyEvent.result.content, [filePart]);
+  assert.equal(
+    recordsFor("compress_response_hook.py").length,
+    fileOnlyBefore,
+    "a file-only result never spawns a hook",
+  );
 
   // A failed shell call forwards the exit-code evidence Core cannot see.
   for (const [index, [tool, exit, expected]] of [
@@ -359,6 +418,110 @@ try {
     properties: { fresh: { type: "string" } },
   });
   delete process.env.TOKENLESS_TEST_RENAME;
+
+  // -- Host loader contracts: which module shapes each generation accepts -----
+  //
+  // Each loader mirrors the upstream implementation for the release it names,
+  // and is fed the module namespace a host gets from `await import(...)`.
+
+  const isRecord = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+
+  // OpenCode 1.3.4-1.19.x: `readV1Plugin(mod, spec, "server", "detect")` first,
+  // then `getLegacyPlugins(mod)` for a module with no usable default export.
+  function readV1Plugin(mod) {
+    const value = mod.default;
+    if (!isRecord(value)) return undefined;
+    if (!("id" in value) && !("server" in value) && !("tui" in value)) return undefined;
+    const server = "server" in value ? value.server : undefined;
+    if (server !== undefined && typeof server !== "function") {
+      throw new TypeError("plugin has invalid server export");
+    }
+    if (server === undefined && !("tui" in value)) {
+      throw new TypeError("plugin must default export an object with server()");
+    }
+    return value;
+  }
+
+  function loadOpenCode1(mod) {
+    const detected = readV1Plugin(mod);
+    if (detected) return [detected.server];
+    const seen = new Set();
+    const servers = [];
+    for (const entry of Object.values(mod)) {
+      if (seen.has(entry)) continue;
+      seen.add(entry);
+      const server =
+        typeof entry === "function"
+          ? entry
+          : isRecord(entry) && typeof entry.server === "function"
+            ? entry.server
+            : undefined;
+      if (!server) throw new TypeError("Plugin export is not a function");
+      servers.push(server);
+    }
+    return servers;
+  }
+
+  // OpenCode 1.0.0-1.3.3: every export is called as a plugin function.
+  function loadOpenCode1Naive(mod) {
+    const seen = new Set();
+    const exports = [];
+    for (const [, fn] of Object.entries(mod)) {
+      if (seen.has(fn)) continue;
+      seen.add(fn);
+      exports.push(fn);
+    }
+    return exports;
+  }
+
+  // OpenCode 2: `default` must decode as `{ id, setup }` or `{ id, effect }`.
+  function readV2Definition(mod) {
+    const value = mod.default;
+    if (!isRecord(value) || typeof value.id !== "string") return undefined;
+    if (typeof value.setup !== "function" && typeof value.effect !== "function") return undefined;
+    return value;
+  }
+
+  assert.ok(readV2Definition(pluginModule), "OpenCode 2 must decode the default definition");
+
+  const v1Servers = loadOpenCode1(pluginModule);
+  assert.deepEqual(v1Servers, [TokenlessPlugin], "OpenCode 1.3.4+ loads exactly one server plugin");
+  const loadedHooks = await v1Servers[0]({});
+  assert.deepEqual(
+    Object.keys(loadedHooks).sort(),
+    ["tool.definition", "tool.execute.after", "tool.execute.before"],
+    "the loader path registers the V1 hooks, not just the named export",
+  );
+
+  // The pre-1.3.4 loader calls every export, including the object default export
+  // OpenCode 2 requires, so it cannot initialize this module. That is why the
+  // manifest floor is 1.3.4. The invariant below ties the two together: the
+  // advertised range may only include those releases once every export is
+  // callable again, so the range cannot be widened without fixing the shape.
+  const naiveExports = loadOpenCode1Naive(pluginModule);
+  await assert.rejects(
+    (async () => {
+      for (const fn of naiveExports) await fn({});
+    })(),
+    TypeError,
+    "the pre-1.3.4 loader must still fail on the object default export",
+  );
+  const manifest = JSON.parse(
+    readFileSync(new URL("../adapters/tokenless/manifest.json.in", import.meta.url), "utf8").replace(
+      /@VERSION@/g,
+      "0.0.0",
+    ),
+  );
+  const supported = manifest.targets.opencode.compatibleVersions;
+  const floor = /^>=\s*(\d+)\.(\d+)\.(\d+)/.exec(supported);
+  assert.ok(floor, `opencode compatibleVersions must declare a lower bound, got "${supported}"`);
+  const [, major, minor, patch] = floor.map(Number);
+  const reachesNaiveLoader =
+    major < 1 || (major === 1 && (minor < 3 || (minor === 3 && patch < 4)));
+  assert.ok(
+    !reachesNaiveLoader || naiveExports.every((entry) => typeof entry === "function"),
+    `opencode compatibleVersions "${supported}" advertises releases whose loader calls every export as a function`,
+  );
 
   // -- The V1 entrypoint shares the shell-family fix --------------------------
   const v1Hooks = await definition.server();
