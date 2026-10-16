@@ -11,6 +11,7 @@ AW 为 Agent 策略提供统一配置和本地服务。在 Linux 上，它通过
 
 | 任务 | 指南 |
 | --- | --- |
+| 通过可选来源观测 Agent 生命周期 | [通过 aw run 接入 AgentSight](../../docs/user-guide/zh/user-entrypoint/aw-agentsight.md) |
 | 安装预编译 core 和可选 sec-core 包 | [Preview 安装](../../docs/user-guide/zh/user-entrypoint/aw-preview.md) |
 | 从源码构建并接入自己的组件 | [组件接入教程](../../docs/developer-guide/zh/aw/integration.md) |
 | 编写和校验配置 | [配置参考](../../docs/developer-guide/zh/aw/configuration.md) |
@@ -19,10 +20,16 @@ AW 为 Agent 策略提供统一配置和本地服务。在 Linux 上，它通过
 | 使用已有 sec-core 后端 | [sec-core Provider](../../docs/user-guide/zh/user-entrypoint/aw-sec-core.md) |
 | 容器部署与审计持久化 | [运行与持久化](../../docs/user-guide/zh/user-entrypoint/aw.md#容器与持久化数据) |
 
+可选 AgentSight 观测贯穿 `aw run`：loopback HTTP 无需 token，HTTPS 要求私有
+token 文件。来源失败保留原生动作与本地审计，语义评估仍属后续阶段。
+
 AW 尚未通过 `anolisa install` 或 RPM 分发。Preview 包使用 `aw-package` 安装，
 不安装 Agent 或配置其模型凭据。core 无需 sec-core 或任何 Provider 即可使用。
 源码教程提供[共用 YAML](crates/aw-service/examples/aw.shared.yaml)和无需后端的
 [布尔策略](crates/aw-service/examples/check-tool.py)。
+
+sec-core 包还包含认证健康探测 helper 和官方服务/配置参考资产。可选显式诊断见
+sec-core 指南；`aw inspect` 保持原合同，不探测后台。
 
 ## 支持的原生入口
 
@@ -37,7 +44,7 @@ AW 尚未通过 `anolisa install` 或 RPM 分发。Preview 包使用 `aw-package
 
 运行时支持工具前 `observe`/`block`、工具后 `observe` 或单文本 `replace_result`，以及各框架的原生命令。
 完成观察和用户 Hook 可位于最后一个替换步骤之前（OpenClaw 在压缩后执行原生观察）；sec-core/Tokenless 联合模板保留扫描及观察，新增执行前的 Tokenless PreTool 重试建议和最终 PostTool 压缩。
-建议命令必须作为新调用重新通过 sec-core/原生权限检查；RTK 是 PreTool 的外部依赖。
+建议命令必须作为新调用重新通过 sec-core/原生权限检查；Preview Tokenless 包为 PreTool 附带固定版本 RTK；PostTool 不依赖它。
 带引号的参数、符号链接状态路径和使用指南列明的执行前缀形式均保留 RTK 归属。
 OpenClaw 缺少替换 middleware API 时，启动会报告压缩降级，保留 before 阻断和完成观察。
 不同框架的 after 事件覆盖不同。配置词汇包含尚未接通的事件/效果，静态校验本身

@@ -12,6 +12,7 @@ scheduling and permissions. It also manages public Pi SDK workers. The current r
 
 | Task | Guide |
 | --- | --- |
+| Observe the Agent lifecycle with an optional source | [AgentSight through aw run](../../docs/user-guide/en/user-entrypoint/aw-agentsight.md) |
 | Install prebuilt core and optional sec-core packages | [Preview installation](../../docs/user-guide/en/user-entrypoint/aw-preview.md) |
 | Build from source and connect your component | [Integration walkthrough](../../docs/developer-guide/en/aw/integration.md) |
 | Write and validate configuration | [Configuration reference](../../docs/developer-guide/en/aw/configuration.md) |
@@ -20,11 +21,19 @@ scheduling and permissions. It also manages public Pi SDK workers. The current r
 | Use an existing sec-core backend | [sec-core Provider](../../docs/user-guide/en/user-entrypoint/aw-sec-core.md) |
 | Deploy in a container and retain audit data | [Runtime and persistence](../../docs/user-guide/en/user-entrypoint/aw.md#containers-and-persistent-data) |
 
+Optional AgentSight observation follows `aw run`; loopback HTTP needs no token,
+while HTTPS requires a private token file. Source failure leaves native actions
+and local audit active; semantic evaluation remains a later stage.
+
 AW is not yet distributed through `anolisa install` or RPM. Preview package
 installation uses `aw-package`; it does not install an Agent or its model
 credentials. Core works without sec-core or any Provider. The source walkthrough
 includes a [shared YAML](crates/aw-service/examples/aw.shared.yaml) and a small
 [boolean policy](crates/aw-service/examples/check-tool.py) that need no backend.
+
+The sec-core package also includes its authenticated health helper and official
+service/configuration reference assets. Optional explicit diagnostics are documented
+in the sec-core guide; `aw inspect` remains unchanged and does not probe the backend.
 
 ## Supported native entrypoints
 
@@ -43,7 +52,7 @@ framework-specific native commands. Completion observers and user Hooks can
 precede one final replacement step (OpenClaw observes natively after compression); the combined sec-core/Tokenless template
 retains scanning/observation and adds Tokenless PreTool retry suggestions before
 execution plus final PostTool compression. Suggested commands require a fresh call
-and pass sec-core/native permissions again; RTK is an external PreTool dependency.
+and pass sec-core/native permissions again; Preview Tokenless packages include the pinned RTK for PreTool; PostTool stays usable without it.
 RTK ownership survives quoted arguments, symlinked state paths and the execution
 prefix forms listed in the user guide. After-event coverage varies by framework.
 If OpenClaw lacks the replacement middleware API, startup reports degraded
