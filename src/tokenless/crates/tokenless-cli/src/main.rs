@@ -463,18 +463,26 @@ fn try_open_recorder(paths: &DatabasePathResolver) -> Option<StatsRecorder> {
     }
 }
 
-/// Best-effort stderr warning whose own write failure cannot fail the
-/// command. `eprintln!` panics when writing to stderr fails (a full
-/// filesystem behind redirected logs), which turned the fail-soft stats
-/// warning into exit 101 while the compression output itself was fine.
-/// Write errors are discarded: there is no fallback channel, and
-/// failing the command here is the regression to avoid.
-fn warn_stats(message: &str) {
-    use std::io::Write;
-    let mut stderr = std::io::stderr();
+/// Best-effort stderr write whose own failure cannot escape the process.
+/// `eprintln!` panics when writing to stderr fails (a full filesystem
+/// behind redirected logs, a closed fd 2), and that panic replaces the
+/// process status with 101. Write errors are discarded: there is no
+/// fallback channel, and both callers — the fail-soft stats warning and
+/// the fatal path in `main()` — need the write to be non-fatal. The bytes
+/// are exactly what the matching `eprintln!` writes whenever stderr
+/// accepts them.
+fn write_stderr(message: &str) {
+    let mut stderr = io::stderr();
     let _ = stderr.write_all(message.as_bytes());
     let _ = stderr.write_all(b"\n");
     let _ = stderr.flush();
+}
+
+/// Best-effort stderr warning whose own write failure cannot fail the
+/// command, which turned the fail-soft stats warning into exit 101 while
+/// the compression output itself was fine.
+fn warn_stats(message: &str) {
+    write_stderr(message);
 }
 
 /// Resolve the stash database path under a trusted state root.
@@ -1325,7 +1333,13 @@ fn record_compression_stats(
 
 fn main() {
     if let Err((msg, code)) = run() {
-        eprintln!("Error: {msg}");
+        // The exit status is the machine-readable verdict `run()` already
+        // chose — 2 for rejected input, 1 for operation failures — and the
+        // message is only its detail. `eprintln!` panics when stderr cannot
+        // be written and would replace that status with 101 before
+        // `process::exit` runs, so the fatal line goes through the same
+        // best-effort writer as the fail-soft warnings.
+        write_stderr(&format!("Error: {msg}"));
         process::exit(code);
     }
 }

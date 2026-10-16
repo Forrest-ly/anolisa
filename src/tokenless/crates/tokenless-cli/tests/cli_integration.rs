@@ -2930,3 +2930,116 @@ fn stash_purge_warning_survives_an_unwritable_stderr() {
     );
     assert_eq!(output.stdout.as_slice(), payload.as_bytes());
 }
+
+/// Spawn with a chosen stderr: the fatal-path contract is the exit
+/// status, so the test has to compare a writable stderr with an
+/// unwritable one.
+#[cfg(target_os = "linux")]
+fn spawn_with_stderr(
+    command: &mut Command,
+    args: &[&str],
+    stdin_text: &str,
+    stderr: std::process::Stdio,
+) -> std::process::Output {
+    command
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(stderr)
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(stdin_text.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap()
+}
+
+/// The fatal path's contract is the exit status `run()` chose — 2 for
+/// rejected input, 1 for operation failures — and the `Error:` line is
+/// only its detail. `eprintln!` panicked when fd 2 could not be written
+/// and replaced that status with 101 before `process::exit` ran, so the
+/// cases of `compress_exit_contract_rejects_v1_and_operation_failures`
+/// must keep their codes with stderr on /dev/full, and keep their message
+/// byte-for-byte whenever stderr accepts the bytes.
+#[test]
+#[cfg(target_os = "linux")]
+fn fatal_error_keeps_its_exit_code_with_an_unwritable_stderr() {
+    let retrieve = serde_json::json!({
+        "protocol_version": 2,
+        "operation": "retrieve",
+        "attribution": {"agent_id": "integration-agent"},
+        "input": {
+            "hash_or_marker": "0123456789abcdef01234567",
+            "visible_markers": []
+        }
+    })
+    .to_string();
+    let cases: Vec<(&str, String, Option<&str>, i32)> = vec![
+        (
+            "rejected input (unsupported protocol version)",
+            r#"{"protocol_version":1,"content":"x","agent_id":"a","seam":"post_tool"}"#.to_string(),
+            None,
+            2,
+        ),
+        (
+            "operation failure (unauthorized stash hash)",
+            retrieve,
+            None,
+            1,
+        ),
+        (
+            "operation failure (unusable data directory)",
+            post_tool_request_json(
+                &serde_json::json!({"records": [{"value": "x".repeat(2000)}]}).to_string(),
+                true,
+                "database-error",
+            ),
+            Some("relative/data"),
+            1,
+        ),
+    ];
+
+    for (label, request, data_dir, expected) in cases {
+        for unwritable in [false, true] {
+            let mut command = tokenless_bin();
+            if let Some(dir) = data_dir {
+                command.env("TOKENLESS_DATA_DIR", dir);
+            }
+            let stderr = if unwritable {
+                std::process::Stdio::from(dev_full())
+            } else {
+                std::process::Stdio::piped()
+            };
+            let output = spawn_with_stderr(&mut command, &["compress"], &request, stderr);
+            let shape = if unwritable {
+                "unwritable stderr"
+            } else {
+                "writable stderr"
+            };
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "{label}: {shape} must keep exit {expected}, got {}",
+                output.status.code().unwrap_or(-1)
+            );
+            if unwritable {
+                continue;
+            }
+            let message = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                message.lines().count(),
+                1,
+                "{label}: expected a single fatal line, got {message:?}"
+            );
+            assert!(
+                message.starts_with("Error: "),
+                "{label}: unexpected fatal line {message:?}"
+            );
+        }
+    }
+}
