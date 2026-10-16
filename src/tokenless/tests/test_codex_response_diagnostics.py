@@ -225,6 +225,54 @@ class CodexEnvHintFailureEvidenceTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "")
 
+    def test_commit_metadata_quoting_error_phrases_stays_silent(self) -> None:
+        """`git show` prints a commit whose message quotes the phrases.
+
+        Observed live: reading the diff of this very fix told the agent not to
+        retry a command that had succeeded. The header (`Author:`), the trailers
+        (`Fixes:`, `Signed-off-by:`) and the indented message body all carry the
+        `word: ` shape of a program prefix, so what separates them from a report
+        is where the phrase sits: a report states its failure first, while prose
+        carries a quoted phrase mid-sentence.
+        """
+        output = (
+            "commit 157b9a2d48c9873e5924857dc1b42a3366629cb4\n"
+            "Author: A. Contributor <contributor@example.com>\n"
+            "Date:   Thu Sep 24 15:52:36 2026 +0800\n"
+            "\n"
+            "    fix(tokenless): require failure evidence for Codex env hints\n"
+            "\n"
+            "    session: a `git log` subject (`fix(tokenless): accept codex\n"
+            '    \"not installed\" row`), an issue body ("the env var does not exist"),\n'
+            "    a grep hit inside a test assertion, and a printed source file's\n"
+            "    `except (ImportError, KeyError):`.\n"
+            "\n"
+            '    Fixes: 5f7e61079648 ("feat(tokenless): add codex adapter plugin")\n'
+            "    Signed-off-by: A. Contributor <contributor@example.com>\n"
+        )
+
+        result = _run_hook(output)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_prose_and_source_lines_with_a_word_prefix_stay_silent(self) -> None:
+        successes = [
+            # a README paragraph printed by a successful `cat`
+            "Note: frobnicate is not installed on this host by default\n",
+            # an assertion in a Python suite printed by `sed -n`
+            'result = _run_hook("permission denied", tool_name="Read")\n',
+            # a commit trailer quoting a change it fixes
+            'Fixes: 5f7e61079648 ("feat(tokenless): add codex adapter plugin")\n',
+            # a diff line of the pattern table itself
+            '+# ENV_PATTERNS matches text, and shell output quotes "not installed"\n',
+        ]
+        for output in successes:
+            with self.subTest(first_line=output.splitlines()[0]):
+                result = _run_hook(output)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+
     def test_printed_json_stays_output_not_process_state(self) -> None:
         """A string payload is command output, whatever it parses to.
 

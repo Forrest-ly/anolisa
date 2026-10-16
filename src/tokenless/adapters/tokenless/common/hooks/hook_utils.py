@@ -434,12 +434,65 @@ def _is_program_prefix(token: str) -> bool:
     return bool(stem)
 
 
+# An environment phrase that leads a line is the failure wording itself, not a
+# quotation of it, so the phrases are anchored for the shape test below. Built
+# from ENV_PATTERNS so the two lists cannot drift apart.
+_ENV_PATTERN_LEAD_RE = re.compile(
+    r"^\s*(?:{})".format(
+        "|".join(f"(?:{pat})" for pats, _, _ in ENV_PATTERNS for pat in pats)
+    ),
+    re.IGNORECASE,
+)
+
+# Between the program that failed and the failure wording a report may carry
+# nested subjects and locations: the offending command, path or versioned name
+# (`bash: frobnicate: ...`, `cat: /work/missing.txt: ...`, `/usr/bin/env:
+# 'node': ...`), a build location (`./configure: line 42: gcc: ...`), a shell
+# argv index (`/bin/sh: 1: ...`), or a transport code (`curl: (6) ...`). Prose
+# stops at its first word that is not such a segment, which is what keeps a
+# quoted phrase buried mid-sentence out of the failure class.
+_REPORT_LEAD_RE = re.compile(
+    r"""^\s*(?:
+          (?P<subject>[\w./+@~*-]+|'[^']*'|"[^"]*")\s*:\s+
+        | (?P<location>[\w./+-]+\s+\d+)\s*:\s+
+        | \(\d+\)\s+
+        )""",
+    re.VERBOSE,
+)
+
+_MAX_REPORT_LEADS = 4
+
+
+def _reports_failure(text: str) -> bool:
+    """Report whether `text` states a failure rather than mentioning one."""
+    return bool(_ENV_ERROR_TEXT_RE.match(text) or _ENV_PATTERN_LEAD_RE.match(text))
+
+
 def _error_shaped_line(line: str) -> bool:
-    """Report whether `line` is a tool error report rather than output quoting one."""
-    if _ENV_ERROR_TEXT_RE.match(line):
+    """Report whether `line` is a tool error report rather than output quoting one.
+
+    A report states the failure itself, so the failure wording has to lead the
+    line: either straight away (`ModuleNotFoundError: ...`, `error: ...`,
+    `which: no frobnicate in ...`) or behind the program that failed and the
+    nested subjects and locations it prints first (`bash: frobnicate: command
+    not found`). Prose carries its phrase mid-sentence instead — a commit-message
+    continuation, a `Fixes:` trailer, a README line — and never reaches the
+    failure class, whatever word it happens to quote.
+    """
+    if _reports_failure(line):
         return True
     prefixed = _ENV_ERROR_PREFIX_RE.match(line)
-    return prefixed is not None and _is_program_prefix(prefixed.group("prefix"))
+    if prefixed is None or not _is_program_prefix(prefixed.group("prefix")):
+        return False
+    rest = line[prefixed.end() :]
+    for _ in range(_MAX_REPORT_LEADS):
+        if _reports_failure(rest):
+            return True
+        lead = _REPORT_LEAD_RE.match(rest)
+        if lead is None:
+            return False
+        rest = rest[lead.end() :]
+    return False
 
 
 def _error_shaped_lines(text: str) -> str:
