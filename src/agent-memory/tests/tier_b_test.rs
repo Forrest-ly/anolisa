@@ -239,6 +239,30 @@ fn get_context_respects_token_budget() {
 }
 
 #[test]
+fn get_context_zero_max_tokens_still_returns_content() {
+    let (_tmp, svc) = setup();
+    svc.write("notes/a.md", "first note body", false).unwrap();
+    svc.write("notes/b.md", "second note body", false).unwrap();
+
+    // A zero budget used to make the first `bytes_used >= max_bytes` check trip
+    // before any file was read, so a populated store was reported as empty.
+    let ctx = svc.memory_get_context(0).unwrap();
+    assert_ne!(
+        ctx, "(no memory files yet)",
+        "zero max_tokens must not claim the store is empty"
+    );
+    assert!(!ctx.is_empty(), "zero max_tokens returned nothing");
+
+    // The floor is one token, not a full preview: a zero budget still yields
+    // strictly less than a real one.
+    let full = svc.memory_get_context(2048).unwrap();
+    assert!(
+        ctx.len() < full.len(),
+        "zero budget must stay below a real one: {ctx:?} vs {full:?}"
+    );
+}
+
+#[test]
 fn get_context_skips_meta_dir() {
     let (_tmp, svc) = setup();
     svc.write("note.md", "real note body", false).unwrap();

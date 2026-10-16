@@ -21,7 +21,14 @@ const TOKEN_TO_BYTES: usize = 4;
 /// This is a deliberately simple heuristic: it doesn't hit the index — it
 /// walks the file tree, sorts by mtime desc, and emits markdown sections.
 pub fn memory_get_context(svc: &MemoryService, max_tokens: usize) -> Result<String> {
-    let max_bytes = max_tokens.saturating_mul(TOKEN_TO_BYTES);
+    // Floor the budget at one token. `max_tokens` arrives here straight from the
+    // MCP parameter — the wrapper only defaults the *absent* case — so a client
+    // whose computed budget lands on zero would otherwise trip the loop's
+    // `bytes_used >= max_bytes` check before a single file is read and get
+    // "(no memory files yet)" back for a store that has files. Sibling tools
+    // floor their numeric inputs the same way (`top_k.max(1)` in memory_search,
+    // `limit.max(1)` in mem_log and session_context).
+    let max_bytes = max_tokens.max(1).saturating_mul(TOKEN_TO_BYTES);
     let meta_dir = svc.mount.meta_dir.clone();
 
     // Collect candidates with mtime. WalkDir gives us absolute paths;

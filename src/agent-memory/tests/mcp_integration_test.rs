@@ -554,6 +554,24 @@ async fn tier_b_observe_search_and_context_via_mcp() {
         "expected one of the seeded body snippets in preview: {text}"
     );
 
+    // memory_get_context with an explicit zero budget: the wrapper defaults
+    // only the *absent* case, so 0 reaches the tool and must still describe a
+    // store that has files rather than claiming it is empty.
+    let resp = call_tool(
+        &mut reader,
+        &mut stdin,
+        105,
+        "memory_get_context",
+        json!({"max_tokens": 0}),
+    )
+    .await;
+    let text = extract_text(&resp);
+    assert_ne!(
+        text, "(no memory files yet)",
+        "max_tokens=0 must not claim the store is empty"
+    );
+    assert!(!text.is_empty(), "memory_get_context returned empty");
+
     drop(stdin);
     let _ = child.kill().await;
 }
