@@ -1266,3 +1266,104 @@ fn test_gemini_wrapper_no_savings_returns_original() {
     // Nothing to compress: the original value is returned unchanged.
     assert_eq!(compressor.compress(&tool), tool);
 }
+
+/// A stash backend whose deletes always fail — the shape the rollback
+/// warning is printed for (a locked database, a `BEFORE DELETE` trigger
+/// that aborts, an I/O error). The failure is already counted in
+/// `stash_errors` and surfaced separately by the caller, so the warning
+/// itself is purely diagnostic.
+#[cfg(target_os = "linux")]
+struct DeleteFailingStore {
+    inner: tokenless_ccr::InMemoryStore,
+}
+
+#[cfg(target_os = "linux")]
+impl DeleteFailingStore {
+    fn new() -> Self {
+        Self {
+            inner: tokenless_ccr::InMemoryStore::new(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl tokenless_ccr::StashStore for DeleteFailingStore {
+    fn stash(&self, payload: &str) -> Result<tokenless_ccr::StashWrite, tokenless_ccr::StashError> {
+        self.inner.stash(payload)
+    }
+
+    fn retrieve(&self, hash: &str) -> Result<Option<String>, tokenless_ccr::StashError> {
+        self.inner.retrieve(hash)
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn evict_expired(&self) -> Result<usize, tokenless_ccr::StashError> {
+        self.inner.evict_expired()
+    }
+
+    fn delete(&self, _hash: &str, _generation: u64) -> Result<bool, tokenless_ccr::StashError> {
+        Err(tokenless_ccr::StashError::Backend(
+            "rollback delete blocked".to_string(),
+        ))
+    }
+}
+
+/// The rollback-delete warning is printed on a path where the compression
+/// already succeeded and the failure is already counted, so it must never
+/// be the thing that kills the process. `eprintln!` panics when stderr
+/// cannot be written (a full filesystem behind redirected logs, a closed
+/// descriptor); the best-effort helper must discard its own write error.
+/// Redirect fd 2 to /dev/full, roll back, restore, and assert both the
+/// returned count and the recorded error.
+#[test]
+#[cfg(target_os = "linux")]
+fn rollback_delete_warning_survives_an_unwritable_stderr() {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::Arc;
+
+    let store = Arc::new(DeleteFailingStore::new());
+    let compressor = SchemaCompressor::new()
+        .with_func_desc_max_len(100)
+        .with_stash_store(store.clone());
+    let schema = json!({
+        "function": {
+            "name": "test",
+            "description": "A".repeat(300),
+            "parameters": {"type": "object", "properties": {}}
+        }
+    });
+    let _ = compressor.compress(&schema);
+    assert_eq!(compressor.stash_writes(), 1, "the write must be pending");
+    assert_eq!(compressor.stash_errors(), 0);
+
+    let dev_full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let saved = unsafe { libc::dup(2) };
+    assert!(saved >= 0, "dup stderr");
+    unsafe {
+        libc::dup2(dev_full.as_raw_fd(), 2);
+    }
+    // A panicking warning write makes this test fail.
+    let removed = compressor.rollback_stash_writes();
+    // Restore before any assert can print.
+    let restored = unsafe { libc::dup2(saved, 2) };
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    assert!(restored >= 0, "restore stderr");
+    unsafe {
+        libc::close(saved);
+    }
+    drop(dev_full);
+
+    assert_eq!(removed, 0, "a failed delete removes nothing");
+    assert_eq!(
+        compressor.stash_errors(),
+        1,
+        "the failure stays counted and separately reported"
+    );
+    assert_eq!(store.len(), 1, "the row the delete failed on is untouched");
+}

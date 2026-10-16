@@ -177,8 +177,13 @@ impl SchemaCompressor {
                 Ok(true) => removed += 1,
                 Ok(false) => {}
                 Err(e) => {
+                    // Counted in `stash_errors` and surfaced by the caller;
+                    // this line is purely diagnostic, so an unwritable stderr
+                    // must not turn it into a panic (exit 101).
                     self.record_stash_error();
-                    eprintln!("[tokenless] stash: rollback delete failed for key {key}: {e}");
+                    crate::warn_soft(&format!(
+                        "[tokenless] stash: rollback delete failed for key {key}: {e}"
+                    ));
                 }
             }
         }
