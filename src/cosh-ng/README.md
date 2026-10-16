@@ -59,7 +59,7 @@ curl -fsSL https://get.agentic-os.sh | bash -s -- --cosh-ng --install-mode syste
 curl -fsSL https://get.agentic-os.sh | bash -s -- --cosh-ng --install-mode system --uninstall
 ```
 
-On macOS arm64, use user scope instead:
+On macOS 11+ (arm64 / x86_64), use user scope instead:
 
 ```bash
 curl -fsSL https://get.agentic-os.sh | bash -s -- --cosh-ng --backend raw --install-mode user
@@ -74,9 +74,15 @@ sudo yum install cosh-ng
 
 The published Linux raw contract is not currently portable across all routed
 distributions, so it is not the recommended Linux installation path. The raw
-package supports macOS arm64, where Linux-only package and service operations
+package supports macOS 11+ (arm64 / x86_64), where Linux-only package and service operations
 remain unavailable. Source builds are for contributors; follow the
 [developer setup](../../docs/developer-guide/en/cosh-ng/getting-started.md).
+
+The release build matrix also produces a macOS x86_64 (Intel) raw archive,
+with the same macOS 11.0 minimum as arm64. Intel artifacts are available from
+GitHub Releases once a version containing this build support is published;
+the public installer above also requires an Intel ANOLISA CLI release and
+separate enablement of the website installer.
 
 ## Start in 30 seconds
 
@@ -101,6 +107,12 @@ available. Press `Shift+Tab` again to return to Assisted mode.
 Status symbols are optional: set `shell.status_symbols = true` in `config.toml`
 (or `COSH_SHELL_STATUS_SYMBOLS=1` for one session) to show a `◇` (Assisted) or
 `◌` (Shell-only) status line above each prompt. They are off by default.
+
+At login, `cosh-shell` checks in the background whether a managed `cosh-ng`
+update is available and shows a notice at the next idle prompt. The check is
+on by default; set `COSH_SHELL_UPGRADE_CHECK=off` to disable it for the next
+session. See [Login upgrade notice](../../docs/user-guide/en/user-entrypoint/cosh-ng/configuration.md#login-upgrade-notice)
+for all opt-out values and the cache path.
 
 Start Native explicitly when the session must have no Cosh hooks, observation,
 or insights:
@@ -128,9 +140,14 @@ Composer that accepts a leading `/skill:<name>` and validated workspace-local
 Up/Down to select, and press Enter to execute the selected command. Use Tab to
 complete a command before adding arguments; Enter submits drafts with arguments
 or multiple lines as written.
-Ordinary shell prompts keep native path completion.
+Ordinary shell prompts keep native path completion. Run `/bug <description>`
+to print a reviewable, pre-filled GitHub issue URL. It never reads logs or
+submits the issue; when the local log directory exists, it only reminds you to
+inspect and redact relevant entries before pasting them yourself.
 
-In `cosh-core`, configured Hooks run by default without `hooks.enabled = true`.
+In `cosh-core`, system and user config Hooks run by default without `hooks.enabled = true`.
+Project config Hook definitions are ignored; project Shell Hooks in `.cosh/hooks` require
+separate consent through `/hooks trust-project`.
 Explicit `hooks.enabled = false` keeps config Hooks disabled even when Extensions
 are installed. See [Hooks](../../docs/user-guide/en/user-entrypoint/cosh-ng/core/hooks.md)
 for disable scope and fail-closed `PreToolUse` behavior.

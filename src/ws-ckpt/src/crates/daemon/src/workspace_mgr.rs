@@ -5,9 +5,7 @@ use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-use ws_ckpt_common::{
-    load_workspace_policy_with_failsafe, ErrorCode, ResolveError, Response, SnapshotIndex,
-};
+use ws_ckpt_common::{load_workspace_policy_with_failsafe, ErrorCode, Response, SnapshotIndex};
 
 use crate::index_store;
 use crate::state::{normalize_registration_path, DaemonState};
@@ -549,22 +547,14 @@ pub async fn delete_snapshot(
     // 2. Write lock after the mutation mutex.
     let mut ws = ws_lock.write().await;
 
-    // 2a. Resolve snapshot by prefix within this workspace
-    let resolved_id = match ws.index.resolve_by_prefix(snapshot_id) {
-        Ok((id, _)) => id.clone(),
-        Err(ResolveError::NotFound) => {
-            return Ok(error_resp(
-                ErrorCode::SnapshotNotFound,
-                format!("snapshot not found: {}", snapshot_id),
-            ));
-        }
-        Err(ResolveError::Ambiguous(n)) => {
-            return Ok(error_resp(
-                ErrorCode::SnapshotNotFound,
-                format!("ambiguous snapshot prefix '{}': {} matches", snapshot_id, n),
-            ));
-        }
-    };
+    // Never reinterpret a previously valid ID as a prefix after its removal.
+    if !ws.index.snapshots.contains_key(snapshot_id) {
+        return Ok(error_resp(
+            ErrorCode::SnapshotNotFound,
+            format!("snapshot not found: {snapshot_id}"),
+        ));
+    }
+    let resolved_id = snapshot_id.to_string();
 
     // 3. Check pinned
     if let Some(meta) = ws.index.snapshots.get(&resolved_id) {
@@ -576,13 +566,27 @@ pub async fn delete_snapshot(
         }
     }
 
-    // 4. Delete subvolume (skip if snapshot is marked missing — subvolume already gone)
-    let is_missing = ws
-        .index
-        .snapshots
-        .get(&resolved_id)
-        .map(|m| m.missing)
-        .unwrap_or(false);
+    // Check disk as well: cleanup may have stopped before persisting a marker.
+    let is_missing = !tokio::fs::try_exists(
+        state
+            .backend
+            .snapshots_root()
+            .join(&ws.ws_id)
+            .join(&resolved_id),
+    )
+    .await
+    .with_context(|| format!("inspect snapshot {resolved_id}"))?;
+    if is_missing && ws.index.governed_evidence.contains_key(&resolved_id) {
+        if let Some(meta) = ws.index.snapshots.get_mut(&resolved_id) {
+            meta.missing = true;
+        }
+        index_store::save(&state.index_dir(&ws.ws_id), &ws.index).await?;
+        return Ok(error_resp(
+            ErrorCode::SnapshotNotFound,
+            format!("snapshot subvolume is missing: {resolved_id}; guarded evidence retained"),
+        ));
+    }
+
     if !is_missing {
         state
             .backend
@@ -594,6 +598,7 @@ pub async fn delete_snapshot(
     ws.index.unlink_node(&resolved_id);
     ws.index.snapshots.remove(&resolved_id);
     ws.index.governed_evidence.remove(&resolved_id);
+    ws.index.recovered_orphans.remove(&resolved_id);
     let snap_dir = state.index_dir(&ws.ws_id);
     tokio::fs::create_dir_all(&snap_dir)
         .await
@@ -606,6 +611,13 @@ pub async fn delete_snapshot(
     // 5b. Save manifest
     if let Err(e) = state.save_manifest().await {
         warn!("save_manifest failed after delete_snapshot: {:#}", e);
+    }
+
+    if is_missing {
+        return Ok(error_resp(
+            ErrorCode::SnapshotNotFound,
+            format!("snapshot subvolume is missing: {resolved_id}; record removed"),
+        ));
     }
 
     // 6. Return
@@ -727,8 +739,9 @@ async fn recover_workspace_inner(
     // Intentionally no cwd guard: recover is a terminal "tear out" operation
     // gated by CLI ConfirmationRequired. The CLI prompt is the contract.
 
-    // 3. call backend recover
-    state
+    // 3. call backend recover; the temp-snapshot paths it could not
+    //    delete join the response as a cleanup warning.
+    let temp_leftovers = state
         .backend
         .recover_workspace(&ws_id, &original_path)
         .await?;
@@ -748,26 +761,41 @@ async fn recover_workspace_inner(
 
     // 5. return
     let backup = crate::backends::btrfs_common::backup_path_for(&original_path);
-    let warning = match archive_recovered_backup(&backup).await {
-        Ok(Some(archive)) => Some(format!(
+    let mut warnings: Vec<String> = Vec::new();
+    if !temp_leftovers.is_empty() {
+        let listed = temp_leftovers
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        warnings.push(format!(
+            "Workspace recovered, but the following internal temp snapshots could not \
+             be deleted and may still occupy backend storage:\n{listed}\n\n\
+             The workspace files were restored and these leftovers do not affect \
+             usage; they are retried on the next bootstrap or diff"
+        ));
+    }
+    match archive_recovered_backup(&backup).await {
+        Ok(Some(archive)) => warnings.push(format!(
             "Pre-init backup archived at {:?}; inspect it before removal. You can run init again.",
             archive
         )),
-        Ok(None) => None,
-        Err(error) => Some(format!(
+        Ok(None) => {}
+        Err(error) => warnings.push(format!(
             "Workspace recovered, but pre-init backup {:?} could not be archived: {error:#}. \
              Inspect and move this backup to another location before running init again",
             backup
         )),
-    };
-    Ok(match warning {
-        Some(warning) => Response::RecoverWithWarning {
+    }
+    Ok(if warnings.is_empty() {
+        Response::RecoverOk {
             workspace: original_path,
-            warning,
-        },
-        None => Response::RecoverOk {
+        }
+    } else {
+        Response::RecoverWithWarning {
             workspace: original_path,
-        },
+            warning: warnings.join("\n\n"),
+        }
     })
 }
 
@@ -1796,6 +1824,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_absent_subvolume_prunes_record_and_remains_not_found() {
+        let (state, _, _temp) = live_topology("ws-del-absent");
+        for _ in 0..2 {
+            let response = delete_snapshot(&state, "ws-del-absent", "snap-1", false)
+                .await
+                .unwrap();
+            assert!(matches!(
+                response,
+                Response::Error {
+                    code: ErrorCode::SnapshotNotFound,
+                    ..
+                }
+            ));
+            let index = index_store::load(&state.index_dir("ws-del-absent"))
+                .await
+                .unwrap();
+            assert!(index.snapshots.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn delete_snapshot_healthy_registration_reaches_snapshot_resolution() {
         let (state, _ws_link, _temp) = live_topology("ws-del-live");
         // A healthy registration must get PAST the guard: the unknown snapshot
@@ -2376,6 +2425,61 @@ mod tests {
         assert!(!dir.exists(), "recover must wipe stale per-ws index dir");
     }
 
+    /// Temp snapshots the backend could not delete during recover must reach
+    /// the caller: the response carries the leftover paths with the
+    /// does-not-affect-usage note instead of a plain success (#6198).
+    #[tokio::test]
+    async fn recover_reports_temp_snapshot_leftovers_as_warning() {
+        let state_tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(RecorderStubBackend {
+            recover_leftovers: vec![
+                "/data/.diff-tmp/ws-warn/a1b2c3".to_string(),
+                "/data/.diff-tmp/ws-warn/deadbeef".to_string(),
+            ],
+            ..RecorderStubBackend::new()
+        });
+        let state = Arc::new(DaemonState::new(
+            test_config(),
+            backend.clone() as Arc<dyn StorageBackend>,
+            state_tmp.path().to_path_buf(),
+        ));
+        let ws_tmp = tempfile::tempdir().unwrap();
+        let canon = tokio::fs::canonicalize(ws_tmp.path()).await.unwrap();
+        state
+            .register_workspace(
+                "ws-warn".into(),
+                canon.clone(),
+                SnapshotIndex::new(canon.clone()),
+            )
+            .unwrap();
+
+        let Response::RecoverWithWarning { warning, .. } =
+            recover_workspace(&state, &canon.to_string_lossy())
+                .await
+                .unwrap()
+        else {
+            panic!("leftover temp snapshots must produce a warning response");
+        };
+        assert!(
+            warning.contains("could not be deleted"),
+            "warning explains the failure: {warning}"
+        );
+        assert!(
+            warning.contains("- /data/.diff-tmp/ws-warn/a1b2c3")
+                && warning.contains("- /data/.diff-tmp/ws-warn/deadbeef"),
+            "warning lists every leftover path: {warning}"
+        );
+        assert!(
+            warning.contains("do not affect usage"),
+            "warning keeps the workspace usable: {warning}"
+        );
+        assert_eq!(
+            backend.recover_call_count(),
+            1,
+            "backend.recover_workspace must run once"
+        );
+    }
+
     #[tokio::test]
     async fn confirmed_recovery_rechecks_deletion_scope_and_pins_identity() {
         let temp = tempfile::tempdir().unwrap();
@@ -2535,6 +2639,7 @@ mod tests {
         init_calls: std::sync::atomic::AtomicUsize,
         pause_migration: bool,
         restore_live_directory: bool,
+        recover_leftovers: Vec<String>,
         init_progress: tokio::sync::Semaphore,
         init_continue: tokio::sync::Semaphore,
     }
@@ -2548,6 +2653,7 @@ mod tests {
                 init_calls: std::sync::atomic::AtomicUsize::new(0),
                 pause_migration: false,
                 restore_live_directory: false,
+                recover_leftovers: Vec::new(),
                 init_progress: tokio::sync::Semaphore::new(0),
                 init_continue: tokio::sync::Semaphore::new(0),
             }
@@ -2568,14 +2674,18 @@ mod tests {
         fn snapshots_root(&self) -> &std::path::Path {
             &self.snapshots_root_path
         }
-        async fn recover_workspace(&self, ws_id: &str, original: &str) -> anyhow::Result<()> {
+        async fn recover_workspace(
+            &self,
+            ws_id: &str,
+            original: &str,
+        ) -> anyhow::Result<Vec<String>> {
             self.recover_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.restore_live_directory {
                 tokio::fs::remove_file(original).await?;
                 tokio::fs::rename(self.data_root().join(ws_id), original).await?;
             }
-            Ok(())
+            Ok(self.recover_leftovers.clone())
         }
         async fn init_workspace(
             &self,

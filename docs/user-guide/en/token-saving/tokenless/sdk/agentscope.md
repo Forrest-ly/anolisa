@@ -23,17 +23,17 @@ AgentScope layer. Product adapters such as Claude Code and OpenCode are document
 The AgentScope integration wheel requires the exact same version of the native Runtime wheel.
 Install both assets from one published Tokenless GitHub Release in a single command, with
 `TOKENLESS_VERSION` set to the newest entry on the
-[`tokenless` releases page](https://github.com/alibaba/anolisa/releases?q=tokenless)
-— `0.8.4` on Linux x86_64 when this page was last checked:
+[`tokenless` releases page](https://github.com/agentic-os-org/ANOLISA/releases?q=tokenless)
+— `0.8.7` on Linux x86_64 when this page was last checked:
 
 ```bash
-TOKENLESS_VERSION=0.8.4   # newest published tokenless release
+TOKENLESS_VERSION=0.8.7   # newest published tokenless release
 
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install \
-  "https://github.com/alibaba/anolisa/releases/download/tokenless/v${TOKENLESS_VERSION}/anolisa_tokenless-${TOKENLESS_VERSION}-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
-  "https://github.com/alibaba/anolisa/releases/download/tokenless/v${TOKENLESS_VERSION}/anolisa_tokenless_agentscope-${TOKENLESS_VERSION}-py3-none-any.whl"
+  "https://github.com/agentic-os-org/ANOLISA/releases/download/tokenless/v${TOKENLESS_VERSION}/anolisa_tokenless-${TOKENLESS_VERSION}-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
+  "https://github.com/agentic-os-org/ANOLISA/releases/download/tokenless/v${TOKENLESS_VERSION}/anolisa_tokenless_agentscope-${TOKENLESS_VERSION}-py3-none-any.whl"
 ```
 
 For Linux aarch64 or macOS Apple silicon, replace the native Runtime URL with the matching asset

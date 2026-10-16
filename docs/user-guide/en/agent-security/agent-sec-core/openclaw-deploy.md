@@ -163,7 +163,7 @@ The default configuration is observation-first:
 
 - `promptScanBlock=false`: the prompt scanner logs an alert on `deny` findings but does not block the model call
 - `codeScanRequireApproval=false`: the code scanner logs an alert on risks but does not prompt for approval
-- `piiScanUserInput=true`: scans user input for PII and credentials
+- `piiScanUserInput=true`: enables PII checks; model-entry scanning on stable OpenClaw `>=2026.5.12`, inbound scanning on older hosts
 - `piiIncludeLowConfidence=false`: excludes low-confidence PII findings
 - `pii-scan-user-input.enableBlock=false`: PII deny does not block by default
 - `skill-ledger.policy=ask`: prefers user confirmation when there is a user-visible message
@@ -204,6 +204,18 @@ Enable PII deny blocking:
 openclaw config set 'plugins.entries.agent-sec.config.capabilities.pii-scan-user-input.enableBlock' true
 ```
 
+PII input scanning selects `before_agent_run` on stable OpenClaw `>=2026.5.12`;
+older supported hosts, prereleases, and unrecognized versions retain `before_dispatch`.
+The minimum supported host remains `2026.4.14`. Startup logs report the selected hook.
+The existing `allowConversationAccess=true` setting is required for the new gate;
+re-run deployment when upgrading an installation that lacks it.
+
+The new gate scans the model-bound text supplied at run entry and can block a `deny`
+result. It does not recover credentials already masked by the host or rewrite input.
+`after_tool_call` still cannot redact or withhold tool results, and `llm_output` does
+not block delivery. See [PII Checker](pii-checker.md#openclaw-input-protection) for the
+protection scope, policy behavior, and legacy limitations.
+
 Configure Skill Ledger to block directly:
 
 ```bash
@@ -218,7 +230,7 @@ AgentSecCore's policy is:
 
 - `before_dispatch`, `before_tool_call`, and `after_tool_call` are the core security hooks within the support matrix
 - `model_call_started` and `model_call_ended` are optional model-call observability hooks
-- `llm_input`, `llm_output`, and `agent_end` require `allowConversationAccess`
+- `before_agent_run`, `llm_input`, `llm_output`, and `agent_end` require `allowConversationAccess`
 - When an older OpenClaw lacks the optional observability hooks, the plugin degrades observability gracefully
 - After upgrading OpenClaw, re-run `deploy.sh` and restart the gateway to gain the hook behavior supported by the new version
 

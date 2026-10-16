@@ -15,7 +15,7 @@ fn html_input(paragraphs: usize) -> String {
 }
 
 #[test]
-fn html_is_opt_in_and_requires_recovery_and_text_replacement() {
+fn html_is_switchable_and_requires_recovery_and_text_replacement() {
     let input = html_input(10);
     for mode in 0..11 {
         let mut req = request(&input);
@@ -163,4 +163,49 @@ fn html_trailers_stay_after_the_view_and_in_the_stash() {
             Some(input.clone())
         );
     }
+}
+
+#[test]
+fn html_renders_a_page_that_opens_with_a_byte_order_mark() {
+    let page = html_input(10);
+    let input = format!("\u{feff}{page}");
+    let mut config = build_log_config();
+    config.html_extraction_enabled = true;
+
+    let marked = Arc::new(CountingStore::default());
+    let marked_store: Arc<dyn StashStore> = marked.clone();
+    let run = PostToolPipeline::run(&request(&input), &config, Some(&marked_store)).unwrap();
+
+    // The mark is a format character, not whitespace: unless detection skips it
+    // the page is never routed to the HTML domain, so a fetched document stays
+    // whole in the model's context even though the renderer reads it exactly as
+    // the unmarked page.
+    assert_eq!(run.response.content_type, Some(ContentType::Html));
+    assert_eq!(run.response.disposition, Disposition::Applied);
+    assert_eq!(
+        run.response.applied_operations,
+        [AppliedOperation::HtmlExtraction]
+    );
+    assert_eq!(run.response.recoverability, Recoverability::Retrievable);
+    let output = &run.response.output;
+    assert!(output.contains("\nTitle: Doc\nURL: https://example.com/doc\n# Title\n"));
+    assert!(output.ends_with("\n[End page]"));
+    assert!(!output.contains('\u{feff}'));
+    assert_eq!(run.response.stash_keys.len(), 1);
+    // Recovery stays byte-exact, mark included.
+    assert_eq!(
+        marked.retrieve(&run.response.stash_keys[0]).unwrap(),
+        Some(input.clone())
+    );
+
+    // The view is the one the same page renders without the mark, apart from
+    // the retrieve line, which names each run's own stash entry.
+    let plain = Arc::new(CountingStore::default());
+    let plain_store: Arc<dyn StashStore> = plain.clone();
+    let plain_run = PostToolPipeline::run(&request(&page), &config, Some(&plain_store)).unwrap();
+    assert_eq!(plain_run.response.disposition, Disposition::Applied);
+    assert_eq!(
+        output.split_once('\n').map(|(_, rest)| rest),
+        plain_run.response.output.split_once('\n').map(|(_, rest)| rest)
+    );
 }

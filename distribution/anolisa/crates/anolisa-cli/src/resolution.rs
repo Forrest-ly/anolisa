@@ -21,6 +21,7 @@ use anolisa_platform::pkg_query::{PackageQuery, PackageQueryError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::commands::common;
 use crate::repo_config::{BackendConfig, HostVars, RepoConfig, component_index_v2_url};
 
 /// On-disk schema version for repo-side `components-v2.toml`.
@@ -718,7 +719,11 @@ pub(crate) fn load_component_index_from_base(
         result => result,
     }
     .map_err(|err| ComponentIndexError::Fetch {
-        reason: format!("failed to fetch {url}: {err}"),
+        reason: format!(
+            "failed to fetch {}: {}",
+            common::repository_url_label(&url),
+            common::redact_known_urls(&err.to_string(), std::slice::from_ref(&url)),
+        ),
     })?;
     ComponentIndex::load(&downloaded.cached_path)
 }
@@ -1035,6 +1040,15 @@ targets = {targets}
         assert!(!agentsight.supports_target("macos", "x86_64"));
         assert!(!agentsight.supports_target("linux", "aarch64"));
 
+        let ws_ckpt = index
+            .components
+            .iter()
+            .find(|component| component.name == "ws-ckpt")
+            .expect("ws-ckpt entry");
+        assert!(ws_ckpt.supports_target("linux", "aarch64"));
+        assert!(!ws_ckpt.supports_target("macos", "aarch64"));
+        assert!(!ws_ckpt.supports_target("macos", "x86_64"));
+
         for name in ["cosh-ng", "tokenless"] {
             let component = index
                 .components
@@ -1043,7 +1057,10 @@ targets = {targets}
                 .expect("component entry");
             assert!(component.supports_target("linux", "aarch64"));
             assert!(component.supports_target("macos", "aarch64"));
-            assert!(!component.supports_target("macos", "x86_64"));
+            assert_eq!(
+                component.supports_target("macos", "x86_64"),
+                name == "cosh-ng"
+            );
         }
     }
 

@@ -56,7 +56,7 @@ pub enum WsCkptError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("frame too large: {size} bytes (max {max})")]
-    FrameTooLarge { size: u32, max: u32 },
+    FrameTooLarge { size: u64, max: u32 },
     #[error("config error: {0}")]
     Config(String),
 }
@@ -199,6 +199,22 @@ pub enum Request {
     /// Recover only if the daemon's preview still describes the same target.
     RecoverConfirmed {
         preview: RecoveryPreview,
+    },
+    /// List snapshots recovered without their original metadata.
+    ListOrphans {
+        /// Omit to query all registered workspaces.
+        workspace: Option<String>,
+    },
+    /// Read a page in ascending (created_at, workspace ID, snapshot ID) order.
+    ListPage {
+        /// Restrict the page to recovered orphan snapshots.
+        orphans_only: bool,
+        /// Workspace path or ID; absent means all registered workspaces.
+        workspace: Option<String>,
+        /// Maximum entries to return; must be greater than zero.
+        limit: u32,
+        /// Opaque continuation token returned by the previous page.
+        cursor: Option<String>,
     },
 }
 
@@ -373,6 +389,11 @@ pub enum Response {
     RecoverPreviewOk {
         preview: RecoveryPreview,
     },
+    /// Byte-bounded snapshot page with an opaque continuation token.
+    ListPageOk {
+        snapshots: Vec<SnapshotListItem>,
+        next_cursor: Option<String>,
+    },
 }
 
 /// Daemon-resolved recovery target; execution revalidates it under lifecycle locks.
@@ -403,6 +424,8 @@ pub enum ErrorCode {
     DiskSpaceInsufficient,
     CwdOccupied,
     CwdScanFailed,
+    /// A diff path cannot be represented as UTF-8; fix the filename before retrying.
+    UnsupportedWorkspacePath,
 }
 
 /// Opaque identity for one live writable-subvolume generation of a workspace.
@@ -539,6 +562,8 @@ pub enum GuardedRollbackRejectionCodeV2 {
     EvidenceCapacityReached,
     CwdOccupied,
     CwdScanFailed,
+    /// A diff path cannot be represented as UTF-8; unchanged input must not be retried.
+    UnsupportedWorkspacePath,
 }
 
 /// Validates the canonical `ws-xxxxxx` identifier and optional `-N` collision suffix.
@@ -657,6 +682,26 @@ pub struct SnapshotEntry {
     pub meta: SnapshotMeta,
 }
 
+/// One result in a paged snapshot listing.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum SnapshotListItem {
+    /// Complete snapshot metadata.
+    Full(SnapshotEntry),
+    /// Identity-only fallback when complete metadata cannot fit in one frame.
+    Summary(SnapshotSummary),
+}
+
+/// Identity fields preserved when a snapshot's optional detail is too large.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SnapshotSummary {
+    pub id: String,
+    pub workspace: String,
+    pub created_at: DateTime<Utc>,
+    pub pinned: bool,
+    pub missing: bool,
+    pub omitted_fields: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SnapshotIndex {
     pub workspace_path: PathBuf,
@@ -669,6 +714,9 @@ pub struct SnapshotIndex {
     /// Durable guarded rollback receipts keyed by caller idempotency identifier.
     #[serde(default)]
     pub guarded_rollbacks: HashMap<String, GuardedRollbackEvidenceV2>,
+    /// Snapshot IDs adopted from disk without their original metadata.
+    #[serde(default)]
+    pub recovered_orphans: HashSet<String>,
 }
 
 impl SnapshotIndex {
@@ -679,6 +727,7 @@ impl SnapshotIndex {
             head: None,
             governed_evidence: HashMap::new(),
             guarded_rollbacks: HashMap::new(),
+            recovered_orphans: HashSet::new(),
         }
     }
 }
@@ -1270,18 +1319,26 @@ impl Default for DaemonConfig {
 /// sides to prevent OOM from a malformed length prefix.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024; // 16 MiB
 
+/// Maximum number of records accepted in one list-page request.
+pub const MAX_LIST_PAGE_ITEMS: u32 = 10_000;
+
+/// Return the encoded payload size without allocating the payload.
+pub fn encoded_size<T: Serialize>(msg: &T) -> Result<u64, WsCkptError> {
+    Ok(bincode::serialized_size(msg)?)
+}
+
 /// Serialize a message into a length-prefixed frame: [4-byte LE length][bincode payload]
 pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, WsCkptError> {
-    let payload = bincode::serialize(msg)?;
-    let len = payload.len() as u32;
-    if len > MAX_FRAME_SIZE {
+    let len = encoded_size(msg)?;
+    if len > u64::from(MAX_FRAME_SIZE) {
         return Err(WsCkptError::FrameTooLarge {
             size: len,
             max: MAX_FRAME_SIZE,
         });
     }
+    let payload = bincode::serialize(msg)?;
     let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&(len as u32).to_le_bytes());
     frame.extend(payload);
     Ok(frame)
 }
@@ -1875,6 +1932,7 @@ mod tests {
             ErrorCode::DiskSpaceInsufficient,
             ErrorCode::CwdOccupied,
             ErrorCode::CwdScanFailed,
+            ErrorCode::UnsupportedWorkspacePath,
         ];
         for code in codes {
             let resp = Response::Error {
@@ -2179,6 +2237,48 @@ mod tests {
     }
 
     // ── Phase 2 Request round-trip tests ──
+
+    #[test]
+    fn list_wire_compatibility_and_frame_boundary() {
+        // Existing bincode discriminants and layouts must not change.
+        let request = Request::List {
+            workspace: None,
+            format: None,
+        };
+        assert_eq!(
+            bincode::serialize(&request).unwrap(),
+            vec![4, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            bincode::serialize(&Response::ListOk { snapshots: vec![] }).unwrap(),
+            vec![5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let request = Request::ListPage {
+            orphans_only: false,
+            workspace: Some("/ws".into()),
+            limit: 10,
+            cursor: Some("opaque".into()),
+        };
+        assert_eq!(
+            bincode::serialize(&request).unwrap(),
+            bincode::serialize(&(29_u32, false, Some("/ws"), 10_u32, Some("opaque"))).unwrap()
+        );
+        assert!(matches!(round_trip_request(&request), Request::ListPage {
+            orphans_only: false,
+            workspace: Some(ws), limit: 10, cursor: Some(cursor),
+        } if ws == "/ws" && cursor == "opaque"));
+
+        // A bincode string has an eight-byte length prefix.
+        let mut payload = "x".repeat(MAX_FRAME_SIZE as usize - 8);
+        let frame = encode_frame(&payload).unwrap();
+        assert_eq!(frame.len(), MAX_FRAME_SIZE as usize + 4);
+        payload.push('x');
+        assert!(
+            matches!(encode_frame(&payload), Err(WsCkptError::FrameTooLarge {
+            size, max: MAX_FRAME_SIZE,
+        }) if size == u64::from(MAX_FRAME_SIZE) + 1)
+        );
+    }
 
     #[test]
     fn request_list_round_trip() {
@@ -3323,6 +3423,25 @@ mod tests {
     }
 
     #[test]
+    fn orphan_query_preserves_legacy_list_wire_layout() {
+        let old = Request::List {
+            workspace: Some("/ws".into()),
+            format: Some("json".into()),
+        };
+        assert_eq!(
+            bincode::serialize(&old).unwrap(),
+            bincode::serialize(&(4_u32, Some("/ws"), Some("json"))).unwrap()
+        );
+        let request = Request::ListOrphans {
+            workspace: Some("/ws".into()),
+        };
+        let encoded = bincode::serialize(&request).unwrap();
+        assert_eq!(encoded, bincode::serialize(&(28_u32, Some("/ws"))).unwrap());
+        assert!(matches!(bincode::deserialize::<Request>(&encoded).unwrap(),
+            Request::ListOrphans { workspace: Some(ws) } if ws == "/ws"));
+    }
+
+    #[test]
     fn recovery_protocol_extensions_preserve_existing_wire_layout() {
         let preview = RecoveryPreview {
             ws_id: Some("ws-preview".into()),
@@ -3525,6 +3644,10 @@ mod tests {
             bincode::serialize(&ErrorCode::CwdScanFailed).unwrap(),
             12_u32.to_le_bytes()
         );
+        assert_eq!(
+            bincode::serialize(&ErrorCode::UnsupportedWorkspacePath).unwrap(),
+            13_u32.to_le_bytes()
+        );
     }
 
     #[test]
@@ -3586,11 +3709,19 @@ mod tests {
             GuardedRollbackRejectionCodeV2::EvidenceCapacityReached,
             GuardedRollbackRejectionCodeV2::CwdOccupied,
             GuardedRollbackRejectionCodeV2::CwdScanFailed,
+            GuardedRollbackRejectionCodeV2::UnsupportedWorkspacePath,
         ];
-        for (code, expected_discriminant) in rollback_rejections.iter().zip(0_u32..=15) {
+        for (code, expected_discriminant) in rollback_rejections.iter().zip(0_u32..=16) {
             assert_eq!(
                 bincode::serialize(code).unwrap(),
                 expected_discriminant.to_le_bytes()
+            );
+            assert_eq!(
+                bincode::deserialize::<GuardedRollbackRejectionCodeV2>(
+                    &expected_discriminant.to_le_bytes()
+                )
+                .unwrap(),
+                *code
             );
         }
     }
@@ -3607,6 +3738,7 @@ mod tests {
         assert_eq!(index.workspace_path, PathBuf::from("/workspace"));
         assert!(index.governed_evidence.is_empty());
         assert!(index.guarded_rollbacks.is_empty());
+        assert!(index.recovered_orphans.is_empty());
     }
 
     #[test]

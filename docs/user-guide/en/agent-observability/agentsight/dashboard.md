@@ -41,6 +41,10 @@ sudo agentsight dashboard --no-open
 A successful login exchanges the token for an httpOnly session cookie, so you do not have to keep
 the token in the URL.
 
+An invalid-token message means the server rejected the token; check it with the command above.
+A connection-error message can also mean the server or a reverse proxy returned an HTTP error.
+Check that AgentSight is running and reachable, then retry the login.
+
 To turn authentication off — only sensible on a trusted internal network:
 
 ```json
@@ -119,6 +123,11 @@ optimization LLM to rank candidates by intent, e.g. "fix build error".
 
 **Analyze** sends the session to the Optimization page.
 
+Opening a session captured by both sources retains its captured steps and Token metrics,
+and includes its collected subagent trajectories in the ATIF viewer. A captured Codex UUID
+can resolve children under one matching collected rollout parent; ambiguous rollout parents
+are not combined. If collected children are unavailable, the captured session remains readable.
+
 ## Reuse Labels
 
 Reviews collected trajectories for later Agent reuse. Run deterministic triage first, then confirm or override `good`, `bad`, `useless`, or `unknown` labels individually or in batch. The rules never assign `bad`; that verdict requires a human decision or an LLM judgement with a cited trajectory step.
@@ -134,6 +143,21 @@ optimization type, plus a savings ranking and concrete tips.
 
 Press **Query** after choosing a range; the page starts empty on purpose. Setup:
 [Integrations](integrations.md#tokenless-token-savings).
+
+**Export CSV** downloads the displayed sessions from the last successful query as
+`token-savings.csv`, in their displayed order. It includes session IDs, Agent names,
+request counts and Token metrics; rates use fractions (for example, `0.4` means 40%).
+The export omits tool content and uses UTF-8 with a BOM for spreadsheet compatibility.
+Text beginning with a spreadsheet formula prefix is prefixed with an apostrophe.
+Export is disabled while querying, after a query error, or when there are no sessions.
+
+To compare a subset, check the box on each session row (or the box in the table header
+to select or clear every session) and press **Export Selected (N)**. The download uses
+the same columns, escaping, units and file lifecycle as the full export, keeps the
+displayed row order, and reads only the already loaded results — it never issues another
+request. Checking a box does not expand or collapse the row; the selection is keyed by
+session ID, and it is cleared whenever a new successful query replaces the snapshot.
+The button stays disabled while querying, after a query error, or while nothing is selected.
 
 ## Optimization
 
@@ -170,13 +194,33 @@ elsewhere.
 
 This is the page to open when you need to know exactly what the Agent sent and received.
 
+**Filter round content** searches the currently selected trajectory locally. It matches a
+case-insensitive literal substring in messages, reasoning, tool names, arguments, and result content,
+and shows the matching/total round count. **Clear filter** restores the full list. The selected round
+detail stays visible while filtering; selecting another trajectory or importing/loading a new
+document clears the filter. Searching sends no model request and leaves **Download JSON** unchanged.
+
 ## Settings
 
-Configures the LLM used by the optimization and semantic-search features (provider, base URL, model,
-API key). The key is masked when read back and stored in `optimization_config.json` next to the
-databases.
+The SQLite storage card consumes schema v2 from authenticated `GET /api/storage/status`. On Linux,
+it includes every AgentSight-owned store plus the external Tokenless target, including the new reuse
+and causal entries. Each card shows the effective retention and size policy, physical and logical usage,
+cleanup state, and coverage (`full`, `partial`, or external). Trajectories, security audit, reuse,
+causal, and enforcement are partial because maintenance intentionally protects bookkeeping,
+active graphs, the newest cache entry, human decisions, or live control state.
 
-![Settings page](../../../../images/agentsight/en/dashboard-settings.png)
+The same card now shows `scheduled`, `worker_running`, the worker heartbeat, last attempt, last
+successful attempt, `last_result`, consecutive failures, and the next run. These runtime fields describe
+only the process serving the endpoint; an unscheduled trace-owned store does not prove that a separate
+trace process is stopped. A `lock_busy` result means another process held that database's maintenance lock. Do not infer worker health from
+`within_policy`: logical usage can be within the limit while a job is unscheduled, the worker is
+stopped, or recent attempts failed. Logical usage excludes reusable freelist pages, so a large
+physical file can also be healthy. The API never exposes filesystem paths.
+
+This page also configures the LLM used by optimization and semantic search (provider, base URL,
+model, API key, and the semantic-search ranking timeout). A timed-out ranking returns no results and
+is recorded as a server warning. The key is masked when read back and stored in
+`optimization_config.json` next to the databases.
 
 ## Language
 

@@ -45,34 +45,46 @@ impl ServeCommand {
         #[cfg(target_os = "linux")]
         {
             use agentsight::server::run_server;
-            use agentsight::storage::sqlite::GenAISqliteStore;
 
+            let mut server_config = super::load_server_config(&self.config);
             let db_path = self
                 .db
                 .as_ref()
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(GenAISqliteStore::default_path);
-
-            let server_config = super::load_server_config(&self.config);
+                .unwrap_or_else(|| server_config.storage.genai_path());
+            if self.db.is_some() {
+                server_config.storage.base_path = db_path
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf();
+            }
             // Initialize logging before warning: standalone `serve` does not
             // register a logger, so a `log::warn!` before this point is lost.
             server_config.apply_verbose();
             let auth_config = server_config.server_auth;
-            let retention_days = server_config.retention_days;
+            let storage_config = server_config.storage;
+            // The health checker discovers agents with the same rules the
+            // trace path uses, so the dashboard reports the agents this
+            // installation actually tracks.
+            let cmdline_rules = server_config.cmdline_rules;
             let judge_enabled = server_config.features.reuse_llm_judge_enabled;
 
             if let Some(dir) = db_path.parent() {
                 agentsight::container::warn_if_data_dir_not_persistent(dir);
             }
 
+            let config_path = std::path::PathBuf::from(&self.config);
             actix_web::rt::System::new().block_on(async move {
                 if let Err(e) = run_server(
                     &host,
                     port,
                     db_path,
                     auth_config,
-                    retention_days,
+                    storage_config,
                     judge_enabled,
+                    cmdline_rules,
+                    Some(config_path),
                 )
                 .await
                 {
@@ -84,19 +96,29 @@ impl ServeCommand {
 
         #[cfg(not(target_os = "linux"))]
         {
-            let judge_enabled = self
+            let mut config = self
                 .config
                 .as_deref()
-                .map(|path| {
-                    super::load_server_config(path)
-                        .features
-                        .reuse_llm_judge_enabled
-                })
-                .unwrap_or(false);
+                .map(super::load_server_config)
+                .unwrap_or_default();
+            if self.config.is_none() {
+                config.storage.base_path = dirs::data_local_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("agentsight");
+            }
+            let judge_enabled = config.features.reuse_llm_judge_enabled;
+            let config_path = config.config_path.clone();
+            let storage_config = config.storage;
 
             actix_web::rt::System::new().block_on(async move {
-                if let Err(e) =
-                    agentsight::local::server::run_server(&host, port, judge_enabled).await
+                if let Err(e) = agentsight::local::server::run_server(
+                    &host,
+                    port,
+                    storage_config,
+                    judge_enabled,
+                    config_path,
+                )
+                .await
                 {
                     eprintln!("Server error: {e}");
                     std::process::exit(1);

@@ -6,10 +6,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use agentsight_sqlite_lifecycle::{
+    CheckpointOutcome, ConnectionOptions, checkpoint_truncate, open_connection,
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
-use super::connection::{create_connection, default_base_path, wal_checkpoint};
 use crate::analyzer::TokenConsumptionBreakdown;
 
 /// A row stored in the token_consumption table (excludes per_message and output_per_block)
@@ -113,7 +115,7 @@ impl TokenConsumptionStore {
     /// Create store with custom table name
     pub fn with_table(path: impl Into<PathBuf>, table_name: &str) -> anyhow::Result<Self> {
         let path = path.into();
-        let conn = create_connection(&path)?;
+        let conn = open_connection(&path, ConnectionOptions::default())?;
         let table_name = table_name.to_string();
 
         conn.execute_batch(&format!(
@@ -141,7 +143,7 @@ impl TokenConsumptionStore {
 
     /// Default storage path
     pub fn default_path() -> PathBuf {
-        default_base_path().join("agentsight.db")
+        crate::config::default_base_path().join("agentsight.db")
     }
 
     /// Insert a `TokenConsumptionBreakdown` record.
@@ -368,9 +370,12 @@ impl TokenConsumptionStore {
         Ok(deleted)
     }
 
-    /// Execute WAL checkpoint to flush WAL data back to the main database file
+    /// Execute WAL checkpoint to flush WAL data back to the main database file.
     pub fn checkpoint(&self) -> anyhow::Result<()> {
-        wal_checkpoint(&self.conn)
+        match checkpoint_truncate(&self.conn)? {
+            CheckpointOutcome::Completed => Ok(()),
+            CheckpointOutcome::Busy => anyhow::bail!("WAL checkpoint remained busy"),
+        }
     }
 
     /// Number of stored records
@@ -389,6 +394,23 @@ impl TokenConsumptionStore {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn unique_db_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "agentsight_token_consumption_{label}_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn cleanup_db(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
 
     fn make_breakdown(provider: &str, model: &str) -> TokenConsumptionBreakdown {
         let mut by_role = HashMap::new();
@@ -417,8 +439,8 @@ mod tests {
 
     #[test]
     fn test_insert_and_query() {
-        let path = "/tmp/test_token_consumption.db";
-        let store = TokenConsumptionStore::new(path).unwrap();
+        let path = unique_db_path("insert_query");
+        let store = TokenConsumptionStore::new(&path).unwrap();
 
         let bd = make_breakdown("openai", "gpt-4o");
         let id = store.insert(&bd, 1_000_000_000, 123, "python").unwrap();
@@ -433,13 +455,13 @@ mod tests {
         assert_eq!(rec.total_output_tokens, 80);
         assert_eq!(rec.by_role().get("user"), Some(&100));
 
-        std::fs::remove_file(path).ok();
+        cleanup_db(&path);
     }
 
     #[test]
     fn test_aggregate() {
-        let path = "/tmp/test_token_consumption_agg.db";
-        let store = TokenConsumptionStore::new(path).unwrap();
+        let path = unique_db_path("aggregate");
+        let store = TokenConsumptionStore::new(&path).unwrap();
 
         let bd = make_breakdown("anthropic", "claude-3-5-sonnet");
         store.insert(&bd, 2_000_000_000, 1, "claude").unwrap();
@@ -452,6 +474,6 @@ mod tests {
         assert_eq!(result.total_input_tokens, 300);
         assert_eq!(result.by_role.get("user"), Some(&200));
 
-        std::fs::remove_file(path).ok();
+        cleanup_db(&path);
     }
 }

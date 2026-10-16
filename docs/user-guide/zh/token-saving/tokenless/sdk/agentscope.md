@@ -21,17 +21,17 @@ OpenCode 等产品 Adapter 单独记录在 [Agent 集成](../framework-integrati
 
 AgentScope 集成 Wheel 要求原生 Runtime Wheel 的版本与它完全相同。请从同一个已发布的
 Tokenless GitHub Release 一次性安装两个产物：把 `TOKENLESS_VERSION` 设为
-[`tokenless` Release 列表](https://github.com/alibaba/anolisa/releases?q=tokenless)
-中最新的一项（本页最后校验时，Linux x86_64 对应 `0.8.4`）：
+[`tokenless` Release 列表](https://github.com/agentic-os-org/ANOLISA/releases?q=tokenless)
+中最新的一项（本页最后校验时，Linux x86_64 对应 `0.8.7`）：
 
 ```bash
-TOKENLESS_VERSION=0.8.4   # 最新的已发布 tokenless Release
+TOKENLESS_VERSION=0.8.7   # 最新的已发布 tokenless Release
 
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install \
-  "https://github.com/alibaba/anolisa/releases/download/tokenless/v${TOKENLESS_VERSION}/anolisa_tokenless-${TOKENLESS_VERSION}-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
-  "https://github.com/alibaba/anolisa/releases/download/tokenless/v${TOKENLESS_VERSION}/anolisa_tokenless_agentscope-${TOKENLESS_VERSION}-py3-none-any.whl"
+  "https://github.com/agentic-os-org/ANOLISA/releases/download/tokenless/v${TOKENLESS_VERSION}/anolisa_tokenless-${TOKENLESS_VERSION}-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
+  "https://github.com/agentic-os-org/ANOLISA/releases/download/tokenless/v${TOKENLESS_VERSION}/anolisa_tokenless_agentscope-${TOKENLESS_VERSION}-py3-none-any.whl"
 ```
 
 在 Linux aarch64 或 macOS Apple 芯片上，请按 [SDK 概览](../sdk.md) 替换原生 Runtime

@@ -272,11 +272,17 @@ enum StatsCommands {
 }
 
 /// Boolean switch from the environment: `1`, `true`, or `yes` (case-insensitive)
-/// enable it; any other value disables it; unset keeps `default`.
+/// enable it; any other non-empty value disables it; unset or empty keeps
+/// `default`.
+// Empty counts as unset so that the recording toggles in `tokenless-stats`
+// and these switches follow one rule.
 fn env_flag(name: &str, default: bool) -> bool {
-    std::env::var(name).map_or(default, |value| {
-        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
-    })
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map_or(default, |value| {
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
@@ -445,6 +451,32 @@ fn open_recorder_with(paths: &DatabasePathResolver) -> Result<StatsRecorder, (St
     StatsRecorder::new(db_path).map_err(|e| (format!("Failed to open database: {e}"), 1))
 }
 
+fn try_open_recorder(paths: &DatabasePathResolver) -> Option<StatsRecorder> {
+    match open_recorder_with(paths) {
+        Ok(recorder) => Some(recorder),
+        Err((message, _)) => {
+            warn_stats(&format!(
+                "[tokenless-stats] WARNING: failed to open stats recorder: {message}"
+            ));
+            None
+        }
+    }
+}
+
+/// Best-effort stderr warning whose own write failure cannot fail the
+/// command. `eprintln!` panics when writing to stderr fails (a full
+/// filesystem behind redirected logs), which turned the fail-soft stats
+/// warning into exit 101 while the compression output itself was fine.
+/// Write errors are discarded: there is no fallback channel, and
+/// failing the command here is the regression to avoid.
+fn warn_stats(message: &str) {
+    use std::io::Write;
+    let mut stderr = std::io::stderr();
+    let _ = stderr.write_all(message.as_bytes());
+    let _ = stderr.write_all(b"\n");
+    let _ = stderr.flush();
+}
+
 /// Resolve the stash database path under a trusted state root.
 ///
 /// File-level overrides may reside beneath the passwd-backed home or the
@@ -548,7 +580,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                 .transpose()
                 .map_err(|error| (error, 1))?;
             let recorder = if config.is_stats_enabled() {
-                open_recorder_with(&database_paths).ok()
+                try_open_recorder(&database_paths)
             } else {
                 None
             };
@@ -575,7 +607,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                         true,
                     ),
                     diff_compression_enabled: env_flag("TOKENLESS_DIFF_COMPRESSION_ENABLED", false),
-                    html_extraction_enabled: env_flag("TOKENLESS_HTML_EXTRACTION_ENABLED", false),
+                    html_extraction_enabled: env_flag("TOKENLESS_HTML_EXTRACTION_ENABLED", true),
                     stash_enabled: true,
                     rtk_path,
                     rtk_data_dir,
@@ -792,7 +824,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             // Retrieve events are attribution, never a gate: a recorder that
             // fails to open degrades to unrecorded retrieval.
             let recorder = if TokenlessConfig::load().is_stats_enabled() {
-                open_recorder_with(&DatabasePathResolver::default()).ok()
+                try_open_recorder(&DatabasePathResolver::default())
             } else {
                 None
             };
@@ -1210,7 +1242,7 @@ fn stats_persist_snapshot(file_config: TokenlessConfig, enabled: bool) -> Tokenl
     config
 }
 
-/// Record compression stats — fail-silent so compression output
+/// Record compression stats — best-effort so compression output
 /// is never blocked by database errors.
 ///
 /// All metrics (chars, tokens) are derived from actual text content,
@@ -1271,11 +1303,17 @@ fn record_compression_stats(
         .with_mode(mode)
         .with_stash(stash_writes, stash_errors, stash_size);
 
-    // SQLite stats recording — gated by stats_enabled
+    // SQLite stats recording — gated by stats_enabled. The warning is
+    // best-effort: a failed stderr write (full filesystem behind
+    // redirected logs) must not turn a fail-soft stats miss into a
+    // failed compression command.
     if config.is_stats_enabled()
-        && let Ok(recorder) = open_recorder_with(database_paths)
+        && let Some(recorder) = try_open_recorder(database_paths)
+        && let Err(e) = recorder.record(&record)
     {
-        let _ = recorder.record(&record);
+        warn_stats(&format!(
+            "[tokenless-stats] WARNING: failed to record stats entry: {e}"
+        ));
     }
 
     // SLS recording — fail-silent, independent of SQLite

@@ -675,7 +675,14 @@ package = "copilot-shell"
     let mut a = args("cosh");
     a.backend = Some("rpm".to_string());
     a.repo = Some(format!("file://{}", override_v1.display()));
-    let ctx = ctx_with_prefix(false, Some(prefix));
+    let mut ctx = ctx_with_prefix(false, Some(prefix));
+    ctx.dry_run = true;
+    install_component_with_deps("cosh", &a, &ctx, &fake, &fake, false)
+        .expect("the override also permits a non-root preview");
+    assert_eq!(fake.install_calls.get(), 0);
+    assert!(load_store(&ctx).installations.is_empty());
+    assert!(load_journals(&layout).is_empty());
+    ctx.dry_run = false;
 
     let outcome = install_component_with_deps("cosh", &a, &ctx, &fake, &fake, true)
         .expect("delegated install via the override repository");
@@ -913,16 +920,61 @@ fn load_journals(layout: &FsLayout) -> Vec<Transaction> {
 
 #[test]
 fn delegated_install_requires_configured_rpm_backend() {
-    let (_tmp, ctx) = system_ctx_with_raw_repo(false);
-    let fake = FakeInstaller::new(
+    for dry_run in [true, false] {
+        let (_tmp, ctx) = system_ctx_with_raw_repo(dry_run);
+        let fake = FakeInstaller::new(
+            "copilot-shell",
+            pkg_info("copilot-shell", "2.3.0", Some("1.al8"), "x86_64"),
+        );
+        let mut a = args("copilot-shell");
+        a.backend = Some("rpm".to_string());
+
+        let err = install_component_with_deps("copilot-shell", &a, &ctx, &fake, &fake, true)
+            .expect_err("missing rpm backend config must block dnf install");
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(
+            fake.preflight_calls.get(),
+            0,
+            "no solver without an RPM source"
+        );
+        assert!(load_journals(&common::resolve_layout(&ctx)).is_empty());
+        assert!(
+            err.reason().contains("backend 'rpm' is not configured"),
+            "got: {}",
+            err.reason()
+        );
+        assert_eq!(
+            fake.install_calls.get(),
+            0,
+            "dnf must not run without a configured RPM source"
+        );
+        assert!(
+            load_store(&ctx)
+                .find(ObjectKind::Component, "copilot-shell")
+                .is_none(),
+            "refused install must not write state"
+        );
+    }
+}
+
+#[test]
+fn dry_run_with_failing_preflight_still_refuses_unconfigured_backend_first() {
+    // Regression for the review finding on #3483: when the rpm backend is
+    // unconfigured AND the DNF preflight would fail, the refusal must be
+    // INVALID_ARGUMENT (BackendNotConfigured), not the preflight's
+    // EXECUTION_FAILED — and no host repository may be queried at all.
+    let (_tmp, ctx) = system_ctx_with_raw_repo(true);
+    let mut fake = FakeInstaller::new(
         "copilot-shell",
         pkg_info("copilot-shell", "2.3.0", Some("1.al8"), "x86_64"),
     );
+    fake.preflight_failure_on_call = Some(1);
     let mut a = args("copilot-shell");
     a.backend = Some("rpm".to_string());
 
     let err = install_component_with_deps("copilot-shell", &a, &ctx, &fake, &fake, true)
-        .expect_err("missing rpm backend config must block dnf install");
+        .expect_err("backend config check must precede the failing preflight");
     assert_eq!(err.code(), "INVALID_ARGUMENT");
     assert!(
         err.reason().contains("backend 'rpm' is not configured"),
@@ -930,16 +982,11 @@ fn delegated_install_requires_configured_rpm_backend() {
         err.reason()
     );
     assert_eq!(
-        fake.install_calls.get(),
+        fake.preflight_calls.get(),
         0,
-        "dnf must not run without a configured RPM source"
+        "preflight must not run without a configured backend"
     );
-    assert!(
-        load_store(&ctx)
-            .find(ObjectKind::Component, "copilot-shell")
-            .is_none(),
-        "refused install must not write state"
-    );
+    assert_eq!(fake.install_calls.get(), 0);
 }
 
 #[test]

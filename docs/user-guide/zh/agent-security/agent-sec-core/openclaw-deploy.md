@@ -161,7 +161,7 @@ openclaw config get plugins.entries.agent-sec.hooks.allowConversationAccess
 
 - `promptScanBlock=false`：prompt scanner 检测到 `deny` 时记录告警，但不阻断模型调用
 - `codeScanRequireApproval=false`：code scanner 检测到风险时记录告警，但不弹审批
-- `piiScanUserInput=true`：扫描用户输入中的 PII 和凭据
+- `piiScanUserInput=true`：启用 PII 检查；正式版 OpenClaw `>=2026.5.12` 检查模型运行入口文本，旧版检查入站文本
 - `piiIncludeLowConfidence=false`：不包含低置信度 PII findings
 - `pii-scan-user-input.enableBlock=false`：PII deny 默认不阻断
 - `skill-ledger.policy=ask`：有用户可见消息时优先要求确认
@@ -200,6 +200,15 @@ openclaw config set plugins.entries.agent-sec.config.codeScanRequireApproval tru
 openclaw config set 'plugins.entries.agent-sec.config.capabilities.pii-scan-user-input.enableBlock' true
 ```
 
+正式版 OpenClaw `>=2026.5.12` 使用 `before_agent_run` 做 PII 输入扫描；较旧的受支持版本、
+预发布版及无法识别的版本保留 `before_dispatch`。最低支持版本仍是 `2026.4.14`，
+启动日志会注明选中的 hook。新 gate 需要已有的 `allowConversationAccess=true` 配置；
+升级时若原安装缺少该配置，请重新执行部署。
+
+新 gate 检查运行入口提供的模型输入文本，并可阻断 `deny` 结果；不会恢复宿主已经打码的凭据，也不会改写输入。
+`after_tool_call` 仍不能脱敏或扣留工具结果，`llm_output` 不阻断交付。
+保护范围、策略行为和旧版限制详见 [PII Checker](pii-checker.md#openclaw-输入保护)。
+
 配置 Skill Ledger 为直接阻断：
 
 ```bash
@@ -214,7 +223,7 @@ AgentSecCore 的策略是：
 
 - `before_dispatch`、`before_tool_call`、`after_tool_call` 是支持矩阵内的核心安全 hook
 - `model_call_started`、`model_call_ended` 属于可选模型调用观测 hook
-- `llm_input`、`llm_output`、`agent_end` 需要 `allowConversationAccess`
+- `before_agent_run`、`llm_input`、`llm_output`、`agent_end` 需要 `allowConversationAccess`
 - 旧版 OpenClaw 缺失可选观测 hook 时，插件允许观测能力降级
 - 用户升级 OpenClaw 后，重新运行 `deploy.sh` 并重启 gateway，即可获得新版本支持的 hook 行为
 
