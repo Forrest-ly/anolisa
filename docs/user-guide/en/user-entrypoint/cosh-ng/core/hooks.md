@@ -7,12 +7,16 @@ notifications, or extra context, and enable them only from a source you trust.
 
 ## Enable and manage Hooks
 
-Define them in `~/.copilot-shell/config.toml` or a trusted project config:
+For `cosh-core`, declaring a Hook enables it by default; `hooks.enabled = true`
+is optional. An explicit `hooks.enabled = false` disables config Hooks and emits
+a warning when definitions are present. A system/user disable also prevents
+Extension Hooks from auto-enabling. Core ignores the `[hooks]` section of a
+project `.copilot-shell/config.toml`, including `hooks.enabled`. `--bare`
+continues to disable all Hooks.
+
+Define them in `~/.copilot-shell/config.toml`:
 
 ```toml
-[hooks]
-enabled = true
-
 [[hooks.PreToolUse]]
 name = "security-check"
 command = "/usr/local/bin/my-security-hook"
@@ -30,9 +34,9 @@ In the interactive terminal:
 /hooks disable <id>
 ```
 
-Project Hooks do not run until the project root is trusted. Use
-`/hooks untrust-project` to remove that trust. Shell Hook state is session-local;
-Agent Hook state is persisted by the registry.
+Project Shell Hooks under `.cosh/hooks` do not run until the project root is
+trusted. Use `/hooks untrust-project` to remove that trust. Shell Hook state is
+session-local; Agent Hook state is persisted by the registry.
 
 ## Event names
 
@@ -62,9 +66,13 @@ Write one JSON object to stdout:
 }
 ```
 
-`allow` continues, `block`/`deny` stops the operation, `ask` requests user
-confirmation, and an empty response passes through. Exit code `2` also blocks;
-other non-zero exits are warnings. The default timeout is 60 seconds; set a
+`allow` continues, `block`/`deny` stops the operation, and `ask` requests user
+confirmation. Exit code `2` also blocks. In `cosh-core`, config `PreToolUse`
+Hooks fail closed on empty output, invalid JSON, timeout, or unexpected non-zero
+exit unless that Hook explicitly sets `fail_open = true`. Extension Hooks may
+return empty output on success; their execution errors still fail closed.
+Return `{}` for an explicit passthrough from a config Hook.
+The default timeout is 60 seconds; set a
 shorter `timeout` when a check must be quick. Use `sequential = true` when
 multiple Hooks for an event must run in order.
 

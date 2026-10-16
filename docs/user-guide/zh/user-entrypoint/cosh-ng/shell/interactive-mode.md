@@ -8,7 +8,7 @@
 
 | 命令 | 用途 |
 |---|---|
-| `cosh` | 启动 Enhanced Assisted（`◇ `），提供 Agent 和斜杠命令路由。 |
+| `cosh` | 启动 Enhanced Assisted，提供 Agent 和斜杠命令路由。 |
 | `COSH_SHELL_INTEGRATION=native cosh` | 启动不加载 Cosh Hook、不观察也不提供洞察的 Native。 |
 | `cosh --shell zsh` | 明确选择zsh。 |
 | `cosh --isolated` | 跳过用户rcfile。 |
@@ -34,11 +34,12 @@
 ## 输入和编辑
 
 - 原生集成把每个输入字节交给前台 bash 或 zsh。
-- Enhanced Assisted（`◇ `）把 Shell 语法交给前台 Shell，并可以把自然语言
+- Enhanced Assisted 把 Shell 语法交给前台 Shell，并可以把自然语言
   请求转为 Agent 请求。
-- 在 Enhanced 的空提示符按 `Shift+Tab` 可切换到 Shell-only（`◌ `）。此时
+- 在 Enhanced 的空提示符按 `Shift+Tab` 可切换到 Shell-only。此时
   包括行首 `/` 在内的普通输入都交给 Shell，但仍可获得命令执行后的洞察。
-  再次按下即可恢复 Assisted。
+  再次按下即可恢复 Assisted。开启 `shell.status_symbols`（默认关闭）后，
+  可选的 `◇ `/`◌ ` 状态行会在每个提示符上方标记当前模式。
 - 行首 `/` 只在 Enhanced Assisted 中运行 Cosh 控制命令。Native 和 Enhanced
   Shell-only 都把它留给 Shell。
 - 终端支持时，`Shift+Enter`插入换行；多行粘贴仍作为一次提交。
@@ -51,6 +52,7 @@
 | `/help` | 查看已安装版本支持的命令。 |
 | `/agent` | 编辑一次性 cosh-core 请求，可选择 Skill 并引用工作空间路径。 |
 | `/health` | 运行本地健康检查。 |
+| `/bug <description>` | 构建可检查的预填 bug 报告 URL。 |
 | `/status`（`/about`） | 查看运行时、Provider和会话状态。 |
 | `/stats [model\|tools]` | 查看模型身份或工具活动。 |
 | `/auth` | 选择或更新Provider认证。 |
@@ -65,6 +67,12 @@
 | `/mcp [list\|connect\|inspect\|refresh\|disconnect\|login\|logout]` | 管理MCP服务器。 |
 
 `/details`、`/audit`和`/send-to-shell`等命令只有在当前卡片或任务提供所需上下文时才会出现。`/mcp login`需要按MCP指南说明在Shell中完成OAuth流程。
+
+`/bug` 会把白名单内的运行时信息加入 issue URL，输出 URL 供检查，并在图形化
+Linux 或 macOS 上尽力打开。它不会读取日志、写文件或提交 issue；打开或点击
+链接时，预填的标题和诊断信息会随表单加载发送到 GitHub，issue 只有在你提交
+表单后才会创建。如果 `~/.copilot-shell/logs/` 存在，面板会提醒你检查最新
+文件，并在自行粘贴相关片段前删除 token、密钥和内网地址。
 
 ## 编辑一次性 Agent 请求
 

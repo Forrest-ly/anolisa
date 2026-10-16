@@ -178,15 +178,15 @@ fn default_max_tool_calls() -> u32 {
     10
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HooksConfig {
-    #[serde(default)]
+    /// Config hooks run unless explicitly disabled, independently of extensions.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Last explicit value applied by a trusted configuration layer.
     ///
-    /// This distinguishes the default `false` from a system/user-requested
-    /// disable so installed extensions can auto-enable hooks without allowing
-    /// untrusted project configuration to override the kill switch.
+    /// Installed extensions can auto-enable hooks unless a trusted layer
+    /// disables them; project configuration cannot override that decision.
     #[serde(skip)]
     pub(crate) enabled_override: Option<bool>,
     #[serde(default, rename = "PreToolUse")]
@@ -205,6 +205,23 @@ pub struct HooksConfig {
     pub before_model: Vec<HookDefinition>,
     #[serde(default, rename = "AfterModel")]
     pub after_model: Vec<HookDefinition>,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enabled_override: None,
+            pre_tool_use: Vec::new(),
+            post_tool_use: Vec::new(),
+            post_tool_use_failure: Vec::new(),
+            user_prompt_submit: Vec::new(),
+            session_start: Vec::new(),
+            stop: Vec::new(),
+            before_model: Vec::new(),
+            after_model: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -486,7 +503,7 @@ impl LoggingConfig {
         if verbose {
             return "debug".to_string();
         }
-        self.level.clone().unwrap_or_else(|| "warn".to_string())
+        self.level.clone().unwrap_or_else(|| "info".to_string())
     }
 }
 
@@ -646,7 +663,12 @@ fn apply_user_layer(config: &mut CoreConfig, layer: &PartialCoreConfig) {
     apply_common_layers(config, layer, true);
 }
 
-fn apply_project_layer(config: &mut CoreConfig, layer: &PartialCoreConfig, path: &std::path::Path) {
+fn apply_project_layer(
+    config: &mut CoreConfig,
+    layer: &PartialCoreConfig,
+    path: &std::path::Path,
+    trusted: bool,
+) {
     if let Some(ref ai) = layer.ai {
         if ai.active_provider.is_some() {
             eprintln!(
@@ -668,7 +690,61 @@ fn apply_project_layer(config: &mut CoreConfig, layer: &PartialCoreConfig, path:
             path.display()
         );
     }
-    apply_common_layers(config, layer, false);
+    // The approval policy is the user's sovereignty over the agent, not a
+    // project decision: a checked-out .copilot-shell/config.toml must not
+    // be able to switch the approval system off (`approval_mode = "trust"`
+    // makes classify_tool allow every tool call). User and system layers
+    // keep setting it, and COSH_APPROVAL_MODE stays an explicit user knob.
+    let mut layer = layer.clone();
+    if layer
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.approval_mode.is_some())
+    {
+        eprintln!(
+            "[cosh-core] Warning: ignoring agent.approval_mode from project config {}",
+            path.display()
+        );
+        if let Some(ref mut agent) = layer.agent {
+            agent.approval_mode = None;
+        }
+    }
+    // The tool allowlist is the same authority in a different shape:
+    // `classify_tool` returns `Outcome::Allow` for an allowlisted tool
+    // before the sensitive-write and approval checks run, so a project
+    // `allowed_tools = ["shell"]` would hand the repository exactly the
+    // auto-approval the approval_mode strip above just took away. The
+    // user and system layers keep setting it; the project layer cannot,
+    // trusted or not.
+    if layer
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.allowed_tools.is_some())
+    {
+        eprintln!(
+            "[cosh-core] Warning: ignoring agent.allowed_tools from project config {}",
+            path.display()
+        );
+        if let Some(ref mut agent) = layer.agent {
+            agent.allowed_tools = None;
+        }
+    }
+    // Project hooks execute shell commands (`sh -c`) at session start and
+    // around every tool call, so a checked-out repository must not gain code
+    // execution through them. No consent cosh-shell records covers hook
+    // definitions in this file: a fingerprinted trust entry pins only the
+    // external `.cosh/hooks` tree, and a bare root pins no content at all. The
+    // definitions (including the enabled flag) are therefore dropped unless
+    // the caller vouches for the layer.
+    if !trusted && layer.hooks.is_some() {
+        eprintln!(
+            "[cosh-core] Warning: ignoring hooks from project config {}: \
+             no recorded consent covers project config hooks",
+            path.display()
+        );
+        layer.hooks = None;
+    }
+    apply_common_layers(config, &layer, false);
 }
 
 fn apply_ai_preferences(ai: &mut AiConfig, layer: &PartialAiConfig) {
@@ -833,8 +909,15 @@ impl CoreConfig {
         let user_path = config_dir().join("config.toml");
         let system_path = PathBuf::from("/etc/copilot-shell/config.toml");
 
-        let mut config =
-            Self::load_from_paths(Some(&system_path), Some(&user_path), Some(&project_path));
+        // cosh-shell's trust store records no consent that covers config-defined
+        // hooks (see `apply_project_layer`), so the project layer is never
+        // vouched for here and its hook definitions stay disabled.
+        let mut config = Self::load_from_paths(
+            Some(&system_path),
+            Some(&user_path),
+            Some(&project_path),
+            false,
+        );
         config.apply_env_overrides();
         config
     }
@@ -844,7 +927,7 @@ impl CoreConfig {
 
         let user_path = config_dir().join("config.toml");
         let system_path = PathBuf::from("/etc/copilot-shell/config.toml");
-        let mut config = Self::load_from_paths(Some(&system_path), Some(&user_path), None);
+        let mut config = Self::load_from_paths(Some(&system_path), Some(&user_path), None, false);
         config.apply_env_overrides();
         config.apply_bare_isolation();
         config
@@ -859,7 +942,7 @@ impl CoreConfig {
     pub(crate) fn load_gateway_brokered() -> Self {
         let user_path = config_dir().join("config.toml");
         let system_path = PathBuf::from("/etc/copilot-shell/config.toml");
-        let mut config = Self::load_from_paths(Some(&system_path), Some(&user_path), None);
+        let mut config = Self::load_from_paths(Some(&system_path), Some(&user_path), None, false);
         config.apply_env_overrides();
         config.apply_bare_isolation();
         config.mcp = McpConfig::default();
@@ -870,6 +953,7 @@ impl CoreConfig {
 
     fn apply_bare_isolation(&mut self) {
         self.hooks = HooksConfig {
+            enabled: false,
             enabled_override: Some(false),
             ..Default::default()
         };
@@ -881,6 +965,7 @@ impl CoreConfig {
         system_path: Option<&std::path::Path>,
         user_path: Option<&std::path::Path>,
         project_path: Option<&std::path::Path>,
+        project_trusted: bool,
     ) -> Self {
         let mut config = CoreConfig::default();
 
@@ -905,7 +990,7 @@ impl CoreConfig {
 
         if let Some(project_path) = project_path {
             if let Some(project) = read_partial_config(project_path) {
-                apply_project_layer(&mut config, &project, project_path);
+                apply_project_layer(&mut config, &project, project_path, project_trusted);
             }
         }
 
@@ -1204,6 +1289,7 @@ mod tests {
         assert_eq!(config.agent.session_token_limit, 128_000);
         assert_eq!(config.agent.max_tool_calls_per_turn, 10);
         assert!(config.session.auto_persist);
+        assert!(config.hooks.enabled);
         assert_eq!(config.hooks.enabled_override, None);
     }
 
@@ -1213,10 +1299,73 @@ mod tests {
         let user = dir.path().join("user.toml");
         std::fs::write(&user, "[hooks]\nenabled = false\n").unwrap();
 
-        let config = CoreConfig::load_from_paths(None, Some(&user), None);
+        let config = CoreConfig::load_from_paths(None, Some(&user), None, false);
 
         assert!(!config.hooks.enabled);
         assert_eq!(config.hooks.enabled_override, Some(false));
+    }
+
+    #[tokio::test]
+    async fn layered_config_hooks_run_without_opt_in_and_respect_explicit_disable() {
+        use crate::hook::{HookDecision, HookFailureKind, HookSystem};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let extension_hooks = serde_json::from_value(serde_json::json!({
+            "PreToolUse": [{"hooks": [{
+                "type": "command", "name": "extension-probe",
+                "command": "printf '{\"systemMessage\":\"extension-ran\"}'"
+            }]}]
+        }))
+        .unwrap();
+
+        for enabled in [None, Some(true), Some(false)] {
+            let flag = enabled
+                .map(|value| format!("[hooks]\nenabled = {value}\n"))
+                .unwrap_or_default();
+            std::fs::write(
+                &path,
+                format!("{flag}[[hooks.PreToolUse]]\nname = 'config-probe'\ncommand = 'true'\n"),
+            )
+            .unwrap();
+
+            // The project row runs vouched-for: project hooks are applied only
+            // when the caller vouches for the layer, which the unvouched case
+            // pins in its own test below.
+            for paths in [
+                (Some(path.as_path()), None, None, false),
+                (None, Some(path.as_path()), None, false),
+                (None, None, Some(path.as_path()), true),
+            ] {
+                let config = CoreConfig::load_from_paths(paths.0, paths.1, paths.2, paths.3);
+                for with_extension in [false, true] {
+                    let mut system = HookSystem::from_config(&config.hooks);
+                    if with_extension {
+                        system.register_extension_hooks(&extension_hooks);
+                    }
+                    let result = system
+                        .fire_pre_tool_use("s1", "/tmp", "tool-1", "WriteFile", &Value::Null, None)
+                        .await;
+
+                    if enabled == Some(false) {
+                        assert_eq!(result.decision, HookDecision::Passthrough);
+                        assert!(result.hook_failures.is_empty());
+                    } else {
+                        assert!(matches!(result.decision, HookDecision::HookFailure(_)));
+                        assert_eq!(result.hook_failures.len(), 1);
+                        assert_eq!(result.hook_failures[0].kind, HookFailureKind::EmptyOutput);
+                    }
+                    assert_eq!(
+                        result
+                            .notifications
+                            .iter()
+                            .any(|n| n.message == "extension-ran"),
+                        with_extension && (enabled != Some(false) || paths.2.is_some()),
+                        "enabled={enabled:?}, paths={paths:?}, extension={with_extension}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1225,7 +1374,7 @@ mod tests {
         let project = dir.path().join("project.toml");
         std::fs::write(&project, "[hooks]\nenabled = false\n").unwrap();
 
-        let config = CoreConfig::load_from_paths(None, None, Some(&project));
+        let config = CoreConfig::load_from_paths(None, None, Some(&project), true);
 
         assert!(!config.hooks.enabled);
         assert_eq!(config.hooks.enabled_override, None);
@@ -1239,10 +1388,81 @@ mod tests {
         std::fs::write(&user, "[hooks]\nenabled = false\n").unwrap();
         std::fs::write(&project, "[hooks]\nenabled = true\n").unwrap();
 
-        let config = CoreConfig::load_from_paths(None, Some(&user), Some(&project));
+        let config = CoreConfig::load_from_paths(None, Some(&user), Some(&project), true);
 
         assert!(config.hooks.enabled);
         assert_eq!(config.hooks.enabled_override, Some(false));
+    }
+
+    #[test]
+    fn project_layer_cannot_set_approval_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        let project = dir.path().join("project.toml");
+        std::fs::write(&user, "[agent]\napproval_mode = \"auto\"\n").unwrap();
+        std::fs::write(
+            &project,
+            "[agent]\napproval_mode = \"trust\"\nmax_turns = 7\n",
+        )
+        .unwrap();
+
+        let config = CoreConfig::load_from_paths(None, Some(&user), Some(&project), true);
+
+        // The user layer's policy stands; the project layer's trust
+        // escalation is dropped even for a trusted workspace (the approval
+        // policy is the user's decision, not the project's), while its
+        // non-security agent fields still apply.
+        assert_eq!(config.agent.approval_mode, ApprovalMode::Auto);
+        assert_eq!(config.agent.max_turns, 7);
+    }
+
+    #[test]
+    fn project_layer_cannot_set_allowed_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        let project = dir.path().join("project.toml");
+        std::fs::write(&user, "[agent]\nallowed_tools = [\"read_file\"]\n").unwrap();
+        std::fs::write(
+            &project,
+            "[agent]\nallowed_tools = [\"shell\", \"write_file\"]\nmax_turns = 5\n",
+        )
+        .unwrap();
+
+        // classify_tool auto-allows an allowlisted tool before the
+        // sensitive-write and approval checks run, so a project allowlist
+        // would bypass the user's approval policy the same way a project
+        // approval_mode would. The project layer's allowlist is dropped
+        // even for a trusted workspace; the user layer's stands, and the
+        // project's non-security agent fields still apply.
+        let config = CoreConfig::load_from_paths(None, Some(&user), Some(&project), true);
+
+        assert!(config.agent.allowed_tools.contains("read_file"));
+        assert!(!config.agent.allowed_tools.contains("shell"));
+        assert!(!config.agent.allowed_tools.contains("write_file"));
+        assert_eq!(config.agent.max_turns, 5);
+    }
+
+    #[test]
+    fn untrusted_project_hooks_are_dropped_entirely() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project.toml");
+        std::fs::write(
+            &project,
+            "[hooks]\nenabled = true\n[[hooks.SessionStart]]\nname = 'probe'\ncommand = 'true'\n",
+        )
+        .unwrap();
+
+        // A checked-out config nobody vouched for cannot register hook
+        // commands; a layer the caller vouches for keeps them.
+        let untrusted = CoreConfig::load_from_paths(None, None, Some(&project), false);
+        assert!(untrusted.hooks.session_start.is_empty());
+
+        let trusted = CoreConfig::load_from_paths(None, None, Some(&project), true);
+        assert_eq!(trusted.hooks.session_start.len(), 1);
+        assert_eq!(
+            trusted.hooks.session_start[0].name.as_deref(),
+            Some("probe")
+        );
     }
 
     #[test]
@@ -1267,7 +1487,7 @@ mod tests {
         std::fs::write(&system, "[agent]\napproval_mode = \"trust\"\n").unwrap();
         std::fs::write(&user, "[agent]\napproval_mode = \"invalid\"\n").unwrap();
 
-        let config = CoreConfig::load_from_paths(Some(&system), Some(&user), None);
+        let config = CoreConfig::load_from_paths(Some(&system), Some(&user), None, false);
 
         assert_eq!(config.agent.approval_mode, ApprovalMode::Recommend);
     }
@@ -1320,7 +1540,7 @@ max_tool_calls_per_turn = 20
                     format!("[session.compaction]\n{field} = {bad}\n"),
                 )
                 .unwrap();
-                let config = CoreConfig::load_from_paths(None, None, Some(&project_path));
+                let config = CoreConfig::load_from_paths(None, None, Some(&project_path), false);
                 let compaction = &config.session.compaction;
                 assert!(
                     compaction.trigger_ratio.is_finite()
@@ -1346,7 +1566,7 @@ max_tool_calls_per_turn = 20
             "[session.compaction]\ntrigger_ratio = 0.5\nemergency_ratio = 0.8\ntarget_ratio = 0.2\n",
         )
         .unwrap();
-        let config = CoreConfig::load_from_paths(None, None, Some(&project_path));
+        let config = CoreConfig::load_from_paths(None, None, Some(&project_path), false);
         assert_eq!(config.session.compaction.trigger_ratio, 0.5);
         assert_eq!(config.session.compaction.emergency_ratio, 0.8);
         assert_eq!(config.session.compaction.target_ratio, 0.2);
@@ -1363,7 +1583,7 @@ max_tool_calls_per_turn = 20
             "[session.compaction]\ntrigger_ratio = 0.9\nemergency_ratio = 0.2\ntarget_ratio = 0.95\n",
         )
         .unwrap();
-        let config = CoreConfig::load_from_paths(None, None, Some(&project_path));
+        let config = CoreConfig::load_from_paths(None, None, Some(&project_path), false);
         assert_eq!(
             config.session.compaction.trigger_ratio,
             DEFAULT_TRIGGER_RATIO
@@ -1390,7 +1610,8 @@ max_tool_calls_per_turn = 20
         // The higher-priority project layer touches only the target ratio.
         std::fs::write(&project_path, "[session.compaction]\ntarget_ratio = 0.2\n").unwrap();
 
-        let config = CoreConfig::load_from_paths(None, Some(&user_path), Some(&project_path));
+        let config =
+            CoreConfig::load_from_paths(None, Some(&user_path), Some(&project_path), false);
         let compaction = &config.session.compaction;
         // The project layer must not have reset the user-layer fields.
         assert!(!compaction.enabled);
@@ -1420,7 +1641,8 @@ max_tool_calls_per_turn = 20
         )
         .unwrap();
 
-        let config = CoreConfig::load_from_paths(None, Some(&user_path), Some(&project_path));
+        let config =
+            CoreConfig::load_from_paths(None, Some(&user_path), Some(&project_path), false);
         let compaction = &config.session.compaction;
         // The project layer's explicit value wins over the user layer's.
         assert_eq!(compaction.preserve_recent_runs, 9);
@@ -1593,7 +1815,7 @@ security_token = "manual-token"
         )
         .unwrap();
 
-        let config = CoreConfig::load_from_paths(None, Some(&user_path), None);
+        let config = CoreConfig::load_from_paths(None, Some(&user_path), None, false);
         let resolved = config.resolve_provider();
         let persisted = std::fs::read_to_string(&user_path).unwrap();
 
@@ -1761,7 +1983,8 @@ active_model = "project-model"
         )
         .unwrap();
 
-        let config = CoreConfig::load_from_paths(None, Some(&user_path), Some(&project_path));
+        let config =
+            CoreConfig::load_from_paths(None, Some(&user_path), Some(&project_path), false);
         let resolved = config.resolve_provider();
 
         assert_eq!(config.ai.active_provider.as_deref(), Some("dashscope"));
@@ -1803,7 +2026,7 @@ active_model = "project-model"
         )
         .unwrap();
 
-        let mut config = CoreConfig::load_from_paths(None, Some(&user_path), None);
+        let mut config = CoreConfig::load_from_paths(None, Some(&user_path), None, false);
         config.apply_bare_isolation();
 
         assert_eq!(config.ai.active_provider.as_deref(), Some("user-provider"));
@@ -1837,7 +2060,7 @@ auth_source = "ecs_ram_role"
         )
         .unwrap();
 
-        let config = CoreConfig::load_from_paths(None, None, Some(&project_path));
+        let config = CoreConfig::load_from_paths(None, None, Some(&project_path), false);
         assert!(config.ai.active_provider.is_none());
         assert!(config.ai.providers.is_empty());
         assert_eq!(config.ai.active_model.as_deref(), Some("project-model"));
@@ -1865,7 +2088,8 @@ command = "project-server"
         )
         .unwrap();
 
-        let config = CoreConfig::load_from_paths(None, Some(&user_path), Some(&project_path));
+        let config =
+            CoreConfig::load_from_paths(None, Some(&user_path), Some(&project_path), false);
         assert!(config.mcp.servers.contains_key("user"));
         assert!(!config.mcp.servers.contains_key("untrusted"));
     }
@@ -1903,7 +2127,7 @@ api_key = "sk-user"
         )
         .unwrap();
 
-        let config = CoreConfig::load_from_paths(Some(&system_path), Some(&user_path), None);
+        let config = CoreConfig::load_from_paths(Some(&system_path), Some(&user_path), None, false);
         let provider = config.ai.providers.get("shared").unwrap();
 
         assert_eq!(provider.provider_type.as_deref(), Some("openai_compat"));
@@ -1927,7 +2151,7 @@ sysom_endpoint = "https://sysom.cn-shanghai.aliyuncs.com"
 "#,
         )
         .unwrap();
-        let mut config = CoreConfig::load_from_paths(None, Some(&path), None);
+        let mut config = CoreConfig::load_from_paths(None, Some(&path), None, false);
         let response = crate::auth::AuthResponse {
             provider_id: "aliyun".to_string(),
             provider_type: None,
@@ -1939,7 +2163,8 @@ sysom_endpoint = "https://sysom.cn-shanghai.aliyuncs.com"
         };
         crate::auth::apply_auth_credentials(&mut config, &response).unwrap();
         persist_config_to_dir(&config, tmp.path()).unwrap();
-        let reloaded = CoreConfig::load_from_paths(None, Some(&path), None).resolve_provider();
+        let reloaded =
+            CoreConfig::load_from_paths(None, Some(&path), None, false).resolve_provider();
         assert_eq!(
             reloaded.sysom_endpoint,
             "https://sysom.cn-shanghai.aliyuncs.com"
@@ -1979,7 +2204,8 @@ output_language = "zh-CN"
         )
         .unwrap();
 
-        let mut config = CoreConfig::load_from_paths(None, Some(&user_path), Some(&project_path));
+        let mut config =
+            CoreConfig::load_from_paths(None, Some(&user_path), Some(&project_path), false);
         config.ai.active_provider = Some("dashscope".to_string());
         persist_config_to_dir(&config, &user_dir).unwrap();
 
@@ -2025,7 +2251,8 @@ api_key = "sk-user"
         )
         .unwrap();
 
-        let mut config = CoreConfig::load_from_paths(Some(&system_path), Some(&user_path), None);
+        let mut config =
+            CoreConfig::load_from_paths(Some(&system_path), Some(&user_path), None, false);
         config.ai.active_provider = Some("system-provider".to_string());
         persist_config_to_dir(&config, &user_dir).unwrap();
 
@@ -2071,7 +2298,7 @@ approval_mode = "balanced"
         )
         .unwrap();
 
-        let mut config = CoreConfig::load_from_paths(None, Some(&user_path), None);
+        let mut config = CoreConfig::load_from_paths(None, Some(&user_path), None, false);
         config.user_ai.active_provider = Some("new-provider".to_string());
         config.user_ai.providers.clear();
         let provider = ProviderConfig {
@@ -2137,7 +2364,7 @@ approval_mode = "balanced"
         )
         .unwrap();
 
-        let mut config = CoreConfig::load_from_paths(None, Some(&user_path), None);
+        let mut config = CoreConfig::load_from_paths(None, Some(&user_path), None, false);
         config.user_ai.active_provider = Some("new-provider".to_string());
         config.user_ai.providers.clear();
         let provider = ProviderConfig {

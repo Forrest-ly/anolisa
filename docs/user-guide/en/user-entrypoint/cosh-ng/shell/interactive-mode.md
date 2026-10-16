@@ -8,7 +8,7 @@ Use this page to start `cosh` and control a running session. Run `/help` to see 
 
 | Command | Use |
 |---|---|
-| `cosh` | Start Enhanced Assisted (`◇ `) with Agent and slash-command routing. |
+| `cosh` | Start Enhanced Assisted with Agent and slash-command routing. |
 | `COSH_SHELL_INTEGRATION=native cosh` | Start Native without Cosh hooks, observation, or insights. |
 | `cosh --shell zsh` | Select zsh explicitly. |
 | `cosh --isolated` | Skip user rcfiles. |
@@ -37,11 +37,13 @@ to use its existing isolation handling.
 ## Input and editing
 
 - Native integration sends every input byte to the foreground bash or zsh.
-- Enhanced Assisted (`◇ `) routes Shell syntax to the foreground Shell and can
+- Enhanced Assisted routes Shell syntax to the foreground Shell and can
   turn a natural-language request into an Agent request.
-- At an empty Enhanced prompt, `Shift+Tab` switches to Shell-only (`◌ `).
+- At an empty Enhanced prompt, `Shift+Tab` switches to Shell-only.
   Ordinary input, including a leading `/`, then goes to the Shell while
   post-command insights remain available. Press it again to restore Assisted.
+  With `shell.status_symbols` enabled (off by default), an optional `◇ `/`◌ `
+  status line marks the current mode above each prompt.
 - A leading `/` runs a Cosh control command only in Enhanced Assisted. In
   Native and Enhanced Shell-only it remains Shell input.
 - `Shift+Enter` inserts a newline when supported. Multiline paste remains one submission.
@@ -54,6 +56,7 @@ to use its existing isolation handling.
 | `/help` | Show the installed command set. |
 | `/agent` | Compose a one-shot cosh-core request with optional Skill and workspace references. |
 | `/health` | Run local health checks. |
+| `/bug <description>` | Build a reviewable, pre-filled bug-report URL. |
 | `/status` (`/about`) | Show runtime, provider, and session status. |
 | `/stats [model\|tools]` | Show model identity or tool activity. |
 | `/auth` | Choose or update provider authentication. |
@@ -68,6 +71,14 @@ to use its existing isolation handling.
 | `/mcp [list\|connect\|inspect\|refresh\|disconnect\|login\|logout]` | Manage MCP servers. |
 
 Commands such as `/details`, `/audit`, and `/send-to-shell` appear only when the current card or run provides their required context. `/mcp login` requires the shell-based OAuth flow described by the MCP guide.
+
+`/bug` adds allowlisted runtime facts to the issue URL, prints the URL for review,
+and best-effort opens it on graphical Linux or macOS. It does not read logs,
+write files, or submit the issue; opening or clicking the link sends the
+pre-filled title and diagnostics to GitHub when the form loads, and the issue
+is only created when you submit the form. If `~/.copilot-shell/logs/` exists,
+the panel reminds you to inspect the latest files and remove tokens, keys, and
+private addresses before pasting relevant excerpts yourself.
 
 ## Compose a one-shot Agent request
 

@@ -97,10 +97,21 @@ revision、搜索路径、已有测试和未自动验证项；不使用构建产
    不位于用户 HOME 或 XDG_RUNTIME_DIR。
 3. 同一 daemon 服务多个本地 UID/Agent。peer UID/GID/PID 来自内核，token 用于认证绑定；
    daemon 构造可信 Principal。客户端自报的 UID、role、scope 只能作为不可信输入。
-4. QueryScope 由服务端生成并与请求 filter 求交。普通 principal 只能访问 owner scope，
-   auditor/admin 才能跨 UID。
-5. CLI/TUI 不得直读 SQLite，不得绕过 daemon 直接调用 Compiler、PCP 或 Repository。
+4. QueryScope 仅由服务端 UDS 身份生成，再应用业务过滤条件。非 root principal 只能访问自身 UID 的数据，
+   UID 0 的 root 默认可查询全部；非 root 的 PolicyAdministrator 无跨 UID 查询权限。
+   非 root auditor 的显式授权留待后续工作包。
+5. CLI/TUI 不得直读 SQLite，不得绕过 daemon 直接调用 PCP 或 Repository。
 6. 恢复完成后 daemon 才进入 READY；shutdown 先停止 admission，再 drain 或 checkpoint。
+
+查询首批实施范围见 [V2 安全事件与 Observability 查询设计](V2_SECURITY_OBSERVABILITY_QUERY_zh.md)
+（obs 三个 RPC、report/review 与 sec 查询已实现）：普通用户只查询 UDS peer UID 对应的数据，root 可查询全部；
+非 root 的 PolicyAdministrator 无查询绕过，auditor 跨 UID 能力留待后续工作包。
+
+查询授权变更记录（本次 obs 查询工作包，决策方：本次需求提出者）：
+`[SUPERSEDED]` 此前 auditor/admin 可跨用户查询的目标，首阶段替换为 root 全量、
+非 root 按 UDS UID 隔离；这是已批准的 V2 目标收窄，不是删除已经发布的 auditor 接口。
+PolicyAdministrator 管理权限不隐含数据读取权限。后续如恢复非 root auditor，须由独立的
+查询授权工作包定义显式授权、撤销及隔离 fixtures；该工作包尚未排期。
 
 ### 3.3 运行时与领域边界
 
@@ -116,9 +127,8 @@ revision、搜索路径、已有测试和未自动验证项；不使用构建产
   cancellation、finalizer 和 observation projection。
 - 具体 security capability 实现 CapabilityExecutor；不得使用 SecurityBackend 统称
   capability、context provider、enforcement adapter 和 persistence adapter。
-- Policy Compiler/PAP、Policy Runtime、PCP 与 security capability 通过稳定的
-  Evidence/AttributeBundle、PreparedPolicy、Binding、Receipt 等合同协作；capability 不依赖
-  Policy Compiler，PCP 不依赖 compiler。
+- PAP、Policy Runtime、PCP 与 security capability 通过稳定的
+  Evidence/AttributeBundle、PreparedPolicy、Binding、Receipt 等合同协作；模板校验由 Policy 领域负责，目标 DSL 由 Adapter 生成。
 - Repository、Client、Sink 是 adapter port。具体 SQLite、HTTP、AgentSight 或模型实现由
   asc-daemon 装配，不反向渗入 domain/runtime crate。
 - JobSupervisor 首版只负责已注册长期 task 的 ownership、取消、shutdown、轻量 health 和
@@ -236,12 +246,16 @@ asc-state-migrator 必须定义并验证：
 
 ### 5.2 Crate 工作包边界
 
+现有库 crate 统一直接放在 `v2/crates/asc-*/`，产品入口保留在
+`v2/apps/`。action、daemon、data、foundation、integrations、policy 是逻辑分类，
+不再作为目录层级；目录扁平化不改变 package 名称、依赖、feature 或工作包边界。
+
 工作包采用本文定义的目标 workspace，至少包括：
 
 - 产品入口：asc-daemon、agent-sec-cli、asc-state-migrator；
 - daemon：asc-daemon-protocol、asc-daemon-service、asc-daemon-handler、asc-daemon-core；
 - action：asc-action-types、asc-evidence-types、asc-action-runtime 和各 asc-capability-*；
-- policy：asc-policy-types、asc-policy-target-contracts、asc-policy-repository、asc-policy-engine、asc-policy-runtime、asc-pap、asc-pcp；
+- policy：asc-policy-types、asc-policy-target-contracts、asc-policy-repository、asc-policy-runtime、asc-pap、asc-pcp；模板在 types 中校验，由目标 Adapter 从 Binding 快照直接编译；
   其中 asc-policy-target-contracts 只定义共享 Adapter/Client trait，依赖纯数据契约
   asc-policy-types；Reconciler 与具体 PEP 实现均依赖该共享层，而不互相依赖实现。
 - data：asc-security-events、asc-observability、asc-session、asc-state、
@@ -258,9 +272,9 @@ composition root 负责注入。
 
 Policy reconciliation 的具体目录与边界见
 [调度、存储与恢复设计](BINDING_RECONCILER_RUNTIME_DESIGN_zh.md)：拟建
-`v2/crates/policy/asc-policy-runtime/src/reconciliation/` 承载 WorkQueue、worker 和恢复调度，
+`v2/crates/asc-policy-runtime/src/reconciliation/` 承载 WorkQueue、worker 和恢复调度，
 `asc-pcp` 每次重新读取并从头执行，不保留跨调用计算缓存；共享 Repository 定义局部条件写，未来
-`v2/crates/data/asc-persistence-sqlite/` 实现持久化。daemon 只装配并管理进程生命周期。
+`v2/crates/asc-persistence-sqlite/` 实现持久化。daemon 只装配并管理进程生命周期。
 这是目标实施位置，不代表相应 crate、后台接线或恢复已交付。
 
 ### 5.3 Integration slices
@@ -332,8 +346,8 @@ Mock E2E、server-side admission 和真实内核执行是不同证据层级，�
 - 第二个 Host daemon 实例被拒绝；
 - 两个不同 UID/Agent 通过同一 system socket 访问且 owner scope 隔离；
 - caller 自报 UID/role/scope 不能提升权限；
-- normal principal 不能跨 owner 查询，auditor/admin 受显式授权；
-- CLI/TUI 无直接 SQLite、Compiler 或 PCP 绕过路径；
+- 非 root principal（含 PolicyAdministrator）不能跨 UID 查询；root 可查询全部；
+- CLI/TUI 无直接 SQLite 或 PCP 绕过路径；
 - 外部 job 保留 owner principal，内置任务使用 System principal。
 
 ### 7.3 安全事件与 tracing
@@ -384,9 +398,23 @@ Mock E2E、server-side admission 和真实内核执行是不同证据层级，�
 | 为“全 Rust”静默破坏外部接口 | compatibility inventory、versioned replacement、change record |
 | crate 并行导致 contract 漂移 | 每任务固定 direct dependency revision，消费者 contract test |
 | system daemon 引入跨 UID 数据泄露 | trusted Principal、server QueryScope、多 UID E2E |
-| CLI 或 TUI 绕过 daemon 授权 | 禁止直读 SQLite/Compiler/PCP，架构依赖检查和黑盒测试 |
+| CLI 或 TUI 绕过 daemon 授权 | 禁止直读 SQLite/PCP，架构依赖检查和黑盒测试 |
 | timeout/断开后副作用状态不明 | supervisor ownership、operation status/receipt、禁止客户端重放 |
 | audit 自动复制敏感字段 | 每 action 显式 projector，默认 deny，隐私 fixture |
 | OTel 故障影响安全功能 | tracing/export 与 ActionResult、SecurityEvent sink 隔离 |
 | per-user 数据迁移丢失 owner | state migrator owner mapping、事务、重复运行和回滚测试 |
 | 只有 Markdown、没有可执行门禁 | manifest、fixture、runner、pass/fail matrix 是完成条件 |
+
+### OTel tracing 基础切片落地
+
+`asc-observability` 已提供统一 OTel Context、Agent Baggage、兼容输入及只读关联快照；
+CLI/client/daemon/PAP 已接线，产品 main 启用 runtime feature 和可选 OTLP。
+该基础设施不依赖尚未落地的 Action Runtime、安全事件 Rust sink 或本地链路重组。
+协议/部署/中间件契约同步记录 TARGET V2 条款，V1 实现继续仅作为冻结输入 oracle。
+实施、验收边界及 server-first/caller-first 回滚顺序见 [V2 OTel 验收](V2_OTEL_ACCEPTANCE_zh.md)。
+
+## PII Checker 第一阶段实现入口
+
+PII 检测核心、中央规则、Runtime/Finalizer、RPC/CLI 和 Hook/RPM 验收位于
+[PII 两阶段迁移设计](PII_V2_MIGRATION_zh.md)。该文显式区分当前执行服务与未来
+PIP 证据获取、PDP 决策、PEP 执行反馈的覆盖范围；不改变本文的系统级部署及 OTel 目标。

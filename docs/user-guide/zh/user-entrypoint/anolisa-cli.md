@@ -55,16 +55,18 @@ anolisa install --all
 另一个 scope 中已有安装，不会让当前 scope 变成“already installed”。已有
 记录的重装或变更由 lifecycle planner 处理，不会被静默覆盖。
 
-RPM 安装（包括 `--dry-run` 和合并的 `--all` 计划）会在创建 recovery
-journal 前，让 DNF 求解依赖和包冲突。预检使用与安装相同的仓库和版本约束，
-可能刷新仓库 metadata，但不会下载包或修改 rpmdb。DNF 4 的预检也要求 root：
+RPM 安装支持 Yum 3 和 DNF 4。ANOLISA 优先使用 yum，不存在时使用 dnf。
+安装前可使用 `sudo` 检查依赖和冲突：
 
 ```bash
 sudo anolisa --install-mode system --dry-run install cosh --backend rpm
 ```
 
-存在冲突时命令失败，不留下 pending operation；解决报告的冲突后再重试。
-预检成功不保证后续下载、scriptlet 或 transaction 一定成功。
+此检查不会安装或更改软件包。请先解决报告的冲突再重试；检查通过不保证
+后续安装一定成功。指定版本与系统版本锁等限制冲突时，命令会失败，不会
+替换为其他版本。
+
+如果 ANOLISA 无法识别系统包管理器，请按提示手工安装缺失依赖后重试。
 
 ### uninstall
 
@@ -194,10 +196,73 @@ anolisa adapter disable <component> [framework]
 anolisa adapter status [component]
 ```
 
-对于 OpenClaw 插件，执行 `adapter enable` 即同意插件声明的能力。ANOLISA
-仅在安装器 help 列出 `--accept-capabilities` 时添加该参数，dry-run 计划也
-遵循相同规则。Capability consent 不授予 `--allow-unsafe-plugin-install`
+对于 OpenClaw 插件，`adapter enable` 默认同意插件声明的能力。ANOLISA 仅在
+对应命令的 help 列出 `--accept-capabilities` 时，将该参数添加到安装和激活
+命令。可通过以下选项拒绝自动授予同意：
+
+```bash
+anolisa adapter enable tokenless openclaw --no-accept-capabilities
+anolisa --dry-run adapter enable tokenless openclaw --no-accept-capabilities
+```
+
+dry-run 计划中的两条命令均不带同意参数。此选项仅适用于 OpenClaw 插件
+adapter；其他框架和仅含 skill 的 adapter 会拒绝它。它不撤销 OpenClaw 中
+已经授予的能力，未提供同意参数的宿主仍按自身策略处理。
+`ANOLISA_ACCEPT_CAPABILITIES` 或 `AGENT_MEMORY_ACCEPT_CAPABILITIES` 等环境
+设置不控制 `adapter enable`；此入口须使用 CLI 选项。
+
+若 OpenClaw 需要新的授权，其拒绝仍作为执行失败报告（`EXECUTION_FAILED`，
+退出码 1），adapter 收据会保留，可通过
+`anolisa adapter disable tokenless openclaw` 清理。在另行授权前，请审阅宿主
+报告的能力要求。Capability consent 不授予 `--allow-unsafe-plugin-install`
 权限；同意被拒绝时会单独诊断，不归为插件安全扫描拒绝。
+
+对于 OpenCode，可用以下命令管理已安装的 Tokenless 插件：
+
+```bash
+anolisa adapter enable tokenless opencode
+anolisa adapter status tokenless
+anolisa adapter disable tokenless opencode
+```
+
+driver 从 PATH 查找 `opencode`，也可通过 `OPENCODE_BIN` 指定。它将 manifest 中的
+`.js` 或 `.ts` 入口注册为 `plugins/<plugin_id>.<扩展名>`，配置目录依次取
+`OPENCODE_CONFIG_DIR`、`XDG_CONFIG_HOME/opencode`、`~/.config/opencode`。
+自定义目录必须是绝对路径。后续 status 和 disable 应使用相同的目录配置；若配置
+发生变化，需恢复原环境后重试清理。本 driver 不管理项目级插件安装或 npm 插件。
+
+enable 会接管指向同一插件源的已有符号链接，包括 Tokenless 独立安装脚本创建的
+链接；相对链接展开后必须与记录的源路径一致。目录别名链接会被拒绝，以确保包卸载后
+仍能清理。接管后 disable 可以删除该链接。同名文件、目录或指向不同目标的链接会被保留；
+清理失败时保留 receipt，解决冲突后可以重试。同路径升级以原子操作替换入口。
+若 enable 或 disable 中断，保持相同配置重试命令即可恢复未完成的变更。如果错误
+提示保留了某个条目，请保留其恢复目录，解决公开路径上的冲突后重试；恢复也支持
+被移走的目录。切回独立安装脚本前，请先完成 ANOLISA disable 和恢复操作；独立脚本不会
+处理这些 journal。配置目录所在的文件系统必须支持原子交换和不覆盖的 rename，才能完成
+替换和清理；不支持时操作会失败，仅解决路径冲突不能补足文件系统能力。如果原安装脚本使用了
+`TOKENLESS_OPENCODE_CONFIG_DIR`，通过 ANOLISA 启用前需将
+`OPENCODE_CONFIG_DIR` 设置为相同目录。
+
+启用或禁用后需重启 OpenCode。status 检查链接和安装源；若启用中断或清理仍需重试，即使
+当前链接匹配也会保留 `cleanup_failed`，需重试 enable 或完成 disable 才能解除。
+运行时加载状态报告为
+`unknown`；链接存在不代表运行中的 OpenCode 已加载插件。`--dry-run` 仅预览操作，
+不修改插件文件或 receipt。
+
+#### 千问办公 QwenWorkCN（macOS 本地模式）
+
+```bash
+anolisa --dry-run adapter enable tokenless qwenwork
+anolisa adapter enable tokenless qwenwork
+anolisa adapter status tokenless
+anolisa adapter disable tokenless qwenwork
+```
+
+driver 旁加载 receipt 归属文件，不修改桌面应用的激活状态。enable/disable 后重启千问办公，
+开启新的本地会话。status 将加载和激活状态报告为 `unknown`，文件存在不代表已激活。
+后续操作保持相同的 `TOKENLESS_QWENWORK_HOME`；`TOKENLESS_QWENWORK_APP` 可覆盖检测到的
+应用 Bundle。已有脚本安装需先用原卸载器移除，再通过 CLI 启用。修改过的文件和无关文件
+会保留。依赖、迁移及 1.2.5 验证范围详见[千问办公集成](../token-saving/tokenless/framework-integration.md#千问办公macos-本地模式)。
 
 ### logs 与 bug report
 
@@ -207,10 +272,29 @@ anolisa adapter status [component]
 anolisa logs <component>
 anolisa logs <component> --limit 50
 anolisa logs <component> --severity warn
+anolisa logs <component> --since '2026-10-01T00:30:00Z'
 anolisa bug
 ```
 
 `--level` 是 `--severity` 的别名。
+
+`--since` 接受包含边界的 RFC3339 起始时间，按实际时间比较时区偏移和小数秒。
+例如，`2026-10-01T08:30:00+08:00` 和 `2026-10-01T00:30:00Z` 选择相同的时间窗口。
+`--limit` 按追加顺序保留最近的匹配记录。
+
+无效的 `--since` 值返回 `INVALID_ARGUMENT`。启用时间筛选时，`started_at` 无法
+解析为 RFC3339 的记录不匹配；省略 `--since` 可查看这些记录。格式错误的 JSON
+仍会导致查询报错。查询不会修改日志文件。
+
+使用 `--component cosh-ng` 时，`anolisa bug` 还会调用已安装的
+`cosh-shell` 二进制，将脱敏诊断包导出到全新的私有路径（`0600`，绝不
+覆盖已有文件），并在报告中汇总其健康检查 finding ID 与清单摘要。二进
+制从 cosh-ng 安装的私有 libexec 位置解析（raw 契约目录与 RPM 的
+`/usr/libexec` 路径），可用 `COSH_SHELL_BIN` 覆盖，PATH 仅作为开发场
+景回退；报告中的手工与复现命令使用解析后的绝对路径，保证可直接执行。
+诊断包写入调用者本人的 state 根目录——即使诊断的是 system scope 安
+装——且不会被上传；请在本地审阅后再附加到 issue。无法产出诊断包时，
+报告会显式说明原因，并给出可手工执行的 `diagnostics export` 命令。
 
 ---
 
@@ -279,6 +363,11 @@ base_url = "https://repo.example.com/anolisa/v1/"
 
 raw backend 每次执行都会重新拉取 distribution index。当前不会使用缓存的 index 作为回退，因此仓库不可达时命令会直接失败。
 旧的 `cache_ttl_secs` 和 `offline_fallback` 字段仍可正常解析以保持向后兼容，但当前 raw backend 不会使用这些值。
+
+RPM 仓库需要代理或私有 CA 时，可在 `/etc/yum.conf` 的 `[main]` 段直接配置
+`proxy`、`proxy_username`、`proxy_password` 或 `sslcacert`；该文件不存在时
+使用 `/etc/dnf/dnf.conf`。未明确配置时，ANOLISA 使用环境代理（`http_proxy`、
+`https_proxy`、`all_proxy`、`no_proxy`）和系统信任的证书。
 
 CLI 参数只影响当前执行的操作，不存在 `[install] mode` 配置。
 
