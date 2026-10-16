@@ -466,9 +466,11 @@ Schema 压缩使用宿主提供给模型的 JSON Schema，并保留运行时参�
 仅提供运行时校验器的宿主会跳过 Schema 压缩；响应压缩和命令重写仍然可用。
 
 同一个 `plugin.js` 同时服务两代宿主：OpenCode 2 读取其 default 定义（`id` + `setup`），
-OpenCode 1.4 及更新版本读取同一导出对象的 `server()` 入口，更早的 OpenCode 1 版本读取具名导出
-`TokenlessPlugin`。命令重写和 Shell 失败证据按共享 Hook 归类的 Shell 工具族匹配
-（OpenCode 1 的内建 Shell Tool 叫 `bash`，OpenCode 2 叫 `shell`），而不是只认某一代宿主的拼写。
+OpenCode 1.3.4 及更新版本读取同一导出对象的 `server()` 入口。OpenCode 1.0.0 至 1.3.3 不在支持范围内：
+这些版本的插件加载器会把模块的每个导出都当作插件函数调用，而 OpenCode 2 要求 default 导出是
+对象，两个加载契约互斥，因此受支持范围从首个能读取对象形 default 导出的 1.3.4 起算。命令重写
+和 Shell 失败证据按共享 Hook 归类的 Shell 工具族匹配（OpenCode 1 的内建 Shell Tool 叫 `bash`，
+OpenCode 2 叫 `shell`），而不是只认某一代宿主的拼写。
 
 OpenCode 2 将同样三条路径注册为 `tool` 域的 `execute.before` / `execute.after` Hook，
 以及 `session` 域的 `context` Hook；后者携带本次请求实际发出的工具声明。由于该请求没有声明
