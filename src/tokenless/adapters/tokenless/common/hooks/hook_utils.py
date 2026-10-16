@@ -679,9 +679,14 @@ def build_post_tool_request(
     tool_use_id: str = "",
     replace_output: bool = False,
     replace_with_text: bool = False,
+    command: str | None = None,
 ) -> dict:
-    """Build a Protocol v2 PostTool transport request."""
-    return {
+    """Build a Protocol v2 PostTool transport request.
+
+    ``command`` is the shell command line behind a ``command_output`` result;
+    Core reports a plain print of local files as ``file_read``.
+    """
+    request = {
         "protocol_version": 2,
         "operation": "post_tool",
         "attribution": _attribution(agent_id, session_id, tool_use_id),
@@ -699,6 +704,9 @@ def build_post_tool_request(
             },
         },
     }
+    if command is not None:
+        request["input"]["command"] = command
+    return request
 
 
 def run_compress(

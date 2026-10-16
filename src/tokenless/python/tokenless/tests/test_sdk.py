@@ -16,6 +16,7 @@ from anolisa_tokenless import (
     BeforeModelCapabilities,
     BeforeModelRequest,
     ContentOrigin,
+    ContentType,
     OutputOptimization,
     PostToolCapabilities,
     PostToolRequest,
@@ -130,6 +131,60 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TokenlessError, "not authorized"):
             await sdk.retrieve(RetrieveRequest(marker.group(1), frozenset(), self.attribution))
 
+    async def test_html_extraction_is_on_by_default_and_recovers_the_page(self) -> None:
+        original = (
+            "<!DOCTYPE html><html><head><title>Guide</title></head><body>"
+            "<nav><a href='/'>Home</a></nav><main><h1>Guide</h1>"
+            + "".join(f"<p>Section {i}: {'explanatory prose ' * 10}</p>" for i in range(8))
+            + "</main><footer>footer</footer><script>" + "window.x = 1;" * 40 + "</script>"
+            "</body></html>"
+        )
+        default_sdk = self.sdk(rtk_enabled=False)
+        disabled_sdk = self.sdk(rtk_enabled=False, html_extraction_enabled=False)
+        for sdk, origin, command, applied in (
+            (disabled_sdk, ContentOrigin.COMMAND_OUTPUT, None, False),
+            (default_sdk, ContentOrigin.COMMAND_OUTPUT, None, True),
+            (default_sdk, ContentOrigin.COMMAND_OUTPUT, "cat page.html", False),
+            (default_sdk, ContentOrigin.COMMAND_OUTPUT, "cat page.html | head -c 9000", True),
+            (default_sdk, ContentOrigin.API_RESPONSE, "cat page.html", True),
+            (default_sdk, ContentOrigin.FILE_CONTENT, None, False),
+            (default_sdk, ContentOrigin.FILE_READ, None, False),
+        ):
+            with self.subTest(
+                enabled=sdk.config.html_extraction_enabled, origin=origin, command=command
+            ):
+                attribution = Attribution("sdk-agent", "sdk-session", "html-1")
+                result = await sdk.post_tool(
+                    PostToolRequest(
+                        result_kind=ResultKind.TOOL,
+                        tool_name="Bash",
+                        content=original,
+                        status=ToolResultStatus.SUCCESS,
+                        content_origin=origin,
+                        output_optimization=OutputOptimization.NONE,
+                        capabilities=PostToolCapabilities(
+                            True, RecoveryMethod.tool("tokenless_retrieve"), True
+                        ),
+                        attribution=attribution,
+                        command=command,
+                    )
+                )
+                self.assertEqual(result.content_type, ContentType.HTML)
+                if not applied:
+                    self.assertEqual(result.applied_operations, ())
+                    self.assertEqual(result.output, original)
+                    continue
+                self.assertEqual(result.applied_operations, (AppliedOperation.HTML_EXTRACTION,))
+                self.assertEqual(result.recoverability.value, "retrievable")
+                self.assertLess(len(result.output), len(original))
+                self.assertIn("Title: Guide\n# Guide\n\nSection 0: explanatory prose", result.output)
+                self.assertNotIn("Home", result.output)
+                self.assertEqual(len(result.stash_keys), 1)
+                retrieved = await sdk.retrieve(
+                    RetrieveRequest(result.stash_keys[0], frozenset(result.stash_keys), attribution)
+                )
+                self.assertEqual(retrieved.payload, original)
+
     def test_config_contains_runtime_resources_and_search_control(self) -> None:
         with self.assertRaisesRegex(ValueError, "absolute path"):
             TokenlessConfig(data_dir="relative")
@@ -141,6 +196,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
                 "rtk_enabled",
                 "search_path_sharing_enabled",
                 "diff_compression_enabled",
+                "html_extraction_enabled",
             },
         )
 
@@ -370,6 +426,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         )
         default_sdk = self.sdk(rtk_enabled=False)
         self.assertFalse(default_sdk.config.diff_compression_enabled)
+        self.assertTrue(default_sdk.config.html_extraction_enabled)
         enabled_sdk = self.sdk(rtk_enabled=False, diff_compression_enabled=True)
         for sdk, optimization, applied in (
             (default_sdk, OutputOptimization.NONE, False),

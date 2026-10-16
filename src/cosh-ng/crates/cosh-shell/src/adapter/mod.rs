@@ -24,6 +24,7 @@ mod cosh_core_registry_tests;
 mod cosh_core_service;
 #[cfg(test)]
 mod cosh_core_tests;
+mod ecs_probe;
 mod fake;
 mod process;
 mod prompt;
@@ -43,6 +44,7 @@ pub use cosh_core::{
     SessionRecovery, SessionRecoveryState, SessionRuntimeState, SessionSummary,
 };
 pub(crate) use cosh_core_registry::RegistryQueryError;
+pub use ecs_probe::EcsProbeTask;
 pub use fake::FakeAgentAdapter;
 pub(crate) use process::{
     agent_event_is_provider_progress, record_cancellation_pending_session,
@@ -191,6 +193,24 @@ impl AgentRunHandle {
     ) -> Self {
         let mut handle = Self::test_with_approval_sender(approval_sender);
         handle.question_answer_confirmation = Some(confirmation);
+        handle
+    }
+
+    /// A test handle whose provider announced it can accept a host-executed
+    /// shell tool result.
+    ///
+    /// The default capabilities are all-false, so without this a fixture can
+    /// only exercise the rejection path; the approval slice's handoff is a
+    /// promise the provider has to be able to keep.
+    #[cfg(test)]
+    pub(crate) fn test_with_host_executed_shell_result(
+        approval_sender: mpsc::Sender<ApprovalChannelMessage>,
+    ) -> Self {
+        let mut handle = Self::test_with_approval_sender(approval_sender);
+        handle.control_capabilities = Arc::new(Mutex::new(ControlProtocolCapabilities {
+            can_handle_host_executed_shell_tool_result: true,
+            ..ControlProtocolCapabilities::default()
+        }));
         handle
     }
 

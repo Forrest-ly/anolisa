@@ -35,9 +35,14 @@ FAIL_OPEN_BEHAVIORS = [
 PRE_TOOL_AGENTS = {
     "claude-code": {"TOKENLESS_AGENT_ID": "claude-code"},
     "qoder-cli": {"TOKENLESS_AGENT_ID": "qoder-cli"},
+    "qwenwork": {"TOKENLESS_AGENT_ID": "qwenwork"},
     "opencode": {"TOKENLESS_AGENT_ID": "opencode"},
     "qwencode": {"TOKENLESS_AGENT_ID": "qwencode"},
     "cosh-ng": {"COSH_NG_VERSION": "0.5.0"},
+}
+RESPONSE_AGENTS = {
+    **corpus.RESPONSE_AGENTS,
+    "qwenwork": {"TOKENLESS_AGENT_ID": "qwenwork"},
 }
 
 
@@ -119,7 +124,7 @@ class ResponseHookContract(unittest.TestCase):
     # Replacement hosts and how an applied output lands in their envelope.
     # qwencode is additionalContext-only: Core sees that it cannot replace
     # output and returns passthrough, but the hook still makes its one v2 call.
-    REPLACEMENT_AGENTS = ["claude-code", "qoder-cli", "opencode", "cosh-ng"]
+    REPLACEMENT_AGENTS = ["claude-code", "qoder-cli", "qwenwork", "opencode", "cosh-ng"]
 
     # additionalContext-only hosts: no replacement capability, so Core
     # returns passthrough for every behavior class, but the hook still makes
@@ -142,7 +147,7 @@ class ResponseHookContract(unittest.TestCase):
         return contract_runner.run_case(
             corpus.RESPONSE_HOOK,
             self.fixture,
-            corpus.RESPONSE_AGENTS[agent],
+            RESPONSE_AGENTS[agent],
             behavior,
         )
 
@@ -183,7 +188,7 @@ class ResponseHookContract(unittest.TestCase):
                 result = contract_runner.run_case(
                     corpus.RESPONSE_HOOK,
                     json.dumps(payload),
-                    corpus.RESPONSE_AGENTS[agent],
+                    RESPONSE_AGENTS[agent],
                     "applied",
                 )
                 self.assertEqual(result.envelope, {})
@@ -196,7 +201,7 @@ class ResponseHookContract(unittest.TestCase):
         result = contract_runner.run_case(
             corpus.RESPONSE_HOOK,
             self.fixture,
-            corpus.RESPONSE_AGENTS["claude-code"],
+            RESPONSE_AGENTS["claude-code"],
             "applied",
             tokenless_on_path=False,
         )
@@ -217,7 +222,7 @@ class ResponseHookContract(unittest.TestCase):
         result = contract_runner.run_case(
             corpus.RESPONSE_HOOK,
             json.dumps(payload),
-            corpus.RESPONSE_AGENTS["claude-code"],
+            RESPONSE_AGENTS["claude-code"],
             "passthrough",
         )
         request = result.requests[0]["input"]
@@ -259,7 +264,7 @@ class ResponseHookContract(unittest.TestCase):
                 self.assertEqual(result.spawns, [])
 
     def test_malformed_hook_stdin_passes_through(self):
-        agents = {a: corpus.RESPONSE_AGENTS[a] for a in self.REPLACEMENT_AGENTS}
+        agents = {a: RESPONSE_AGENTS[a] for a in self.REPLACEMENT_AGENTS}
         agents.update(self.ADDITIVE_AGENTS)
         for agent, agent_env in agents.items():
             with self.subTest(agent=agent):
@@ -272,12 +277,53 @@ class ResponseHookContract(unittest.TestCase):
                 self.assertEqual(result.envelope, {})
                 self.assertEqual(result.spawns, [])
 
+    def test_qwenwork_preserves_mcp_response_types(self):
+        records = [{"name": "row", "details": "x" * 500}]
+        for response in (records, {"records": records}, json.dumps(records)):
+            with self.subTest(response_type=type(response).__name__):
+                payload = json.loads(self.fixture)
+                payload.update(tool_name="mcp__office__list_rows", tool_response=response)
+                result = contract_runner.run_case(
+                    corpus.RESPONSE_HOOK,
+                    json.dumps(payload),
+                    RESPONSE_AGENTS["qwenwork"],
+                    "applied",
+                )
+                hso = result.envelope["hookSpecificOutput"]
+                replacement = hso["updatedToolOutput"]
+                self.assertIsInstance(replacement, type(response))
+                expected = mock_applied_output(json.dumps(response))
+                self.assertEqual(
+                    replacement, expected if isinstance(response, str) else json.loads(expected)
+                )
+                self.assertNotIn("additionalContext", hso)
+                self.assertEqual(result.spawns, ["compress"])
+                request = result.requests[0]
+                self.assertEqual(request["attribution"]["agent_id"], "qwenwork")
+                self.assertEqual(request["input"]["content_origin"], "api_response")
+                self.assertTrue(request["input"]["capabilities"]["replace_output"])
+
+    def test_qwenwork_preserves_file_content(self):
+        for tool in ("Read", "Glob", "Grep"):
+            with self.subTest(tool=tool):
+                payload = json.loads(self.fixture)
+                payload.update(tool_name=tool, tool_input={})
+                result = contract_runner.run_case(
+                    corpus.RESPONSE_HOOK,
+                    json.dumps(payload),
+                    RESPONSE_AGENTS["qwenwork"],
+                    "applied",
+                )
+                self.assertEqual(result.envelope, {})
+                if result.requests:
+                    self.assertEqual(result.requests[0]["input"]["content_origin"], "file_content")
+
     def test_timeout_kills_the_subprocess_and_passes_through(self):
-        # One representative agent: the timeout class costs a real 8-second
-        # wait per case (the hook's subprocess timeout must fire).
-        result = self.run_case("claude-code", "timeout")
-        self.assertEqual(result.envelope, {})
-        self.assertEqual(result.spawns, ["compress"])
+        for agent in ("claude-code", "qwenwork"):
+            with self.subTest(agent=agent):
+                result = self.run_case(agent, "timeout")
+                self.assertEqual(result.envelope, {})
+                self.assertEqual(result.spawns, ["compress"])
 
 
 class SchemaHookContract(unittest.TestCase):

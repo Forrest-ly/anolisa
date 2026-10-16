@@ -1,0 +1,279 @@
+//! Read-only query plumbing shared by both stream readers.
+//!
+//! v1 duplicates this lifecycle in `security_events/sqlite_reader.py` and
+//! `observability/sqlite_reader.py`: build a read-only store, hand it to a
+//! repository, and forward each query while degrading to an empty result when
+//! the database is unavailable. That skeleton lives here once.
+
+use std::sync::Arc;
+
+use rusqlite::Connection;
+
+use crate::error::KernelError;
+use crate::store::SqliteStore;
+
+/// A read-only view over one store and repository.
+#[derive(Debug)]
+pub struct ReadOnlySource<R> {
+    store: Arc<SqliteStore>,
+    repository: R,
+}
+
+impl<R> ReadOnlySource<R> {
+    /// Wraps `store` and `repository`.
+    ///
+    /// The store is expected to have been built with `read_only = true`; that is
+    /// what keeps queries from creating or migrating anything.
+    pub const fn new(store: Arc<SqliteStore>, repository: R) -> Self {
+        Self { store, repository }
+    }
+
+    /// Returns the underlying store.
+    #[must_use]
+    pub fn store(&self) -> &Arc<SqliteStore> {
+        &self.store
+    }
+
+    /// Returns the repository.
+    #[must_use]
+    pub const fn repository(&self) -> &R {
+        &self.repository
+    }
+
+    /// Runs `query` and falls back to `default` when it cannot run.
+    ///
+    /// This is the degradation v1 relies on: a missing or unreadable database
+    /// yields an empty result rather than an error, so read commands stay usable
+    /// before the first write has happened.
+    ///
+    /// A query that *fails* additionally drops the cached connection, matching
+    /// every v1 read path's `except SQLAlchemyError: self._store.dispose()`. A
+    /// database that was simply unavailable is not a reason to dispose, so the
+    /// `Ok(None)` arm leaves the store alone.
+    pub fn query_or<T>(
+        &self,
+        default: T,
+        query: impl FnOnce(&R, &Connection) -> Result<T, KernelError>,
+    ) -> T {
+        match self
+            .store
+            .with_connection(false, |conn| query(&self.repository, conn))
+        {
+            Ok(Some(value)) => value,
+            Ok(None) => default,
+            Err(_) => {
+                self.store.dispose();
+                default
+            }
+        }
+    }
+
+    /// Runs `query` and falls back to `T::default()`.
+    pub fn query_or_default<T: Default>(
+        &self,
+        query: impl FnOnce(&R, &Connection) -> Result<T, KernelError>,
+    ) -> T {
+        self.query_or(T::default(), query)
+    }
+
+    /// Runs `query` and reports the full outcome instead of degrading.
+    ///
+    /// This is the query-port counterpart of [`ReadOnlySource::query_or`]:
+    /// `Ok(None)` still means "database absent" (the normal before-first-write
+    /// state), while a store that exists but cannot be opened or read
+    /// (corrupt pages, I/O failure, interrupted query) is returned as an
+    /// error so it is distinguishable from a store that holds no rows. The
+    /// cached connection is disposed exactly when the query fails, matching
+    /// `query_or`'s recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError`] when the store cannot be opened or the query
+    /// cannot run.
+    pub fn try_query<T>(
+        &self,
+        query: impl FnOnce(&R, &Connection) -> Result<T, KernelError>,
+    ) -> Result<Option<T>, KernelError> {
+        // `raise_on_error = true` is what separates the two failure families:
+        // an absent database still yields `Ok(None)`, an unopenable or
+        // unreadable one yields `Err` instead of silently degrading.
+        let outcome = self
+            .store
+            .with_connection(true, |conn| query(&self.repository, conn));
+        if outcome.is_err() {
+            self.store.dispose();
+        }
+        outcome
+    }
+
+    /// Drops the cached connection.
+    pub fn close(&self) {
+        self.store.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{ColumnSpec, TableSpec};
+    use tempfile::TempDir;
+
+    const WIDGETS: &[TableSpec] = &[TableSpec {
+        name: "widgets",
+        strict: false,
+        constraints: &[],
+        columns: &[ColumnSpec {
+            name: "id",
+            definition: "TEXT PRIMARY KEY",
+        }],
+        indexes: &[],
+        extra_columns: &[],
+    }];
+
+    struct WidgetReader {
+        table: &'static str,
+    }
+
+    impl WidgetReader {
+        const fn new() -> Self {
+            Self { table: "widgets" }
+        }
+
+        fn count(&self, conn: &Connection) -> Result<i64, KernelError> {
+            Ok(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {}", self.table), [], |row| {
+                    row.get(0)
+                })?,
+            )
+        }
+    }
+
+    fn store(path: &std::path::Path, read_only: bool) -> Arc<SqliteStore> {
+        Arc::new(SqliteStore::new(path, read_only, 1, WIDGETS, None, "[test]").expect("store"))
+    }
+
+    #[test]
+    fn missing_database_degrades_to_the_default() {
+        let dir = TempDir::new().expect("temp dir");
+        let source = ReadOnlySource::new(
+            store(&dir.path().join("absent.db"), true),
+            WidgetReader::new(),
+        );
+        assert_eq!(source.query_or(-1, WidgetReader::count), -1);
+        assert_eq!(source.query_or_default(WidgetReader::count), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_database_is_rejected_for_soft_and_strict_queries() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("owned.db");
+        store(&path, false)
+            .with_connection(true, |_| Ok(()))
+            .expect("create owned db")
+            .expect("value");
+        let target = dir.path().join("target.db");
+        store(&target, false)
+            .with_connection(true, |_| Ok(()))
+            .expect("create target")
+            .expect("value");
+        let source = ReadOnlySource::new(store(&path, true), WidgetReader::new());
+        assert_eq!(source.query_or(-1, WidgetReader::count), 0);
+
+        std::fs::remove_file(&path).expect("remove owned db");
+        symlink(&target, &path).expect("replace with symlink");
+
+        assert_eq!(source.query_or(-1, WidgetReader::count), -1);
+        assert!(matches!(
+            source.try_query(WidgetReader::count),
+            Err(KernelError::UnsafePath(unsafe_path)) if unsafe_path == path
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_is_not_treated_as_a_missing_database() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().expect("temp dir");
+        let link = dir.path().join("dangling.db");
+        symlink(dir.path().join("absent-target.db"), &link).expect("symlink");
+        let source = ReadOnlySource::new(store(&link, true), WidgetReader::new());
+
+        assert_eq!(source.query_or(-1, WidgetReader::count), -1);
+        assert!(matches!(
+            source.try_query(WidgetReader::count),
+            Err(KernelError::UnsafePath(path)) if path == link
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_database_is_rejected_as_unsafe() {
+        let dir = TempDir::new().expect("temp dir");
+        let source = ReadOnlySource::new(store(dir.path(), true), WidgetReader::new());
+
+        assert_eq!(source.query_or(-1, WidgetReader::count), -1);
+        assert!(matches!(
+            source.try_query(WidgetReader::count),
+            Err(KernelError::UnsafePath(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_database_is_rejected_without_opening_it() {
+        use rustix::fs::{CWD, Mode, mkfifoat};
+
+        let dir = TempDir::new().expect("temp dir");
+        let fifo = dir.path().join("database.fifo");
+        mkfifoat(CWD, &fifo, Mode::from_raw_mode(0o600)).expect("fifo");
+        let source = ReadOnlySource::new(store(&fifo, true), WidgetReader::new());
+
+        assert_eq!(source.query_or(-1, WidgetReader::count), -1);
+        assert!(matches!(
+            source.try_query(WidgetReader::count),
+            Err(KernelError::UnsafePath(path)) if path == fifo
+        ));
+    }
+
+    #[test]
+    fn a_failing_query_degrades_to_the_default() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("widgets.db");
+        store(&path, false)
+            .with_connection(true, |_| Ok(()))
+            .expect("create")
+            .expect("value");
+
+        let source = ReadOnlySource::new(store(&path, true), WidgetReader::new());
+        let value = source.query_or(-1, |_, conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM nonexistent", [], |row| row.get(0))?)
+        });
+        assert_eq!(value, -1);
+    }
+
+    #[test]
+    fn reads_go_through_when_the_database_exists() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("widgets.db");
+        store(&path, false)
+            .with_connection(true, |conn| {
+                conn.execute("INSERT INTO widgets (id) VALUES ('a')", [])?;
+                Ok(())
+            })
+            .expect("write")
+            .expect("value");
+
+        let source = ReadOnlySource::new(store(&path, true), WidgetReader::new());
+        assert_eq!(source.query_or(-1, WidgetReader::count), 1);
+        source.close();
+        assert_eq!(
+            source.query_or(-1, WidgetReader::count),
+            1,
+            "the source must reopen after close"
+        );
+    }
+}

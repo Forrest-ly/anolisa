@@ -1,0 +1,401 @@
+use std::io::Write;
+use std::sync::Arc;
+
+use asc_daemon_core::{
+    ActionService, PeerCredentials, PolicyAdministration, Principal, PrincipalPolicy, PrincipalRole,
+};
+use asc_daemon_protocol::method::{self, AccessPolicy, MethodId};
+use asc_daemon_protocol::{DaemonRequest, DaemonResponse, RequestId, error_code};
+use asc_daemon_service::{DispatchError, DispatchRequest, RequestDispatcher, ResponseDisposition};
+
+use crate::action::CodeScanHandler;
+use crate::pap::PapHandler;
+use crate::pii::PiiScanHandler;
+use crate::prompt_scan::PromptScanHandler;
+use crate::query::QueryHandler;
+
+const DEFAULT_DISPATCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Protocol router composed over daemon application use cases.
+pub struct DaemonDispatcher {
+    started_at: std::time::Instant,
+    pap: PapHandler,
+    code_scan: CodeScanHandler,
+    pii_scan: PiiScanHandler,
+    skill_sec: crate::skill_sec::SkillSecHandler,
+    prompt_scan: PromptScanHandler,
+    queries: QueryHandler,
+    principal_policy: Arc<dyn PrincipalPolicy>,
+    observability: Option<asc_daemon_core::ObservabilityService>,
+}
+
+impl DaemonDispatcher {
+    /// Composes PAP dispatch with trusted server authorization policy.
+    ///
+    /// The role is process-owned configuration. It is never decoded from the
+    /// request or inferred from caller-supplied attribution. The `sec.*`
+    /// query family starts unbound and rejects every call until
+    /// [`Self::with_queries`] binds a store, so a composition root
+    /// cannot accidentally serve queries from a wrong database.
+    pub fn new(
+        application: impl PolicyAdministration + 'static,
+        principal_policy: Arc<dyn PrincipalPolicy>,
+        actions: Arc<ActionService>,
+    ) -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            pap: PapHandler::new(application),
+            code_scan: CodeScanHandler::new(Arc::clone(&actions)),
+            pii_scan: PiiScanHandler::new(Arc::clone(&actions)),
+            skill_sec: crate::skill_sec::SkillSecHandler::new(Arc::clone(&actions)),
+            prompt_scan: PromptScanHandler::new(actions),
+            queries: QueryHandler::default(),
+            principal_policy,
+            observability: None,
+        }
+    }
+
+    /// Installs the explicitly configured observability ingestion application.
+    #[must_use]
+    pub fn with_observability(mut self, service: asc_daemon_core::ObservabilityService) -> Self {
+        self.observability = Some(service);
+        self
+    }
+
+    /// Installs the configured security-event and observability query handlers.
+    #[must_use]
+    pub fn with_queries(mut self, queries: QueryHandler) -> Self {
+        self.queries = queries;
+        self
+    }
+
+    /// Handles an in-process request with a five-second convenience budget.
+    /// UDS dispatch uses its transport-owned control instead.
+    pub fn handle(
+        &self,
+        request_id: RequestId,
+        peer: PeerCredentials,
+        request: DaemonRequest,
+    ) -> DaemonResponse {
+        self.handle_with_control(
+            request_id,
+            peer,
+            &asc_daemon_service::DispatchControl::new(
+                std::time::Instant::now() + DEFAULT_DISPATCH_BUDGET,
+            ),
+            request,
+        )
+    }
+
+    /// Handles one request with its transport-owned control state.
+    pub fn handle_with_control(
+        &self,
+        request_id: RequestId,
+        peer: PeerCredentials,
+        control: &asc_daemon_service::DispatchControl,
+        request: DaemonRequest,
+    ) -> DaemonResponse {
+        let parent = request_parent(&request);
+        let method = request.method.clone();
+        request_scope(parent, &method, || {
+            let result = self.handle_inner(request_id, peer, control, request);
+            record_result(&result);
+            result
+        })
+    }
+
+    fn handle_inner(
+        &self,
+        request_id: RequestId,
+        peer: PeerCredentials,
+        control: &asc_daemon_service::DispatchControl,
+        request: DaemonRequest,
+    ) -> DaemonResponse {
+        let Some(method_id) = method::resolve(&request.method) else {
+            return DaemonResponse::error(
+                request_id,
+                error_code::UNKNOWN_METHOD,
+                "daemon method is not implemented",
+            );
+        };
+
+        let role = self.principal_policy.role_for(peer);
+        let principal = Principal::from_authenticated_peer(peer, role);
+        if !is_authorized(&principal, method_id.metadata().access) {
+            return DaemonResponse::error(
+                request_id,
+                error_code::PERMISSION_DENIED,
+                "principal is not authorized to administer policy",
+            );
+        }
+        match method_id {
+            MethodId::Health => DaemonResponse::success(
+                request_id,
+                serde_json::json!({
+                    "status": "ok",
+                    "pid": std::process::id(),
+                    "uptime_seconds": self.started_at.elapsed().as_secs_f64(),
+                }),
+            ),
+            MethodId::ObservabilityQuery(method) => {
+                self.queries
+                    .handle_observability(request_id, peer, control, method, request.params)
+            }
+            MethodId::ObservabilityRecord => crate::observability::handle(
+                request_id,
+                peer,
+                control,
+                self.observability.as_ref(),
+                request.params,
+            ),
+            MethodId::Pap(method) => {
+                self.pap
+                    .handle(request_id, &principal, method, request.params)
+            }
+            MethodId::Query(method) => {
+                self.queries
+                    .handle(request_id, &principal, method, request.params)
+            }
+            MethodId::Action(method) => match method {
+                method::ActionMethod::SkillSec => {
+                    self.skill_sec
+                        .handle(request_id, peer, control, request.params)
+                }
+                method::ActionMethod::CodeScan => {
+                    self.code_scan
+                        .handle(request_id, peer, control, request.params)
+                }
+                method::ActionMethod::PiiScan => {
+                    self.pii_scan
+                        .handle(request_id, peer, control, request.params)
+                }
+                method::ActionMethod::PromptScan => {
+                    self.prompt_scan
+                        .handle(request_id, peer, control, request.params)
+                }
+                method::ActionMethod::PromptScanWarmup => {
+                    self.prompt_scan.handle_warmup(request_id, request.params)
+                }
+            },
+        }
+    }
+}
+
+fn is_authorized(principal: &Principal, access: AccessPolicy) -> bool {
+    match access {
+        AccessPolicy::PolicyAdministrator => principal.role() == PrincipalRole::PolicyAdministrator,
+        // Any kernel-authenticated peer is a local user; the transport rejects
+        // unauthenticated peers before dispatch, so reaching here already means
+        // the peer is authenticated.
+        AccessPolicy::LocalUser => true,
+    }
+}
+
+impl RequestDispatcher for DaemonDispatcher {
+    fn is_administrator(&self, peer: asc_daemon_service::PeerCredentials) -> bool {
+        self.principal_policy
+            .is_administrator_for_admission(PeerCredentials::new(
+                peer.uid(),
+                peer.gid(),
+                peer.pid(),
+            ))
+    }
+
+    fn dispatch_timeout(&self, payload: &[u8]) -> Option<std::time::Duration> {
+        if let Ok(request) = serde_json::from_slice::<asc_daemon_protocol::V1Request>(payload)
+            && request.caller.as_deref() == Some("agentsight")
+        {
+            return request
+                .timeout_ms
+                .filter(|ms| (1..=300_000).contains(ms))
+                .map(std::time::Duration::from_millis);
+        }
+        let request: DaemonRequest = serde_json::from_slice(payload).ok()?;
+        // Prompt Scanner retains its existing fixed local-model budget.
+        if request.method == method::ACTION_PROMPT_SCAN
+            || request.method == method::ACTION_PROMPT_SCAN_WARMUP
+        {
+            return Some(std::time::Duration::from_secs(35));
+        }
+        if request.method == method::ACTION_CODE_SCAN
+            && request
+                .params
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                == Some("llm")
+        {
+            return Some(asc_model_client::code_scan_budget());
+        }
+        if request.method != method::ACTION_SKILL_SEC {
+            return None;
+        }
+        let millis = request
+            .params
+            .get("timeoutMs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(60_000)
+            .clamp(1, 120_000);
+        Some(std::time::Duration::from_millis(millis))
+    }
+
+    fn dispatch(
+        &self,
+        request: DispatchRequest,
+        response: &mut dyn Write,
+    ) -> Result<ResponseDisposition, DispatchError> {
+        if let Some(result) = crate::v1_compat::dispatch(self, &request, response) {
+            return result;
+        }
+        let request_id = new_request_id();
+        if request.control.is_cancelled() {
+            return asc_observability::rejection_scope("deadline_exceeded", || {
+                write_response(
+                    response,
+                    &DaemonResponse::<serde_json::Value>::error(
+                        request_id,
+                        error_code::DEADLINE_EXCEEDED,
+                        "request dispatch deadline expired",
+                    ),
+                )
+            });
+        }
+
+        let peer = PeerCredentials::new(request.peer.uid(), request.peer.gid(), request.peer.pid());
+        let decoded = serde_json::from_slice::<DaemonRequest>(&request.payload);
+        let Some(decoded) = decoded.ok().filter(|_| {
+            // After strict decoding, a small frame fits both independent budgets.
+            // Transport strips LF, so reserve one byte even on this fast path.
+            request.payload.len() < asc_daemon_protocol::CONTEXT_FRAME_BYTES
+                || asc_daemon_protocol::request_fits_budget(&request.payload).unwrap_or(false)
+        }) else {
+            return asc_observability::rejection_scope("invalid_request", || {
+                write_response(
+                    response,
+                    &DaemonResponse::<serde_json::Value>::error(
+                        request_id,
+                        error_code::INVALID_REQUEST,
+                        "request envelope is invalid",
+                    ),
+                )
+            });
+        };
+        let parent = request_parent(&decoded);
+        let method = decoded.method.clone();
+        request_scope(parent, &method, || {
+            let result = self.handle_inner(request_id, peer, &request.control, decoded);
+            record_result(&result);
+            if request.control.is_cancelled() {
+                tracing::Span::current().record("cancel_requested", true);
+                asc_observability::diagnostic("request_completed_after_cancellation");
+            }
+            let success = matches!(&result, DaemonResponse::Success(_));
+            let encoded = write_response(response, &result);
+            if encoded.is_err() {
+                asc_observability::mark_error("response_encode_failed");
+            }
+            asc_observability::diagnostic(if encoded.is_err() {
+                "response_encode_failed"
+            } else if success {
+                "request_completed"
+            } else {
+                "request_rejected"
+            });
+            encoded
+        })
+    }
+}
+
+pub(crate) fn new_request_id() -> RequestId {
+    RequestId::new(uuid::Uuid::new_v4().to_string())
+        .expect("UUID request identities are always non-empty")
+}
+
+pub(crate) fn write_response<T: serde::Serialize>(
+    response: &mut dyn Write,
+    value: &DaemonResponse<T>,
+) -> Result<ResponseDisposition, DispatchError> {
+    serde_json::to_writer(response, value).map_err(|_| DispatchError)?;
+    Ok(ResponseDisposition::Send)
+}
+
+fn request_parent(request: &DaemonRequest) -> asc_observability::Context {
+    let parent = request
+        .trace_context
+        .as_ref()
+        .map_or_else(asc_observability::Context::new, |carrier| {
+            asc_observability::extract_parent(&carrier.headers())
+        });
+    if let Some(labels) = &request.compatibility {
+        parent.with_value(asc_observability::CompatibilityCorrelation {
+            trace_id: labels
+                .trace_id
+                .as_deref()
+                .and_then(asc_observability::normalize),
+            invocation_label: labels
+                .invocation_label
+                .as_deref()
+                .and_then(asc_observability::normalize),
+        })
+    } else {
+        parent
+    }
+}
+
+fn request_scope<T>(
+    parent: asc_observability::Context,
+    method_name: &str,
+    work: impl FnOnce() -> T,
+) -> T {
+    let safe_method = if method::resolve(method_name).is_some() {
+        method_name
+    } else {
+        "unknown"
+    };
+    let _parent = parent.clone().attach();
+    let span = asc_observability::parent_span(
+        tracing::info_span!(parent: None, "daemon.request", otel.kind = "server", rpc.method = safe_method,
+            rpc.request_id = tracing::field::Empty, cancel_requested = false),
+        parent,
+    );
+    span.in_scope(|| {
+        let _context = asc_observability::request_context().attach();
+        asc_observability::report_propagation_issues();
+        let _completion = RequestCompletion;
+        asc_observability::diagnostic("request_started");
+        work()
+    })
+}
+struct RequestCompletion;
+impl Drop for RequestCompletion {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            asc_observability::mark_error("request_panicked");
+            asc_observability::diagnostic("request_panicked");
+        }
+    }
+}
+
+fn record_result(result: &DaemonResponse) {
+    let response_id = result.request_id().as_str();
+    if response_id.len() <= 256 {
+        tracing::Span::current().record("rpc.request_id", response_id);
+    }
+    match result {
+        DaemonResponse::Success(_) => asc_observability::mark_success(),
+        DaemonResponse::Error(response) => {
+            let category = match response.error.code.as_str() {
+                error_code::INVALID_REQUEST => error_code::INVALID_REQUEST,
+                error_code::INVALID_ARGUMENT => error_code::INVALID_ARGUMENT,
+                error_code::UNKNOWN_METHOD => error_code::UNKNOWN_METHOD,
+                error_code::PERMISSION_DENIED => error_code::PERMISSION_DENIED,
+                error_code::NOT_FOUND => error_code::NOT_FOUND,
+                error_code::CONFLICT => error_code::CONFLICT,
+                error_code::RESOURCE_EXHAUSTED => error_code::RESOURCE_EXHAUSTED,
+                error_code::DEADLINE_EXCEEDED => error_code::DEADLINE_EXCEEDED,
+                error_code::UNAVAILABLE => error_code::UNAVAILABLE,
+                _ => error_code::INTERNAL,
+            };
+            asc_observability::mark_error(category);
+        }
+    }
+}

@@ -353,6 +353,8 @@ pub enum ContentOrigin {
     CommandOutput,
     /// A copy of authoritative file content.
     FileContent,
+    /// Local files printed by a shell command such as `cat`.
+    FileRead,
     /// A service or framework response.
     ApiResponse,
 }
@@ -364,6 +366,7 @@ impl ContentOrigin {
         match self {
             Self::CommandOutput => "command_output",
             Self::FileContent => "file_content",
+            Self::FileRead => "file_read",
             Self::ApiResponse => "api_response",
         }
     }
@@ -396,8 +399,15 @@ pub struct PostToolRequest {
     pub content: String,
     /// Host-reported execution status.
     pub status: ToolResultStatus,
-    /// Authoritative origin selected by the adapter.
+    /// Origin selected by the adapter; Core refines `command_output` to
+    /// `file_read` when `command` only prints local files.
     pub content_origin: ContentOrigin,
+    /// Shell command line behind a `command_output` result, when the host has it.
+    ///
+    /// Core reports a plain print of local files such as `cat page.html` as
+    /// `file_read`; the field is ignored for every other origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     /// Optimization state returned by PreTool.
     pub output_optimization: OutputOptimization,
     /// Host capabilities for applying the result.
@@ -503,6 +513,9 @@ pub enum AppliedOperation {
     SearchPathSharing,
     /// Unmodified Git diff context was reduced with the original available in Stash.
     DiffReduction,
+    /// An HTML page was rendered as Markdown with enumerated non-content elements
+    /// removed and the original available in Stash.
+    HtmlExtraction,
     /// Empty and diagnostic JSON fields were removed.
     JsonCleanup,
     /// A JSON record collection was reduced with retrievable omissions.
@@ -525,6 +538,7 @@ impl AppliedOperation {
             Self::TabularRowReduction => "tabular_row_reduction",
             Self::SearchPathSharing => "search_path_sharing",
             Self::DiffReduction => "diff_reduction",
+            Self::HtmlExtraction => "html_extraction",
             Self::JsonCleanup => "json_cleanup",
             Self::JsonRecordReduction => "json_record_reduction",
             Self::JsonTruncation => "json_truncation",

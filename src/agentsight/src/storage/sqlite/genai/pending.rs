@@ -1,9 +1,74 @@
 //! Pending-call lifecycle methods for GenAI SQLite store.
 
 use rusqlite::{TransactionBehavior, params};
+use serde::Deserialize;
+use serde_json::value::RawValue;
+use std::borrow::Cow;
 
 use super::GenAISqliteStore;
 use crate::genai::semantic::GenAISemanticEvent;
+
+// Borrow message arrays from the completed event's JSON without constructing
+// another DOM or retaining a second serialization of the same large fields.
+#[derive(Deserialize)]
+struct EventMessages<'a> {
+    #[serde(rename = "LLMCall", borrow)]
+    call: CallMessages<'a>,
+}
+
+#[derive(Deserialize)]
+struct CallMessages<'a> {
+    #[serde(borrow)]
+    request: MessageArray<'a>,
+    #[serde(borrow)]
+    response: MessageArray<'a>,
+}
+
+#[derive(Deserialize)]
+struct MessageArray<'a> {
+    #[serde(borrow)]
+    messages: &'a RawValue,
+}
+
+/// Serialize once for completion, insertion, and capacity-retry paths.
+pub(super) fn completed_event_json(
+    event: &GenAISemanticEvent,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut buffer = Vec::with_capacity(event.retained_bytes().saturating_add(4096));
+    serde_json::to_writer(&mut buffer, event)?;
+    if buffer.capacity() > buffer.len().saturating_add(buffer.len() / 4) {
+        buffer.shrink_to_fit();
+    }
+    Ok(String::from_utf8(buffer)?)
+}
+
+/// Borrow whole message arrays; serialize only an incremental request subset.
+pub(super) fn message_columns<'a>(
+    call: &crate::genai::semantic::LLMCall,
+    event_json: &'a str,
+) -> (Option<Cow<'a, str>>, Option<Cow<'a, str>>) {
+    let serialized = serde_json::from_str::<EventMessages<'_>>(event_json).ok();
+    let latest = crate::genai::semantic::latest_round_input_messages(&call.request.messages);
+    let input = if latest.is_empty() {
+        None
+    } else if latest.len() == call.request.messages.len() && serialized.is_some() {
+        serialized
+            .as_ref()
+            .map(|fields| Cow::Borrowed(fields.call.request.messages.get()))
+    } else {
+        serde_json::to_string(&latest).ok().map(Cow::Owned)
+    };
+    let output = if call.response.messages.is_empty() {
+        None
+    } else if let Some(fields) = &serialized {
+        Some(Cow::Borrowed(fields.call.response.messages.get()))
+    } else {
+        serde_json::to_string(&call.response.messages)
+            .ok()
+            .map(Cow::Owned)
+    };
+    (input, output)
+}
 
 // ─── Query result types ────────────────────────────────────────────────────────
 
@@ -17,6 +82,9 @@ pub enum PendingOrigin {
     DeadPidDrain,
     /// In-flight stream was snapshotted after an idle timeout while the PID lived.
     IdleDrain,
+    /// Response headers were captured on a clean exit but the declared body
+    /// never arrived; the row was completed from the partial capture (#7553).
+    CleanExitPartial,
 }
 
 impl PendingOrigin {
@@ -26,6 +94,7 @@ impl PendingOrigin {
             Self::RequestCapture => "request_capture",
             Self::DeadPidDrain => "dead_pid_drain",
             Self::IdleDrain => "idle_drain",
+            Self::CleanExitPartial => "clean_exit_partial",
         }
     }
 }
@@ -81,10 +150,48 @@ pub struct SseEnrichment {
     pub sse_event_count: Option<i64>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    /// Cache counters as the provider reported them. Drain persistence folds
+    /// these into semantic input for Anthropic-compatible providers that
+    /// report them outside `input_tokens`.
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
 }
 
 impl GenAISqliteStore {
     // ─── Pending-call lifecycle methods ────────────────────────────────────────
+
+    /// Store an already completed capture without first writing a pending copy.
+    /// Existing request evidence and idle snapshots still use normal promotion.
+    pub(crate) fn complete_captured(
+        &self,
+        event: &GenAISemanticEvent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _priority = self.prioritize_capture();
+        let _timer = crate::runtime_metrics::StageTimer::start("genai_capture_complete");
+        let has_pending = if let GenAISemanticEvent::LLMCall(call) = event {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|error| format!("GenAI capture completion mutex poisoned: {error}"))?;
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM genai_events WHERE call_id = ?1)
+                    OR (SELECT COUNT(*) = 1 FROM genai_events
+                        WHERE event_type = 'llm_call'
+                          AND pending_origin = 'idle_drain'
+                          AND pending_match_key = ?2
+                          AND status IN ('pending', 'interrupted'))",
+                params![call.call_id, call.metadata.get("pending_match_key")],
+                |row| row.get::<_, bool>(0),
+            )?
+        } else {
+            false
+        };
+        if has_pending {
+            self.complete_pending(event)
+        } else {
+            self.store_event(event)
+        }
+    }
 
     /// Insert a PENDING record as soon as a request is captured.
     ///
@@ -94,19 +201,15 @@ impl GenAISqliteStore {
     /// a unique unfinished idle snapshot with the same match key; replaying an
     /// existing call ID leaves its row unchanged.
     pub fn insert_pending(&self, info: &PendingCallInfo) -> Result<(), Box<dyn std::error::Error>> {
-        // Enforce size limit before creating a new row. Best-effort: if
-        // pruning fails (e.g. VACUUM error), proceed with the INSERT — a
-        // missed prune is better than losing the event entirely.
-        if let Err(e) = self.check_and_prune_if_needed() {
-            log::warn!("Pre-insert size check failed: {e}");
-        }
-
+        let _timer = crate::runtime_metrics::StageTimer::start("genai_pending_insert");
         // Cold instance-ID resolution may perform I/O; keep it outside the writer lock.
         let instance = crate::genai::instance_id::get_instance_id();
+        let lock_timer = crate::runtime_metrics::StageTimer::start("genai_pending_lock_wait");
         let mut conn = self
             .conn
             .lock()
             .map_err(|e| format!("GenAI pending insert mutex poisoned: {e}"))?;
+        drop(lock_timer);
         // Reserve the writer before checking, including across store connections.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let exists: bool = tx.query_row(
@@ -136,11 +239,16 @@ impl GenAISqliteStore {
                 };
                 if let [id] = candidates.as_slice() {
                     // Keep request evidence and row identity; RequestCapture also
-                    // keeps deferred calls visible to crash recovery.
+                    // keeps deferred calls visible to crash recovery, which only
+                    // looks at pending rows. The stale sweep may have flipped the
+                    // snapshot to interrupted while the call was still in flight,
+                    // so the adopted row returns to pending and drops the stale
+                    // interruption type.
                     tx.execute(
                         "UPDATE genai_events SET
                             call_id = ?1, trace_id = ?2, conversation_id = ?3,
-                            session_id = ?4, pending_origin = 'request_capture'
+                            session_id = ?4, pending_origin = 'request_capture',
+                            status = 'pending', interruption_type = NULL
                          WHERE id = ?5",
                         params![
                             info.call_id,
@@ -212,11 +320,10 @@ impl GenAISqliteStore {
         &self,
         event: &GenAISemanticEvent,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let _timer = crate::runtime_metrics::StageTimer::start("genai_pending_complete");
         if let GenAISemanticEvent::LLMCall(call) = event {
+            let event_json = completed_event_json(event)?;
             {
-                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                let event_json = serde_json::to_string(event)?;
-
                 let (input_tokens, output_tokens, total_tokens) = call
                     .token_usage
                     .as_ref()
@@ -250,20 +357,7 @@ impl GenAISqliteStore {
                         serde_json::to_string(&sys).ok()
                     }
                 };
-                let input_messages: Option<String> = {
-                    let latest =
-                        crate::genai::semantic::latest_round_input_messages(&call.request.messages);
-                    if latest.is_empty() {
-                        None
-                    } else {
-                        serde_json::to_string(&latest).ok()
-                    }
-                };
-                let output_messages: Option<String> = if call.response.messages.is_empty() {
-                    None
-                } else {
-                    serde_json::to_string(&call.response.messages).ok()
-                };
+                let (input_messages, output_messages) = message_columns(call, &event_json);
                 let finish_reasons: Option<String> = {
                     let reasons: Vec<_> = call
                         .response
@@ -278,31 +372,16 @@ impl GenAISqliteStore {
                     }
                 };
 
-                let tool_call_ids: Option<String> = {
-                    let ids: Vec<String> = call
-                        .response
-                        .messages
-                        .iter()
-                        .flat_map(|m| m.parts.iter())
-                        .filter_map(|p| {
-                            if let crate::genai::semantic::MessagePart::ToolCall {
-                                id: Some(tc_id),
-                                ..
-                            } = p
-                            {
-                                Some(tc_id.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if ids.is_empty() {
-                        None
-                    } else {
-                        serde_json::to_string(&ids).ok()
-                    }
-                };
+                let tool_call_ids =
+                    crate::genai::semantic::tool_call_ids_json(&call.response.messages);
 
+                let lock_timer =
+                    crate::runtime_metrics::StageTimer::start("genai_pending_lock_wait");
+                let conn = self
+                    .conn
+                    .lock()
+                    .map_err(|error| format!("GenAI completion mutex poisoned: {error}"))?;
+                drop(lock_timer);
                 let updated = conn.execute(
                     "UPDATE genai_events SET
                         status = 'complete',
@@ -323,12 +402,13 @@ impl GenAISqliteStore {
                         finish_reasons      = ?15,
                         server_address      = ?16,
                         input_tokens        = ?17,
+                        input_tokens_includes_cache = 1,
                         output_tokens       = ?18,
                         total_tokens        = ?19,
                         cache_creation_tokens = ?20,
                         cache_read_tokens   = ?21,
-                        system_instructions = ?22,
-                        input_messages      = ?23,
+                        system_instructions = COALESCE(?22, system_instructions),
+                        input_messages      = COALESCE(?23, input_messages),
                         output_messages     = ?24,
                         status_code         = ?25,
                         sse_event_count     = ?26,
@@ -414,6 +494,10 @@ impl GenAISqliteStore {
                 );
 
                 if let Some(match_key) = call.metadata.get("pending_match_key") {
+                    // A completion whose parsed request carries no messages
+                    // must not erase the evidence the idle snapshot captured:
+                    // the snapshot is then the only record of what the caller
+                    // sent. The call-id branch above carries the same guard.
                     let updated = conn.execute(
                         "UPDATE genai_events SET
                             status = 'complete',
@@ -434,12 +518,13 @@ impl GenAISqliteStore {
                             finish_reasons      = ?15,
                             server_address      = ?16,
                             input_tokens        = ?17,
+                            input_tokens_includes_cache = 1,
                             output_tokens       = ?18,
                             total_tokens        = ?19,
                             cache_creation_tokens = ?20,
                             cache_read_tokens   = ?21,
-                            system_instructions = ?22,
-                            input_messages      = ?23,
+                            system_instructions = COALESCE(?22, system_instructions),
+                            input_messages      = COALESCE(?23, input_messages),
                             output_messages     = ?24,
                             status_code         = ?25,
                             sse_event_count     = ?26,
@@ -450,13 +535,12 @@ impl GenAISqliteStore {
                             call_id             = ?31,
                             is_sse              = COALESCE(?33, is_sse)
                          WHERE id = (
-                            SELECT id FROM genai_events
+                            SELECT MIN(id) FROM genai_events
                             WHERE event_type = 'llm_call'
                               AND status IN ('pending', 'interrupted')
                               AND pending_origin = 'idle_drain'
                               AND pending_match_key = ?32
-                            ORDER BY start_timestamp_ns DESC
-                            LIMIT 1
+                            HAVING COUNT(*) = 1
                          )",
                         params![
                             call.metadata.get("response_id"),
@@ -515,8 +599,8 @@ impl GenAISqliteStore {
                     }
                 }
             }
-            // Fallback: store_event handles the full INSERT path
-            self.store_event(event)
+            // Reuse the serialization when there was no pending row to promote.
+            self.store_serialized_event(event, &event_json)
         } else {
             // Non-LLMCall events have no pending lifecycle, store directly
             self.store_event(event)
@@ -597,8 +681,14 @@ impl GenAISqliteStore {
     ) -> Vec<crate::interruption::RecentCallSummary> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         // Subquery fetches latest N rows desc, outer query reverses to asc order
-        let sql = "SELECT call_id, output_messages, COALESCE(input_tokens, 0), COALESCE(output_tokens, 0) \
-                   FROM (SELECT call_id, output_messages, input_tokens, output_tokens, start_timestamp_ns \
+        let sql = "SELECT call_id, output_messages, \
+                          CASE WHEN input_tokens_includes_cache = 1 THEN COALESCE(input_tokens, 0) \
+                               WHEN LOWER(COALESCE(provider, '')) = 'anthropic' \
+                               THEN COALESCE(input_tokens, 0) + COALESCE(cache_creation_tokens, 0) + COALESCE(cache_read_tokens, 0) \
+                               ELSE COALESCE(input_tokens, 0) END, \
+                          COALESCE(output_tokens, 0) \
+                   FROM (SELECT call_id, output_messages, input_tokens, output_tokens, \
+                                provider, cache_creation_tokens, cache_read_tokens, input_tokens_includes_cache, start_timestamp_ns \
                          FROM genai_events \
                          WHERE event_type = 'llm_call' \
                            AND conversation_id = ?1 \
@@ -744,25 +834,73 @@ impl GenAISqliteStore {
     }
 
     /// Enrich a pending record with data extracted from captured SSE events.
-    /// Updates model, trace_id, provider, output_messages, sse_event_count, and token counts.
+    /// Updates model, trace_id, provider, output_messages, sse_event_count, the
+    /// cache columns, and the token counts.
+    ///
+    /// Only rows still in 'pending' are touched: a call that already completed
+    /// holds the authoritative full-response values, and `insert_pending`
+    /// returns early (leaving an existing completed row in place) when the
+    /// same call_id is captured twice, so an enrichment issued after such a
+    /// replay must not partially overwrite the completed row.
     pub fn enrich_pending_from_sse(
         &self,
         call_id: &str,
         enrichment: &SseEnrichment,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // The drained call never reaches completion, so this is the only
+        // chance to record the tool calls its SSE chunks carried: every reader
+        // of the column (session turn indices, token-savings attribution, the
+        // session resource timeline) pairs its data by these ids.
+        let tool_call_ids = enrichment
+            .output_messages
+            .as_deref()
+            .and_then(|json| {
+                serde_json::from_str::<Vec<crate::genai::semantic::OutputMessage>>(json).ok()
+            })
+            .and_then(|messages| crate::genai::semantic::tool_call_ids_json(&messages));
         conn.execute(
+            // The SSE enrichment contains provider-reported input. Store the
+            // semantic input convention used by live GenAI events, and mark
+            // it so aggregate readers do not add Anthropic cache tokens a
+            // second time. The provider is taken after this UPDATE's own
+            // COALESCE so the row's stored provider and the enrichment agree.
             "UPDATE genai_events SET
                 model            = COALESCE(?2, model),
                 trace_id         = COALESCE(?3, trace_id),
                 provider         = COALESCE(?4, provider),
                 output_messages  = COALESCE(?5, output_messages),
                 sse_event_count  = COALESCE(?6, sse_event_count),
-                input_tokens     = COALESCE(?7, input_tokens),
+                input_tokens     = CASE
+                                     WHEN ?7 IS NULL THEN input_tokens
+                                     WHEN LOWER(COALESCE(COALESCE(?4, provider), '')) = 'anthropic'
+                                     THEN ?7 + COALESCE(?10, cache_creation_tokens, 0)
+                                          + COALESCE(?11, cache_read_tokens, 0)
+                                     ELSE ?7
+                                   END,
+                input_tokens_includes_cache = CASE
+                                     WHEN ?7 IS NOT NULL THEN 1
+                                     ELSE input_tokens_includes_cache
+                                   END,
                 output_tokens    = COALESCE(?8, output_tokens),
-                total_tokens     = COALESCE(?7, input_tokens, 0)
-                                 + COALESCE(?8, output_tokens, 0)
-             WHERE call_id = ?1",
+                cache_creation_tokens = COALESCE(?10, cache_creation_tokens),
+                cache_read_tokens     = COALESCE(?11, cache_read_tokens),
+                total_tokens     = CASE
+                                     WHEN ?7 IS NOT NULL
+                                          AND LOWER(COALESCE(COALESCE(?4, provider), '')) = 'anthropic'
+                                     THEN ?7 + COALESCE(?10, cache_creation_tokens, 0)
+                                              + COALESCE(?11, cache_read_tokens, 0)
+                                     WHEN ?7 IS NOT NULL THEN ?7
+                                     WHEN input_tokens_includes_cache = 1 THEN COALESCE(input_tokens, 0)
+                                     WHEN LOWER(COALESCE(COALESCE(?4, provider), '')) = 'anthropic'
+                                     THEN COALESCE(input_tokens, 0)
+                                        + COALESCE(?10, cache_creation_tokens, 0)
+                                        + COALESCE(?11, cache_read_tokens, 0)
+                                     ELSE COALESCE(input_tokens, 0)
+                                   END
+                                 + COALESCE(?8, output_tokens, 0),
+                tool_call_ids    = COALESCE(?9, tool_call_ids)
+             WHERE call_id = ?1 AND status = 'pending'",
             params![
                 call_id,
                 enrichment.model,
@@ -772,6 +910,9 @@ impl GenAISqliteStore {
                 enrichment.sse_event_count,
                 enrichment.input_tokens,
                 enrichment.output_tokens,
+                tool_call_ids,
+                enrichment.cache_creation_tokens,
+                enrichment.cache_read_tokens,
             ],
         )?;
         Ok(())
@@ -801,12 +942,23 @@ impl GenAISqliteStore {
         call_id: &str,
         new_session_id: &str,
     ) -> Result<usize, Box<dyn std::error::Error>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| format!("GenAI session fix-up mutex poisoned: {error}"))?;
         // GLOB is case-sensitive (unlike LIKE), so uppercase hex fails the
         // guard by design; a NULL session_id yields NULL and never matches.
         let updated = conn.execute(
             "UPDATE genai_events
-             SET session_id = ?1
+             SET session_id = ?1,
+                 event_json = CASE
+                     WHEN json_valid(event_json) THEN CASE
+                         WHEN json_type(event_json, '$.LLMCall.metadata') = 'object'
+                         THEN json_set(event_json, '$.LLMCall.metadata.session_id', ?1)
+                         ELSE event_json
+                     END
+                     ELSE event_json
+                 END
              WHERE call_id = ?2
                AND session_id != ?1
                AND length(session_id) = 32

@@ -13,6 +13,11 @@
 | 路径约定 | 下文模块落点相对于组件根目录 `src/agent-sec-core/` |
 | 验收类型 | MIGRATION_EQUIVALENCE（见[《Rust 迁移总计划》](AGENT_SEC_RUST_MIGRATION_zh.md) §5.1） |
 
+> 后续接线说明：本文描述 2026-09-11 的存储层迁移范围。当前 daemon 已使用显式路径的
+> security-event 双写，并接入共用 scan lifecycle 与独立 telemetry；详见
+> [共享执行生命周期](RUST_SECURITY_CORE_EXECUTION_ARCHITECTURE_zh.md#54-已实现的共享生命周期)。下文“不接 daemon”只描述原工作包边界，
+> 不代表当前 checkout 无生产消费者。observability ingestion/query 仍未接入 daemon。
+
 ## 1. 范围与非范围
 
 ### 1.1 迁入范围
@@ -21,13 +26,13 @@ v1 侧共约 3900 行 Python，落到 7 个新 crate：
 
 | crate | 路径 | 职责 | v1 来源 |
 | --- | --- | --- | --- |
-| `asc-security-events` | `v2/crates/data/asc-security-events/` | 事件值类型、时间戳规范化、路径三级降级、修订登记表 | `security_events/{schema,config}.py` |
-| `asc-observability` | `v2/crates/data/asc-observability/` | 六个 hook 的判别联合、metrics 白名单、相关 ID 截断 | `observability/{schema,models}.py` |
-| `asc-event-log` | `v2/crates/data/asc-event-log/` | JSONL 追加写、flock、轮转与备份保留 | `security_events/writer.py` |
-| `asc-sqlite-kernel` | `v2/crates/data/persistence/asc-sqlite-kernel/` | 与领域无关的 SQLite 内核：连接、schema 收敛、写入阶梯、维护闸门 | `security_events/orm_store.py` + 两个 `sqlite_writer.py` 的公共部分 |
-| `asc-persistence-sqlite` | `v2/crates/data/persistence/asc-persistence-sqlite/` | 两条流的领域绑定：表契约、仓储、故障策略、迁移器 | `*/models.py`、`*/repositories.py`、`*/sqlite_{writer,reader}.py` |
-| `asc-security-summary` | `v2/crates/data/asc-security-summary/` | 摘要文本渲染 | `security_events/summary_formatter.py` |
-| `asc-event-sink` | `v2/crates/data/asc-event-sink/` | 双写装配、进程级单例、关停 | `security_events/__init__.py`、`observability/__init__.py` |
+| `asc-security-events` | `v2/crates/asc-security-events/` | 事件值类型、时间戳规范化、路径三级降级、修订登记表 | `security_events/{schema,config}.py` |
+| `asc-observability` | `v2/crates/asc-observability/` | 六个 hook 的判别联合、metrics 白名单、相关 ID 截断 | `observability/{schema,models}.py` |
+| `asc-event-log` | `v2/crates/asc-event-log/` | JSONL 追加写、flock、轮转与备份保留 | `security_events/writer.py` |
+| `asc-sqlite-kernel` | `v2/crates/asc-sqlite-kernel/` | 与领域无关的 SQLite 内核：连接、schema 收敛、写入阶梯、维护闸门 | `security_events/orm_store.py` + 两个 `sqlite_writer.py` 的公共部分 |
+| `asc-persistence-sqlite` | `v2/crates/asc-persistence-sqlite/` | 两条流的领域绑定：表契约、仓储、故障策略、迁移器 | `*/models.py`、`*/repositories.py`、`*/sqlite_{writer,reader}.py` |
+| `asc-security-summary` | `v2/crates/asc-security-summary/` | 摘要文本渲染 | `security_events/summary_formatter.py` |
+| `asc-event-sink` | `v2/crates/asc-event-sink/` | 双写装配、进程级单例、关停 | `security_events/__init__.py`、`observability/__init__.py` |
 
 ### 1.2 明确不做
 
@@ -35,7 +40,7 @@ v1 侧共约 3900 行 Python，落到 7 个新 crate：
 - **不做 `asc-state-migrator`。** 那是产品入口层的工作包，本层只提供库内 schema 收敛。
 - **不迁调用方。** `correlation.py`、`review.py`、`cli.py`、`session_report.py` 以及各
   Agent Hook 都是本层的消费者，其测试不在搬迁范围（见
-  [`v2/crates/data/TEST_MIGRATION.md`](../../v2/crates/data/TEST_MIGRATION.md) §Out of scope）。
+  [`v2/crates/DATA_TEST_MIGRATION.md`](../../v2/crates/DATA_TEST_MIGRATION.md) §Out of scope）。
 
 ## 2. OPEN 项定案
 
@@ -290,9 +295,14 @@ v1 用**两种不同机制**完成 1→3，v2 都保留：
 文件记录上次时间、`<db>.maintenance.lock` 做跨进程互斥，默认间隔一天。标记损坏、标记
 时间在未来、间隔非正数都有明确行为（分别是「视为不存在」「视为过期」「总是执行」）。
 
-**闸门只在维护回调返回成功时前进。** 但 writer 的 `run_maintenance` 有意吞掉裁剪错误，
-所以「裁剪失败」在闸门看来仍是成功，标记照常写入——这与 v1 相同（v1 的 prune 也是内部
-catch）。差别只在失败后是否 dispose 连接，见 §10.3。
+**闸门只在维护回调返回成功时前进。** 自 #6602 起，writer 的 `run_maintenance` 传播裁剪
+错误：裁剪失败的 pass 不写标记，下一次维护机会直接重试而不是等满一个窗口。gate 自身的
+失败同样以结构化结果透出（`MaintenanceOutcome`：`NotDue`/`Contended`/`Ran`/`Failed`，
+覆盖 lock 文件打开/加锁失败与 marker 写/改名失败），不再与「未到期」混淆；持有 `Contended`
+表示他进程持锁。checkpoint 保持 v1 的 best-effort 语义（`repository.rs` 默认实现吞错），
+不计入 `Failed`。与 v1 相同的差别只在失败后是否 dispose 连接，见 §10.3。长驻 daemon 的
+周期触发、admission 排序与 shutdown 生命周期契约见
+`DAEMON_JOB_CONTRACT_zh.md` §11.5。
 
 ## 6. 去重与抽象
 
@@ -364,7 +374,7 @@ writer/reader`），因为两条流的表契约、故障策略和迁移机制都
 | 差分矩阵 | 迁移期本地工具，27 项。两侧各有一个对偶探针，同一套子命令、同一输出格式，diff stdout。它不随仓库交付；结论已固化为 crate 内用例、API 台账与冻结 fixture |
 | API 台账 | `api_parity.rs`，见 §8 |
 | 冻结 fixture | `scripts/gen-v1-db-fixtures.sh` 生成 5 个历史版本库 + 9 份预期投影 JSON；`tests/v1_fixtures.rs` 只用 `cargo test` 就能验升级路径。**oracle 由 v1 生成**——从 v2 生成会让测试同义反复 |
-| 测试搬迁账本 | [`TEST_MIGRATION.md`](../../v2/crates/data/TEST_MIGRATION.md)：v1 16 个文件 322 个用例逐条映射到 v2 的 364 个用例，废弃项恰好 2 个且都是 SQLAlchemy 实现细节 |
+| 测试搬迁账本 | [`TEST_MIGRATION.md`](../../v2/crates/DATA_TEST_MIGRATION.md)：v1 16 个文件 322 个用例逐条映射到 v2 的 364 个用例，废弃项恰好 2 个且都是 SQLAlchemy 实现细节 |
 
 差分矩阵与账本分工不同：矩阵验「两个版本对同一个库行为一致」，账本验「v2 自身的分支
 覆盖不低于 v1」。
@@ -374,8 +384,9 @@ writer/reader`），因为两条流的表契约、故障策略和迁移机制都
 ### 10.1 无 `atexit`
 
 v1 靠 `atexit` 注册 writer 的 `close`，进程退出时自动跑维护。Rust 没有等价物，因此
-`asc-event-sink` 暴露显式的 `shutdown_sinks()`。**composition root 必须调它**，否则
-裁剪与 checkpoint 永远不会发生（§11.2）。
+host 必须显式关闭 writer。进程全局安全事件 sinks 通过 `shutdown_sinks()` 关闭；
+daemon 持有的 configured sinks 由 composition root 在 drain 后调用 `close()`。
+可观测采集仅使用 `ConfiguredObservabilitySinks`，不再提供全局 accessor/record API。
 
 ### 10.2 `format_summary_at` 的存在理由
 
@@ -529,7 +540,7 @@ pytest 默认串行，所以 v1 用 `autouse` fixture 改 `AGENT_SEC_DATA_DIR` �
 
 ### 13.2 必须串行的用例
 
-只有 `asc-event-sink` 有进程级全局状态（四个 `OnceLock` sink slot），它的 15 个有状态
+`asc-event-sink` 的安全事件路径保留进程级全局状态（三个 `RwLock` slot），其有状态
 用例统一取 `test_support::serial()`（进程内 `Mutex`）。**没有任何地方需要
 `--test-threads=1`**。清单见 `TEST_MIGRATION.md` §Serial cases。
 

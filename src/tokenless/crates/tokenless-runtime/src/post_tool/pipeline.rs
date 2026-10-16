@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokenless_ccr::{InMemoryStore, StashStore, StashWrite};
 use tokenless_compressors::{
-    BuildLogCompressor, BuildLogOperation, JsonCompressionConfig, JsonCompressionContext,
-    JsonCompressor, JsonOperation, SearchResultsCompressor, TabularCompressor, TabularOperation,
+    BuildLogCompressor, BuildLogOperation, HtmlExtractor, JsonCompressionConfig,
+    JsonCompressionContext, JsonCompressor, JsonError, JsonOperation, SearchResultsCompressor,
+    TabularCompressor, TabularOperation,
 };
 use tokenless_protocol::{
     AppliedOperation, BYTE_ESTIMATOR_ID, ContentOrigin, ContentType, Disposition, PostToolRequest,
@@ -28,6 +29,7 @@ pub(crate) struct PostToolPipelineConfig {
     pub(crate) compression_enabled: bool,
     pub(crate) search_path_sharing_enabled: bool,
     pub(crate) diff_compression_enabled: bool,
+    pub(crate) html_extraction_enabled: bool,
     pub(crate) stash_enabled: bool,
     pub(crate) require_reversibility: bool,
     pub(crate) force_json: bool,
@@ -89,18 +91,29 @@ impl PostToolPipeline {
         // Tabular. Shape detection does not remove the need to retain every
         // match; other domain compressors may drop rows or rewrite source text.
         let search_only = request.tool_name == "Grep";
+        // Data printed by a shell file read (`cat build.log`) compresses like
+        // command output; a page printed that way is source the agent may edit,
+        // so only HTML keeps it verbatim. Read tool results were excluded above.
+        let shell_output = matches!(
+            request.content_origin,
+            ContentOrigin::CommandOutput | ContentOrigin::FileRead
+        );
         let diff_candidate = config.diff_compression_enabled
             && !search_only
             && content_type == ContentType::Diff
-            && request.content_origin == ContentOrigin::CommandOutput
+            && shell_output
+            && request.capabilities.replace_with_text;
+        let html_candidate = config.html_extraction_enabled
+            && !search_only
+            && content_type == ContentType::Html
+            && request.content_origin != ContentOrigin::FileRead
             && request.capabilities.replace_with_text;
         let json_candidate = !search_only
             && (config.force_json
                 || content_type == ContentType::Json
                 || is_wrapped_structured_json(&request.content));
-        let build_log_candidate = !search_only
-            && content_type == ContentType::BuildLog
-            && request.content_origin == ContentOrigin::CommandOutput;
+        let build_log_candidate =
+            !search_only && content_type == ContentType::BuildLog && shell_output;
         let tabular_candidate = !search_only
             && content_type == ContentType::Tabular
             && request.capabilities.replace_with_text;
@@ -109,6 +122,7 @@ impl PostToolPipeline {
             && content_type == ContentType::SearchResults
             && request.capabilities.replace_with_text;
         if !diff_candidate
+            && !html_candidate
             && !json_candidate
             && !build_log_candidate
             && !tabular_candidate
@@ -159,6 +173,33 @@ impl PostToolPipeline {
                     unrecoverable_truncations: None,
                 }
             }
+        } else if html_candidate {
+            if let Some(store) = attached_store
+                && let Some(view) = HtmlExtractor.render(&request.content)
+            {
+                let write = store
+                    .stash(&request.content)
+                    .map_err(|error| PostToolPipelineError(error.to_string()))?;
+                let hint =
+                    tokenless_ccr::recovery_instruction(&write.key, &request.capabilities.recovery);
+                DomainCandidate {
+                    output: format!("{hint}\n{}", view.output),
+                    operations: vec![AppliedOperation::HtmlExtraction],
+                    recoverability: tokenless_compressors::Recoverability::Retrievable,
+                    stash_writes: vec![write],
+                    stash_errors: 0,
+                    unrecoverable_truncations: None,
+                }
+            } else {
+                DomainCandidate {
+                    output: request.content.clone(),
+                    operations: Vec::new(),
+                    recoverability: tokenless_compressors::Recoverability::Lossless,
+                    stash_writes: Vec::new(),
+                    stash_errors: 0,
+                    unrecoverable_truncations: None,
+                }
+            }
         } else if json_candidate {
             let context = JsonCompressionContext {
                 recovery: &request.capabilities.recovery,
@@ -168,9 +209,20 @@ impl PostToolPipeline {
                 min_toon_chars: config.min_toon_chars,
                 allow_unrecoverable: !config.require_reversibility || !config.compression_enabled,
             };
-            let outcome = JsonCompressor::new(config.json.clone())
+            let outcome = match JsonCompressor::new(config.json.clone())
                 .compress(&request.content, &context)
-                .map_err(|error| PostToolPipelineError(error.to_string()))?;
+            {
+                Ok(outcome) => outcome,
+                // The bracket sniff that routed this content here inspects
+                // only the first and last non-whitespace bytes, so
+                // concatenated documents (for example stream JSON printed
+                // one object per line) reach the JSON compressor without
+                // parsing. The compressor is the parsing authority; treat
+                // the misroute as passthrough instead of failing the call.
+                Err(JsonError::InvalidJson(_)) => {
+                    return Ok(passthrough(request, before_tokens, content_type));
+                }
+            };
             DomainCandidate {
                 output: outcome.output,
                 operations: json_operations(&outcome.operations),
@@ -241,8 +293,12 @@ impl PostToolPipeline {
             original: &request.content,
             candidate: &candidate.output,
             has_operations: !candidate.operations.is_empty(),
-            // Reject marginal Diff estimates after including wrapper and recovery text.
-            min_token_savings: if diff_candidate { 16 } else { 1 },
+            // Reject marginal Diff and HTML estimates after including wrapper and recovery text.
+            min_token_savings: if diff_candidate || html_candidate {
+                16
+            } else {
+                1
+            },
             recoverability: candidate.recoverability,
             require_reversibility: config.require_reversibility && config.compression_enabled,
             dry_run: !config.compression_enabled,
@@ -400,6 +456,7 @@ mod tests {
 
     use super::*;
     include!("tests/tabular_pipeline_tests.rs");
+    include!("tests/html_pipeline_tests.rs");
     fn search_input() -> String {
         (1..30)
             .map(|line| format!("crates/long_directory/src/search_file.rs:{line}:  value  \r\n"))
@@ -550,16 +607,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bracket_sniffed_non_json_passes_through_instead_of_failing() {
+        // Two concatenated JSON documents look like JSON to the bracket
+        // sniff but do not parse. The detector delegates authority to the
+        // JSON compressor, so this misroute must degrade to passthrough
+        // rather than failing the whole PostTool call.
+        let input = "{\"items\": [1, 2, 3]}\n{\"second\": \"document\"}\n";
+        let mut req = request(input);
+        req.tool_name = "WebFetch".into();
+        let run = PostToolPipeline::run(&req, &build_log_config(), None).unwrap();
+        assert_eq!(run.response.disposition, Disposition::Passthrough);
+        assert_eq!(run.response.output, input);
+        assert_eq!(run.response.content_type, Some(ContentType::Json));
+        assert!(run.response.applied_operations.is_empty());
+        assert!(run.response.stash_keys.is_empty());
+    }
+
     #[derive(Default)]
     struct CountingStore {
         inner: InMemoryStore,
         stash_calls: AtomicUsize,
         delete_calls: AtomicUsize,
+        /// When nonzero, `stash` starts failing after that many calls.
+        fail_stashes_after: usize,
     }
 
     impl StashStore for CountingStore {
         fn stash(&self, payload: &str) -> Result<StashWrite, StashError> {
-            self.stash_calls.fetch_add(1, Ordering::Relaxed);
+            let calls = self.stash_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_stashes_after != 0 && calls >= self.fail_stashes_after {
+                return Err(StashError::Backend("simulated mid-run failure".to_owned()));
+            }
             self.inner.stash(payload)
         }
 
@@ -588,6 +667,7 @@ mod tests {
             content: content.into(),
             status: ToolResultStatus::Success,
             content_origin: ContentOrigin::CommandOutput,
+            command: None,
             output_optimization: OutputOptimization::None,
             capabilities: PostToolCapabilities {
                 replace_output: true,
@@ -605,6 +685,7 @@ mod tests {
             compression_enabled: true,
             search_path_sharing_enabled: true,
             diff_compression_enabled: false,
+            html_extraction_enabled: false,
             stash_enabled: true,
             require_reversibility: false,
             force_json: true,
@@ -689,6 +770,36 @@ mod tests {
         assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 1);
         assert_eq!(concrete.delete_calls.load(Ordering::Relaxed), 1);
         assert_eq!(concrete.len(), 0);
+    }
+
+    #[test]
+    fn a_marked_json_document_is_compressed_not_bypassed() {
+        // The detector skips one leading byte-order mark, so the marked page
+        // takes the JSON path; the parser must skip it too, or that routing
+        // turns a passthrough into a pipeline error. Recovery keeps the
+        // marked bytes exactly.
+        let plain = serde_json::to_string(&serde_json::json!({
+            "debug": "discarded noise",
+            "items": (0..12)
+                .map(|index| format!("item-{index}-{}", "x".repeat(80)))
+                .collect::<Vec<_>>(),
+        }))
+        .unwrap();
+        let input = format!("\u{feff}{plain}");
+        let concrete = Arc::new(CountingStore::default());
+        let store: Arc<dyn StashStore> = concrete.clone();
+        let mut config = build_log_config();
+        config.json.truncate_arrays_at = 2;
+        let run = PostToolPipeline::run(&request(&input), &config, Some(&store)).unwrap();
+
+        assert_eq!(run.response.content_type, Some(ContentType::Json));
+        assert_eq!(run.response.disposition, Disposition::Applied);
+        assert!(run.response.output.chars().count() < input.chars().count());
+        assert!(!run.response.output.contains('\u{feff}'));
+        // The JSON domain stashes the truncated tail for replay recovery;
+        // the uncompressed twin takes exactly this path, mark aside.
+        assert_eq!(run.response.stash_keys.len(), 1);
+        assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -809,6 +920,36 @@ mod tests {
             .collect()
     }
 
+    fn build_log_with_midway_diagnostic() -> String {
+        // One cargo run split by a diagnostic into two reducible blocks, so
+        // the compressor performs two stash writes.
+        let mut output = "$ cargo build\n".to_owned();
+        for index in 0..30 {
+            if index == 15 {
+                output.push_str("error[E0308]: mismatched types\n  --> src/main.rs:3:4\n");
+            }
+            output.push_str(&format!(
+                "Compiling package-{index:03} v0.1.{index} with extended progress output\n"
+            ));
+        }
+        output.push_str("Finished `dev` profile [unoptimized] target(s) in 1.2s\n");
+        output
+    }
+
+    fn build_log_with_duplicate_blocks() -> String {
+        // Two routine blocks whose omitted payloads are identical, so the
+        // compressor creates then refreshes a single stash row.
+        let mut output = "$ cargo build\n".to_owned();
+        for group in 0..2 {
+            for _ in 0..12 {
+                output.push_str("Compiling package v0.1.0 with extended progress output\n");
+            }
+            output.push_str(&format!("phase boundary {group}\n"));
+        }
+        output.push_str("Finished `dev` profile [unoptimized] target(s) in 1.2s\n");
+        output
+    }
+
     fn build_log_config() -> PostToolPipelineConfig {
         let mut config = config(Duration::from_secs(1), 32);
         config.force_json = false;
@@ -859,28 +1000,32 @@ mod tests {
     #[test]
     fn diff_retains_changes_and_recovers_original_with_one_stash_write() {
         let input = diff_input(100);
-        let concrete = Arc::new(CountingStore::default());
-        let store: Arc<dyn StashStore> = concrete.clone();
-        let mut config = build_log_config();
-        config.diff_compression_enabled = true;
-        let run = PostToolPipeline::run(&request(&input), &config, Some(&store)).unwrap();
+        for origin in [ContentOrigin::CommandOutput, ContentOrigin::FileRead] {
+            let concrete = Arc::new(CountingStore::default());
+            let store: Arc<dyn StashStore> = concrete.clone();
+            let mut config = build_log_config();
+            config.diff_compression_enabled = true;
+            let mut req = request(&input);
+            req.content_origin = origin;
+            let run = PostToolPipeline::run(&req, &config, Some(&store)).unwrap();
 
-        assert_eq!(run.response.disposition, Disposition::Applied);
-        assert_eq!(
-            run.response.applied_operations,
-            [AppliedOperation::DiffReduction]
-        );
-        assert_eq!(run.response.recoverability, Recoverability::Retrievable);
-        assert!(run.response.output.contains("-old\n+new\n tail\n"));
-        assert!(run.response.output.contains("@@ -9,4 +9,4 @@"));
-        assert!(run.response.before_tokens - run.response.after_tokens >= 16);
-        assert_eq!(run.response.stash_keys.len(), 1);
-        assert_eq!(
-            concrete.retrieve(&run.response.stash_keys[0]).unwrap(),
-            Some(input)
-        );
-        assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(concrete.delete_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(run.response.disposition, Disposition::Applied);
+            assert_eq!(
+                run.response.applied_operations,
+                [AppliedOperation::DiffReduction]
+            );
+            assert_eq!(run.response.recoverability, Recoverability::Retrievable);
+            assert!(run.response.output.contains("-old\n+new\n tail\n"));
+            assert!(run.response.output.contains("@@ -9,4 +9,4 @@"));
+            assert!(run.response.before_tokens - run.response.after_tokens >= 16);
+            assert_eq!(run.response.stash_keys.len(), 1);
+            assert_eq!(
+                concrete.retrieve(&run.response.stash_keys[0]).unwrap(),
+                Some(input.clone())
+            );
+            assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(concrete.delete_calls.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[test]
@@ -925,21 +1070,76 @@ mod tests {
 
     #[test]
     fn one_build_log_domain_reaches_one_final_commit() {
+        for origin in [ContentOrigin::CommandOutput, ContentOrigin::FileRead] {
+            let concrete = Arc::new(CountingStore::default());
+            let store: Arc<dyn StashStore> = concrete.clone();
+            let mut req = request(&build_log());
+            req.content_origin = origin;
+            let run = PostToolPipeline::run(&req, &build_log_config(), Some(&store)).unwrap();
+
+            assert_eq!(run.response.disposition, Disposition::Applied);
+            assert_eq!(run.response.content_type, Some(ContentType::BuildLog));
+            assert_eq!(run.operations, [AppliedOperation::BuildLogReduction]);
+            assert_eq!(
+                run.response.applied_operations,
+                [AppliedOperation::BuildLogReduction]
+            );
+            assert_eq!(run.response.recoverability, Recoverability::Retrievable);
+            assert_eq!(run.response.stash_keys.len(), 1);
+            assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(concrete.delete_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(concrete.len(), 1);
+        }
+    }
+
+    #[test]
+    fn partial_build_log_stash_failure_deletes_orphaned_tentative_writes() {
+        // The compressor's second stash write fails mid-run: it returns the
+        // lossless original plus one tentative write, and the pipeline must
+        // delete that orphaned row instead of leaving an unreachable entry.
+        let concrete = Arc::new(CountingStore {
+            fail_stashes_after: 1,
+            ..CountingStore::default()
+        });
+        let store: Arc<dyn StashStore> = concrete.clone();
+        let input = build_log_with_midway_diagnostic();
+
+        let run =
+            PostToolPipeline::run(&request(&input), &build_log_config(), Some(&store)).unwrap();
+
+        assert_eq!(run.response.disposition, Disposition::NoSavings);
+        assert_eq!(run.response.output, input);
+        assert!(run.response.applied_operations.is_empty());
+        assert!(run.response.stash_keys.is_empty());
+        assert_eq!(run.stash_errors, Some(1));
+        assert_eq!(run.stash_writes, Some(0));
+        assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(concrete.delete_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(concrete.len(), 0);
+    }
+
+    #[test]
+    fn applied_build_log_with_duplicate_payloads_commits_one_row() {
+        // Two omission blocks share one payload: the compressor creates then
+        // refreshes one row, both markers carry its key, and commit reports
+        // the key exactly once with a single surviving row.
         let concrete = Arc::new(CountingStore::default());
         let store: Arc<dyn StashStore> = concrete.clone();
-        let run = PostToolPipeline::run(&request(&build_log()), &build_log_config(), Some(&store))
-            .unwrap();
+        let input = build_log_with_duplicate_blocks();
+
+        let run =
+            PostToolPipeline::run(&request(&input), &build_log_config(), Some(&store)).unwrap();
 
         assert_eq!(run.response.disposition, Disposition::Applied);
-        assert_eq!(run.response.content_type, Some(ContentType::BuildLog));
-        assert_eq!(run.operations, [AppliedOperation::BuildLogReduction]);
+        assert_eq!(run.response.recoverability, Recoverability::Retrievable);
         assert_eq!(
             run.response.applied_operations,
             [AppliedOperation::BuildLogReduction]
         );
-        assert_eq!(run.response.recoverability, Recoverability::Retrievable);
         assert_eq!(run.response.stash_keys.len(), 1);
-        assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(run.stash_writes, Some(1));
+        assert_eq!(run.stash_errors, Some(0));
+        assert_eq!(concrete.stash_calls.load(Ordering::Relaxed), 2);
         assert_eq!(concrete.delete_calls.load(Ordering::Relaxed), 0);
         assert_eq!(concrete.len(), 1);
     }

@@ -90,6 +90,7 @@ class ContentOrigin(StrEnum):
 
     COMMAND_OUTPUT = "command_output"
     FILE_CONTENT = "file_content"
+    FILE_READ = "file_read"
     API_RESPONSE = "api_response"
 
 
@@ -130,6 +131,7 @@ class AppliedOperation(StrEnum):
     TABULAR_ROW_REDUCTION = "tabular_row_reduction"
     SEARCH_PATH_SHARING = "search_path_sharing"
     DIFF_REDUCTION = "diff_reduction"
+    HTML_EXTRACTION = "html_extraction"
     JSON_CLEANUP = "json_cleanup"
     JSON_RECORD_REDUCTION = "json_record_reduction"
     JSON_TRUNCATION = "json_truncation"
@@ -168,6 +170,7 @@ class TokenlessConfig:
     rtk_enabled: bool = True
     search_path_sharing_enabled: bool = True
     diff_compression_enabled: bool = False
+    html_extraction_enabled: bool = True
 
     def __post_init__(self) -> None:
         try:
@@ -274,6 +277,10 @@ class PostToolRequest:
     output_optimization: OutputOptimization
     capabilities: PostToolCapabilities
     attribution: Attribution
+    #: Shell command line behind a ``COMMAND_OUTPUT`` result, when the host has
+    #: it. Core reports a plain print of local files such as ``cat page.html``
+    #: as ``FILE_READ``; ignored for every other origin.
+    command: str | None = None
 
     def __post_init__(self) -> None:
         if not self.tool_name:
@@ -324,6 +331,7 @@ class TokenlessSdk:
             self.config.data_dir,
             search_path_sharing_enabled=self.config.search_path_sharing_enabled,
             diff_compression_enabled=self.config.diff_compression_enabled,
+            html_extraction_enabled=self.config.html_extraction_enabled,
         )
         self._rtk_path = self._resolve_rtk() if self.config.rtk_enabled else None
         self._stats: TokenlessStats | None = None
@@ -385,23 +393,24 @@ class TokenlessSdk:
 
     async def post_tool(self, request: PostToolRequest) -> PostToolResponse:
         """Runs Core PostTool routing and the content-domain Pipeline."""
+        payload: dict[str, Any] = {
+            "result_kind": request.result_kind,
+            "tool_name": request.tool_name,
+            "content": request.content,
+            "status": request.status,
+            "content_origin": request.content_origin,
+            "output_optimization": request.output_optimization,
+            "capabilities": {
+                "replace_output": request.capabilities.replace_output,
+                "recovery": request.capabilities.recovery.as_dict(),
+                "replace_with_text": request.capabilities.replace_with_text,
+            },
+        }
+        if request.command is not None:
+            payload["command"] = request.command
         response = await asyncio.to_thread(
             self.runtime._post_tool_json,
-            _json_dumps(
-                {
-                    "result_kind": request.result_kind,
-                    "tool_name": request.tool_name,
-                    "content": request.content,
-                    "status": request.status,
-                    "content_origin": request.content_origin,
-                    "output_optimization": request.output_optimization,
-                    "capabilities": {
-                        "replace_output": request.capabilities.replace_output,
-                        "recovery": request.capabilities.recovery.as_dict(),
-                        "replace_with_text": request.capabilities.replace_with_text,
-                    },
-                }
-            ),
+            _json_dumps(payload),
             **_attribution_kwargs(request.attribution),
         )
         value = _json_object(response)
