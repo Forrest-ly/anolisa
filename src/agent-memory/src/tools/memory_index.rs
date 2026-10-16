@@ -61,24 +61,49 @@ pub fn parse_index(content: &str) -> Vec<IndexEntry> {
         }
         // Format: - [title](path) — description
         let rest = &line[3..]; // skip "- ["
-        if let Some(bracket_end) = rest.find("](") {
-            let title = &rest[..bracket_end];
-            let after_bracket = &rest[bracket_end + 2..];
-            if let Some(paren_end) = after_bracket.find(')') {
-                let path = &after_bracket[..paren_end];
-                let description = after_bracket[paren_end + 1..]
-                    .trim_start_matches(" — ")
-                    .trim_start_matches(" - ")
-                    .to_string();
-                entries.push(IndexEntry {
-                    title: title.to_string(),
-                    path: path.to_string(),
-                    description,
-                });
-            }
+        if let Some(entry) = parse_entry_line(rest) {
+            entries.push(entry);
         }
     }
     entries
+}
+
+/// Parse one index line body — everything after the leading `- [`.
+///
+/// Titles are free-form text (a frontmatter `title:`, or the first body line),
+/// so a title may itself contain `"]("` and the first occurrence is not
+/// reliably the link opener. Try each `"]("` left to right and accept the first
+/// whose extracted path holds no `"]("`: a cut at a stray title bracket
+/// necessarily swallows the real opener's `"]("` into the candidate path, so
+/// the scan reaches the real link. A path never holds `"]("`, and every line
+/// that parsed correctly before parses identically — including one whose
+/// description holds `"]("` after the link.
+fn parse_entry_line(rest: &str) -> Option<IndexEntry> {
+    let mut offset = 0;
+    while let Some(found) = rest[offset..].find("](") {
+        let bracket_end = offset + found;
+        let after_bracket = &rest[bracket_end + 2..];
+        offset = bracket_end + 2;
+
+        let Some(paren_end) = after_bracket.find(')') else {
+            continue;
+        };
+        let path = &after_bracket[..paren_end];
+        if path.contains("](") {
+            continue;
+        }
+
+        let description = after_bracket[paren_end + 1..]
+            .trim_start_matches(" — ")
+            .trim_start_matches(" - ")
+            .to_string();
+        return Some(IndexEntry {
+            title: rest[..bracket_end].to_string(),
+            path: path.to_string(),
+            description,
+        });
+    }
+    None
 }
 
 /// Build a complete index by scanning all .md files in the mount.
@@ -258,6 +283,20 @@ fn extract_title_and_description(content: &str, fallback_path: &str) -> (String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AppConfig;
+    use tempfile::tempdir;
+
+    fn setup() -> (tempfile::TempDir, MemoryService) {
+        let tmp = tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.memory.paths.base_dir = tmp.path().to_string_lossy().to_string();
+        config.memory.index.enabled = false;
+        config.memory.git.enabled = false;
+        config.memory.consolidation.enabled = false;
+        config.memory.session.base_dir = tmp.path().join("sessions").to_string_lossy().to_string();
+        let svc = MemoryService::new(config).unwrap();
+        (tmp, svc)
+    }
 
     #[test]
     fn parse_index_basic() {
@@ -285,6 +324,92 @@ mod tests {
         };
         let line = entry.to_line();
         assert!(line.len() <= MAX_ENTRY_BYTES);
+    }
+
+    #[test]
+    fn index_entry_round_trips_through_parse_index() {
+        let entry = IndexEntry {
+            title: "array literal ]( vs concat".into(),
+            path: "notes/x.md".into(),
+            description: "pick one".into(),
+        };
+        let parsed = parse_index(&entry.to_line());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].title, entry.title);
+        assert_eq!(parsed[0].path, entry.path);
+        assert_eq!(parsed[0].description, entry.description);
+    }
+
+    #[test]
+    fn parse_index_keeps_link_in_description() {
+        // A description may itself contain "]("; the real link still wins
+        // because its path holds no "](".
+        let content = "- [Title](notes/x.md) — see ](other.md) for the syntax\n";
+        let entries = parse_index(content);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Title");
+        assert_eq!(entries[0].path, "notes/x.md");
+        assert_eq!(entries[0].description, "see ](other.md) for the syntax");
+    }
+
+    #[test]
+    fn parse_index_recovers_neighbors_of_bracket_title() {
+        let entries = [
+            IndexEntry {
+                title: "before".into(),
+                path: "notes/a.md".into(),
+                description: "first".into(),
+            },
+            IndexEntry {
+                title: "array literal ]( vs concat".into(),
+                path: "notes/x.md".into(),
+                description: "pick one".into(),
+            },
+            IndexEntry {
+                title: "after".into(),
+                path: "notes/z.md".into(),
+                description: "last".into(),
+            },
+        ];
+        let content = entries
+            .iter()
+            .map(IndexEntry::to_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = parse_index(&content);
+        assert_eq!(parsed.len(), entries.len());
+        for (got, want) in parsed.iter().zip(entries.iter()) {
+            assert_eq!(got.title, want.title);
+            assert_eq!(got.path, want.path);
+            assert_eq!(got.description, want.description);
+        }
+    }
+
+    #[test]
+    fn index_upsert_and_removal_match_a_bracket_title_entry() {
+        // The reported symptom: a corrupted path made the upsert miss (a
+        // duplicate line on every write) and the removal miss (entry kept).
+        let (_tmp, svc) = setup();
+        let entry = IndexEntry {
+            title: "array literal ]( vs concat".into(),
+            path: "notes/x.md".into(),
+            description: "pick one".into(),
+        };
+        update_index_entry(&svc, &entry).unwrap();
+
+        let mut revised = entry.clone();
+        revised.description = "pick two".into();
+        update_index_entry(&svc, &revised).unwrap();
+
+        let index_path = svc.mount.root.join(INDEX_FILE);
+        let parsed = parse_index(&std::fs::read_to_string(&index_path).unwrap());
+        assert_eq!(parsed.len(), 1, "upsert appended instead of replacing");
+        assert_eq!(parsed[0].title, entry.title);
+        assert_eq!(parsed[0].description, "pick two");
+
+        remove_index_entry(&svc, &entry.path).unwrap();
+        let left = parse_index(&std::fs::read_to_string(&index_path).unwrap());
+        assert!(left.is_empty(), "removal missed the entry: {left:?}");
     }
 
     #[test]
