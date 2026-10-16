@@ -63,6 +63,19 @@ def _write_tree(tree: ET.ElementTree, path: str) -> None:
         pass
 
 
+def style_index(raw: str | None) -> int:
+    """Parse a cell's optional ``s`` attribute into a style index.
+
+    The attribute may be absent, empty or non-numeric in files written by
+    other tools; none of those may abort an edit, so they all fall back to
+    the default index 0.
+    """
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
 def col_number(s: str) -> int:
     n = 0
     for c in s.upper():
@@ -128,7 +141,7 @@ def get_row_styles(ws_tree: ET.ElementTree, row_num: int) -> dict[str, int]:
                 ref = c.get("r", "")
                 col_str = re.match(r"([A-Z]+)", ref)
                 if col_str:
-                    styles[col_str.group(1)] = int(c.get("s", "0"))
+                    styles[col_str.group(1)] = style_index(c.get("s"))
             break
     return styles
 

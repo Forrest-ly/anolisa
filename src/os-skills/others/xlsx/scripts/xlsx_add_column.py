@@ -61,6 +61,19 @@ def _write_tree(tree: ET.ElementTree, path: str) -> None:
         pass
 
 
+def style_index(raw: str | None) -> int:
+    """Parse a cell's optional ``s`` attribute into a style index.
+
+    The attribute may be absent, empty or non-numeric in files written by
+    other tools; none of those may abort an edit, so they all fall back to
+    the default index 0.
+    """
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
 def col_number(s: str) -> int:
     n = 0
     for c in s.upper():
@@ -131,7 +144,7 @@ def get_cell_style(ws_tree: ET.ElementTree, col: str, row: int) -> int:
         if row_el.get("r") == str(row):
             for c in row_el:
                 if c.get("r") == ref:
-                    return int(c.get("s", "0"))
+                    return style_index(c.get("s"))
     return 0
 
 
@@ -219,7 +232,7 @@ def _apply_border_to_row(work_dir: str, ws_path: str, ws_tree: ET.ElementTree,
     row_el = row_map[border_row]
     # Collect all cells in this row and their styles
     for c in row_el:
-        old_s = int(c.get("s", "0"))
+        old_s = style_index(c.get("s"))
         if old_s not in style_remap:
             xf_list = list(cellxfs)
             ref_xf = xf_list[min(old_s, len(xf_list) - 1)]
@@ -232,7 +245,7 @@ def _apply_border_to_row(work_dir: str, ws_path: str, ws_tree: ET.ElementTree,
 
     # 3. Apply remapped styles to all cells in the row
     for c in row_el:
-        old_s = int(c.get("s", "0"))
+        old_s = style_index(c.get("s"))
         if old_s in style_remap:
             c.set("s", str(style_remap[old_s]))
 
