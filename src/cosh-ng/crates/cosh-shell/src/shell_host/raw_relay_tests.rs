@@ -177,7 +177,6 @@ fn buffered_pty_output_stays_before_queued_candidate_redraw() {
         &mut parser,
         &mut output,
         "prompt> ",
-        0,
         &mut echoed,
         &mut prompt_replay,
         &prompt_presentation,
@@ -312,13 +311,11 @@ fn relay_write_event_expires_armed_prompt_replay() {
 }
 
 #[test]
-fn any_pty_user_write_emits_the_prompt_cwd_invalidation_barrier() {
-    // Production wiring: a PTY write with zero detected line submits
-    // (submit detection cannot see custom `accept-line` bindings)
-    // must still emit the shell_pty_input barrier event that the
-    // dispatcher consumes to invalidate the prompt-cwd report.
-    // Consecutive writes collapse into one event; a fresh
-    // command-less prompt report re-arms the barrier.
+fn pty_user_writes_emit_independent_prompt_evidence_barriers() {
+    // Production wiring must invalidate both cwd evidence and prompt occupancy
+    // even when submit detection cannot see a custom `accept-line` binding.
+    // Cwd evidence is restored only by `ShellReady`, while every precmd restores
+    // prompt occupancy and independently re-arms that barrier.
     let mut parser = parser_for_test("pty-write-cwd-barrier");
     let (generation, mut prompt_replay) = tracker_for_test();
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -326,12 +323,12 @@ fn any_pty_user_write_emits_the_prompt_cwd_invalidation_barrier() {
     let mut echoed = 0usize;
     let prompt_presentation = PromptPresentation::new(false);
 
-    let barrier_count = |parser: &OscParser| {
+    let barrier_count = |parser: &OscParser, component| {
         parser
             .events
             .iter()
             .filter(|event| {
-                event.component.as_deref() == Some("shell_pty_input")
+                event.component.as_deref() == Some(component)
                     && event.message.as_deref() == Some("write")
             })
             .count()
@@ -350,16 +347,15 @@ fn any_pty_user_write_emits_the_prompt_cwd_invalidation_barrier() {
         &mut parser,
         &mut output,
         "prompt> ",
-        0,
         &mut echoed,
         &mut prompt_replay,
         &prompt_presentation,
     )
     .expect("drain pty writes");
     assert_eq!(
-        barrier_count(&parser),
+        barrier_count(&parser, "shell_pty_input"),
         1,
-        "consecutive writes must collapse into one barrier event"
+        "consecutive writes must collapse into one cwd barrier event"
     );
 
     // A fresh command-less prompt report re-arms the barrier, so the
@@ -376,16 +372,49 @@ fn any_pty_user_write_emits_the_prompt_cwd_invalidation_barrier() {
         &mut parser,
         &mut output,
         "prompt> ",
-        0,
         &mut echoed,
         &mut prompt_replay,
         &prompt_presentation,
     )
     .expect("drain post-prompt write");
     assert_eq!(
-        barrier_count(&parser),
+        barrier_count(&parser, "shell_pty_input"),
         2,
-        "a fresh prompt report must re-arm the barrier"
+        "a command-less prompt report must re-arm the cwd barrier"
+    );
+
+    parser
+        .feed(
+            b"\x1b]1337;COSH;{\"event\":\"preexec\",\"token\":\"test-marker-token\",\"command\":\"true\",\"cwd\":\"/tmp\"}\x07",
+        )
+        .expect("feed preexec");
+    feed_shell_ready(&mut parser);
+    sender
+        .send(crate::raw_input::RawInputEvent::PtyUserWrite {
+            generation: generation.bump(),
+            line_submits: 0,
+        })
+        .expect("queue post-command write");
+    drain_raw_input_events(
+        &receiver,
+        &mut parser,
+        &mut output,
+        "prompt> ",
+        &mut echoed,
+        &mut prompt_replay,
+        &prompt_presentation,
+    )
+    .expect("drain post-command write");
+
+    assert_eq!(
+        barrier_count(&parser, "shell_pty_input"),
+        2,
+        "command completion must not restore invalidated cwd evidence"
+    );
+    assert_eq!(
+        barrier_count(&parser, "shell_prompt_input"),
+        3,
+        "command completion must re-arm the prompt occupancy barrier"
     );
 }
 
@@ -413,7 +442,6 @@ fn composer_slash_retains_workspace_before_the_next_shell_ready() {
         &mut parser,
         &mut Vec::new(),
         "prompt$ ",
-        0,
         &mut 0,
         &mut prompt_replay,
         &PromptPresentation::new(false),
@@ -453,7 +481,6 @@ fn candidate_hint_uses_terminfo_cursor_save_restore() {
         &mut parser,
         &mut output,
         "",
-        0,
         &mut echoed,
         &mut prompt_replay,
         &prompt_presentation,
@@ -499,7 +526,6 @@ fn isolated_candidate_repaints_do_not_add_status_lines() {
         &mut parser,
         &mut output,
         "prompt> ",
-        0,
         &mut echoed,
         &mut prompt_replay,
         &prompt_presentation,
@@ -536,7 +562,6 @@ fn candidate_hint_disables_autowrap_in_both_branches() {
             &mut parser,
             &mut output,
             prompt,
-            0,
             &mut echoed,
             &mut prompt_replay,
             &prompt_presentation,
@@ -739,6 +764,109 @@ fn typeahead_submission_blocks_arm_until_its_own_prompt_boundary() {
     prompt_replay.observe_prompt_boundary();
     prompt_replay.arm_for_replay(b"prompt> ");
     assert!(prompt_replay.is_armed());
+}
+
+#[test]
+fn uncounted_input_holds_occupancy_through_a_quiet_painted_prompt() {
+    let (generation, mut prompt_replay) = tracker_for_test();
+
+    prompt_replay.observe_user_write(generation.bump(), 1);
+    prompt_replay.observe_user_write(generation.bump(), 0);
+    assert!(prompt_replay.observe_prompt_boundary());
+
+    // A prefix key bound to accept-line fires only after the line editor's
+    // key timeout, so even a long quiet painted prompt proves nothing about
+    // the unclassified input; the counted submit alone is written off.
+    prompt_replay.set_idle_reconcile_window(Duration::ZERO);
+    assert!(!prompt_replay.reconcile_idle_at_prompt(false, true, None));
+    assert!(!prompt_replay.has_unconsumed_submit());
+    assert!(prompt_replay.observe_prompt_boundary());
+}
+
+#[test]
+fn uncounted_write_holds_prompt_occupancy_in_every_shell() {
+    // zsh `bindkey` widgets are as invisible to byte counting as Readline
+    // `bind` ones, so no shell may treat a zero-count write as pure editing.
+    let (generation, mut prompt_replay) = tracker_for_test();
+    prompt_replay.set_idle_reconcile_window(Duration::ZERO);
+
+    prompt_replay.observe_user_write(generation.bump(), 0);
+    assert!(prompt_replay.observe_prompt_boundary());
+    // Nothing can release the hold, so the relay must not schedule idle
+    // wakeups for it either.
+    assert_eq!(
+        prompt_replay.idle_reconcile_remaining(false, true, None),
+        None
+    );
+    assert!(!prompt_replay.reconcile_idle_at_prompt(false, true, None));
+    assert!(prompt_replay.observe_prompt_boundary());
+}
+
+#[test]
+fn consecutive_uncounted_submissions_hold_through_every_command_boundary() {
+    let (generation, mut prompt_replay) = tracker_for_test();
+
+    prompt_replay.observe_user_write(generation.bump(), 1);
+    // One coalesced PTY write may contain any number of custom accept-line
+    // keys, so it deliberately records no guessed submission count.
+    prompt_replay.observe_user_write(generation.bump(), 0);
+
+    // The foreground command and both queued commands each produce a
+    // boundary, but none is proof that the line editor exhausted the queue.
+    for _ in 0..3 {
+        assert!(prompt_replay.observe_prompt_boundary());
+        assert!(!prompt_replay.reconcile_idle_at_prompt(true, true, None));
+    }
+
+    // Idling at the last prompt is no proof either.
+    prompt_replay.set_idle_reconcile_window(Duration::ZERO);
+    assert!(!prompt_replay.reconcile_idle_at_prompt(false, true, None));
+    assert!(prompt_replay.observe_prompt_boundary());
+}
+
+#[test]
+fn idle_write_off_restores_replay_dedup_but_keeps_held_occupancy() {
+    let (generation, mut prompt_replay) = tracker_for_test();
+    prompt_replay.set_idle_reconcile_window(Duration::ZERO);
+
+    // `read value` plus a typed reply consumed by `read`: the reply's counted
+    // submit never gets a boundary, and the typed keys are unclassified.
+    prompt_replay.observe_user_write(generation.bump(), 1);
+    prompt_replay.observe_user_write(generation.bump(), 0);
+    prompt_replay.observe_user_write(generation.bump(), 1);
+    assert!(prompt_replay.observe_prompt_boundary());
+    prompt_replay.arm_for_replay(b"prompt> ");
+    assert!(!prompt_replay.is_armed());
+
+    // The write-off recovers dedup without claiming the prompt is free.
+    assert!(!prompt_replay.reconcile_idle_at_prompt(false, true, None));
+    prompt_replay.arm_for_replay(b"prompt> ");
+    assert!(prompt_replay.is_armed());
+    assert!(prompt_replay.observe_prompt_boundary());
+}
+
+#[test]
+fn held_occupancy_still_arms_replay_and_passes_accept_line_responses() {
+    let (generation, mut prompt_replay) = tracker_for_test();
+
+    prompt_replay.observe_user_write(generation.bump(), 0);
+    assert!(prompt_replay.observe_prompt_boundary());
+
+    // Plain editing keys look exactly like custom accept-line keys; arming
+    // keeps a panel restore from repainting the prompt twice.
+    prompt_replay.arm_for_replay(b"prompt> \x1b[?2004h");
+    assert!(prompt_replay.is_armed());
+
+    // A hidden accept-line response opens with the paste disable, so the
+    // fail-open strip leaves it and the following prompt paint intact.
+    assert_eq!(
+        prompt_replay.strip(b"\x1b[?2004l\r\r\n"),
+        b"\x1b[?2004l\r\r\n"
+    );
+    assert_eq!(
+        prompt_replay.strip(b"prompt> \x1b[?2004h"),
+        b"prompt> \x1b[?2004h"
+    );
 }
 
 #[test]
@@ -1040,6 +1168,7 @@ fn prompt_fragment_after_restore_keeps_ghost_last_on_screen() {
 #[test]
 fn wrapped_candidate_erase_clears_the_rows_above_the_cursor() {
     let mut parser = parser_for_test("candidate-wrapped-erase");
+    parser.set_terminal_columns(40);
     let (_generation, mut prompt_replay) = tracker_for_test();
     let (sender, receiver) = std::sync::mpsc::channel();
     let mut output = Vec::new();
@@ -1059,7 +1188,6 @@ fn wrapped_candidate_erase_clears_the_rows_above_the_cursor() {
         &mut parser,
         &mut output,
         "",
-        40,
         &mut echoed,
         &mut prompt_replay,
         &prompt_presentation,
@@ -1075,6 +1203,7 @@ fn wrapped_candidate_erase_clears_the_rows_above_the_cursor() {
 #[test]
 fn unwrapped_candidate_erase_keeps_the_backspace_path() {
     let mut parser = parser_for_test("candidate-unwrapped-erase");
+    parser.set_terminal_columns(40);
     let (_generation, mut prompt_replay) = tracker_for_test();
     let (sender, receiver) = std::sync::mpsc::channel();
     let mut output = Vec::new();
@@ -1091,7 +1220,6 @@ fn unwrapped_candidate_erase_keeps_the_backspace_path() {
         &mut parser,
         &mut output,
         "",
-        40,
         &mut echoed,
         &mut prompt_replay,
         &prompt_presentation,
@@ -1125,7 +1253,6 @@ fn unknown_terminal_width_never_clears_rows_above_the_cursor() {
         &mut parser,
         &mut output,
         "",
-        0,
         &mut echoed,
         &mut prompt_replay,
         &prompt_presentation,
@@ -1142,6 +1269,7 @@ fn unknown_terminal_width_never_clears_rows_above_the_cursor() {
 #[test]
 fn uncaptured_prompt_width_never_clears_rows_above_the_cursor() {
     let mut parser = parser_for_test("candidate-uncaptured-prompt-erase");
+    parser.set_terminal_columns(40);
     let (_generation, mut prompt_replay) = tracker_for_test();
     let (sender, receiver) = std::sync::mpsc::channel();
     let mut output = Vec::new();
@@ -1168,7 +1296,6 @@ fn uncaptured_prompt_width_never_clears_rows_above_the_cursor() {
         &mut parser,
         &mut output,
         "",
-        40,
         &mut echoed,
         &mut prompt_replay,
         &prompt_presentation,
@@ -1185,6 +1312,7 @@ fn uncaptured_prompt_width_never_clears_rows_above_the_cursor() {
 #[test]
 fn captured_prompt_width_counts_toward_the_wrapped_echo_rows() {
     let mut parser = parser_for_test("candidate-captured-prompt-erase");
+    parser.set_terminal_columns(40);
     let (_generation, mut prompt_replay) = tracker_for_test();
     let (sender, receiver) = std::sync::mpsc::channel();
     let mut output = Vec::new();
@@ -1209,7 +1337,6 @@ fn captured_prompt_width_counts_toward_the_wrapped_echo_rows() {
         &mut parser,
         &mut output,
         "",
-        40,
         &mut echoed,
         &mut prompt_replay,
         &prompt_presentation,
@@ -1226,4 +1353,50 @@ fn captured_prompt_width_counts_toward_the_wrapped_echo_rows() {
         "the cleared prompt was not redrawn: {output:?}"
     );
     assert_eq!(echoed, 0);
+}
+
+#[test]
+fn capture_batch_is_drained_under_mode_lock_before_observe() {
+    let mode = Arc::new(Mutex::new(RawInputMode::Hold));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    sender
+        .send(RawInputEvent::CardApprove("inline-approval".to_string()))
+        .expect("queue approval action");
+    let mut parser = parser_for_test("inline-capture-batch");
+    let mut output = Vec::new();
+    let (_, mut replay) = tracker_for_test();
+    let presentation = PromptPresentation::new(false);
+    let mut echoed = 0;
+    let action = observe_with_input_mode_lock(
+        &mut |view: ShellEventView<'_>, _: &mut Vec<u8>| {
+            assert!(mode.try_lock().is_err(), "observe must hold the mode lock");
+            assert!(view
+                .events()
+                .iter()
+                .any(|event| event.message.as_deref() == Some("approve")));
+            Ok(RawObserverAction::RawPassthrough)
+        },
+        &mut parser,
+        &mut output,
+        &mode,
+        &mut |parser, output| {
+            assert!(mode.try_lock().is_err(), "drain must hold the mode lock");
+            assert!(!drain_raw_input_events(
+                &receiver,
+                parser,
+                output,
+                "prompt> ",
+                &mut echoed,
+                &mut replay,
+                &presentation,
+            )?);
+            Ok(())
+        },
+    )
+    .expect("consume the complete capture batch");
+    assert_eq!(action, RawObserverAction::RawPassthrough);
+    assert!(matches!(
+        *mode.try_lock().expect("mode lock released after update"),
+        RawInputMode::RawPassthrough
+    ));
 }

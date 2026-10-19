@@ -10,6 +10,8 @@ LLM Token 优化工具包——content-aware 压缩 + 命令重写 + 环境失�
 Flag 迁移、Pipeline 行为和输出恢复详见
 [随包提供的 RTK 命令](../../docs/user-guide/zh/token-saving/tokenless/cli-reference.md#随包提供的-rtk-命令)。
 
+当解析器无法保留某个 JSON 数字的值时，PostTool 会保持整个响应原样。其他响应仍可进行清理和 Record Reduction；Core 仅在 TOON 解码后保留相同的值与类型时采用它。
+
 ## 核心能力
 
 | 能力 | 节省率示例 | 说明 |
@@ -19,7 +21,7 @@ Flag 迁移、Pipeline 行为和输出恢复详见
 | Build Log 压缩 | 取决于具体负载 | 清理终端控制输出，并缩减已识别 Cargo、pytest、npm/Jest、Go、Make/C 和通用命令日志中的重复常规进度，同时保留诊断、摘要、阶段和 Stack Trace |
 | 搜索路径共享 | 取决于工作负载 | API 搜索列表（含 Claude 原生 Grep）可共享连续记录的文件路径并保留全部已收到命中；默认开启，通过 `TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0` 或 SDK `search_path_sharing_enabled=False` 关闭；命令输出保持原路由 |
 | Git Diff 上下文裁剪 | 取决于工作负载 | 通过 `TOKENLESS_DIFF_COMPRESSION_ENABLED=1` 或 SDK `diff_compression_enabled=True` 启用；保留全部增删行，按 hunk 裁剪上下文并提供原文恢复。默认关闭，尚未证实稳定的 Agent 整轮 token 收益 |
-| HTML 页面转写 | 取决于工作负载 | 通过 `TOKENLESS_HTML_EXTRACTION_ENABLED=1` 或 SDK `html_extraction_enabled=True` 启用；把命令或 API 返回的完整 HTML 文档转写为 Markdown，只移除可枚举的非内容元素（脚本、样式、导航、页眉、页脚、侧栏、表单控件、媒体嵌入）并在视图头部计数，提供原文恢复。默认关闭；文件读取透传 |
+| HTML 页面转写 | 取决于工作负载 | 默认开启：把命令或 API 返回的完整 HTML 文档转写为 Markdown，只移除可枚举的非内容元素（脚本、样式、导航、页眉、页脚、侧栏、表单控件、媒体嵌入）并在视图头部计数，提供原文恢复；通过 `TOKENLESS_HTML_EXTRACTION_ENABLED=0` 或 SDK `html_extraction_enabled=False` 关闭；文件读取透传 |
 | CSV/TSV 表格压缩 | 取决于具体负载 | 压紧引号和记录分隔符时保留全部单元格；较大的表格可保留选定行，明确提示表格不完整，并支持取回字节一致的原文。需要文本替换能力；文件读取透传 |
 | TOON 上下文压缩 | 参考响应 17.0% | 将 JSON 编码为 TOON 格式 |
 | 命令重写 | 60–90% | 通过 RTK 过滤 CLI 输出（支持 70+ 命令） |
@@ -86,7 +88,7 @@ tokenless 优化进入 LLM 上下文前、由它实际处理的工具相关内�
 
 ### Agent Adapter
 
-- **OpenClaw 插件** — 通过 Core 执行 PreTool RTK 改写和无损 transcript PostTool 优化；宿主不支持 BeforeModel Schema 与授权 Retrieve
+- **OpenClaw 插件** — 通过 Core 执行 PreTool RTK 改写和无损实时 PostTool 优化；宿主不支持 BeforeModel Schema 与授权 Retrieve
 - **copilot-shell 钩子** — Tool Ready（已硬关闭）+ 命令重写；Cosh-NG 支持响应压缩和 Marker 命令恢复，旧 copilot-shell 保持无损 PostTool；Common BeforeModel 在授权 Retrieve 接入前透传 Schema
 - **Hermes Agent 插件** — 把阻止后建议式命令重写和模型可见结果优化委托给 Core，并通过已有 Shell Tool 支持 Marker 命令恢复；无 Schema 压缩
 - **Qoder CLI 插件** — Tool Ready（已硬关闭）+ 命令重写 + 通过 `updatedToolOutput` 交付响应 Pipeline + Marker 命令恢复
@@ -99,15 +101,21 @@ tokenless 优化进入 LLM 上下文前、由它实际处理的工具相关内�
 - **QwenPaw 插件** — 通过 QwenPaw 插件系统注册 AgentScope 中间件，进程内调用 `anolisa_tokenless` wheel，提供 Schema 压缩、RTK 命令重写、响应/TOON 压缩和 `tokenless_retrieve` 静态工具恢复
 
 OpenClaw Plugin 只保留宿主事件转换与逐调用状态：`before_tool_call` 把 `exec` 参数交给
-`tokenless compress`，`tool_result_persist` 把 OpenClaw 自己持久化的 Tool Result 交给同一
-Protocol v2 入口。Core 持有 RTK、JSON 检测、清理、TOON、阈值、诊断与最终仲裁；Plugin
+`tokenless compress`，`registerAgentToolResultMiddleware` 在同轮模型请求之前，把实时工具
+结果交给同一 Protocol v2 入口。Core 持有 RTK、JSON 检测、清理、TOON、阈值、诊断与最终仲裁；Plugin
 把 PreTool 返回的 `output_optimization` 传到匹配的 PostTool，因此不会二次压缩 RTK 输出。
 本地 CLI 恢复命令是受信运维入口，不等价于 Agent 的 Marker 授权，因此 OpenClaw 只应用无损
-候选。该 PostTool Hook 只改写持久化 transcript，不会改变同一轮中模型已经看到的实时结果；
-Media 与多个 Content Block 也会透传。
+候选。插件声明 `contracts.agentToolResultMiddleware: ["openclaw"]`，并需在宿主中显式启用。
+PostTool 替换单个文本块并保留结果其他字段；Media 与多个 Content Block 透传。不再注册
+独立的持久化压缩 hook，避免重复压缩和重复统计。Fail-open 保留宿主交付的结果，
+包括此前发生的截断。2026.8.2 等旧版宿主在注册 middleware 后会把文本限制在
+100,000 个 UTF-16 Code Unit 内，仍在该限制下受支持；建议使用包含上游提交
+`2f620b970a04` 的构建。宿主限制及关闭 PostTool 的方法见
+[OpenClaw 兼容说明](../../docs/user-guide/zh/token-saving/tokenless/framework-integration.md#openclaw)。
 
-该 Adapter 要求 OpenClaw Plugin API `2026.4.22` 或更高版本；支持兼容性检查的宿主会在
-安装阶段根据 Package Metadata 强制执行该下限。OpenClaw 配置只包含
+该 Adapter 要求 OpenClaw `2026.6.6` 或更高版本；安装脚本在安装前拒绝旧版和无法识别的
+版本，Package Metadata 也声明相同下限。运行时缺少 middleware API 或注册抛错时，插件
+告警并关闭 PostTool，PreTool 仍可运行；不回退到仅持久化优化。OpenClaw 配置只包含
 `rtk_enabled`、`post_tool_enabled`、`tool_ready_enabled` 和 `verbose`；
 默认值依次为 `true`、`true`、`true` 和 `false`。旧的 Response、TOON 与工具分类开关已经
 删除，所有压缩策略由 Core 统一决定。
@@ -313,6 +321,9 @@ Session，再传入启用 Tokenless 的 Session。
 
 ### OpenCode 安装
 
+Schema 压缩使用宿主提供给模型的 JSON Schema，并保留运行时参数校验器。
+仅提供运行时校验器的宿主会跳过 Schema 压缩；响应压缩和命令重写仍然可用。
+
 OpenCode 适配器通过 `tool.execute.before/after` 原生插件事件注册已硬关闭的 Tool Ready、
 RTK 命令重写和响应/TOON 压缩，并通过 `tool.definition` 压缩工具 Schema。
 压缩后的响应会替换原始模型可见输出，避免重复占用上下文。
@@ -340,6 +351,28 @@ Bundle 生命周期脚本额外支持最高优先级的 `TOKENLESS_OPENCODE_CONF
 两种方式都会拒绝冲突的文件或链接。在 ANOLISA disable 后若要恢复独立管理，重新运行
 `make opencode-install` 或 Bundle 中的 `scripts/install.sh`。
 完整生命周期参阅[框架集成](../../docs/user-guide/zh/token-saving/tokenless/framework-integration.md#opencode)。
+
+### 千问办公插件（macOS 本地模式）
+
+`qwenwork` Adapter 面向千问办公 QwenWorkCN 的本地会话。PreToolUse **只改写 Bash 输入**；
+PostToolUse **监听所有工具**，按公共策略压缩符合条件的完整结果。`mcp_list`、`mcp_get`、
+`mcp_call` 仅包含遥测信息的回调保持透传，不会用遥测替换真实响应；完整 MCP 响应仍可压缩。
+保留文件内容保护和 RTK 去重。统计归属为 `qwenwork`，
+与 Qoder CLI、Qwen Code、QwenPaw 独立。
+
+运行 `anolisa install tokenless` 后，退出千问办公，再显式旁加载插件：
+
+```bash
+anolisa --dry-run adapter enable tokenless qwenwork
+anolisa adapter enable tokenless qwenwork
+anolisa adapter status tokenless
+```
+
+完成后重启千问办公并开启新的本地会话，在应用内检查激活状态。CLI 验证受管理文件，
+加载和激活状态保持 `unknown`。旁加载不修改 settings，也不自动启用已禁用的插件。
+当前不支持安全工作区／VM 会话。已有脚本管理的安装需先用原脚本卸载，再通过 CLI 启用；
+CLI 管理的副本使用 `anolisa adapter disable tokenless qwenwork` 卸载。
+安装、卸载及 1.2.5 验证范围参见[千问办公集成](../../docs/user-guide/zh/token-saving/tokenless/framework-integration.md#千问办公macos-本地模式)。
 
 ### QwenPaw 安装
 
@@ -523,6 +556,11 @@ node npm/scripts/package-npm.js --all
 
 ## 查看 Token 节省明细
 
+`tokenless stats serve --data-dir /var/lib/tokenless --credential-file /run/secrets/tokenless-query`
+提供独立的只读 HTTP 查询服务，默认监听 `127.0.0.1:7397`，通过 Bearer 凭据校验。
+两个文件路径为部署占位值，统计数据库必须已存在。
+接口、分页和内容访问约定见 [CLI 参考](../../docs/user-guide/zh/token-saving/tokenless/cli-reference.md#只读-http-查询)。
+
 `stats summary` 用于查看合计；`show` 用于原样打印完整的压缩前后内容；
 `diff` 用于解释估算 Token 节省，并只突出发生变化的行：
 
@@ -614,6 +652,19 @@ tokenless env-check --tool Shell --fix
 
 安装产物检查与可选的真实 Agent 任务见
 [发布前回归测试](tests/release_regression/README_zh.md)，分别报告工具输出节省和恢复开销。
+
+要用本地脚本模型检查 OpenClaw 的实时交付边界，先构建 CLI 和插件，再执行
+与本地 Docker 镜像对应的命令：
+
+```bash
+python3 tests/test-openclaw-gateway.py --image tokenless-test-agent-openclaw:2026.8.2 --host-output-policy legacy
+python3 tests/test-openclaw-gateway.py --image tokenless-openclaw-full:2f620b970a04 --host-output-policy normalized
+```
+
+镜像需提供对应的 OpenClaw 构建和 Python 3.11+。本文的 2026.8.2 镜像使用 `legacy`；
+源码包含上游修复 `2f620b970a04` 的构建使用 `normalized`。应根据源码来源选择，
+不能仅依赖版本字符串。测试覆盖透传、立即替换、持久化、统计单次计数和 Core 失败恢复；
+会打印证据目录，不发送云端请求。
 
 - `crates/tokenless-schema/` — BeforeModel 工具 Schema 压缩：`SchemaCompressor`
 - `crates/tokenless-ccr/` — 可逆压缩缓存（Compress-Cache-Retrieve）

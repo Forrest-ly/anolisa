@@ -1,11 +1,13 @@
 // Owner: shell_host. Routing lives in osc/routing.rs; the pending-handoff
 // claim lives in osc/handoff_claim.rs; alt-screen tracking in osc/alt_screen.rs.
-// CurrentCommand state and display-window helpers are owned by osc/command.rs.
+// CurrentCommand state and display-window helpers are owned by osc/command.rs;
+// relay-facing input events live in osc/input_events.rs.
 mod alt_screen;
 mod command;
 mod event_store;
 mod handoff_claim;
 mod handoff_echo;
+mod input_events;
 mod marker_sequence;
 mod prompt_epoch;
 mod routing;
@@ -88,6 +90,11 @@ pub(super) struct OscParser {
     last_prompt_display_start: Option<usize>,
     last_prompt_display: Vec<u8>,
     capture_prompt_display: bool,
+    /// Columns the child shell wraps its readline echo at, published by the
+    /// raw relay each time it syncs the outer terminal's winsize onto the PTY.
+    /// Zero means "never published", so wrap-sensitive erase math degrades to
+    /// the single-row path instead of guessing (#3401).
+    terminal_columns: usize,
     prompt_ready_display_start: Option<usize>,
     prompt_presentation_display_starts: Vec<super::prompt_presentation::PromptDisplayStart>,
     prompt_epoch_exchange: Option<crate::raw_input::PromptEpochExchange>,
@@ -125,6 +132,9 @@ pub(super) struct OscParser {
     /// invalidation barrier; a fresh command-less prompt report
     /// (`ShellReady`) re-arms it.
     pty_input_barrier_pushed: bool,
+    /// Tracks prompt occupancy independently from cwd validity because every
+    /// `precmd`, including command completion, establishes a fresh prompt.
+    prompt_input_barrier_pushed: bool,
     /// #2196 R7: bounded last-visible-line tracker for the active command,
     /// fed incrementally per PTY chunk; owned by osc/command.rs.
     visible_tail: VisibleTailTracker,
@@ -144,6 +154,18 @@ impl OscParser {
 
     pub(crate) fn set_prompt_cwd(&mut self, cwd: crate::input::ShellPromptCwd) {
         self.shell_prompt_cwd = cwd;
+    }
+
+    /// Records the width the child shell wraps at. The relay owns the value:
+    /// it is the winsize just pushed onto the PTY, which is what the shell's
+    /// own readline echo wrapped against (#3401).
+    pub(crate) fn set_terminal_columns(&mut self, columns: usize) {
+        self.terminal_columns = columns;
+    }
+
+    /// Width the child shell wraps at; zero when the relay never published one.
+    pub(crate) fn terminal_columns(&self) -> usize {
+        self.terminal_columns
     }
 
     pub(crate) fn set_shell_path_command_names(
@@ -400,6 +422,9 @@ impl OscParser {
             }
             "precmd" => {
                 self.prompt_ready_display_start = None;
+                // Every precmd establishes a fresh prompt, including the
+                // command-completion path that does not emit `ShellReady`.
+                self.prompt_input_barrier_pushed = false;
                 let Some(current) = self.current.take() else {
                     let prompt_cwd = marker.physical_cwd.clone();
                     self.intervention_cuts.push(self.clean.position());
@@ -756,67 +781,6 @@ impl OscParser {
                 pending_submits.max(1),
             ));
         }
-    }
-
-    pub(super) fn push_control_event(&mut self, input: &str) {
-        self.push_self_session_input_event(
-            "control",
-            "control input observed while relaying to bash",
-            Some(input),
-        );
-    }
-
-    /// Observe-only soft-newline shortcut signal on a passthrough path
-    /// (#1721 T-c): the bytes were relayed to bash unchanged; the runtime
-    /// may surface a one-time discoverability tip at the next prompt-ready.
-    pub(super) fn push_soft_newline_shortcut_event(&mut self) {
-        self.push_self_session_input_event(
-            "soft_newline_shortcut",
-            "soft-newline shortcut observed while relaying to bash",
-            None,
-        );
-    }
-
-    /// #1932 F5: a multi-line bracketed paste was relayed straight to bash;
-    /// the runtime may attach a multi-line entry hint to a failure insight.
-    pub(super) fn push_multiline_paste_event(&mut self) {
-        self.push_self_session_input_event(
-            "multiline_paste",
-            "multi-line bracketed paste relayed to bash",
-            None,
-        );
-    }
-
-    /// #1721 D13: forwards prompt-draft card lifecycle events (open/changed/
-    /// submit/cancel) to the runtime as structured JSON payloads.
-    pub(super) fn push_prompt_draft_event(&mut self, action: &str, payload: Option<&str>) {
-        self.push_self_session_input_event("prompt_draft", action, payload);
-    }
-
-    pub(super) fn push_shell_input_activity_event(&mut self, empty: bool) {
-        self.push_self_session_input_event(
-            "shell_input",
-            if empty {
-                "input empty"
-            } else {
-                "input editing"
-            },
-            None,
-        );
-    }
-
-    /// User bytes were written to the shell's PTY: whatever the shell
-    /// does with them (a custom `accept-line` binding cannot be told
-    /// apart from editing keys in the byte stream), a previously
-    /// reported prompt cwd stops being provably current until a fresh
-    /// cwd-bearing marker arrives. Consecutive writes collapse into
-    /// one barrier event; a new prompt report re-arms it.
-    pub(super) fn push_shell_pty_input_event(&mut self) {
-        if self.pty_input_barrier_pushed {
-            return;
-        }
-        self.pty_input_barrier_pushed = true;
-        self.push_self_session_input_event("shell_pty_input", "write", None);
     }
 
     pub(super) fn push_card_event(&mut self, action: &str, value: &str) {

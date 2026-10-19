@@ -271,6 +271,10 @@ const enUSMessages = {
   'ts.compoundedSavings': 'Compounded savings {n} tokens',
   'ts.singleTurn': '(single-turn {pct}%)',
   'ts.sessionId': 'Session ID',
+  'ts.exportCsv': 'Export CSV',
+  'ts.exportSelectedCsv': 'Export Selected ({n})',
+  'ts.selectSessionForExport': 'Select session {id} for CSV export',
+  'ts.selectAllSessions': 'Select all sessions',
   'ts.inputTokens': 'Input Tokens',
   'ts.outputTokens': 'Output Tokens',
   'ts.savingsRateCol': 'Savings Rate',
@@ -315,6 +319,10 @@ const enUSMessages = {
   'atif.actualTokens': 'Actual Tokens (optimized)',
   'atif.interactionTrajectory': 'Interaction Trajectory',
   'atif.roundsSteps': '{rounds} rounds · {steps} steps',
+  'atif.filterRounds': 'Filter round content',
+  'atif.matchingRounds': '{matched} of {total} rounds',
+  'atif.clearRoundFilter': 'Clear filter',
+  'atif.noMatchingRounds': 'No rounds match this text.',
   'atif.noStepData': 'No step data in this trajectory',
   'atif.clickRoundToView': 'Click a round on the left to view details',
   'atif.noMessageContent': 'No message content',
@@ -341,6 +349,7 @@ const enUSMessages = {
   'atif.jsonParseFailedNotATIF': 'JSON parse failed: missing schema_version field or not ATIF format',
   'atif.sessionNotFound': 'Session not found: {id} (no eBPF capture records and no collected trajectory)',
   'atif.malformedCollected': 'Malformed collected trajectory: {id}',
+  'atif.malformedDocument': 'Invalid ATIF document structure',
   'atif.cannotResolveSub': 'Cannot resolve sub-trajectory reference: missing trajectory_id or trajectory_path',
   'atif.externalNotSupported': 'External sub-trajectory references are not supported yet: {path}',
   'atif.selectSubagentInGraph': 'Select this subagent in the topology graph above to view its trajectory',
@@ -698,6 +707,8 @@ const enUSMessages = {
   'opt.session.action.start': 'Start analysis',
   'opt.session.loadingHistory': 'Loading historical analysis results...',
   'opt.session.noAnalysisYet': 'This session has not been analyzed yet.',
+  'opt.session.resultsUnavailable':
+    'The stored analysis results could not be read, so no dimension was started automatically. Use "Start analysis" to run them.',
   'opt.session.startHint': 'Click "Start analysis" to run accuracy / performance / cost analysis in parallel.',
   'opt.llm.notConfiguredHint': 'LLM is not configured — summary / performance strategies / cost waste / accuracy analysis all require LLM calls.',
   'opt.llm.goToSettings': 'Go to settings',
@@ -750,9 +761,9 @@ const enUSMessages = {
   'opt.llm.model.customOption': '✏️ Custom model name...',
   'opt.llm.model.customPlaceholder': 'Enter model ID',
   'opt.llm.model.placeholder': 'Enter model ID, e.g. gpt-4o',
-  'opt.llm.saving': 'Saving...',
-  'opt.llm.save': 'Save configuration',
-  'opt.llm.saved': '✓ Configuration saved and applied',
+  'opt.llm.semanticSearchTimeout.label': 'Semantic search timeout (seconds)',
+  'opt.llm.semanticSearchTimeout.hint': 'Ranking requests that exceed this deadline return no results and emit a server warning.',
+  'opt.llm.semanticSearchTimeout.invalid': 'Enter a positive whole number of seconds.',
 
   // ── TokenFlameChart ──
   'flame.ctx.static': 'Static region',
@@ -817,6 +828,7 @@ const enUSMessages = {
   'as.semanticSearching': 'Searching by meaning...',
   'as.noMatchingSessions': 'No matching sessions',
   'as.semanticSearchUnavailable': 'Semantic search is unavailable — configure the LLM in optimization settings',
+  'as.semanticSearchFailed': 'Semantic search failed — the session list is unchanged, try again',
   'as.noSessionsInRange': 'No session data in the current time range',
   'as.source': 'Source',
   'as.project': 'Project',
@@ -837,6 +849,20 @@ const enUSMessages = {
   'comp.agentHealth.hungToast': '⏳ Agent "{name}" (PID {pid}) timed out responding and may be hung',
   'comp.settings.title': '⚙️ Settings',
   'comp.settings.description': 'Manage the dashboard global configuration.',
+  'comp.settings.save': 'Save settings',
+  'comp.settings.saving': 'Saving…',
+  'comp.settings.saved': '✓ Settings saved',
+  'comp.settings.saveFailed': 'Save failed, see card errors above',
+  'comp.settings.storage.title': 'SQLite storage',
+  'comp.settings.storage.description': 'Combined storage limit for all AgentSight databases.',
+  'comp.settings.storage.loading': 'Loading storage status…',
+  'comp.settings.storage.loadFailed': 'Failed to load storage status: {error}',
+  'comp.settings.storage.retry': 'Retry',
+  'comp.settings.storage.currentUsage': 'Current usage {used} of {limit}',
+  'comp.settings.storage.unlimited': 'unlimited',
+  'comp.settings.storage.limitLabel': 'Total storage limit',
+  'comp.settings.storage.invalid': 'Enter 0 or an integer of at least 9 MB.',
+  'comp.settings.storage.hint': 'Set 0 to disable the combined limit. Saved changes apply on the next maintenance cycle without a restart. When the total exceeds the limit, the largest databases are trimmed first.',
 
   // ── RiskEnforcementPage ──
   'risk.error.requestFailed': 'Request failed',
@@ -1339,6 +1365,10 @@ export const messages: Record<Locale, Record<MessageKey, string>> = {
     'ts.compoundedSavings': '复合节省 {n} tokens',
     'ts.singleTurn': '（单轮 {pct}%）',
     'ts.sessionId': 'Session ID',
+    'ts.exportCsv': '导出 CSV',
+    'ts.exportSelectedCsv': '导出所选（{n}）',
+    'ts.selectSessionForExport': '选择会话 {id} 用于 CSV 导出',
+    'ts.selectAllSessions': '全选会话',
     'ts.inputTokens': '输入 Tokens',
     'ts.outputTokens': '输出 Tokens',
     'ts.savingsRateCol': '节省率',
@@ -1383,6 +1413,10 @@ export const messages: Record<Locale, Record<MessageKey, string>> = {
     'atif.actualTokens': '实际 Tokens（已优化）',
     'atif.interactionTrajectory': '交互轨迹',
     'atif.roundsSteps': '{rounds} 轮 · {steps} 步',
+    'atif.filterRounds': '筛选轮次内容',
+    'atif.matchingRounds': '匹配 {matched} 轮，共 {total} 轮',
+    'atif.clearRoundFilter': '清除筛选',
+    'atif.noMatchingRounds': '没有轮次匹配此文本。',
     'atif.noStepData': '该轨迹暂无步骤数据',
     'atif.clickRoundToView': '点击左侧的轮次查看详情',
     'atif.noMessageContent': '无消息内容',
@@ -1409,6 +1443,7 @@ export const messages: Record<Locale, Record<MessageKey, string>> = {
     'atif.jsonParseFailedNotATIF': 'JSON 解析失败：缺少 schema_version 字段或不是 ATIF 格式',
     'atif.sessionNotFound': '未找到 Session: {id}（无 eBPF 捕获记录且无采集轨迹）',
     'atif.malformedCollected': '采集轨迹格式错误: {id}',
+    'atif.malformedDocument': 'ATIF 文档结构无效',
     'atif.cannotResolveSub': '无法解析子轨迹引用：缺少 trajectory_id 或 trajectory_path',
     'atif.externalNotSupported': '暂不支持外部子轨迹引用: {path}',
     'atif.selectSubagentInGraph': '在上方拓扑图中选择此子代理以查看其轨迹',
@@ -1766,6 +1801,8 @@ export const messages: Record<Locale, Record<MessageKey, string>> = {
     'opt.session.action.start': '开始分析',
     'opt.session.loadingHistory': '加载历史分析结果...',
     'opt.session.noAnalysisYet': '该会话尚未进行优化分析',
+    'opt.session.resultsUnavailable':
+      '读取历史分析结果失败，因此没有自动开始任何维度分析；可点击「开始分析」手动运行。',
     'opt.session.startHint': '点击「开始分析」并行运行准确性 / 性能 / 成本三维度剖析',
     'opt.llm.notConfiguredHint': 'LLM 尚未配置 —— 摘要 / 性能策略 / 成本浪费 / 准确性维度需要调用 LLM。',
     'opt.llm.goToSettings': '前往设置',
@@ -1818,9 +1855,9 @@ export const messages: Record<Locale, Record<MessageKey, string>> = {
     'opt.llm.model.customOption': '✏️ 自定义模型名...',
     'opt.llm.model.customPlaceholder': '输入模型 ID',
     'opt.llm.model.placeholder': '输入模型 ID，如 gpt-4o',
-    'opt.llm.saving': '保存中...',
-    'opt.llm.save': '保存配置',
-    'opt.llm.saved': '✓ 配置已保存并生效',
+    'opt.llm.semanticSearchTimeout.label': '语义搜索超时（秒）',
+    'opt.llm.semanticSearchTimeout.hint': '排序请求超过此时限会返回空结果，并在服务端记录警告日志。',
+    'opt.llm.semanticSearchTimeout.invalid': '请输入正整数秒数。',
 
     // ── TokenFlameChart ──
     'flame.ctx.static': '静态区域',
@@ -1885,6 +1922,7 @@ export const messages: Record<Locale, Record<MessageKey, string>> = {
     'as.semanticSearching': '正在按语义搜索...',
     'as.noMatchingSessions': '没有匹配的会话',
     'as.semanticSearchUnavailable': '语义搜索不可用 — 请在优化设置中配置 LLM',
+    'as.semanticSearchFailed': '语义搜索失败 — 会话列表保持不变，请重试',
     'as.noSessionsInRange': '当前时间范围内没有会话数据',
     'as.source': '来源',
     'as.project': '项目',
@@ -1905,6 +1943,20 @@ export const messages: Record<Locale, Record<MessageKey, string>> = {
     'comp.agentHealth.hungToast': '⏳ Agent "{name}" (PID {pid}) 响应超时，可能卡顿',
     'comp.settings.title': '⚙️ 设置',
     'comp.settings.description': '管理 Dashboard 的全局配置。',
+    'comp.settings.save': '保存配置',
+    'comp.settings.saving': '保存中…',
+    'comp.settings.saved': '✓ 配置已保存',
+    'comp.settings.saveFailed': '保存失败，请查看上方卡片中的错误',
+    'comp.settings.storage.title': 'SQLite 存储',
+    'comp.settings.storage.description': '设置所有 AgentSight 数据库的总存储上限。',
+    'comp.settings.storage.loading': '正在加载存储状态…',
+    'comp.settings.storage.loadFailed': '加载存储状态失败：{error}',
+    'comp.settings.storage.retry': '重试',
+    'comp.settings.storage.currentUsage': '当前占用 {used}，上限 {limit}',
+    'comp.settings.storage.unlimited': '不限制',
+    'comp.settings.storage.limitLabel': '总存储上限',
+    'comp.settings.storage.invalid': '请输入 0 或不小于 9 的整数（MB）。',
+    'comp.settings.storage.hint': '设为 0 表示不限制总量。保存后无需重启，下一轮维护即生效；超出上限时优先从占用最大的数据库开始清理。',
 
     // ── RiskEnforcementPage ──
     'risk.error.requestFailed': '请求失败',
@@ -2250,6 +2302,24 @@ export function localeTag(locale: Locale): string {
   return locale;
 }
 
+/**
+ * Substitutes `{name}` placeholders in a message template.
+ *
+ * Parameter values are opaque data, so the substitution is a single pass over
+ * the template: a value is never scanned for placeholders (`{n}` inside a
+ * value stays literal) and, because the replacer is a function rather than a
+ * replacement string, `$&`, `$'`, `$`` and `$$` inside a value survive too.
+ */
+export function interpolateMessage(
+  template: string,
+  params?: Record<string, string | number>,
+): string {
+  if (!params) return template;
+  return template.replace(/\{([a-zA-Z_][a-zA-Z0-9_]*)\}/g, (placeholder, name) =>
+    Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : placeholder,
+  );
+}
+
 export const I18nProvider: React.FC<React.PropsWithChildren> = ({ children }) => {
   const [locale, setLocaleState] = useState<Locale>(resolveInitialLocale);
 
@@ -2268,15 +2338,8 @@ export const I18nProvider: React.FC<React.PropsWithChildren> = ({ children }) =>
   }, []);
 
   const t = useCallback(
-    (key: MessageKey, params?: Record<string, string | number>) => {
-      let msg = messages[locale][key];
-      if (params) {
-        for (const [k, v] of Object.entries(params)) {
-          msg = msg.replace(new RegExp(`\\{${k}\\}`, 'g'), String(v));
-        }
-      }
-      return msg;
-    },
+    (key: MessageKey, params?: Record<string, string | number>) =>
+      interpolateMessage(messages[locale][key], params),
     [locale],
   );
 
