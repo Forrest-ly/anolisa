@@ -1,12 +1,13 @@
 use crate::state::DaemonState;
 use std::sync::Arc;
+use ws_ckpt_common::backend::DiffError;
 use ws_ckpt_common::{
     default_auto_cleanup_keep, delete_workspace_policy, load_config_file, save_workspace_policy,
     ConfigReport, DaemonConfig, EffectivePolicy, ErrorCode, FileConfig, GlobalPolicySnapshot,
     PolicyFieldOp, Request, Response, StatusReport, WorkspaceInfo, WorkspacePolicy,
     ADVISORY_SNAPSHOT_LIMIT, CONFIG_FILE_PATH, DEFAULT_AUTO_CLEANUP,
     DEFAULT_AUTO_CLEANUP_INTERVAL_SECS, DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
-    DEFAULT_IMG_MAX_PERCENT, DEFAULT_IMG_SIZE_GB,
+    DEFAULT_IMG_MAX_PERCENT, DEFAULT_IMG_SIZE_GB, MAX_LIST_PAGE_ITEMS,
 };
 
 /// Kernel-derived connection identity available to guarded requests.
@@ -109,12 +110,8 @@ pub(crate) async fn dispatch_with_context(
                             let mut match_count = 0usize;
                             for entry in state.all_workspaces() {
                                 let ws = entry.read().await;
-                                match ws.index.resolve_by_prefix(&snapshot) {
-                                    Ok(_) => match_count += 1,
-                                    Err(ws_ckpt_common::ResolveError::Ambiguous(_)) => {
-                                        match_count += 2
-                                    }
-                                    Err(ws_ckpt_common::ResolveError::NotFound) => {}
+                                if ws.index.snapshots.contains_key(&snapshot) {
+                                    match_count += 1;
                                 }
                             }
                             if match_count > 1 {
@@ -137,9 +134,34 @@ pub(crate) async fn dispatch_with_context(
             },
         },
         Request::List { workspace, .. } => match workspace {
-            Some(ws) => crate::snapshot_mgr::list_snapshots(state, &ws).await,
-            None => crate::snapshot_mgr::list_all_snapshots(state).await,
+            Some(ws) => crate::snapshot_mgr::list_snapshots(state, &ws, false).await,
+            None => crate::snapshot_mgr::list_all_snapshots(state, false).await,
         },
+        Request::ListOrphans { workspace } => match workspace {
+            Some(ws) => crate::snapshot_mgr::list_snapshots(state, &ws, true).await,
+            None => crate::snapshot_mgr::list_all_snapshots(state, true).await,
+        },
+        Request::ListPage {
+            orphans_only,
+            workspace,
+            limit,
+            cursor,
+        } => {
+            if limit == 0 || limit > MAX_LIST_PAGE_ITEMS {
+                return Response::Error {
+                    code: ErrorCode::InvalidPath,
+                    message: format!("list page limit must be between 1 and {MAX_LIST_PAGE_ITEMS}"),
+                };
+            }
+            crate::snapshot_mgr::list_snapshot_page(
+                state,
+                workspace.as_deref(),
+                limit as usize,
+                cursor.as_deref(),
+                orphans_only,
+            )
+            .await
+        }
         Request::Diff {
             workspace,
             from,
@@ -293,7 +315,12 @@ pub(crate) async fn dispatch_with_context(
     match result {
         Ok(response) => response,
         Err(e) => Response::Error {
-            code: ErrorCode::InternalError,
+            code: match e.downcast_ref::<DiffError>() {
+                Some(DiffError::UnsupportedWorkspacePath { .. }) => {
+                    ErrorCode::UnsupportedWorkspacePath
+                }
+                None => ErrorCode::InternalError,
+            },
             message: format!("{:#}", e),
         },
     }

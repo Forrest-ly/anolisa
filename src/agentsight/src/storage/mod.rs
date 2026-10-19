@@ -31,14 +31,12 @@ pub use sqlite::{
     // Token storage
     TokenStore,
     Trend,
-    // Connection utilities
-    create_connection,
-    default_base_path,
     format_tokens,
     format_tokens_with_commas,
 };
 
 // Re-export unified storage
+pub(crate) use unified::MaintenanceCursor;
 pub use unified::{SqliteConfig, Storage, StorageBackend};
 
 /// Check if a custom data file path exists

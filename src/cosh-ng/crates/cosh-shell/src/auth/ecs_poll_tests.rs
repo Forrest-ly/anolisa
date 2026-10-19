@@ -948,7 +948,7 @@ fn cancelled_and_reaped_probe_stays_idle_despite_overdue_checks() {
 }
 
 #[test]
-fn ecs_refresh_message_is_appended_and_bilingual() {
+fn ecs_refresh_message_is_bilingual() {
     use crate::config::Language;
     // Tail ownership moved to the appended #3413 health-confinement segment, so
     // this keeps the ECS messages pinned to their own segment position; the

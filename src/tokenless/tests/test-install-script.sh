@@ -506,9 +506,48 @@ case "$1 $2" in
       echo "codex: error: cannot read the plugin list" >&2
       exit 1
     fi
-    [ -f "$state/plugin" ] && echo "tokenless@anolisa-tokenless   enabled"
+    # codex-cli 0.154.0 lists every plugin the registered marketplaces offer,
+    # in whatever state it is in, under a header that names the marketplace:
+    #
+    #   Marketplace `anolisa-tokenless`
+    #   PLUGIN                       STATUS              VERSION  SOURCE
+    #   tokenless@anolisa-tokenless  installed, enabled  local    <source>
+    #
+    # `plugin remove` only flips that STATUS to `not installed`; the row itself
+    # survives until the marketplace that ships the plugin is removed. Reading
+    # the listing correctly under both facts is what the adapter's deregistration
+    # check is judged on, so the stub reproduces them rather than printing a bare
+    # row that disappears with the plugin.
+    target_id="tokenless@anolisa-tokenless"
+    other_id="tokenless@other-market"
+    absent_status="not installed"
+    if [ -f "$state/bare_names" ]; then
+      target_id="tokenless"
+      other_id="tokenless"
+    fi
+    if [ -f "$state/status_comma" ]; then
+      absent_status="not installed, disabled"
+    fi
+    if [ -f "$state/marketplace" ]; then
+      echo "Marketplace \`anolisa-tokenless\`"
+      echo "PLUGIN                       STATUS              VERSION  SOURCE"
+      if [ -f "$state/plugin" ]; then
+        echo "$target_id  installed, enabled  local    $state/plugin"
+      else
+        echo "$target_id  $absent_status                $state/plugin"
+      fi
+    fi
+    if [ -f "$state/other_plugin" ]; then
+      echo "Marketplace \`other-market\`"
+      echo "$other_id  installed, enabled  local    $state/other_plugin"
+    fi
     exit 0 ;;
   "plugin remove")
+    printf '%s\n' "$3" >> "$state/plugin_remove_calls"
+    if [ "$3" != "tokenless@anolisa-tokenless" ]; then
+      echo "codex: error: unexpected plugin identity: $3" >&2
+      exit 2
+    fi
     if [ "${CODEX_STUB_REMOVE_FAILS:-0}" = "1" ]; then
       echo "codex: error: refusing to remove tokenless@anolisa-tokenless" >&2
       exit 1
@@ -3209,5 +3248,142 @@ assert_file "the adapter resources that registration points at are kept" \
   "$S56_ADAPTERS/claude-code/.claude-plugin/plugin.json"
 assert_file "and the adapter tree itself is kept" \
   "$S56_ADAPTERS/claude-code/scripts/uninstall.sh"
+
+# =============================================================================
+# Scenario 57 — a `not installed` row is a deregistration, not a registration
+# =============================================================================
+# codex-cli 0.154.0 keeps listing a plugin that a registered marketplace
+# offers after `plugin remove`, with its STATUS flipped to `not installed`; the
+# row only disappears together with the marketplace, which the adapter script
+# removes immediately afterwards. A deregistration check that just looks for
+# "tokenless" in `plugin list` read that row as a surviving registration — as it
+# read the `Marketplace` header above it, which is printed even when the plugin
+# was never added — so every successful uninstall exited 1, kept the marketplace
+# directory, and stopped the component uninstaller from dropping the adapter
+# resources and the receipt. Scenario 29's retry covers the same row through the
+# receipt-driven uninstaller; this one pins the adapter contract directly. A
+# registration that really did survive still has to fail (scenarios 29 and 33).
+S57_HOME="$TEST_DIR/codex-residual/home"
+S57_STATE="$S57_HOME/.codex-stub"
+S57_MARKET="$S57_HOME/.local/share/anolisa/codex-marketplace"
+mkdir -p "$S57_HOME/.local/bin" "$S57_STATE" "$S57_MARKET/tokenless"
+printf '#!/bin/sh\necho kept\n' > "$S57_HOME/.local/bin/tokenless"
+chmod +x "$S57_HOME/.local/bin/tokenless"
+printf '{"name":"tokenless"}\n' > "$S57_MARKET/tokenless/plugin.json"
+: > "$S57_STATE/plugin"
+: > "$S57_STATE/marketplace"
+RUN_OUTPUT="$(
+  env -i \
+    PATH="$STUB_DIR:/usr/local/bin:/usr/bin:/bin" \
+    HOME="$S57_HOME" \
+    SHELL=/bin/bash \
+    TOKENLESS_DEREGISTER_ONLY=1 \
+    bash "$TOKENLESS_ROOT/adapters/tokenless/codex/scripts/uninstall.sh" --non-interactive 2>&1
+)" && RUN_STATUS=0 || RUN_STATUS=$?
+assert_eq "a deregistration codex confirms exits 0" "$RUN_STATUS" "0"
+assert_not_contains "does not report a registration that is already gone" "$RUN_OUTPUT" \
+  "still lists the tokenless plugin"
+assert_contains "reports the run as complete" "$RUN_OUTPUT" "Uninstall complete"
+assert_no_file "the plugin registration is gone" "$S57_STATE/plugin"
+assert_no_file "and so is the marketplace registration" "$S57_STATE/marketplace"
+assert_no_file "so the marketplace directory it pointed at is dropped" "$S57_MARKET"
+assert_file "deregistration-only mode still keeps the component binary" \
+  "$S57_HOME/.local/bin/tokenless"
+
+# =============================================================================
+# Scenario 58 — another marketplace's same-name plugin is not our registration
+# =============================================================================
+for listing_style in qualified bare comma; do
+for target_state in present absent; do
+  S58_HOME="$TEST_DIR/codex-other-${listing_style}-${target_state}/home"
+  S58_STATE="$S58_HOME/.codex-stub"
+  S58_MARKET="$S58_HOME/.local/share/anolisa/codex-marketplace"
+  mkdir -p "$S58_HOME/.local/bin" "$S58_STATE" "$S58_MARKET/tokenless"
+  printf '#!/bin/sh\necho kept\n' > "$S58_HOME/.local/bin/tokenless"
+  chmod +x "$S58_HOME/.local/bin/tokenless"
+  : > "$S58_STATE/marketplace"
+  : > "$S58_STATE/other_plugin"
+  [ "$listing_style" != "bare" ] || : > "$S58_STATE/bare_names"
+  [ "$listing_style" != "comma" ] || : > "$S58_STATE/status_comma"
+  if [ "$target_state" = "present" ]; then
+    : > "$S58_STATE/plugin"
+  fi
+  RUN_OUTPUT="$(
+    env -i PATH="$STUB_DIR:/usr/local/bin:/usr/bin:/bin" \
+      HOME="$S58_HOME" SHELL=/bin/bash TOKENLESS_DEREGISTER_ONLY=1 \
+      bash "$TOKENLESS_ROOT/adapters/tokenless/codex/scripts/uninstall.sh" --non-interactive 2>&1
+  )" && RUN_STATUS=0 || RUN_STATUS=$?
+  assert_eq "same-name plugin does not block ${target_state} target uninstall" "$RUN_STATUS" "0"
+  assert_no_file "target registration is gone (${target_state})" "$S58_STATE/plugin"
+  assert_no_file "target marketplace registration is gone (${target_state})" "$S58_STATE/marketplace"
+  assert_no_file "target marketplace directory is removed (${target_state})" "$S58_MARKET"
+  assert_file "other marketplace's plugin is kept (${target_state})" "$S58_STATE/other_plugin"
+  assert_file "deregistration-only mode keeps the binary (${target_state})" "$S58_HOME/.local/bin/tokenless"
+  if [ "$target_state" = "present" ]; then
+    assert_eq "only the exact target is removed" "$(cat "$S58_STATE/plugin_remove_calls")" \
+      "tokenless@anolisa-tokenless"
+  else
+    assert_no_file "other plugin alone does not trigger removal" "$S58_STATE/plugin_remove_calls"
+  fi
+done
+done
+
+# =============================================================================
+# Scenario 59 — the receipt-driven uninstall completes with a same-name plugin
+# =============================================================================
+for target_state in present absent; do
+  scenario="codex-receipt-other-${target_state}"
+  run_script "$INSTALL_SH" "$scenario" "TOKENLESS_VERSION=$FAKE_VERSION"
+  assert_eq "receipt install succeeds (${target_state})" "$RUN_STATUS" "0"
+  S59_HOME="$TEST_DIR/$scenario/home"
+  S59_ADAPTERS="$S59_HOME/.local/share/anolisa/adapters/tokenless"
+  cp -R "$TOKENLESS_ROOT/adapters/tokenless/codex" "$S59_ADAPTERS/codex"
+  S59_STATE="$S59_HOME/.codex-stub"
+  S59_MARKET="$S59_HOME/.local/share/anolisa/codex-marketplace"
+  mkdir -p "$S59_STATE" "$S59_MARKET/tokenless"
+  : > "$S59_STATE/marketplace"
+  : > "$S59_STATE/other_plugin"
+  if [ "$target_state" = "present" ]; then
+    : > "$S59_STATE/plugin"
+  fi
+  run_script "$UNINSTALL_SH" "$scenario"
+  assert_eq "receipt uninstall ignores the other marketplace (${target_state})" "$RUN_STATUS" "0"
+  assert_no_file "receipt is removed (${target_state})" "$(receipt_of "$scenario")"
+  assert_no_file "adapter resources are removed (${target_state})" "$S59_ADAPTERS"
+  assert_no_file "marketplace directory is removed (${target_state})" "$S59_MARKET"
+  assert_file "external plugin registration survives (${target_state})" "$S59_STATE/other_plugin"
+  if [ "$target_state" = "present" ]; then
+    assert_eq "receipt removes only the exact plugin id" "$(cat "$S59_STATE/plugin_remove_calls")" \
+      "tokenless@anolisa-tokenless"
+  else
+    assert_no_file "receipt skips removal for the external plugin" "$S59_STATE/plugin_remove_calls"
+  fi
+done
+
+# =============================================================================
+# Scenario 60 — an external same-name row cannot hide a live, refusing target
+# =============================================================================
+for listing_style in qualified bare; do
+  S60_HOME="$TEST_DIR/codex-other-refuses-${listing_style}/home"
+  S60_STATE="$S60_HOME/.codex-stub"
+  S60_MARKET="$S60_HOME/.local/share/anolisa/codex-marketplace"
+  mkdir -p "$S60_HOME/.local/bin" "$S60_STATE" "$S60_MARKET/tokenless"
+  : > "$S60_STATE/plugin"
+  : > "$S60_STATE/marketplace"
+  : > "$S60_STATE/other_plugin"
+  [ "$listing_style" != "bare" ] || : > "$S60_STATE/bare_names"
+  RUN_OUTPUT="$(
+    env -i PATH="$STUB_DIR:/usr/local/bin:/usr/bin:/bin" \
+      HOME="$S60_HOME" SHELL=/bin/bash TOKENLESS_DEREGISTER_ONLY=1 \
+      CODEX_STUB_REMOVE_FAILS=1 \
+      bash "$TOKENLESS_ROOT/adapters/tokenless/codex/scripts/uninstall.sh" --non-interactive 2>&1
+  )" && RUN_STATUS=0 || RUN_STATUS=$?
+  assert_eq "external ${listing_style} row does not hide refusal" "$RUN_STATUS" "1"
+  assert_file "refused target stays registered (${listing_style})" "$S60_STATE/plugin"
+  assert_file "external row survives refusal (${listing_style})" "$S60_STATE/other_plugin"
+  assert_file "marketplace resources survive refusal (${listing_style})" "$S60_MARKET"
+  assert_eq "refusal still targets the full id (${listing_style})" \
+    "$(cat "$S60_STATE/plugin_remove_calls")" "tokenless@anolisa-tokenless"
+done
 
 echo "install-script test passed"

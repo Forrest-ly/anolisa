@@ -27,10 +27,12 @@ DEFAULT_DIRS = [
     Path.home() / ".qoder" / "projects",
 ]
 
+_ASCII_ID_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
 # ─── JSONL → ATIF conversion ─────────────────────────────────────────────────
 
 
-def extract_text(content) -> str:
+def extract_text(content, *, include_tool_results: bool = True) -> str:
     """Extract plain text from message content (string or list of blocks)."""
     if isinstance(content, str):
         return content
@@ -40,7 +42,7 @@ def extract_text(content) -> str:
             if isinstance(block, dict):
                 if block.get("type") == "text":
                     parts.append(block.get("text", ""))
-                elif block.get("type") == "tool_result":
+                elif block.get("type") == "tool_result" and include_tool_results:
                     parts.append(block.get("content", ""))
             elif isinstance(block, str):
                 parts.append(block)
@@ -75,10 +77,13 @@ def extract_tool_results(content) -> list:
                 result_content = " ".join(
                     b.get("text", "") for b in result_content if isinstance(b, dict)
                 )
-            results.append({
+            result = {
                 "source_call_id": block.get("tool_use_id"),
                 "content": str(result_content)[:2000],  # truncate
-            })
+            }
+            if isinstance(block.get("is_error"), bool):
+                result["extra"] = {"is_error": block["is_error"]}
+            results.append(result)
     return results
 
 
@@ -93,19 +98,32 @@ def extract_thinking(content) -> Optional[str]:
     return "\n".join(parts) if parts else None
 
 
+def _call_id_keys(identifier: str) -> tuple[tuple[str, str], tuple[str, str]]:
+    """Index the shared agentsight_atif::same_call_id echo contract."""
+    case_key = ("case", identifier.translate(_ASCII_ID_LOWER))
+    kind = "separated" if "_" in identifier or "-" in identifier else "plain"
+    normalized = "".join(char.lower() for char in identifier if char not in "_-")
+    return case_key, (kind, normalized)
+
+
 def jsonl_to_atif(filepath: Path) -> Optional[dict]:
     """Convert a Claude/Qoder conversation JSONL to ATIF v1.7 dict."""
     entries = []
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    entries.append(json.loads(line))
+                    parsed = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                # json.loads also accepts scalars and arrays; only objects
+                # carry event fields, so anything else is skipped exactly like
+                # a decode error instead of aborting the whole batch.
+                if isinstance(parsed, dict):
+                    entries.append(parsed)
     except OSError:
         return None
 
@@ -115,6 +133,8 @@ def jsonl_to_atif(filepath: Path) -> Optional[dict]:
     model_name = None
 
     steps = []
+    tool_call_steps = {}
+    tool_call_aliases = {}
     step_id = 0
 
     for entry in entries:
@@ -142,28 +162,50 @@ def jsonl_to_atif(filepath: Path) -> Optional[dict]:
             model_name = msg.get("model")
 
         if role == "user" or entry_type == "user":
-            # Check if this is a tool result (observation)
+            # Tool replies can arrive after other assistant or user records.
             tool_results = extract_tool_results(content)
-            if tool_results and steps and steps[-1]["source"] == "agent":
-                # Attach as observation to previous agent step
-                steps[-1]["observation"] = {"results": tool_results}
-            else:
-                text = extract_text(content)
-                if text.strip():
-                    step_id += 1
-                    steps.append({
-                        "step_id": step_id,
-                        "timestamp": timestamp,
-                        "source": "user",
-                        "message": text[:5000],
-                    })
+            unmatched_results = []
+            for result in tool_results:
+                call_id = result.get("source_call_id")
+                owner = tool_call_steps.get(call_id) if isinstance(call_id, str) else None
+                if owner is None and isinstance(call_id, str):
+                    case_key, (kind, normalized) = _call_id_keys(call_id)
+                    other_kind = "plain" if kind == "separated" else "separated"
+                    matches = tool_call_aliases.get(case_key, set()) | tool_call_aliases.get(
+                        (other_kind, normalized), set()
+                    )
+                    # An exact ID wins; an ambiguous echo must not steal a sibling's result.
+                    if len(matches) == 1:
+                        owner = tool_call_steps[next(iter(matches))]
+                if owner is not None:
+                    owner.setdefault("observation", {"results": []})["results"].append(result)
+                else:
+                    unmatched_results.append(result)
+
+            # A mixed reply still contains a genuine user turn. Pure orphan
+            # results have no issuing step and must not become human input.
+            text = extract_text(content, include_tool_results=False)
+            if text.strip():
+                step_id += 1
+                step = {
+                    "step_id": step_id,
+                    "timestamp": timestamp,
+                    "source": "user",
+                    "message": text[:5000],
+                }
+                if unmatched_results:
+                    step["observation"] = {"results": unmatched_results}
+                steps.append(step)
 
         elif role == "assistant" or entry_type == "assistant":
             text = extract_text(content)
             tool_calls = extract_tool_calls(content)
             thinking = extract_thinking(content)
 
-            if not text.strip() and not tool_calls:
+            # Thinking is part of the turn even when the record carries no
+            # text or tool call: Claude Code can stream it in its own record,
+            # and dropping the step also dropped the reasoning_content.
+            if not text.strip() and not tool_calls and not thinking:
                 continue
 
             step_id += 1
@@ -176,19 +218,33 @@ def jsonl_to_atif(filepath: Path) -> Optional[dict]:
             }
             if tool_calls:
                 step["tool_calls"] = tool_calls
+                for call in tool_calls:
+                    call_id = call.get("tool_call_id")
+                    if isinstance(call_id, str) and call_id:
+                        tool_call_steps[call_id] = step
+                        for key in _call_id_keys(call_id):
+                            tool_call_aliases.setdefault(key, set()).add(call_id)
             if thinking:
                 step["reasoning_content"] = thinking[:3000]
 
             # Extract usage metrics if present
             usage = msg.get("usage", {})
-            if usage:
+            if isinstance(usage, dict):
                 metrics = {}
-                if usage.get("input_tokens"):
-                    metrics["prompt_tokens"] = usage["input_tokens"]
-                if usage.get("output_tokens"):
-                    metrics["completion_tokens"] = usage["output_tokens"]
-                if usage.get("cache_read_input_tokens"):
-                    metrics["cached_tokens"] = usage["cache_read_input_tokens"]
+                counters = {
+                    key: value for key, value in usage.items() if type(value) is int and value >= 0
+                }
+                for source, target in (
+                    ("input_tokens", "prompt_tokens"),
+                    ("output_tokens", "completion_tokens"),
+                    ("cache_read_input_tokens", "cached_tokens"),
+                ):
+                    if source in counters:
+                        metrics[target] = counters[source]
+                if "prompt_tokens" in metrics:
+                    # Anthropic reports uncached, read, and created input separately.
+                    metrics["prompt_tokens"] += counters.get("cache_read_input_tokens", 0)
+                    metrics["prompt_tokens"] += counters.get("cache_creation_input_tokens", 0)
                 if metrics:
                     step["metrics"] = metrics
 
@@ -324,27 +380,36 @@ def main():
 
         # Write ATIF to temp file and run analyze
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", prefix="atif-", delete=False
+            mode="w", encoding="utf-8", suffix=".json", prefix="atif-", delete=False
         ) as tmp:
             json.dump(atif, tmp, ensure_ascii=False)
             tmp_path = tmp.name
 
         try:
-            result = subprocess.run(
-                analyze_cmd + [tmp_path, "--dim", args.dim],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                timeout=300,
-            )
+            try:
+                result = subprocess.run(
+                    analyze_cmd + [tmp_path, "--dim", args.dim],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    timeout=300,
+                )
+            except OSError as error:
+                print(f"  FAIL: cannot run analyzer: {error}", file=sys.stderr)
+                failed += 1
+                continue
             if result.returncode == 0:
-                print(f"  OK ({args.dim})", file=sys.stderr)
                 # Output result with file attribution
                 output = json.loads(result.stdout)
+                if not isinstance(output, dict):
+                    print("  FAIL: expected a JSON object from analyzer", file=sys.stderr)
+                    failed += 1
+                    continue
                 output["_source_file"] = str(filepath)
                 output["_session_id"] = atif["session_id"]
                 output["_steps"] = n_steps
                 print(json.dumps(output, ensure_ascii=False, indent=2))
+                print(f"  OK ({args.dim})", file=sys.stderr)
                 analyzed += 1
             else:
                 print(f"  FAIL: {result.stderr.strip()[:200]}", file=sys.stderr)

@@ -294,17 +294,26 @@ mod tests {
         );
         assert_eq!(
             MessageId::AuthEcsChecking as usize,
-            MessageId::ALL.len() - 15
+            MessageId::ALL.len() - 24
         );
         assert_eq!(
             MessageId::AuthEcsCancelHint as usize,
             MessageId::AuthEcsChecking as usize + 10
         );
-        // The #3413 kernel-confinement health segment is the current tail; tail
-        // ownership assertions move with each appended segment.
+        // Tail ownership assertions move with each appended segment: the
+        // startup-upgrade and /bug segments sit between the ECS segment and the
+        // #3413 kernel-confinement health segment, which is the current tail.
+        assert_eq!(
+            MessageId::StartupUpgradeHintLine as usize,
+            MessageId::AuthEcsRefreshing as usize + 1
+        );
+        assert_eq!(
+            MessageId::HelpSummaryBug as usize,
+            MessageId::StartupUpgradeNoticeTitle as usize + 1
+        );
         assert_eq!(
             MessageId::HealthFindingWorkspaceConfinementUnsupported as usize,
-            MessageId::AuthEcsRefreshing as usize + 1
+            MessageId::SlashBugCopyLine as usize + 1
         );
         assert_eq!(
             MessageId::HealthRemediationWorkspaceConfinement as usize + 1,
