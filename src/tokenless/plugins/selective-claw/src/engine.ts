@@ -197,18 +197,15 @@ export class SelectiveContextEngine implements ContextEngine {
     const bindings = this.bindSummaryTurns(params.sessionId, turns, records);
     const summaries = await this.generateMissingSummaries(params.sessionId, turns, bindings);
 
+    // The assembler keeps the result inside tokenBudget or rejects with
+    // ContextBudgetError when the protected recent tail alone cannot fit. Raw
+    // messages are already archived above, so a rejection loses nothing.
     const result = this.assembler.assemble({
       messages,
       summaries,
       tokenBudget,
       freshTailTurns: this.config.freshTailTurns,
     });
-
-    if (result.estimatedTokens > tokenBudget) {
-      console.warn(
-        `[selective-claw] assembled context (${result.estimatedTokens} tokens) exceeds budget (${tokenBudget})`
-      );
-    }
 
     return {
       messages: result.messages,

@@ -395,6 +395,12 @@ middleware 不返回替换内容也是如此。过大的 `details` 也可能被�
 `selective-claw.db`；该环境变量未设置时使用 `~/.openclaw`。将插件的 `enabled` 选项设为
 `false` 时，不打开数据库，也不注册上下文引擎或召回工具。
 
+`assemble()` 会执行宿主传入的 token 预算，衡量方式是插件自带的估算器，而不是各 provider 的
+分词器。`freshTailTurns` 内的消息整条保留——tool call 与 tool result 永不被截断；历史摘要条目
+按 turn 从新到旧纳入，只有整条仍放得下时才写入。当受保护的最近轮次本身就超出预算时，
+`assemble()` 抛出 `ContextBudgetError`，不再返回超预算的上下文。未进入上下文的轮次仍完整归档在
+SQLite 中，`expand_turn` 依然可以取回其原始消息。
+
 ### Hermes
 
 Plugin 在 Hermes 新会话中生效。重启 Hermes 后先执行 Shell 工具任务验证阻止后重试改写，

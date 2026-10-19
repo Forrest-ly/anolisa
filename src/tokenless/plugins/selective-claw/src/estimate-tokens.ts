@@ -21,12 +21,20 @@ function estimateCodePointTokens(cp: number): number {
   return 0.25;
 }
 
-export function estimateTokens(text: string): number {
+/**
+ * Un-rounded estimate. Additive over concatenation, which lets callers accumulate the
+ * cost of a message segment by segment; `estimateTokens` rounds the same sum.
+ */
+export function estimateTokenUnits(text: string): number {
   let tokens = 0;
   for (const char of text) {
     tokens += estimateCodePointTokens(char.codePointAt(0) ?? 0);
   }
-  return Math.ceil(tokens);
+  return tokens;
+}
+
+export function estimateTokens(text: string): number {
+  return Math.ceil(estimateTokenUnits(text));
 }
 
 export function truncateTextToEstimatedTokens(text: string, maxTokens: number): string {

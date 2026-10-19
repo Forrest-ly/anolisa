@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { estimateTokens, truncateTextToEstimatedTokens } from "../src/estimate-tokens.js";
+import {
+  estimateTokens,
+  estimateTokenUnits,
+  truncateTextToEstimatedTokens,
+} from "../src/estimate-tokens.js";
 
 describe("estimateTokens", () => {
   it("estimates ASCII text at ~0.25 tokens per char", () => {
@@ -14,6 +18,21 @@ describe("estimateTokens", () => {
 
   it("returns 0 for empty string", () => {
     expect(estimateTokens("")).toBe(0);
+  });
+});
+
+describe("estimateTokenUnits", () => {
+  it("returns the un-rounded sum estimateTokens ceils", () => {
+    expect(estimateTokenUnits("hello world")).toBe(2.75);
+    expect(estimateTokens("hello world")).toBe(Math.ceil(estimateTokenUnits("hello world")));
+  });
+
+  it("is additive over concatenation so segments can be summed", () => {
+    const left = "摘要 \"quoted\"\n\t";
+    const right = "path\\to\\file \u{1F600}\u0007";
+    expect(estimateTokenUnits(left + right)).toBe(
+      estimateTokenUnits(left) + estimateTokenUnits(right),
+    );
   });
 });
 

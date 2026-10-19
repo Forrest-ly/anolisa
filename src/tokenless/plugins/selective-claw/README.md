@@ -6,6 +6,7 @@
 
 - [功能概述](#功能概述)
 - [工作原理](#工作原理)
+- [上下文预算与溢出行为](#上下文预算与溢出行为)
 - [快速上手](#快速上手)
 - [配置项](#配置项)
 - [项目架构](#项目架构)
@@ -45,6 +46,25 @@ afterTurn() 生成摘要：
   - 为 freshTail 之外且尚无摘要的 turn 并行调用 LLM
   - 每个 turn 生成一句话摘要，存入 DB
 ```
+
+## 上下文预算与溢出行为
+
+`assemble()` 会执行宿主传入的 `tokenBudget`，衡量方式是 `estimate-tokens.ts` 的估算器，
+不是各家 provider 的精确分词器。规则如下：
+
+1. **最近轮次原文优先，且永不裁剪** — `freshTailTurns` 内的消息整条保留，tool call 与
+   tool result 的结构与内容原样传递，不会为了塞进预算而截断任何消息。
+2. **历史摘要整条纳入，从新到旧** — 摘要块按 turn 从新到旧逐条尝试，只有整条放得下才写入；
+   遇到第一条放不下的摘要即停止，因此进入上下文的历史总是最近的连续一段。
+3. **放不下就明确失败** — 当受保护的最近轮次本身就超过预算时，`assemble()` 抛出
+   `ContextBudgetError`（携带 `requiredTokens`、`tokenBudget`、`freshTailTurnCount`、
+   `freshTailMessageCount`），不再返回超预算的上下文，也不再只打一条 warning。
+   处理办法是提高宿主传入的预算，或调小 `freshTailTurns`。
+4. **原始消息始终归档** — 被省略的轮次仍完整保存在 SQLite 中，LLM 可以用 `expand_turn`
+   按 turn_seq 取回原文。
+
+`assemble()` 的返回结果因此始终满足 `estimatedTokens <= tokenBudget`；`stats.omittedTurns`
+报告因预算被省略的旧轮次数，`stats.summaryCount` 报告实际写入的摘要行数。
 
 ## 快速上手
 
@@ -115,13 +135,14 @@ selective-claw/
 │   └── store/
 │       ├── message-store.ts  # 消息 CRUD + 全文搜索
 │       └── index.ts          # 重导出
-└── test/                     # Vitest 测试套件（64 个测试）
+└── test/                     # Vitest 测试套件
 ```
 
 ### 核心设计决策
 
 - **`ownsCompaction: true`** — 告知 OpenClaw 不要触发自带的自动压缩，由 selective-claw 管理上下文
 - **`compact()` 返回成功** — 实际裁剪在 assemble 中完成，compact 只是告诉 gateway "已处理"
+- **预算在 assemble 内强制执行** — 最近轮次整条保留、历史摘要整条纳入，放不下时抛出 `ContextBudgetError`，见[上下文预算与溢出行为](#上下文预算与溢出行为)
 - **消息通过 reconcile 入库** — Gateway 不调用 ingest()，消息通过 assemble/afterTurn 的 params.messages 增量导入
 - **内容对齐** — reconcileMessages 使用 rawMessage JSON 匹配做增量导入，处理 gateway 替换消息的情况
 - **FTS5 + Porter 词干提取** — `tokenize='porter unicode61'` 提供词干化和 Unicode 支持
@@ -144,7 +165,7 @@ npm run build
 测试使用内存数据库，无需文件系统配置：
 
 ```bash
-npm test                              # 全部 64 个测试
+npm test                              # 全部测试
 npx vitest run test/assembler.test.ts # 运行单个测试套件
 ```
 

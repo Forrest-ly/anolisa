@@ -430,6 +430,14 @@ is `selective-claw.db` under `OPENCLAW_STATE_DIR`, or under `~/.openclaw` when t
 variable is unset. Setting the plugin's `enabled` option to `false` skips database,
 context engine and recall tool registration.
 
+`assemble()` enforces the token budget the host passes in, measured with the plugin's
+own estimator rather than a provider tokenizer. Messages inside `freshTailTurns` are kept
+whole — tool calls and tool results are never cut — and historical summary entries are
+admitted newest-first only while a whole entry still fits the remaining budget. When the
+protected recent tail alone exceeds the budget, `assemble()` raises `ContextBudgetError`
+instead of returning context above the budget. Turns left out of the context stay archived
+in SQLite, so `expand_turn` can still retrieve their original messages.
+
 ### Hermes
 
 The plugin takes effect in a new Hermes session. Restart Hermes, run a shell-tool task to verify the

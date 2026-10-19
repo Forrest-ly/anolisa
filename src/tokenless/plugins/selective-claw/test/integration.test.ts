@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { SelectiveContextEngine } from "../src/engine.js";
+import { ContextBudgetError } from "../src/assembler.js";
 import { executeExpandTurn } from "../src/recall-tool.js";
 import { createConnection, closeConnection } from "../src/db/connection.js";
 import { estimateTokens } from "../src/estimate-tokens.js";
@@ -99,7 +100,7 @@ describe("Integration: gateway lifecycle simulation", () => {
   // ─── 2. 上下文裁剪（assemble） ───
 
   describe("2. context trimming (assemble)", () => {
-    it("reports overflow from a large summary and preserves structured fresh-tail messages", async () => {
+    it("drops an oversized summary instead of returning context above the budget", async () => {
       const messages = buildMessages(4);
       const toolResult: AgentMessage = {
         role: "toolResult",
@@ -116,22 +117,54 @@ describe("Integration: gateway lifecycle simulation", () => {
         await engine.afterTurn({ sessionId: SESSION, messages });
         const result = await engine.assemble({ sessionId: SESSION, messages, tokenBudget: 500 });
 
-        expect(result.estimatedTokens).toBeGreaterThan(500);
-        expect(warning).toHaveBeenCalledWith(
-          `[selective-claw] assembled context (${result.estimatedTokens} tokens) exceeds budget (500)`,
-        );
+        expect(result.estimatedTokens).toBeLessThanOrEqual(500);
+        expect(warning).not.toHaveBeenCalled();
         expect(result.estimatedTokens).toBe(result.messages.reduce(
           (total, message) => total + estimateTokens(JSON.stringify(message)),
           0,
         ));
         const tail = messages.slice(2);
+        expect(result.messages).toHaveLength(tail.length);
         for (let index = 0; index < tail.length; index++) {
-          expect(result.messages[index + 1]).toBe(tail[index]);
+          expect(result.messages[index]).toBe(tail[index]);
         }
         expect(result.messages[result.messages.length - 1]).toBe(toolResult);
       } finally {
         warning.mockRestore();
       }
+    });
+
+    it("keeps the archive intact and rejects when the fresh tail alone exceeds the budget", async () => {
+      const messages = buildMessages(4);
+      const toolResult: AgentMessage = {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "read_file",
+        content: [{ type: "text", text: "文件内容".repeat(120) }],
+        isError: false,
+      };
+      messages.push(toolResult);
+      const tail = messages.slice(2);
+      const tailTokens = tail.reduce(
+        (total, message) => total + estimateTokens(JSON.stringify(message)),
+        0,
+      );
+
+      await engine.afterTurn({ sessionId: SESSION, messages });
+
+      await expect(
+        engine.assemble({ sessionId: SESSION, messages, tokenBudget: tailTokens - 1 }),
+      ).rejects.toThrow(ContextBudgetError);
+
+      // Raw messages stay archived and expand_turn still reaches the trimmed history.
+      expect(engine.getStore().getMessageCount(SESSION)).toBe(messages.length);
+      expect(engine.expandTurns(SESSION, [1]).found).toBe(1);
+
+      const fitting = await engine.assemble({ sessionId: SESSION, messages, tokenBudget: tailTokens });
+      expect(fitting.estimatedTokens).toBeLessThanOrEqual(tailTokens);
+      expect(fitting.messages).toHaveLength(tail.length);
+      tail.forEach((message, index) => expect(fitting.messages[index]).toBe(message));
+      expect(fitting.messages[fitting.messages.length - 1]).toBe(toolResult);
     });
 
     it("returns all messages when turns <= freshTailTurns", async () => {
