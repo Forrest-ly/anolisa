@@ -225,6 +225,10 @@ Test message
 # 示例
 sudo ../scripts/test-module.sh hello_module
 sudo ../scripts/test-module.sh param_module greeting="Hi" repeat_count=5
+
+# 参数值含空格或通配符（* ? []）时，请用引号包住整个参数：
+# 每个参数都会原样作为单个 insmod 参数传入，不做分词与通配展开
+sudo ../scripts/test-module.sh param_module 'greeting=Hello World' 'pattern=a*'
 ```
 
 **测试流程：**
