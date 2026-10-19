@@ -17,6 +17,9 @@ import { Assembler } from "./assembler.js";
 import { estimateTokens } from "./estimate-tokens.js";
 
 const MAX_CACHED_SESSIONS = 10;
+// Engine-wide bound on in-flight turn summaries. Overlapping sessions share this
+// capacity so reopening a long archive cannot burst the host LLM transport.
+const MAX_CONCURRENT_SUMMARIES = 4;
 
 type ReconcileMessage = { role: string; content: string; toolIdentity: string | null };
 
@@ -71,6 +74,8 @@ export class SelectiveContextEngine implements ContextEngine {
   private turnSummaryCache = new Map<string, Map<number, string>>();
   private turnMessagesCache = new Map<string, Map<number, AgentMessage[]>>();
   private sessionAccessOrder: string[] = [];
+  private activeSummaries = 0;
+  private summaryWaiters: Array<() => void> = [];
 
   private store: MessageStore;
   private assembler: Assembler;
@@ -396,12 +401,14 @@ export class SelectiveContextEngine implements ContextEngine {
     const needSummary = olderTurns.filter((turn) => !summaries.has(turn.turnSeq));
 
     const results = await Promise.allSettled(
-      needSummary.map((turn) => {
-        const text = turn.messages
-          .map((message) => `${message.role}: ${this.extractContent(message)}`)
-          .join("\n");
-        return summarizeFn(text).then((summary) => ({ turnSeq: turn.turnSeq, summary }));
-      }),
+      needSummary.map((turn) =>
+        this.runBoundedSummary(() => {
+          const text = turn.messages
+            .map((message) => `${message.role}: ${this.extractContent(message)}`)
+            .join("\n");
+          return summarizeFn(text).then((summary) => ({ turnSeq: turn.turnSeq, summary }));
+        }),
+      ),
     );
 
     for (const result of results) {
@@ -418,6 +425,41 @@ export class SelectiveContextEngine implements ContextEngine {
       }
     }
     return summaries;
+  }
+
+  /**
+   * Runs one summary task under the engine-wide concurrency bound. A rejected
+   * task releases its slot exactly like a fulfilled one, so a failing provider
+   * call cannot strand the turns queued behind it.
+   */
+  private async runBoundedSummary<T>(task: () => Promise<T>): Promise<T> {
+    await this.acquireSummarySlot();
+    try {
+      return await task();
+    } finally {
+      this.releaseSummarySlot();
+    }
+  }
+
+  private acquireSummarySlot(): Promise<void> {
+    if (this.activeSummaries < MAX_CONCURRENT_SUMMARIES) {
+      this.activeSummaries += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      // Waiters are released FIFO and claim the slot themselves, so the active
+      // count never exceeds the bound even when several slots free at once.
+      this.summaryWaiters.push(() => {
+        this.activeSummaries += 1;
+        resolve();
+      });
+    });
+  }
+
+  private releaseSummarySlot(): void {
+    this.activeSummaries -= 1;
+    const next = this.summaryWaiters.shift();
+    if (next) next();
   }
 
   private cacheTurnMessages(
