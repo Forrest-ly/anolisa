@@ -176,6 +176,34 @@ impl Episode {
     }
 }
 
+/// An episode together with the inclusive range of audit entries it was
+/// extracted from. The patterns deliberately overlap, so the range is what
+/// makes "these two episodes describe the same memory" decidable; it is an
+/// extraction detail and is not part of the serialized [`Episode`].
+#[derive(Debug)]
+struct SpannedEpisode {
+    episode: Episode,
+    /// Index of the first audit entry the episode covers.
+    start: usize,
+    /// Index of the last audit entry the episode covers.
+    end: usize,
+}
+
+impl SpannedEpisode {
+    fn new(episode: Episode, start: usize, end: usize) -> Self {
+        Self {
+            episode,
+            start,
+            end,
+        }
+    }
+
+    /// True when every entry this episode covers is also covered by `other`.
+    fn is_contained_in(&self, other: &Self) -> bool {
+        other.start <= self.start && self.end <= other.end
+    }
+}
+
 /// Extract episodes from a sequence of audit entries.
 /// Returns up to `max_episodes` episodes.
 /// `session_id` is the actual session identifier, propagated to every
@@ -200,17 +228,32 @@ pub fn extract_episodes(
     // Pattern 4: general task chains (≥min_steps consecutive diverse calls)
     episodes.extend(extract_general_chains(entries, session_id, min_steps));
 
-    // Deduplicate overlapping episodes (prefer longer ones)
-    episodes.sort_by_key(|e| std::cmp::Reverse(e.chain.len()));
-    episodes.truncate(max_episodes);
+    // Deduplicate overlapping episodes (prefer longer ones). One span of
+    // entries can satisfy two patterns — search → read → edit → read is also
+    // a 4-tool task chain — and every episode becomes its own fact, so an
+    // undeduplicated overlap double-writes the same episodic memory and
+    // spends budget distinct memories should get. Longer chains sort first
+    // (the sort is stable, so equal lengths keep pattern priority: the
+    // specific patterns are extracted before the general one), and any
+    // episode whose entry range is contained in an already-kept range is
+    // dropped. Deduplication runs before the truncate so duplicates cannot
+    // consume `max_episodes` slots.
+    episodes.sort_by_key(|e| std::cmp::Reverse(e.episode.chain.len()));
+    let mut deduped: Vec<SpannedEpisode> = Vec::with_capacity(episodes.len());
+    for candidate in episodes {
+        if !deduped.iter().any(|kept| candidate.is_contained_in(kept)) {
+            deduped.push(candidate);
+        }
+    }
+    deduped.truncate(max_episodes);
 
-    episodes
+    deduped.into_iter().map(|s| s.episode).collect()
 }
 
 // ── Pattern 1: Edit-Verify Cycle ──────────────────────────────────
 // search/grep → read → edit → read
 
-fn extract_edit_cycle(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<Episode> {
+fn extract_edit_cycle(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<SpannedEpisode> {
     let mut episodes = Vec::new();
     let mut i = 0;
 
@@ -259,13 +302,10 @@ fn extract_edit_cycle(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<Epis
         let trigger = format!("{} {}", entries[i].tool, entries[i].path);
         let duration = duration_between(&entries[i].ts, &entries[l].ts);
 
-        episodes.push(Episode::new(
-            session_id,
-            trigger,
-            chain,
-            outcome,
-            error_count,
-            duration,
+        episodes.push(SpannedEpisode::new(
+            Episode::new(session_id, trigger, chain, outcome, error_count, duration),
+            i,
+            l,
         ));
 
         i = l + 1; // Skip past this episode
@@ -277,7 +317,7 @@ fn extract_edit_cycle(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<Epis
 // ── Pattern 2: Promote Chain ──────────────────────────────────────
 // read → write(scratch/) → promote
 
-fn extract_promote_chain(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<Episode> {
+fn extract_promote_chain(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<SpannedEpisode> {
     let mut episodes = Vec::new();
     let mut i = 0;
 
@@ -312,13 +352,17 @@ fn extract_promote_chain(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<E
 
             let trigger = format!("promote: {}", entries[i].path);
             let duration = duration_between(&entries[ri].ts, &entries[i].ts);
-            episodes.push(Episode::new(
-                session_id,
-                trigger,
-                chain,
-                EpisodeOutcome::Promoted,
-                0,
-                duration,
+            episodes.push(SpannedEpisode::new(
+                Episode::new(
+                    session_id,
+                    trigger,
+                    chain,
+                    EpisodeOutcome::Promoted,
+                    0,
+                    duration,
+                ),
+                ri,
+                i,
             ));
         }
 
@@ -331,7 +375,7 @@ fn extract_promote_chain(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<E
 // ── Pattern 3: Error Recovery ─────────────────────────────────────
 // tool(error) → tool(ok) or different_tool(ok)
 
-fn extract_error_recovery(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<Episode> {
+fn extract_error_recovery(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<SpannedEpisode> {
     let mut episodes = Vec::new();
 
     for i in 0..entries.len().saturating_sub(1) {
@@ -345,13 +389,17 @@ fn extract_error_recovery(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<
                 let chain = vec![make_step(1, &entries[i]), make_step(2, &entries[j])];
                 let trigger = format!("error recovery: {}", entries[i].tool);
                 let duration = duration_between(&entries[i].ts, &entries[j].ts);
-                episodes.push(Episode::new(
-                    session_id,
-                    trigger,
-                    chain,
-                    EpisodeOutcome::Recovered,
-                    1,
-                    duration,
+                episodes.push(SpannedEpisode::new(
+                    Episode::new(
+                        session_id,
+                        trigger,
+                        chain,
+                        EpisodeOutcome::Recovered,
+                        1,
+                        duration,
+                    ),
+                    i,
+                    j,
                 ));
                 break;
             }
@@ -368,7 +416,7 @@ fn extract_general_chains(
     entries: &[OwnedAuditEntry],
     session_id: &str,
     min_steps: usize,
-) -> Vec<Episode> {
+) -> Vec<SpannedEpisode> {
     let mut episodes = Vec::new();
 
     // Find contiguous blocks of "interesting" tools (not mem_list, not repeated reads)
@@ -402,13 +450,10 @@ fn extract_general_chains(
                 let start_idx: usize = *current_chain.first().unwrap();
                 let end_idx: usize = *current_chain.last().unwrap();
                 let duration = duration_between(&entries[start_idx].ts, &entries[end_idx].ts);
-                episodes.push(Episode::new(
-                    session_id,
-                    trigger,
-                    chain,
-                    outcome,
-                    error_count,
-                    duration,
+                episodes.push(SpannedEpisode::new(
+                    Episode::new(session_id, trigger, chain, outcome, error_count, duration),
+                    start_idx,
+                    end_idx,
                 ));
             }
             current_chain.clear();
@@ -444,13 +489,10 @@ fn extract_general_chains(
         let start_idx: usize = *current_chain.first().unwrap();
         let end_idx: usize = *current_chain.last().unwrap();
         let duration = duration_between(&entries[start_idx].ts, &entries[end_idx].ts);
-        episodes.push(Episode::new(
-            session_id,
-            trigger,
-            chain,
-            outcome,
-            error_count,
-            duration,
+        episodes.push(SpannedEpisode::new(
+            Episode::new(session_id, trigger, chain, outcome, error_count, duration),
+            start_idx,
+            end_idx,
         ));
     }
 
@@ -532,8 +574,13 @@ mod tests {
         ];
         let episodes = extract_edit_cycle(&entries, "test-sid");
         assert_eq!(episodes.len(), 1);
-        assert_eq!(episodes[0].chain.len(), 4);
-        assert_eq!(episodes[0].outcome, EpisodeOutcome::Success);
+        assert_eq!(episodes[0].episode.chain.len(), 4);
+        assert_eq!(episodes[0].episode.outcome, EpisodeOutcome::Success);
+        assert_eq!(
+            (episodes[0].start, episodes[0].end),
+            (0, 3),
+            "the span must cover exactly the cycle's four entries"
+        );
     }
 
     #[test]
@@ -551,8 +598,13 @@ mod tests {
         ];
         let episodes = extract_promote_chain(&entries, "test-sid");
         assert_eq!(episodes.len(), 1);
-        assert_eq!(episodes[0].chain.len(), 3);
-        assert_eq!(episodes[0].outcome, EpisodeOutcome::Promoted);
+        assert_eq!(episodes[0].episode.chain.len(), 3);
+        assert_eq!(episodes[0].episode.outcome, EpisodeOutcome::Promoted);
+        assert_eq!(
+            (episodes[0].start, episodes[0].end),
+            (0, 2),
+            "the span runs from the source read to the promote"
+        );
     }
 
     #[test]
@@ -569,7 +621,12 @@ mod tests {
         ];
         let episodes = extract_error_recovery(&entries, "test-sid");
         assert_eq!(episodes.len(), 1);
-        assert_eq!(episodes[0].outcome, EpisodeOutcome::Recovered);
+        assert_eq!(episodes[0].episode.outcome, EpisodeOutcome::Recovered);
+        assert_eq!(
+            (episodes[0].start, episodes[0].end),
+            (0, 1),
+            "the span runs from the failure to the successful retry"
+        );
     }
 
     #[test]
@@ -582,7 +639,7 @@ mod tests {
         ];
         let episodes = extract_edit_cycle(&entries, "test-sid");
         assert_eq!(episodes.len(), 1);
-        let fact = episodes[0].to_fact();
+        let fact = episodes[0].episode.to_fact();
         assert_eq!(fact.category, FactCategory::Episodic);
         assert!(
             fact.title.contains("情景") || fact.content.contains("episodic"),
@@ -591,6 +648,129 @@ mod tests {
             &fact.content[..100.min(fact.content.len())]
         );
         assert!(fact.confidence >= 0.9);
+    }
+
+    // ── Overlap deduplication ───────────────────────────────────────
+    //
+    // The four patterns deliberately overlap: one span of audit entries can
+    // satisfy two of them, and every episode becomes its own
+    // `ConsolidatedFact`, so an undeduplicated overlap writes the same
+    // episodic memory twice and spends `max_episodes` / `max_facts` budget
+    // that distinct memories should get.
+
+    /// search → read → edit → read satisfies both the edit-verify cycle
+    /// (pattern 1) and the general task chain (pattern 4): one span, one
+    /// episode, and the more specific pattern keeps it.
+    #[test]
+    fn extract_episodes_dedups_one_span_to_one_episode() {
+        let entries = vec![
+            make_entry("memory_search", "bm25:rust config", true, None, Some(3)),
+            make_entry("mem_read", "src/config.rs", true, None, Some(200)),
+            make_entry("mem_edit", "src/config.rs", true, None, Some(1)),
+            make_entry("mem_read", "src/config.rs", true, None, Some(200)),
+        ];
+        let episodes = extract_episodes(&entries, "test-sid", 3, 10);
+        let triggers: Vec<_> = episodes.iter().map(|e| e.trigger.clone()).collect();
+        assert_eq!(
+            episodes.len(),
+            1,
+            "one span must not yield two episodes: {triggers:?}"
+        );
+        assert_eq!(triggers[0], "memory_search bm25:rust config");
+    }
+
+    /// Episodes extracted from disjoint entry ranges describe different
+    /// memories and must all survive, whatever their length.
+    #[test]
+    fn extract_episodes_keeps_disjoint_spans() {
+        let entries = vec![
+            make_entry(
+                "mem_write",
+                "notes/a.md",
+                false,
+                Some("already exists"),
+                None,
+            ),
+            make_entry("mem_write", "notes/a.md", true, None, Some(100)),
+            // mem_list is chain noise: it separates the two spans below.
+            make_entry("mem_list", "", true, None, Some(2)),
+            make_entry("mem_read", "notes/b.md", false, Some("transient"), None),
+            make_entry("mem_append", "notes/b.md", true, None, Some(50)),
+        ];
+        let episodes = extract_episodes(&entries, "test-sid", 3, 10);
+        let triggers: Vec<_> = episodes.iter().map(|e| e.trigger.clone()).collect();
+        assert_eq!(
+            episodes.len(),
+            2,
+            "two disjoint error-recovery spans must both survive: {triggers:?}"
+        );
+        assert_eq!(triggers[0], "error recovery: mem_write");
+        assert_eq!(triggers[1], "error recovery: mem_read");
+    }
+
+    /// A shorter episode whose entries all sit inside a longer kept episode
+    /// is the same material: the longer chain already carries those steps
+    /// (including the failure and its `error_count`).
+    #[test]
+    fn extract_episodes_prefers_the_longer_span_when_nested() {
+        let entries = vec![
+            make_entry(
+                "mem_write",
+                "notes/x.md",
+                false,
+                Some("already exists"),
+                None,
+            ),
+            make_entry("mem_write", "notes/x.md", true, None, Some(100)),
+            make_entry("mem_read", "notes/y.md", true, None, Some(80)),
+            make_entry("mem_append", "notes/y.md", true, None, Some(20)),
+        ];
+        let episodes = extract_episodes(&entries, "test-sid", 3, 10);
+        let triggers: Vec<_> = episodes.iter().map(|e| e.trigger.clone()).collect();
+        assert_eq!(
+            episodes.len(),
+            1,
+            "the nested error recovery is part of the task chain: {triggers:?}"
+        );
+        assert_eq!(triggers[0], "task chain: 4 tools");
+        assert_eq!(episodes[0].error_count, 1, "the failure stays visible");
+    }
+
+    /// Deduplication must run before the `max_episodes` truncate, otherwise
+    /// duplicates eat the budget and a distinct memory is dropped.
+    #[test]
+    fn extract_episodes_dedups_before_truncating_to_max_episodes() {
+        let entries = vec![
+            // Span 1: an edit-verify cycle, which also reads as a task chain.
+            make_entry("memory_search", "bm25:rust config", true, None, Some(3)),
+            make_entry("mem_read", "src/config.rs", true, None, Some(200)),
+            make_entry("mem_edit", "src/config.rs", true, None, Some(1)),
+            make_entry("mem_read", "src/config.rs", true, None, Some(200)),
+            // Chain noise separates the two spans.
+            make_entry("mem_list", "", true, None, Some(2)),
+            // Span 2: a plain task chain, no other pattern fires on it.
+            make_entry("mem_write", "notes/b1.md", true, None, Some(10)),
+            make_entry("mem_append", "notes/b1.md", true, None, Some(10)),
+            make_entry("mem_read", "notes/b2.md", true, None, Some(10)),
+            make_entry("mem_write", "notes/b3.md", true, None, Some(10)),
+        ];
+        let episodes = extract_episodes(&entries, "test-sid", 3, 2);
+        let triggers: Vec<_> = episodes.iter().map(|e| e.trigger.clone()).collect();
+        assert_eq!(
+            triggers,
+            vec![
+                "memory_search bm25:rust config".to_string(),
+                "task chain: 4 tools".to_string()
+            ],
+            "both distinct memories must fit the budget of 2"
+        );
+        // The surviving task chain must be the *second* span's: on the
+        // undeduplicated path the budget is spent on a duplicate of the
+        // edit-verify cycle's own entries and this memory is lost.
+        assert_eq!(
+            episodes[1].chain[0].tool, "mem_write",
+            "the second budget slot must hold the distinct span, not a duplicate"
+        );
     }
 
     #[test]
@@ -602,7 +782,7 @@ mod tests {
             make_entry("mem_read", "src/lib.rs", true, None, Some(100)),
         ];
         let episodes = extract_edit_cycle(&entries, "test-sid");
-        let md = episodes[0].to_markdown();
+        let md = episodes[0].episode.to_markdown();
         assert!(md.starts_with("---\n"));
         assert!(md.contains("outcome: success"));
         assert!(md.contains("## Step 1: memory_search"));
