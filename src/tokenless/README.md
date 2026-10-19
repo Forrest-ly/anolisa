@@ -789,7 +789,10 @@ One `plugin.js` serves both host generations. OpenCode 2 loads its default defin
 OpenCode 1.0.0 through 1.3.3 are not supported: their plugin loader calls every module export as
 a plugin function, which the object default export OpenCode 2 requires cannot satisfy. The two
 loader contracts are mutually exclusive, so the supported range starts at 1.3.4, the first
-release that reads an object default export. Command rewriting and shell failure evidence match
+release that reads an object default export. On a host below that floor the bundled installer
+removes a registration left over from when the release was still supported, so replacing the
+adapter source in place cannot hand the old host a module it fails to initialize; `detect.sh`
+names that stale registration. Command rewriting and shell failure evidence match
 the shell tool family the shared hooks classify — OpenCode 1 names its built-in shell tool
 `bash`, OpenCode 2 names it `shell` — instead of a single host spelling.
 

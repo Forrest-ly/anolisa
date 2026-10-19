@@ -45,6 +45,14 @@ case "$hook" in
   compress_response_hook.py)
     if [[ "$payload" == *'"is_error":true'* ]]; then
       printf '%s\\n' '{"hookSpecificOutput":{"additionalContext":"[tokenless:env] command failed"}}'
+    elif [[ -n "\${TOKENLESS_TEST_PASSTHROUGH:-}" && "$payload" == *"\${TOKENLESS_TEST_PASSTHROUGH}"* ]]; then
+      # Core returned this slot unchanged: echo the model-visible text back.
+      TOKENLESS_TEST_PAYLOAD="$payload" node -e '
+        const payload = JSON.parse(process.env.TOKENLESS_TEST_PAYLOAD);
+        process.stdout.write(JSON.stringify({
+          hookSpecificOutput: { updatedToolOutput: String(payload.tool_response ?? "") },
+        }));
+      '
     else
       printf '%s\\n' '{"hookSpecificOutput":{"updatedToolOutput":"compressed-response","additionalContext":"[tokenless:env] warning"}}'
     fi
@@ -259,6 +267,61 @@ try {
   const runCalls = recordsFor("compress_response_hook.py").slice(runBefore);
   assert.equal(runCalls.length, 1, "one adjacent text run costs one hook call");
   assert.equal(runCalls[0].payload.tool_response, "run part one\nrun part two");
+
+  // A run Core returned unchanged keeps every one of its original parts, even
+  // when another run in the same result did change: only the changed run is
+  // rebuilt, so the untouched run's shape and part identity both survive.
+  const headPart = { type: "text", text: "unchanged run head" };
+  const tailPart = { type: "text", text: "unchanged run tail" };
+  const changedPart = { type: "text", text: "compressible tail run" };
+  const mixedEvent = {
+    tool: "read",
+    sessionID: "ses_v2",
+    id: "call_mixed_runs",
+    input: {},
+    status: "completed",
+    result: { content: [headPart, tailPart, filePart, changedPart], metadata: {} },
+  };
+  const mixedBefore = recordsFor("compress_response_hook.py").length;
+  process.env.TOKENLESS_TEST_PASSTHROUGH = "unchanged run head";
+  await host.fire("tool", "execute.after", mixedEvent);
+  delete process.env.TOKENLESS_TEST_PASSTHROUGH;
+
+  assert.deepEqual(mixedEvent.result.content, [
+    headPart,
+    tailPart,
+    filePart,
+    { type: "text", text: compressed },
+  ]);
+  assert.equal(mixedEvent.result.content[0], headPart, "an unchanged run keeps its head part");
+  assert.equal(mixedEvent.result.content[1], tailPart, "an unchanged run keeps its tail part");
+  assert.equal(mixedEvent.result.content[2], filePart, "the file part still sits between them");
+  assert.deepEqual(
+    recordsFor("compress_response_hook.py")
+      .slice(mixedBefore)
+      .map((record) => record.payload.tool_response),
+    ["unchanged run head\nunchanged run tail", "compressible tail run"],
+    "each run is still sent to Core separately, in host order",
+  );
+
+  // When Core changes nothing at all, the host's own array is left in place.
+  const untouchedEvent = {
+    tool: "read",
+    sessionID: "ses_v2",
+    id: "call_untouched",
+    input: {},
+    status: "completed",
+    result: { content: [headPart, filePart], metadata: {} },
+  };
+  const untouchedContent = untouchedEvent.result.content;
+  process.env.TOKENLESS_TEST_PASSTHROUGH = "unchanged run head";
+  await host.fire("tool", "execute.after", untouchedEvent);
+  delete process.env.TOKENLESS_TEST_PASSTHROUGH;
+  assert.equal(
+    untouchedEvent.result.content,
+    untouchedContent,
+    "an unchanged result keeps the host's own content array",
+  );
 
   // A result with no text part has nothing model-visible to replace.
   const fileOnlyEvent = {

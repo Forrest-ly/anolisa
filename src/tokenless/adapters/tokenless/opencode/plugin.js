@@ -237,7 +237,10 @@ function isTextPart(part) {
  */
 function resultTextLayout(content) {
   if (typeof content === "string") {
-    return { slots: [{ text: content }], apply: (texts) => texts[0] };
+    return {
+      slots: [{ text: content }],
+      apply: (texts) => (typeof texts[0] === "string" ? texts[0] : content),
+    };
   }
   if (!Array.isArray(content)) return null;
 
@@ -249,26 +252,34 @@ function resultTextLayout(content) {
       return;
     }
     if (!run) {
-      run = { first: index, texts: [], rest: [] };
+      run = { first: index, texts: [], indexes: [] };
       runs.push(run);
     }
     run.texts.push(part.text);
-    if (index !== run.first) run.rest.push(index);
+    run.indexes.push(index);
   });
   if (!runs.length) return null;
 
-  const runByFirst = new Map(runs.map((entry, slot) => [entry.first, slot]));
-  const collapsed = new Set(runs.flatMap((entry) => entry.rest));
+  const slots = runs.map((entry) => ({ first: entry.first, text: entry.texts.join("\n") }));
+  const slotByIndex = new Map();
+  runs.forEach((entry, slot) => {
+    for (const index of entry.indexes) slotByIndex.set(index, slot);
+  });
+
   return {
-    slots: runs.map((entry) => ({ text: entry.texts.join("\n") })),
-    // Slots whose text came back unchanged keep the host's own part object, so
-    // a host that compares parts by identity still sees the parts it created.
+    slots,
+    // Only a run whose replacement differs from its own joined text is rebuilt.
+    // A run Core returned unchanged keeps every one of its original parts, so
+    // its shape and part identity survive even when another run in the same
+    // result did change -- collapsing it would replace the host's head part and
+    // delete its tail for text nobody touched.
     apply: (texts) =>
       content.flatMap((part, index) => {
-        const slot = runByFirst.get(index);
-        if (slot === undefined) return collapsed.has(index) ? [] : [part];
+        const slot = slotByIndex.get(index);
+        if (slot === undefined) return [part];
         const text = texts[slot];
-        return typeof text === "string" && text !== part.text ? [{ ...part, text }] : [part];
+        if (typeof text !== "string" || text === slots[slot].text) return [part];
+        return index === slots[slot].first ? [{ ...part, text }] : [];
       }),
   };
 }

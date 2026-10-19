@@ -202,6 +202,82 @@ for version in 1.0.0 1.2.3-test 1.3.3; do
     fi
 done
 
+# -- Upgrade state: a registration made while the old host was supported --------
+# The adapter source behind the link is replaced in place (the npm postinstall
+# swaps the shared adapter tree), so an already installed OpenCode 1.0.0-1.3.3
+# host would load the new object default export and abort plugin initialization
+# on every start. A fresh install has no link and cannot reach this path.
+mkdir -p "$(dirname "$PLUGIN_LINK")"
+ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+
+detect_rc=0
+detect_out="$(TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 bash "$DETECT_SH" 2>&1)" || detect_rc=$?
+if [ "$detect_rc" -eq 2 ]; then
+    pass "detect reports the unsupported host"
+else
+    fail "detect returned ${detect_rc} for an unsupported host with a stale link"
+fi
+case "$detect_out" in
+    *"unsupported registration still present"*)
+        pass "detect names the stale registration on an unsupported host" ;;
+    *) fail "detect did not name the stale registration" ;;
+esac
+if [ -L "$PLUGIN_LINK" ]; then
+    pass "detect leaves the removal to the installer"
+else
+    fail "detect removed the registration itself"
+fi
+
+dry_out="$(ANOLISA_DRY_RUN=1 TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 bash "$INSTALL_SH" 2>&1)"
+case "$dry_out" in
+    *"DRY-RUN: rm"*) dry_previewed=1 ;;
+    *) dry_previewed=0 ;;
+esac
+if [ "$dry_previewed" -eq 1 ] && [ -L "$PLUGIN_LINK" ]; then
+    pass "dry-run previews the removal and keeps the stale registration"
+else
+    fail "dry-run did not preview the stale registration removal"
+fi
+
+install_rc=0
+install_out="$(TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 bash "$INSTALL_SH" 2>&1)" || install_rc=$?
+if [ "$install_rc" -eq 0 ] && [ ! -e "$PLUGIN_LINK" ] && [ ! -L "$PLUGIN_LINK" ]; then
+    pass "installer clears the stale registration on an unsupported host"
+else
+    fail "installer left the stale registration (rc=${install_rc})"
+fi
+case "$install_out" in
+    *"removed the now-unsupported registration"*)
+        pass "installer reports why the registration was removed" ;;
+    *) fail "installer did not report the removal" ;;
+esac
+if [ -f "$PLUGIN_SOURCE" ]; then
+    pass "clearing the registration leaves the adapter source intact"
+else
+    fail "installer deleted the adapter plugin source"
+fi
+
+# A file this adapter did not create is never removed, even on an old host.
+printf '%s\n' 'export const ForeignPlugin = async () => ({})' > "$PLUGIN_LINK"
+foreign_cksum="$(cksum "$PLUGIN_LINK")"
+TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 bash "$INSTALL_SH" >/dev/null 2>&1 || true
+if [ "$(cksum "$PLUGIN_LINK")" = "$foreign_cksum" ]; then
+    pass "installer leaves an unmanaged file alone on an unsupported host"
+else
+    fail "installer removed or modified an unmanaged file"
+fi
+rm -f "$PLUGIN_LINK"
+
+# A supported host keeps the registration it already has.
+ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+if TOKENLESS_TEST_OPENCODE_VERSION=2.0.29 bash "$INSTALL_SH" >/dev/null 2>&1 &&
+    [ -L "$PLUGIN_LINK" ] && [ "$(readlink "$PLUGIN_LINK")" = "$PLUGIN_SOURCE" ]; then
+    pass "installer keeps a valid registration on a supported host"
+else
+    fail "installer disturbed a valid registration on a supported host"
+fi
+rm -f "$PLUGIN_LINK"
+
 echo ""
 echo "OpenCode adapter tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

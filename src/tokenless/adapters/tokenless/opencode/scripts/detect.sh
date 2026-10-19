@@ -68,14 +68,29 @@ if [ -z "$VERSION" ]; then
     exit 2
 fi
 
+CONFIG_HOME="${TOKENLESS_OPENCODE_CONFIG_DIR:-${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}}"
+PLUGIN_LINK="$CONFIG_HOME/plugins/tokenless.js"
+
+is_managed_link() {
+    [ -L "$PLUGIN_LINK" ] && {
+        [ "$PLUGIN_LINK" -ef "$PLUGIN_SOURCE" ] ||
+            [ "$(readlink "$PLUGIN_LINK")" = "$PLUGIN_SOURCE" ]
+    }
+}
+
 if ! opencode_version_supported "$VERSION"; then
     echo "[${COMPONENT}] ${AGENT}: ${VERSION} is older than the supported OpenCode ${MIN_OPENCODE_VERSION}" >&2
     echo "[${COMPONENT}] ${AGENT}: such releases call every plugin export as a function" >&2
+    # A link left over from an install made while this host was still supported
+    # now points at a module the host cannot initialize. Name it so the state is
+    # diagnosable before the installer is re-run.
+    if is_managed_link; then
+        echo "[${COMPONENT}] ${AGENT}: unsupported registration still present: ${PLUGIN_LINK}" >&2
+        echo "[${COMPONENT}] ${AGENT}: re-run the installer to remove it" >&2
+    fi
     exit 2
 fi
 
-CONFIG_HOME="${TOKENLESS_OPENCODE_CONFIG_DIR:-${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}}"
-PLUGIN_LINK="$CONFIG_HOME/plugins/tokenless.js"
 if [ -L "$PLUGIN_LINK" ] && [ "$PLUGIN_LINK" -ef "$PLUGIN_SOURCE" ]; then
     echo "[${COMPONENT}] ${AGENT}: ready (${VERSION})"
     exit 0

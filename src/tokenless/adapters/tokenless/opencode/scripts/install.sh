@@ -61,15 +61,6 @@ if [ ! -f "$PLUGIN_SOURCE" ]; then
     exit 1
 fi
 
-VERSION="$($OPENCODE_BIN --version 2>/dev/null || true)"
-if ! opencode_version_supported "$VERSION"; then
-    echo "[${COMPONENT}] ${AGENT}: OpenCode ${VERSION:-unknown} is older than ${MIN_OPENCODE_VERSION}."
-    echo "[${COMPONENT}] ${AGENT}: such releases call every plugin export as a function, which"
-    echo "[${COMPONENT}] ${AGENT}: the object default export OpenCode 2 requires cannot satisfy."
-    echo "[${COMPONENT}] ${AGENT}: skipping plugin installation."
-    exit 0
-fi
-
 CONFIG_HOME="${TOKENLESS_OPENCODE_CONFIG_DIR:-${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}}"
 PLUGIN_DIR="$CONFIG_HOME/plugins"
 PLUGIN_LINK="$PLUGIN_DIR/tokenless.js"
@@ -80,6 +71,30 @@ is_managed_link() {
             [ "$(readlink "$PLUGIN_LINK")" = "$PLUGIN_SOURCE" ]
     }
 }
+
+VERSION="$($OPENCODE_BIN --version 2>/dev/null || true)"
+if ! opencode_version_supported "$VERSION"; then
+    echo "[${COMPONENT}] ${AGENT}: OpenCode ${VERSION:-unknown} is older than ${MIN_OPENCODE_VERSION}."
+    echo "[${COMPONENT}] ${AGENT}: such releases call every plugin export as a function, which"
+    echo "[${COMPONENT}] ${AGENT}: the object default export OpenCode 2 requires cannot satisfy."
+    # Lowering the floor has to clear a registration made while those releases
+    # were still supported. The adapter source behind the link is replaced in
+    # place (the npm postinstall swaps the shared adapter tree), so leaving the
+    # link would hand this host the new object default export and abort its
+    # plugin initialization on every start.
+    if is_managed_link; then
+        if [ "${ANOLISA_DRY_RUN:-0}" = "1" ]; then
+            echo "DRY-RUN: rm ${PLUGIN_LINK}"
+        else
+            rm "$PLUGIN_LINK"
+            echo "[${COMPONENT}] ${AGENT}: removed the now-unsupported registration at ${PLUGIN_LINK}."
+        fi
+    elif [ -e "$PLUGIN_LINK" ] || [ -L "$PLUGIN_LINK" ]; then
+        echo "[${COMPONENT}] ${AGENT}: WARNING: leaving unmanaged path untouched: ${PLUGIN_LINK}" >&2
+    fi
+    echo "[${COMPONENT}] ${AGENT}: skipping plugin installation."
+    exit 0
+fi
 
 if [ -e "$PLUGIN_LINK" ] || [ -L "$PLUGIN_LINK" ]; then
     if is_managed_link; then
