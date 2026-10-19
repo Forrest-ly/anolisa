@@ -20,6 +20,15 @@ const MAX_CACHED_SESSIONS = 10;
 
 type ReconcileMessage = { role: string; content: string; toolIdentity: string | null };
 
+/**
+ * One materialization of the archived session. Reconciliation and summary
+ * binding share it, so a lifecycle call reads the archive exactly once.
+ */
+type ArchiveSnapshot = {
+  records: MessageRecord[];
+  byTurn: Map<number, MessageRecord[]>;
+};
+
 function toolIdentity(message: AgentMessage): string | null {
   if (!["tool", "toolResult", "tool_result"].includes(message.role)) return null;
   // Compare stable tool semantics; replay timestamps do not identify a result.
@@ -169,10 +178,14 @@ export class SelectiveContextEngine implements ContextEngine {
     this.touchSession(params.sessionId);
 
     let records: MessageRecord[];
+    let archive: ArchiveSnapshot;
     if (params.messages && params.messages.length > 0) {
-      records = this.reconcileMessages(params.sessionId, params.messages);
+      const reconciled = this.reconcileMessages(params.sessionId, params.messages);
+      records = reconciled.records;
+      archive = reconciled.archive;
     } else {
-      records = this.store.getMessages(params.sessionId);
+      archive = this.readArchiveSnapshot(params.sessionId);
+      records = archive.records;
     }
 
     let messages: AgentMessage[];
@@ -194,7 +207,7 @@ export class SelectiveContextEngine implements ContextEngine {
     const turns = this.deriveTurns(messages);
     this.cacheTurnMessages(params.sessionId, turns);
 
-    const bindings = this.bindSummaryTurns(params.sessionId, turns, records);
+    const bindings = this.bindSummaryTurns(turns, records, archive);
     const summaries = await this.generateMissingSummaries(params.sessionId, turns, bindings);
 
     const result = this.assembler.assemble({
@@ -224,11 +237,13 @@ export class SelectiveContextEngine implements ContextEngine {
     this.activeSessionId = params.sessionId;
     this.touchSession(params.sessionId);
 
-    if (params.messages && params.messages.length > 0) {
-      this.reconcileMessages(params.sessionId, params.messages);
-    }
+    // The reconciled snapshot already carries the rows this turn imported.
+    const archive =
+      params.messages && params.messages.length > 0
+        ? this.reconcileMessages(params.sessionId, params.messages).archive
+        : this.readArchiveSnapshot(params.sessionId);
 
-    const stored = this.store.getMessages(params.sessionId);
+    const stored = archive.records;
     if (stored.length === 0) return;
 
     const messages = stored.map((message) => this.restoreMessage(message));
@@ -236,7 +251,7 @@ export class SelectiveContextEngine implements ContextEngine {
     this.cacheTurnMessages(params.sessionId, turns);
 
     if (turns.length > this.config.freshTailTurns && this.summarizeFn) {
-      const bindings = this.bindSummaryTurns(params.sessionId, turns, stored);
+      const bindings = this.bindSummaryTurns(turns, stored, archive);
       await this.generateMissingSummaries(params.sessionId, turns, bindings);
     }
   }
@@ -286,9 +301,40 @@ export class SelectiveContextEngine implements ContextEngine {
     return { found: result.length, turns: result };
   }
 
-  private reconcileMessages(sessionId: string, messages: AgentMessage[]): MessageRecord[] {
+  private readArchiveSnapshot(sessionId: string): ArchiveSnapshot {
     const records = this.store.getMessages(sessionId);
-    const stored = records.map((message) => ({
+    const byTurn = new Map<number, MessageRecord[]>();
+    for (const record of records) {
+      const group = byTurn.get(record.turnSeq);
+      if (group) {
+        group.push(record);
+      } else {
+        byTurn.set(record.turnSeq, [record]);
+      }
+    }
+    return { records, byTurn };
+  }
+
+  private extendArchive(archive: ArchiveSnapshot, imported: MessageRecord[]): void {
+    for (const record of imported) {
+      archive.records.push(record);
+      const group = archive.byTurn.get(record.turnSeq);
+      if (group) {
+        group.push(record);
+      } else {
+        archive.byTurn.set(record.turnSeq, [record]);
+      }
+    }
+  }
+
+  private reconcileMessages(
+    sessionId: string,
+    messages: AgentMessage[],
+  ): { records: MessageRecord[]; archive: ArchiveSnapshot } {
+    const archive = this.readArchiveSnapshot(sessionId);
+    const archived = archive.records;
+    const archivedCount = archived.length;
+    const stored = archived.map((message) => ({
       role: message.role,
       content: message.content,
       toolIdentity: toolIdentity(this.restoreMessage(message)),
@@ -311,18 +357,21 @@ export class SelectiveContextEngine implements ContextEngine {
 
     const overlap = suffixOverlap(stored.slice(matchLen), incoming.slice(matchLen));
     const toImport = messages.slice(matchLen + overlap);
-    this.importMessages(sessionId, toImport);
-    const imported = this.store.getMessages(sessionId).slice(stored.length);
-    return [
-      ...records.slice(0, matchLen),
-      ...records.slice(records.length - overlap),
+    // Inserts return their own rows, so the suffix needs no second archive read.
+    const imported = this.importMessages(sessionId, toImport);
+    const records = [
+      ...archived.slice(0, matchLen),
+      ...archived.slice(archivedCount - overlap),
       ...imported,
     ];
+    this.extendArchive(archive, imported);
+    return { records, archive };
   }
 
-  private importMessages(sessionId: string, messages: AgentMessage[]): void {
+  private importMessages(sessionId: string, messages: AgentMessage[]): MessageRecord[] {
     let seq = this.store.getNextSeq(sessionId);
     let turnSeq = this.store.getMaxTurnSeq(sessionId);
+    const imported: MessageRecord[] = [];
 
     for (const msg of messages) {
       const role = this.normalizeRole(msg.role);
@@ -334,31 +383,29 @@ export class SelectiveContextEngine implements ContextEngine {
         turnSeq = 1;
       }
 
-      this.store.createMessage({
-        sessionId,
-        seq,
-        turnSeq,
-        role,
-        content,
-        tokenCount: estimateTokens(content),
-        rawMessage: JSON.stringify(msg),
-      });
+      imported.push(
+        this.store.createMessage({
+          sessionId,
+          seq,
+          turnSeq,
+          role,
+          content,
+          tokenCount: estimateTokens(content),
+          rawMessage: JSON.stringify(msg),
+        }),
+      );
       seq++;
     }
+
+    return imported;
   }
 
   private bindSummaryTurns(
-    sessionId: string,
     turns: Array<{ turnSeq: number; messages: AgentMessage[] }>,
     records: MessageRecord[],
+    archive: ArchiveSnapshot,
   ): Map<number, number> {
-    const archived = new Map<number, MessageRecord[]>();
-    for (const record of this.store.getMessages(sessionId)) {
-      const group = archived.get(record.turnSeq) ?? [];
-      group.push(record);
-      archived.set(record.turnSeq, group);
-    }
-
+    const archived = archive.byTurn;
     const bindings = new Map<number, number>();
     let offset = 0;
     for (const turn of turns) {
