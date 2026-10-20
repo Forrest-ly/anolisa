@@ -5264,3 +5264,231 @@ fn opencode_rejects_alias_links_that_cannot_survive_source_removal() {
     );
     assert!(!link.is_symlink());
 }
+
+/// Rewrite the staged contract so the OpenCode adapter declares a framework
+/// version requirement, the way a component whose bundle needs a minimum host
+/// release does. Everything else mirrors `seed_component`.
+fn declare_opencode_framework_version(world: &World, requirement: &str) {
+    let manifest = world
+        .layout
+        .state_dir
+        .join("component-manifests")
+        .join(COMPONENT)
+        .join("component.toml");
+    std::fs::write(
+        &manifest,
+        format!(
+            r#"[component]
+name = "{COMPONENT}"
+version = "0.6.0"
+
+[component.layout]
+modes = ["system"]
+
+[[adapters]]
+framework = "opencode"
+adapter_type = "plugin"
+plugin_id = "{COMPONENT}"
+dest = "{{datadir}}/adapters/{{component}}/opencode/"
+
+[adapters.compat]
+framework_version = "{requirement}"
+"#
+        ),
+    )
+    .expect("declare framework_version");
+}
+
+/// Replace the staged OpenCode CLI with one that runs `script`, so a test can
+/// pin what `opencode --version` reports.
+fn write_opencode_cli(world: &World, script: &str) {
+    let binary = world.prefix.join("opencode");
+    std::fs::write(&binary, script).expect("write fake opencode");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake opencode");
+}
+
+/// Assert that a refused enable left neither a plugin link nor a receipt.
+fn assert_opencode_not_registered(world: &World, link: &Path) {
+    assert!(
+        link.symlink_metadata().is_err(),
+        "a refused enable must not create the plugin link"
+    );
+    assert!(
+        world
+            .load_state()
+            .find_adapter_claim(COMPONENT, "opencode")
+            .is_none(),
+        "a refused enable must not persist a receipt"
+    );
+}
+
+#[test]
+fn opencode_enable_refuses_a_host_below_the_declared_version() {
+    let guard = EnvGuard::acquire();
+    let world = stage_opencode();
+    let link = apply_opencode_env(&guard, &world);
+    write_opencode_cli(&world, "#!/bin/sh\necho '1.3.3'\n");
+    declare_opencode_framework_version(&world, ">=1.3.4");
+
+    let error = world
+        .manager()
+        .enable(COMPONENT, Some("opencode"), false)
+        .expect_err("a host below the declared floor must be refused");
+    match error {
+        AdapterError::FrameworkVersionMismatch {
+            framework,
+            detected,
+            required,
+        } => {
+            assert_eq!(framework, "opencode");
+            assert_eq!(detected, "1.3.3");
+            assert_eq!(required, ">=1.3.4");
+        }
+        other => panic!("expected a version mismatch, got {other}"),
+    }
+    assert_opencode_not_registered(&world, &link);
+}
+
+#[test]
+fn opencode_enable_accepts_hosts_that_satisfy_the_declared_version() {
+    // Boundary and shape coverage: the floor itself, a higher minor whose
+    // numeric compare would fail as text, a higher major, a labelled and
+    // punctuated banner, and an explicit prerelease allowance.
+    for (output, requirement) in [
+        ("1.3.4", ">=1.3.4"),
+        ("1.19.2", ">=1.3.4"),
+        ("2.0.29", ">=1.3.4"),
+        ("opencode v2.1.0 (build 99)", ">=1.3.4"),
+        ("1.4.0-rc.1", ">=1.3.4, >=1.4.0-rc.1"),
+    ] {
+        let guard = EnvGuard::acquire();
+        let world = stage_opencode();
+        let link = apply_opencode_env(&guard, &world);
+        write_opencode_cli(&world, &format!("#!/bin/sh\necho '{output}'\n"));
+        declare_opencode_framework_version(&world, requirement);
+
+        let manager = world.manager();
+        manager
+            .enable(COMPONENT, Some("opencode"), false)
+            .unwrap_or_else(|error| panic!("{output:?} must satisfy {requirement:?}: {error}"));
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            world.resource_root.join("plugin.js")
+        );
+        assert!(
+            manager
+                .disable(COMPONENT, Some("opencode"), false)
+                .unwrap()
+                .claim_removed
+        );
+    }
+}
+
+#[test]
+fn opencode_enable_refuses_a_prerelease_the_constraint_does_not_name() {
+    let guard = EnvGuard::acquire();
+    let world = stage_opencode();
+    let link = apply_opencode_env(&guard, &world);
+    write_opencode_cli(&world, "#!/bin/sh\necho '1.4.0-rc.1'\n");
+    declare_opencode_framework_version(&world, ">=1.3.4");
+
+    let error = world
+        .manager()
+        .enable(COMPONENT, Some("opencode"), false)
+        .expect_err("semver excludes prereleases a constraint does not name");
+    assert!(
+        matches!(error, AdapterError::FrameworkVersionMismatch { .. }),
+        "expected a version mismatch, got {error}"
+    );
+    assert_opencode_not_registered(&world, &link);
+}
+
+#[test]
+fn opencode_enable_fails_closed_when_the_version_cannot_be_read() {
+    for script in [
+        // The CLI is present and detectable, but the probe itself fails.
+        "#!/bin/sh\nexit 99\n",
+        // The CLI succeeds without reporting anything parseable.
+        "#!/bin/sh\necho 'unknown build'\n",
+    ] {
+        let guard = EnvGuard::acquire();
+        let world = stage_opencode();
+        let link = apply_opencode_env(&guard, &world);
+        write_opencode_cli(&world, script);
+        declare_opencode_framework_version(&world, ">=1.3.4");
+
+        let error = world
+            .manager()
+            .enable(COMPONENT, Some("opencode"), false)
+            .expect_err("an unreadable version must not pass a declared floor");
+        assert!(
+            matches!(error, AdapterError::FrameworkCli { .. }),
+            "expected a CLI failure, got {error}"
+        );
+        assert_opencode_not_registered(&world, &link);
+    }
+}
+
+#[test]
+fn opencode_enable_reports_a_malformed_requirement_as_a_manifest_bug() {
+    for requirement in ["", ">=not-a-version"] {
+        let guard = EnvGuard::acquire();
+        let world = stage_opencode();
+        let link = apply_opencode_env(&guard, &world);
+        write_opencode_cli(&world, "#!/bin/sh\necho '1.3.4'\n");
+        declare_opencode_framework_version(&world, requirement);
+
+        let error = world
+            .manager()
+            .enable(COMPONENT, Some("opencode"), false)
+            .expect_err("a malformed requirement must not be ignored");
+        assert!(
+            matches!(error, AdapterError::InvalidAdapterInput { .. }),
+            "expected a manifest error, got {error}"
+        );
+        assert_opencode_not_registered(&world, &link);
+    }
+}
+
+#[test]
+fn opencode_dry_run_reports_the_version_mismatch_without_touching_the_host() {
+    let guard = EnvGuard::acquire();
+    let world = stage_opencode();
+    let link = apply_opencode_env(&guard, &world);
+    write_opencode_cli(&world, "#!/bin/sh\necho '1.3.3'\n");
+    declare_opencode_framework_version(&world, ">=1.3.4");
+    let manager = world.manager();
+    let before = std::fs::read(world.layout.state_dir.join("installed.toml")).unwrap();
+
+    let error = manager
+        .enable(COMPONENT, Some("opencode"), true)
+        .expect_err("a preview must not plan a link the real run would refuse");
+    assert!(
+        matches!(error, AdapterError::FrameworkVersionMismatch { .. }),
+        "expected a version mismatch, got {error}"
+    );
+    assert!(!link.parent().unwrap().exists());
+    assert_eq!(
+        before,
+        std::fs::read(world.layout.state_dir.join("installed.toml")).unwrap()
+    );
+}
+
+#[test]
+fn opencode_enable_never_probes_the_cli_without_a_declared_requirement() {
+    // The staged CLI exits non-zero and prints nothing. An adapter that
+    // declares no floor must keep the driver's filesystem-only behavior, so
+    // enable still succeeds: the probe is conditional on the declaration.
+    let guard = EnvGuard::acquire();
+    let world = stage_opencode();
+    let link = apply_opencode_env(&guard, &world);
+    world
+        .manager()
+        .enable(COMPONENT, Some("opencode"), false)
+        .expect("no declared requirement means no version probe");
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        world.resource_root.join("plugin.js")
+    );
+}

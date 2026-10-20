@@ -2,8 +2,16 @@
 //!
 //! OpenCode loads plugins at startup. Filesystem registration is verifiable;
 //! whether an already-running host loaded the plugin is not.
+//!
+//! Which OpenCode releases can load a bundle is a property of the bundle, not
+//! of the framework, so the driver owns no version floor of its own: a
+//! component declares one with `[adapters.compat].framework_version` and
+//! enable refuses a host that does not satisfy it.
 
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
+
+use semver::{Version, VersionReq};
 
 use super::AdapterError;
 use super::claim::{
@@ -13,9 +21,14 @@ use super::claim::{
 use super::driver::{
     AdapterBundle, AdapterCondition, AdapterConditionKind, AdapterStatusReport, AdapterSummary,
     ClaimResourceRef, ConditionStatus, DetectResult, DisableReport, DriverCtx, DriverPlan,
-    EnableProgress, FrameworkDriver, HostEnv, PreparedEnable, find_binary_in_path, is_executable,
+    EnableProgress, FrameworkCommand, FrameworkDriver, HostEnv, PreparedEnable,
+    find_binary_in_path, is_executable,
 };
-use super::util::{bool_status, now_iso8601, symlink_matches};
+use super::util::{bool_status, cli_failure_reason, now_iso8601, symlink_matches};
+
+/// Hard timeout for the read-only `opencode --version` probe. Same budget the
+/// other CLI-driving adapters use, so a slow host fails identically everywhere.
+const CLI_TIMEOUT: Duration = Duration::from_secs(60);
 
 const RES_LINK: &str = "opencode_plugin_link";
 
@@ -26,6 +39,60 @@ impl OpenCodeDriver {
     /// Construct the stateless driver.
     pub fn new() -> Self {
         Self
+    }
+
+    /// Enforce the adapter's declared OpenCode version requirement. A missing
+    /// requirement is a no-op and never probes the CLI, so an adapter that
+    /// declares none keeps the driver's original filesystem-only behavior.
+    ///
+    /// The requirement is a semver constraint, which excludes prereleases
+    /// unless the constraint names one: `>=1.3.4` refuses `1.4.0-rc.1`.
+    /// Declare the prerelease explicitly when a bundle supports one.
+    ///
+    /// Fails closed — a requirement the host version cannot be read for is a
+    /// refusal, not a pass — because the alternative registers a plugin the
+    /// host's loader cannot initialize, which is invisible until OpenCode
+    /// starts and reports nothing about the plugin it skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`AdapterError::InvalidAdapterInput`] when the declared requirement is
+    /// empty or is not a parseable semver constraint, or when `OPENCODE_BIN`
+    /// cannot name a program to run; [`AdapterError::FrameworkCli`] when the
+    /// probe cannot spawn, times out, exits non-zero, or prints no parseable
+    /// version; [`AdapterError::FrameworkVersionMismatch`] when the host
+    /// version does not satisfy the requirement.
+    fn ensure_supported_version(&self, ctx: &DriverCtx) -> Result<(), AdapterError> {
+        // A present-but-empty requirement is a declaration error, not a silent
+        // no-op: the author wrote the field and meant to constrain the host.
+        let Some(declared) = ctx.framework_version_req.as_deref() else {
+            return Ok(());
+        };
+        let required = declared.trim();
+        if required.is_empty() {
+            return Err(AdapterError::InvalidAdapterInput {
+                component: ctx.component.clone(),
+                framework: ctx.framework.clone(),
+                reason: "adapter framework_version requirement is present but empty".to_string(),
+            });
+        }
+        let constraint =
+            VersionReq::parse(required).map_err(|error| AdapterError::InvalidAdapterInput {
+                component: ctx.component.clone(),
+                framework: ctx.framework.clone(),
+                reason: format!(
+                    "invalid adapter framework_version requirement '{required}': {error}"
+                ),
+            })?;
+        let detected = opencode_version(ctx)?;
+        if constraint.matches(&detected) {
+            return Ok(());
+        }
+        Err(AdapterError::FrameworkVersionMismatch {
+            framework: self.name().to_string(),
+            detected: detected.to_string(),
+            required: required.to_string(),
+        })
     }
 }
 
@@ -92,6 +159,10 @@ impl FrameworkDriver for OpenCodeDriver {
         bundle: &AdapterBundle,
         ctx: &DriverCtx,
     ) -> Result<DriverPlan, AdapterError> {
+        // `--dry-run` reaches only this method, so the gate has to live here
+        // as well: a preview that plans a link the real run would refuse
+        // reports a change that cannot happen.
+        self.ensure_supported_version(ctx)?;
         let (link, target) = plugin_paths(bundle, ctx)?;
         let action = if symlink_matches(&link, &target)? {
             "adopt"
@@ -118,6 +189,9 @@ impl FrameworkDriver for OpenCodeDriver {
         bundle: &AdapterBundle,
         ctx: &DriverCtx,
     ) -> Result<(AdapterClaim, PreparedEnable), AdapterError> {
+        // Before the Manager persists a receipt: an unsupported host must not
+        // leave behind a claim that a later `disable` has to clean up.
+        self.ensure_supported_version(ctx)?;
         let (link, target) = plugin_paths(bundle, ctx)?;
         Ok((
             AdapterClaim {
@@ -368,6 +442,94 @@ impl FrameworkDriver for OpenCodeDriver {
     }
 }
 
+/// The OpenCode CLI to run: `$OPENCODE_BIN` when set, else `opencode`.
+///
+/// [`FrameworkDriver::detect`] accepts a non-UTF-8 `OPENCODE_BIN` because it
+/// only stats the path, while [`FrameworkCommand::program`] is a `String`.
+/// Such a value is reported rather than replaced with `opencode` from `PATH`:
+/// probing a different binary than the one detection accepted would gate the
+/// enable on an unrelated host.
+///
+/// # Errors
+///
+/// [`AdapterError::InvalidAdapterInput`] when `OPENCODE_BIN` holds a value
+/// that is not valid UTF-8.
+fn opencode_program(ctx: &DriverCtx) -> Result<String, AdapterError> {
+    match std::env::var_os("OPENCODE_BIN").filter(|value| !value.is_empty()) {
+        Some(value) => value
+            .into_string()
+            .map_err(|value| AdapterError::InvalidAdapterInput {
+                component: ctx.component.clone(),
+                framework: ctx.framework.clone(),
+                reason: format!(
+                    "OPENCODE_BIN is not valid UTF-8: {}",
+                    value.to_string_lossy()
+                ),
+            }),
+        None => Ok("opencode".to_string()),
+    }
+}
+
+/// Build the read-only `opencode --version` probe.
+///
+/// # Errors
+///
+/// As [`opencode_program`].
+fn build_version_cmd(ctx: &DriverCtx) -> Result<FrameworkCommand, AdapterError> {
+    Ok(FrameworkCommand {
+        program: opencode_program(ctx)?,
+        args: vec!["--version".to_string()],
+        stdin: None,
+        // Keep ANSI escapes out of the token stream the parser scans.
+        env_set: vec![("NO_COLOR".to_string(), "1".to_string())],
+        env_remove: Vec::new(),
+        path_prepend: Vec::new(),
+        timeout: CLI_TIMEOUT,
+    })
+}
+
+/// Probe the host's OpenCode version.
+///
+/// # Errors
+///
+/// [`AdapterError::FrameworkCli`] when the probe cannot spawn, times out,
+/// exits non-zero, or prints no parseable version.
+fn opencode_version(ctx: &DriverCtx) -> Result<Version, AdapterError> {
+    let command = build_version_cmd(ctx)?;
+    let program = command.program.clone();
+    let output = ctx.ops.run_framework_cli(command)?;
+    if output.timed_out || !output.success() {
+        return Err(AdapterError::FrameworkCli {
+            program,
+            reason: cli_failure_reason("opencode --version", &output),
+        });
+    }
+    // A host may write its banner to either stream; scanning both keeps the
+    // parse independent of that choice.
+    let text = format!("{} {}", output.stdout, output.stderr);
+    parse_opencode_version(&text).ok_or_else(|| AdapterError::FrameworkCli {
+        program,
+        reason: format!(
+            "cannot parse an OpenCode version from `opencode --version` output '{}'",
+            text.trim()
+        ),
+    })
+}
+
+/// First whitespace-delimited token that parses as semver, tolerating a
+/// leading `v` and surrounding punctuation, so `opencode v1.3.4 (build 9)`
+/// and `1.3.4,` both yield `1.3.4`. The first match wins, which assumes the
+/// CLI does not print an unrelated dotted-number token before its own version.
+fn parse_opencode_version(output: &str) -> Option<Version> {
+    output.split_whitespace().find_map(|token| {
+        let trimmed = token.trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '.' | '-' | '+')
+        });
+        let candidate = trimmed.strip_prefix('v').unwrap_or(trimmed);
+        Version::parse(candidate).ok()
+    })
+}
+
 fn valid_entry(entry: &Path) -> bool {
     entry
         .components()
@@ -435,4 +597,51 @@ pub(crate) fn claimed_link(claim: &AdapterClaim) -> Result<(&Path, &Path), Adapt
         root: claim.resource_root.clone(),
         reason: "OpenCode receipt is missing its plugin symlink resource".to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_opencode_version;
+    use semver::Version;
+
+    #[test]
+    fn parses_bare_and_labelled_versions() {
+        for (output, expected) in [
+            ("1.3.4", "1.3.4"),
+            ("v1.3.4", "1.3.4"),
+            ("opencode 2.0.29", "2.0.29"),
+            ("opencode v1.19.2", "1.19.2"),
+            ("opencode v2.1.0 (build 99)", "2.1.0"),
+            ("1.3.4,\n", "1.3.4"),
+            ("1.2.3-test", "1.2.3-test"),
+        ] {
+            assert_eq!(
+                parse_opencode_version(output),
+                Version::parse(expected).ok(),
+                "output {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_output_without_a_version() {
+        for output in [
+            "",
+            "opencode",
+            "version",
+            "v2",
+            "build 99",
+            "opencode: command not found",
+        ] {
+            assert_eq!(parse_opencode_version(output), None, "output {output:?}");
+        }
+    }
+
+    #[test]
+    fn skips_a_diagnostic_line_before_the_version() {
+        assert_eq!(
+            parse_opencode_version("warning: deprecated config key\nopencode 1.3.4"),
+            Version::parse("1.3.4").ok()
+        );
+    }
 }
