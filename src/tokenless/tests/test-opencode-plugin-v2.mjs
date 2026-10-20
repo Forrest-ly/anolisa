@@ -586,6 +586,46 @@ try {
     `opencode compatibleVersions "${supported}" advertises releases whose loader calls every export as a function`,
   );
 
+  // `anolisa adapter enable` never runs the bundled installer, so the ANOLISA
+  // component manifest has to carry the same floor or that path links a module
+  // the host cannot initialize. All three declarations must agree, and the
+  // component manifest's sub-table must sit inside the opencode adapter element
+  // rather than the neighbouring one.
+  const contract = readFileSync(new URL("../.anolisa/component.toml.in", import.meta.url), "utf8");
+  const adapterBlocks = contract.split(/^\[\[adapters\]\][^\S\n]*$/m).slice(1);
+  const opencodeBlock = adapterBlocks.find((block) =>
+    /^framework\s*=\s*"opencode"[^\S\n]*$/m.test(block),
+  );
+  assert.ok(opencodeBlock, "component.toml.in must declare an opencode adapter");
+  const declaredCompat = /\[adapters\.compat\][\s\S]*?framework_version\s*=\s*"([^"]*)"/.exec(
+    opencodeBlock,
+  );
+  assert.ok(
+    declaredCompat,
+    "the opencode adapter must declare [adapters.compat].framework_version, or the managed"
+      + " enable path gates on nothing while the bundled installer gates on " + supported,
+  );
+  assert.equal(
+    declaredCompat[1],
+    supported,
+    `component.toml.in declares "${declaredCompat[1]}" but manifest.json.in declares "${supported}"`,
+  );
+
+  // The bundled scripts gate on their own constant; it must not drift either.
+  for (const script of ["detect.sh", "install.sh"]) {
+    const source = readFileSync(
+      new URL(`../adapters/tokenless/opencode/scripts/${script}`, import.meta.url),
+      "utf8",
+    );
+    const gate = /^MIN_OPENCODE_VERSION="([^"]*)"/m.exec(source);
+    assert.ok(gate, `${script} must declare MIN_OPENCODE_VERSION`);
+    assert.equal(
+      `>=${gate[1]}`,
+      supported,
+      `${script} gates on ${gate[1]} but the manifests declare "${supported}"`,
+    );
+  }
+
   // -- The V1 entrypoint shares the shell-family fix --------------------------
   const v1Hooks = await definition.server();
   const v1Output = { args: { command: "git status" } };
