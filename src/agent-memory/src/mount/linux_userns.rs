@@ -18,8 +18,8 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, unshare};
@@ -33,10 +33,25 @@ use super::MountStrategy;
 const MNT_ROOT: &str = "/mnt";
 const MNT_MEMORY: &str = "/mnt/memory";
 
-/// Tracks completion of the unshare + uid/gid map stage. unshare(NEWUSER)
-/// is one-shot per task — a second call EINVALs — and uid_map/gid_map are
-/// write-once, so this stage must never be retried once it's run.
+/// Records that `unshare(NEWUSER|NEWNS)` has run. The syscall is one-shot
+/// per task — a second call EINVALs — so it is set the moment the unshare
+/// succeeds, *before* the map writes that can still fail. Read it through
+/// [`stage1_action`], never on its own: `UNSHARED` alone says "stage 1
+/// started", not "stage 1 finished".
 static UNSHARED: AtomicBool = AtomicBool::new(false);
+/// Records that the one-shot map writes (setgroups / uid_map / gid_map)
+/// all landed — the real stage-1 completion signal. A failed map write
+/// leaves the process inside a namespace with no uid mapping, where
+/// `geteuid()` reads 65534 and inode creation on a fresh filesystem fails
+/// EOVERFLOW, yet the stage-2 mount steps still run (the process holds full
+/// capabilities in the namespace it created). A retry that consulted only
+/// `UNSHARED` therefore reached those steps and either returned `Ok` from
+/// the broken namespace or surfaced a recoverable-looking mount error that
+/// `auto` swallowed into a silent userland fallback.
+static MAPS_OK: AtomicBool = AtomicBool::new(false);
+/// Inner detail of why stage 1 was abandoned, kept so every later `enter()`
+/// reports the original failure instead of a contextless "already broken".
+static MAPS_FAILURE: OnceLock<String> = OnceLock::new();
 /// Tracks completion of the mount steps (private /, tmpfs /mnt, mkdir
 /// /mnt/memory). Each mount call is individually idempotent (EBUSY when
 /// already done), so a partial failure is safe to retry by calling
@@ -46,6 +61,36 @@ static MOUNTS_READY: AtomicBool = AtomicBool::new(false);
 /// exactly once even under contention.
 static INIT_LOCK: Mutex<()> = Mutex::new(());
 
+/// What a (re)entrant `enter()` must do with the one-shot stage 1, derived
+/// from the recorded flags. Extracted from `enter` so the retry matrix is
+/// unit-testable: forcing a real `uid_map` write to fail needs root or
+/// userns control of `/proc`, which is not portable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage1Action {
+    /// Nothing recorded yet — run unshare + maps.
+    Run,
+    /// Maps landed — stage 1 is complete, go straight to the mount steps.
+    Skip,
+    /// unshare ran but a map write failed. The process is stuck inside a
+    /// half-initialised namespace that can never be repaired from within,
+    /// so every retry must fail with `UserNsUnrecoverable`.
+    Poisoned,
+}
+
+/// Maps success is the only completion signal; `unshared` without it means
+/// stage 1 started and never finished. `maps_ok` wins even on its own,
+/// because re-running `unshare(NEWUSER)` EINVALs whatever else the flags
+/// say.
+fn stage1_action(unshared: bool, maps_ok: bool) -> Stage1Action {
+    if maps_ok {
+        Stage1Action::Skip
+    } else if unshared {
+        Stage1Action::Poisoned
+    } else {
+        Stage1Action::Run
+    }
+}
+
 pub struct LinuxUserNsMount;
 
 impl LinuxUserNsMount {
@@ -53,6 +98,13 @@ impl LinuxUserNsMount {
     /// Idempotent at the process level: if mounts are already set up,
     /// returns Ok. If a prior call failed mid-mount, retry mount steps
     /// without re-running the one-shot unshare/maps stage.
+    ///
+    /// # Errors
+    ///
+    /// `UserNsUnrecoverable` when an earlier call unshared but failed a map
+    /// write. The process is then permanently inside a half-initialised
+    /// namespace, so this keeps failing on every retry instead of letting
+    /// the mount steps paper over it with an `Ok`.
     pub fn enter() -> Result<Self> {
         if MOUNTS_READY.load(Ordering::Acquire) {
             return Ok(Self);
@@ -65,35 +117,49 @@ impl LinuxUserNsMount {
             return Ok(Self);
         }
 
-        // Stage 1: unshare + write maps. Runs at most once. Mark UNSHARED
-        // immediately after unshare succeeds so a maps-stage failure does
-        // not leave the process able to call unshare(NEWUSER) again
-        // (which would EINVAL). Maps failures are reported as
-        // UserNsUnrecoverable so the auto-fallback path knows the
-        // process is in a broken user namespace and refuses to keep
-        // running under userland (which would silently produce wrong
-        // ownership / permissions on every home-dir syscall).
-        if !UNSHARED.load(Ordering::Acquire) {
-            // Record the launching uid *before* the unshare below makes
-            // `geteuid()` report the mapped one, so the per-user session
-            // fallback name can still tell host users apart. `main` already
-            // did this; it is repeated here because `enter` is also reached
-            // from `MemoryService::new` in library consumers.
-            crate::host::capture_host_uid();
+        // Stage 1: unshare + write maps, at most once. `UNSHARED` is marked
+        // immediately after the unshare so a maps-stage failure cannot tempt
+        // a retry into unshare(NEWUSER) again (EINVAL); `MAPS_OK` is marked
+        // only once all three writes landed, and the gap between the two is
+        // exactly what `Stage1Action::Poisoned` reports. Maps failures are
+        // UserNsUnrecoverable so the auto-fallback path knows the process is
+        // in a broken user namespace and refuses to keep running under
+        // userland (which would silently produce wrong ownership /
+        // permissions on every home-dir syscall).
+        match stage1_action(
+            UNSHARED.load(Ordering::Acquire),
+            MAPS_OK.load(Ordering::Acquire),
+        ) {
+            Stage1Action::Skip => {}
+            Stage1Action::Poisoned => {
+                return Err(MemoryError::UserNsUnrecoverable(poisoned_maps_reason()));
+            }
+            Stage1Action::Run => {
+                // Record the launching uid *before* the unshare below makes
+                // `geteuid()` report the mapped one, so the per-user session
+                // fallback name can still tell host users apart. `main` already
+                // did this; it is repeated here because `enter` is also reached
+                // from `MemoryService::new` in library consumers.
+                crate::host::capture_host_uid();
 
-            let real_uid = geteuid().as_raw();
-            let real_gid = getegid().as_raw();
+                let real_uid = geteuid().as_raw();
+                let real_gid = getegid().as_raw();
 
-            unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)
-                .map_err(|e| MemoryError::Other(format!("unshare(NEWUSER|NEWNS): {e}")))?;
-            UNSHARED.store(true, Ordering::Release);
+                unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)
+                    .map_err(|e| MemoryError::Other(format!("unshare(NEWUSER|NEWNS): {e}")))?;
+                UNSHARED.store(true, Ordering::Release);
 
-            // Order: setgroups=deny -> uid_map -> gid_map (kernel requirement).
-            // From here on we are inside a fresh user namespace; any error
-            // is unrecoverable for this process — see UserNsUnrecoverable.
-            write_proc_unrecoverable("/proc/self/setgroups", "deny")?;
-            write_proc_unrecoverable("/proc/self/uid_map", &format!("0 {real_uid} 1"))?;
-            write_proc_unrecoverable("/proc/self/gid_map", &format!("0 {real_gid} 1"))?;
+                // From here on we are inside a fresh user namespace; any
+                // error is unrecoverable for this process. Record the detail
+                // before returning so later retries can quote it.
+                if let Err(e) = write_maps(real_uid, real_gid) {
+                    if let MemoryError::UserNsUnrecoverable(detail) = &e {
+                        let _ = MAPS_FAILURE.set(detail.clone());
+                    }
+                    return Err(e);
+                }
+                MAPS_OK.store(true, Ordering::Release);
+            }
         }
 
         // Stage 2: mount setup. Each step is idempotent — EBUSY signals
@@ -130,6 +196,28 @@ impl LinuxUserNsMount {
 
         MOUNTS_READY.store(true, Ordering::Release);
         Ok(Self)
+    }
+}
+
+/// The three one-shot map writes, in kernel-mandated order
+/// (setgroups=deny must precede gid_map).
+fn write_maps(real_uid: u32, real_gid: u32) -> Result<()> {
+    write_proc_unrecoverable("/proc/self/setgroups", "deny")?;
+    write_proc_unrecoverable("/proc/self/uid_map", &format!("0 {real_uid} 1"))?;
+    write_proc_unrecoverable("/proc/self/gid_map", &format!("0 {real_gid} 1"))
+}
+
+/// Message for a retry that finds stage 1 poisoned. The detail is always
+/// recorded by the path that sets `UNSHARED` without `MAPS_OK`; the fallback
+/// keeps the error actionable if that ever stops holding.
+fn poisoned_maps_reason() -> String {
+    match MAPS_FAILURE.get() {
+        Some(detail) => {
+            format!("retry after an earlier failed attempt ({detail}); the maps are write-once")
+        }
+        None => {
+            "retry after an earlier attempt that unshared without completing the maps".to_string()
+        }
     }
 }
 
@@ -218,5 +306,38 @@ pub fn in_user_namespace() -> bool {
             .map(|range| range != "4294967295")
             .unwrap_or(false),
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Stage1Action, stage1_action};
+
+    #[test]
+    fn a_fresh_process_runs_stage1() {
+        assert_eq!(stage1_action(false, false), Stage1Action::Run);
+    }
+
+    #[test]
+    fn completed_maps_skip_stage1_on_retry() {
+        assert_eq!(stage1_action(true, true), Stage1Action::Skip);
+    }
+
+    #[test]
+    fn unshare_without_maps_poisons_every_retry() {
+        // Regression guard: this combination used to fall through to the
+        // stage-2 mount steps inside a namespace with no uid mapping, which
+        // either returned `Ok` from the broken namespace or surfaced a
+        // recoverable-looking mount error that `auto` downgraded to a silent
+        // userland fallback — while the process stayed broken.
+        assert_eq!(stage1_action(true, false), Stage1Action::Poisoned);
+    }
+
+    #[test]
+    fn maps_ok_alone_never_re_unshares() {
+        // Unreachable in practice — the maps are only written after the
+        // unshare — but the completion flag is authoritative: a second
+        // unshare(NEWUSER) would EINVAL.
+        assert_eq!(stage1_action(false, true), Stage1Action::Skip);
     }
 }
