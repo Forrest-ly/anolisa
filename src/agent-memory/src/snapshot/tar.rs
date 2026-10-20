@@ -168,6 +168,44 @@ pub fn list_tarballs(mount: &MountPoint) -> Result<Vec<SnapshotInfo>> {
     Ok(out)
 }
 
+/// Number of candidate names tried before giving up on a trash reservation.
+const TRASH_NAME_ATTEMPTS: u32 = 1024;
+
+/// Atomically reserve an empty trash directory for a single restore.
+///
+/// The natural name `<UTC second>-<snapshot id>` is only unique per second, so
+/// two restores of the same snapshot inside one second used to land in the
+/// same directory: `create_dir_all` returned the existing one, the second
+/// restore then replaced the first restore's displaced regular file, and a
+/// displaced directory could not be moved in at all (its destination already
+/// existed), stranding it in the meta dir. Every successful restore now gets a
+/// directory of its own — `create_dir`, unlike `create_dir_all`, fails when the
+/// name is taken, which makes the reservation atomic, and a collision simply
+/// bumps the `-<n>` suffix.
+fn reserve_trash_dir(trash_root: &Path, id: &str) -> Result<std::path::PathBuf> {
+    std::fs::create_dir_all(trash_root)?;
+    let base = format!("{}-{id}", Utc::now().format("%Y%m%dT%H%M%SZ"));
+    for attempt in 0..TRASH_NAME_ATTEMPTS {
+        let name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{attempt}")
+        };
+        let candidate = trash_root.join(&name);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            // Already taken by an earlier restore (or by a regular file of the
+            // same name) — try the next suffix.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(MemoryError::Other(format!(
+        "no free trash directory name under {} after {TRASH_NAME_ATTEMPTS} attempts",
+        trash_root.display()
+    )))
+}
+
 pub fn restore_tarball(mount: &MountPoint, id: &str) -> Result<()> {
     // SECURITY: reject any id that could traverse out of the snapshot dir.
     // Without this, `id="../../tmp/x"` would let `staging` and `archive_path`
@@ -312,32 +350,30 @@ pub fn restore_tarball(mount: &MountPoint, id: &str) -> Result<()> {
     // as the swap succeeded — an unrecoverable destruction of the prior
     // state. Operators (or a future GC tool) can purge `.anolisa/trash/`
     // explicitly when they decide the restore is good.
-    let trash_dir = mount
-        .meta_dir
-        .join("trash")
-        .join(format!("{}-{id}", Utc::now().format("%Y%m%dT%H%M%SZ")));
-    if let Err(e) = std::fs::create_dir_all(&trash_dir) {
-        // Trash creation failed — fall back to leaving rollback entries in
-        // place so the user still has a recovery path. Log loudly.
-        tracing::warn!(
-            "could not create trash dir {} ({e}); rollback entries left in meta dir",
-            trash_dir.display()
-        );
-    } else {
-        for (original, rolled) in rollbacks {
-            let leaf = original
-                .file_name()
-                .map(|s| s.to_os_string())
-                .unwrap_or_else(|| std::ffi::OsString::from("entry"));
-            let dest = trash_dir.join(&leaf);
-            if let Err(e) = std::fs::rename(&rolled, &dest) {
-                tracing::warn!(
-                    "could not move rollback {} → {}: {e}",
-                    rolled.display(),
-                    dest.display()
-                );
+    let trash_root = mount.meta_dir.join("trash");
+    match reserve_trash_dir(&trash_root, id) {
+        Ok(trash_dir) => {
+            for (original, rolled) in rollbacks {
+                let leaf = original
+                    .file_name()
+                    .map(|s| s.to_os_string())
+                    .unwrap_or_else(|| std::ffi::OsString::from("entry"));
+                let dest = trash_dir.join(&leaf);
+                if let Err(e) = std::fs::rename(&rolled, &dest) {
+                    tracing::warn!(
+                        "could not move rollback {} → {}: {e}",
+                        rolled.display(),
+                        dest.display()
+                    );
+                }
             }
         }
+        // Trash reservation failed — fall back to leaving rollback entries in
+        // place so the user still has a recovery path. Log loudly.
+        Err(e) => tracing::warn!(
+            "could not reserve a trash dir under {} ({e}); rollback entries left in meta dir",
+            trash_root.display()
+        ),
     }
     if let Err(e) =
         crate::safe_fs::remove_dir_all_safe(mount.root_fd.as_fd(), staging_rel, &staging)
@@ -411,5 +447,59 @@ mod tests {
         assert!(validate_snapshot_id("/abs").is_err());
         // 128-byte limit is enforced.
         assert!(validate_snapshot_id(&"a".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn reserve_trash_dir_returns_an_empty_dir_under_trash_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("trash");
+        let dir = reserve_trash_dir(&root, "snap_1").unwrap();
+        assert_eq!(dir.parent().unwrap(), root);
+        assert!(
+            dir.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-snap_1")
+        );
+        assert!(
+            std::fs::read_dir(&dir).unwrap().next().is_none(),
+            "a reserved trash dir must start out empty"
+        );
+    }
+
+    #[test]
+    fn reserve_trash_dir_never_hands_out_the_same_name_twice() {
+        // Back-to-back restores of one snapshot collide on the per-second base
+        // name; the second reservation must fall back to a `-<n>` suffix rather
+        // than return the directory the first restore is already filling.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("trash");
+        let first = reserve_trash_dir(&root, "snap_1").unwrap();
+        let second = reserve_trash_dir(&root, "snap_1").unwrap();
+        let third = reserve_trash_dir(&root, "snap_1").unwrap();
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert!(first.is_dir() && second.is_dir() && third.is_dir());
+    }
+
+    #[test]
+    fn reserve_trash_dir_skips_a_name_squatted_by_a_regular_file() {
+        // `create_dir` reports AlreadyExists for a regular file too; the
+        // reservation must step over it instead of failing the restore.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("trash");
+        std::fs::create_dir_all(&root).unwrap();
+        let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+        let squatted = root.join(format!("{stamp}-snap_1"));
+        std::fs::write(&squatted, b"not a directory").unwrap();
+
+        let dir = reserve_trash_dir(&root, "snap_1").unwrap();
+        assert_ne!(dir, squatted);
+        assert!(dir.is_dir());
+        assert_eq!(
+            std::fs::read(&squatted).unwrap(),
+            b"not a directory",
+            "the squatted file must be left untouched"
+        );
     }
 }
