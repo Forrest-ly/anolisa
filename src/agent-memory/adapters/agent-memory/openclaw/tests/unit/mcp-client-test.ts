@@ -6,6 +6,7 @@
  * - `buildChildEnv` allowlist behaviour
  * - `McpStdioClient.stop()` safety on an unstarted client
  * - `callTool` rejection when the binary can't spawn
+ * - Unicode fidelity when a real fake worker dribbles replies byte by byte
  */
 
 import { describe, it } from "node:test";
@@ -157,6 +158,106 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       await client.stop();
     });
   }
+
+  // Regression for fragmented-Unicode decoding: the fake worker below is a
+  // real child process that answers the initialize handshake and tools/call,
+  // but writes each reply ONE BYTE per event-loop turn. Every multibyte code
+  // point therefore straddles a pipe chunk boundary, which is exactly what
+  // turned Chinese text, accents and emoji into U+FFFD when each stdout
+  // Buffer was decoded on its own.
+  const UNICODE_PAYLOAD = "记忆 · café · naïve · 中文记忆内容 · 🚀🔍 · émoji · 漢字";
+
+  it("keeps multibyte Unicode intact across byte-by-byte stdout chunks", {
+    timeout: 30_000,
+  }, async (context) => {
+    const directory = await mkdtemp(join(tmpdir(), "memory-unicode-test-"));
+    const binaryPath = join(directory, "mcp-server");
+    const pidPath = join(directory, "pid");
+    context.after(async () => {
+      // The worker records its own pid so a failed assertion can't leave an
+      // orphan behind. Missing file == never spawned == nothing to kill.
+      let pid = NaN;
+      try {
+        pid = Number(await readFile(pidPath, "utf8"));
+      } catch {
+        pid = NaN;
+      }
+      if (Number.isSafeInteger(pid) && pid > 0) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch (error) {
+          assert.equal((error as NodeJS.ErrnoException).code, "ESRCH");
+        }
+      }
+      await rm(directory, { recursive: true, force: true });
+    });
+    await writeFile(
+      binaryPath,
+      `#!${process.execPath}
+const fs = require("node:fs");
+const readline = require("node:readline");
+const UNICODE = ${JSON.stringify(UNICODE_PAYLOAD)};
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+fs.writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));
+
+// One byte per turn, so the parent never reads a whole code point at once.
+async function dribble(buf) {
+  for (let i = 0; i < buf.length; i += 1) {
+    process.stdout.write(buf.subarray(i, i + 1));
+    await sleep(0);
+  }
+}
+
+// Serialize replies: two interleaved dribbles would corrupt both frames.
+let queue = Promise.resolve();
+
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  queue = queue.then(async () => {
+    const result = request.method === "initialize"
+      ? {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          serverInfo: { name: "agent-memory-记忆-fake", version: "0.0.0-test" },
+        }
+      : {
+          content: [{
+            type: "text",
+            text: request.params.arguments.query + "|" + UNICODE +
+              "|" + request.params.arguments.query,
+          }],
+          isError: false,
+        };
+    const frame =
+      JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\\n";
+    await dribble(Buffer.from(frame, "utf8"));
+  });
+});
+`,
+      { mode: 0o700 },
+    );
+
+    const client = new McpStdioClient({ ...cfg, binaryPath });
+    context.after(async () => {
+      await client.stop();
+    });
+
+    // The handshake reply is dribbled as well, so getting a tool result at
+    // all proves the initialize frame survived byte-by-byte delivery too.
+    const query = "记忆🚀";
+    const expected = `${query}|${UNICODE_PAYLOAD}|${query}`;
+
+    const first = await client.callTool("memory_observe", { query });
+    assert.equal(first, expected);
+    assert.ok(!first.includes("\uFFFD"), "reply must not contain U+FFFD");
+
+    // A second call on the same child: the decoder must not carry state into
+    // the next frame, and the newline parser must still split the two.
+    const second = await client.callTool("memory_observe", { query });
+    assert.equal(second, expected);
+  });
 
   it("callTool rejects with a real error when the binary cannot spawn", async () => {
     const client = new McpStdioClient(cfg);

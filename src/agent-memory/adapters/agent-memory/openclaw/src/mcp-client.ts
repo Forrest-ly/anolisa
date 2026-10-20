@@ -8,6 +8,7 @@
  */
 
 import { ChildProcess, spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import type { AgentMemoryConfig } from "./config.js";
 
 // Build-time injection by esbuild's --define flag (see package.json
@@ -220,12 +221,25 @@ export class McpStdioClient {
       detached: false,
     });
 
+    // One incremental UTF-8 decoder per spawned stream. A JSON-RPC reply
+    // can be split by a pipe chunk boundary in the middle of a multibyte
+    // code point (Chinese text, accents, emoji), and `Buffer.toString("utf8")`
+    // decodes every chunk in isolation, so those truncated bytes became
+    // U+FFFD before `handleData` ever saw them — memory tool output was
+    // silently corrupted although the child had written valid UTF-8.
+    // `StringDecoder` keeps the trailing partial sequence and prepends it to
+    // the next chunk, so the newline frame parser below still owns framing
+    // and receives only whole code points. Decoders live in this closure and
+    // are recreated per spawn, so a respawn never inherits half a character.
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+
     this.proc.stdout?.on("data", (chunk: Buffer) => {
-      this.handleData(chunk.toString("utf8"));
+      this.handleData(stdoutDecoder.write(chunk));
     });
 
     this.proc.stderr?.on("data", (chunk: Buffer) => {
-      this.appendStderr(chunk.toString("utf8"));
+      this.appendStderr(stderrDecoder.write(chunk));
     });
 
     this.proc.on("exit", (code, signal) => {
