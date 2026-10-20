@@ -278,6 +278,69 @@ else
 fi
 rm -f "$PLUGIN_LINK"
 
+# -- Reconcile mode: the package postinstall contract ---------------------------
+# An npm-owned upgrade replaces the shared adapter tree in place, so the plugin
+# link ends up pointing at the new module without the installer ever running.
+# The postinstall therefore re-runs the installer in reconcile-only mode, which
+# must clear a registration the floor invalidated and must never create one.
+rm -f "$PLUGIN_LINK"
+recon_rc=0
+ANOLISA_ADAPTER_RECONCILE=1 TOKENLESS_TEST_OPENCODE_VERSION=2.0.29 \
+    bash "$INSTALL_SH" >/dev/null 2>&1 || recon_rc=$?
+if [ "$recon_rc" -eq 0 ] && [ ! -e "$PLUGIN_LINK" ] && [ ! -L "$PLUGIN_LINK" ]; then
+    pass "reconcile mode never registers a host that has no link"
+else
+    fail "reconcile mode created a registration (rc=${recon_rc})"
+fi
+
+ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+recon_rc=0
+ANOLISA_ADAPTER_RECONCILE=1 TOKENLESS_TEST_OPENCODE_VERSION=2.0.29 \
+    bash "$INSTALL_SH" >/dev/null 2>&1 || recon_rc=$?
+if [ "$recon_rc" -eq 0 ] && [ -L "$PLUGIN_LINK" ] &&
+    [ "$(readlink "$PLUGIN_LINK")" = "$PLUGIN_SOURCE" ]; then
+    pass "reconcile mode keeps a valid registration on a supported host"
+else
+    fail "reconcile mode disturbed a valid registration (rc=${recon_rc})"
+fi
+rm -f "$PLUGIN_LINK"
+
+ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+recon_rc=0
+ANOLISA_ADAPTER_RECONCILE=1 TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 \
+    bash "$INSTALL_SH" >/dev/null 2>&1 || recon_rc=$?
+if [ "$recon_rc" -eq 0 ] && [ ! -e "$PLUGIN_LINK" ] && [ ! -L "$PLUGIN_LINK" ]; then
+    pass "reconcile mode clears the stale registration on an unsupported host"
+else
+    fail "reconcile mode left the stale registration (rc=${recon_rc})"
+fi
+
+ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+recon_dry="$(ANOLISA_DRY_RUN=1 ANOLISA_ADAPTER_RECONCILE=1 \
+    TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 bash "$INSTALL_SH" 2>&1)"
+case "$recon_dry" in
+    *"DRY-RUN: rm"*) recon_previewed=1 ;;
+    *) recon_previewed=0 ;;
+esac
+if [ "$recon_previewed" -eq 1 ] && [ -L "$PLUGIN_LINK" ]; then
+    pass "reconcile mode honours ANOLISA_DRY_RUN"
+else
+    fail "reconcile mode ignored ANOLISA_DRY_RUN"
+fi
+rm -f "$PLUGIN_LINK"
+
+printf '%s\n' 'export const ForeignPlugin = async () => ({})' > "$PLUGIN_LINK"
+recon_cksum="$(cksum "$PLUGIN_LINK")"
+recon_rc=0
+ANOLISA_ADAPTER_RECONCILE=1 TOKENLESS_TEST_OPENCODE_VERSION=2.0.29 \
+    bash "$INSTALL_SH" >/dev/null 2>&1 || recon_rc=$?
+if [ "$recon_rc" -eq 0 ] && [ "$(cksum "$PLUGIN_LINK")" = "$recon_cksum" ]; then
+    pass "reconcile mode leaves an unmanaged file alone without failing"
+else
+    fail "reconcile mode touched or rejected an unmanaged file (rc=${recon_rc})"
+fi
+rm -f "$PLUGIN_LINK"
+
 echo ""
 echo "OpenCode adapter tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

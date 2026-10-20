@@ -520,7 +520,8 @@ loader contracts are mutually exclusive, so the supported range starts at 1.3.4,
 release that reads an object default export. On a host below that floor the bundled installer
 removes a registration left over from when the release was still supported, so replacing the
 adapter source in place cannot hand the old host a module it fails to initialize; `detect.sh`
-names that stale registration. Command rewriting and shell failure evidence match
+names that stale registration. An npm package upgrade runs that reconciliation automatically,
+in a mode that clears a stale registration but never creates one. Command rewriting and shell failure evidence match
 the shell tool family the shared hooks classify — OpenCode 1 names its built-in shell tool
 `bash`, OpenCode 2 names it `shell` — instead of a single host spelling.
 

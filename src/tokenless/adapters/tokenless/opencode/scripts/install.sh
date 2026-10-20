@@ -96,13 +96,29 @@ if ! opencode_version_supported "$VERSION"; then
     exit 0
 fi
 
+# Reconcile mode never registers the plugin; it only clears a registration the
+# supported-version floor invalidated. Package postinstall hooks run it after
+# replacing the shared adapter tree in place, so an upgrade cannot leave an old
+# host loading a module its loader cannot initialize -- and cannot register a
+# host the user never enabled.
+RECONCILE_ONLY="${ANOLISA_ADAPTER_RECONCILE:-0}"
+
 if [ -e "$PLUGIN_LINK" ] || [ -L "$PLUGIN_LINK" ]; then
     if is_managed_link; then
         echo "[${COMPONENT}] ${AGENT} plugin already installed at ${PLUGIN_LINK}."
         exit 0
     fi
+    if [ "$RECONCILE_ONLY" = "1" ]; then
+        echo "[${COMPONENT}] ${AGENT}: leaving unmanaged path untouched: ${PLUGIN_LINK}"
+        exit 0
+    fi
     echo "[${COMPONENT}] ERROR: refusing to replace unmanaged path: ${PLUGIN_LINK}" >&2
     exit 1
+fi
+
+if [ "$RECONCILE_ONLY" = "1" ]; then
+    echo "[${COMPONENT}] ${AGENT}: no Tokenless registration to reconcile."
+    exit 0
 fi
 
 if [ "${ANOLISA_DRY_RUN:-0}" = "1" ]; then
