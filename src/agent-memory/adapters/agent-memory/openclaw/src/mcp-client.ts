@@ -170,22 +170,42 @@ export class McpStdioClient {
   private async doStart(): Promise<void> {
     this.spawnProcess();
 
-    // Send MCP initialize handshake.
-    const initResult = await this.sendRaw("initialize", {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: {
-        name: "openclaw-agent-memory-plugin",
-        version: PLUGIN_VERSION,
-      },
-    });
+    try {
+      // Send MCP initialize handshake.
+      const initResult = await this.sendRaw("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: {
+          name: "openclaw-agent-memory-plugin",
+          version: PLUGIN_VERSION,
+        },
+      });
 
-    if (!initResult) {
-      throw new Error("agent-memory initialize handshake returned no result");
+      if (!initResult) {
+        throw new Error("agent-memory initialize handshake returned no result");
+      }
+
+      // Send initialized notification (no response expected).
+      this.sendNotification("notifications/initialized");
+    } catch (err) {
+      // A failed handshake leaves `initialized` false, so the next
+      // ensureStarted() spawns a replacement that overwrites this.proc —
+      // the worker spawned above is then untracked and out of stop()'s
+      // reach for as long as the plugin lives. Release it here instead.
+      //
+      // stop() marks the exit deliberate, so tearing down a worker that
+      // merely answered the handshake badly is not counted as a crash. A
+      // handshake rejected because the child already exited finds
+      // this.proc cleared by handleExit() and so keeps that exit's normal
+      // crash accounting. A teardown failure is logged, never substituted
+      // for the handshake error the caller has to see.
+      await this.stop().catch((shutdownError: unknown) => {
+        const reason =
+          shutdownError instanceof Error ? shutdownError.message : String(shutdownError);
+        console.error(`[agent-memory] failed to release worker after init failure: ${reason}`);
+      });
+      throw err;
     }
-
-    // Send initialized notification (no response expected).
-    this.sendNotification("notifications/initialized");
 
     this.initialized = true;
     // Successful init: reset the respawn counter so the next crash

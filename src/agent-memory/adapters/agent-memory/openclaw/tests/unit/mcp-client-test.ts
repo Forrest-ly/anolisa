@@ -5,6 +5,7 @@
  * - `resolveMcpToolName` (the real TOOL_NAME_MAP via its exported wrapper)
  * - `buildChildEnv` allowlist behaviour
  * - `McpStdioClient.stop()` safety on an unstarted client
+ * - worker release after a failed `initialize` handshake
  * - `callTool` rejection when the binary can't spawn
  */
 
@@ -89,6 +90,52 @@ describe("buildChildEnv", () => {
   });
 });
 
+/**
+ * Fake MCP worker used by the failed-handshake tests.
+ *
+ * Every spawn appends its pid to `pidsPath` so a test can assert on the
+ * workers that were created, including one that never answered a tool
+ * call. The first spawn reads `modePath`: `error` answers `initialize`
+ * with a JSON-RPC error, `empty` with a null result, and the file is
+ * consumed either way so the next spawn handshakes normally.
+ */
+function failingHandshakeWorker(modePath: string, pidsPath: string): string {
+  return `#!${process.execPath}
+const fs = require("node:fs");
+const readline = require("node:readline");
+const MODE_PATH = ${JSON.stringify(modePath)};
+const PIDS_PATH = ${JSON.stringify(pidsPath)};
+fs.appendFileSync(PIDS_PATH, process.pid + "\\n");
+setInterval(() => {}, 1000);
+process.stdin.on("end", () => process.exit(0));
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  if (request.method === "initialize") {
+    let mode = "";
+    try {
+      mode = fs.readFileSync(MODE_PATH, "utf8").trim();
+      fs.rmSync(MODE_PATH);
+    } catch {}
+    if (mode === "error") {
+      const error = { code: -32603, message: "handshake refused by test worker" };
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, error }) + "\\n");
+      return;
+    }
+    if (mode === "empty") {
+      const msg = { jsonrpc: "2.0", id: request.id, result: null };
+      process.stdout.write(JSON.stringify(msg) + "\\n");
+      return;
+    }
+  }
+  const result = request.method === "initialize" ? {} : {
+    content: [{ type: "text", text: String(process.pid) }],
+  };
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\\n");
+});
+`;
+}
+
 describe("McpStdioClient", () => {
   const cfg = {
     binaryPath: "/nonexistent/agent-memory-binary",
@@ -155,6 +202,67 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         assert.equal(await readFile(eofPath, "utf8"), "eof");
       }
       await client.stop();
+    });
+  }
+
+  // Regression for the orphaned worker: `initialized` stays false after a
+  // failed handshake, so the next tool call spawns a replacement and
+  // overwrites `proc`. Without a release in doStart the first worker is
+  // untracked — stop() can never reach it and it outlives the plugin.
+  for (const mode of ["error", "empty"] as const) {
+    const handshake = mode === "error" ? "a JSON-RPC error" : "an empty result";
+
+    it(`releases the worker when the handshake returns ${handshake}`, {
+      timeout: 20_000,
+    }, async (context) => {
+      const directory = await mkdtemp(join(tmpdir(), "memory-init-fail-test-"));
+      const binaryPath = join(directory, "mcp-server");
+      const modePath = join(directory, "mode");
+      const pidsPath = join(directory, "pids");
+      const spawned: number[] = [];
+      context.after(async () => {
+        for (const pid of spawned) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch (error) {
+            assert.equal((error as NodeJS.ErrnoException).code, "ESRCH");
+          }
+        }
+        await rm(directory, { recursive: true, force: true });
+      });
+
+      await writeFile(binaryPath, failingHandshakeWorker(modePath, pidsPath), { mode: 0o700 });
+      await writeFile(modePath, mode);
+      const client = new McpStdioClient({ ...cfg, binaryPath });
+      const readPids = async (): Promise<number[]> =>
+        (await readFile(pidsPath, "utf8").catch(() => "")).split("\n").filter(Boolean).map(Number);
+
+      // The handshake failure — not the teardown — is what reaches the caller.
+      await assert.rejects(client.callTool("memory_get_context", {}), (error: Error) => {
+        assert.match(
+          error.message,
+          mode === "error" ? /JSON-RPC error -32603/ : /handshake returned no result/,
+        );
+        return true;
+      });
+
+      const [firstPid] = await readPids();
+      assert.ok(Number.isSafeInteger(firstPid) && firstPid > 0);
+      spawned.push(firstPid);
+      // stop() resolves only after the exit event, so the worker is already
+      // reaped by the time the rejection surfaces.
+      assert.throws(() => process.kill(firstPid, 0), { code: "ESRCH" });
+
+      // The same client must still be usable: the abort left no stale
+      // `proc`, and the deliberate teardown did not burn the respawn quota.
+      const secondPid = Number(await client.callTool("memory_get_context", {}));
+      assert.ok(Number.isSafeInteger(secondPid) && secondPid > 0);
+      assert.notEqual(secondPid, firstPid);
+      spawned.push(secondPid);
+
+      await client.stop();
+      assert.throws(() => process.kill(secondPid, 0), { code: "ESRCH" });
+      assert.deepEqual(await readPids(), [firstPid, secondPid]);
     });
   }
 
