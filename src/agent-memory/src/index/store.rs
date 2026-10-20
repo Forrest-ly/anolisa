@@ -294,6 +294,11 @@ impl BM25Store {
     /// consistent on partial failure.
     pub fn remove(&mut self, rel_path: &str) -> Result<bool> {
         let tx = self.conn.transaction()?;
+        // Literal prefix match, not `LIKE`: `_`, `%` and `\` are ordinary path
+        // characters but LIKE wildcards, so a LIKE-built prefix would also evict
+        // look-alike sibling trees whose files are still on disk. If this ever
+        // moves back to `LIKE`, escape the prefix with `escape_like_literal` and
+        // declare `ESCAPE '\'` (see tests/index_remove_test.rs).
         let prefix = format!("{rel_path}/");
         let rowids: Vec<i64> = {
             let mut stmt =
@@ -1192,24 +1197,29 @@ fn agent_scope_sql_like(scope: &AgentScope) -> (String, Option<String>) {
     }
 }
 
+/// Backslash-escape the `LIKE` wildcards (`%`, `_`) and the escape character
+/// itself, so `s` matches literally under `LIKE ... ESCAPE '\'`. Callers add
+/// their own unescaped wildcards around the result.
+fn escape_like_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        match c {
+            '_' | '%' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Build a `LIKE` pattern matching `token` as a substring, backslash-escaping
 /// the `%` / `_` / `\` wildcards so they match literally. `sanitize_fts_query`
 /// keeps `_` (and drops `%`), but escaping all three is defensive against
 /// future sanitisation changes.
 fn like_pattern(token: &str) -> String {
-    let mut s = String::with_capacity(token.len() + 4);
-    s.push('%');
-    for c in token.chars() {
-        match c {
-            '_' | '%' | '\\' => {
-                s.push('\\');
-                s.push(c);
-            }
-            other => s.push(other),
-        }
-    }
-    s.push('%');
-    s
+    format!("%{}%", escape_like_literal(token))
 }
 
 /// Byte-wise ASCII case-insensitive substring search, mirroring SQLite
@@ -1534,6 +1544,72 @@ mod tests {
         // FTS row for the cascaded body is also gone.
         let hits = s.search("alpha", 5, true).unwrap();
         assert!(hits.is_empty());
+    }
+
+    /// Sorted `files` paths, so assertions do not depend on row order.
+    fn sorted_paths(s: &BM25Store) -> Vec<String> {
+        let mut v = s.known_paths().unwrap();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn remove_cascade_matches_path_prefix_literally() {
+        // `_`, `%` and `\` are ordinary path characters but LIKE wildcards, so
+        // the cascade prefix must be matched literally: removing one subtree may
+        // never evict a look-alike sibling that is still on disk. On-disk
+        // coverage of the same contract lives in tests/index_remove_test.rs.
+        let mut s = BM25Store::open_in_memory().unwrap();
+        s.upsert("notes_v2/a.md", 0, 0, "alpha", None).unwrap();
+        s.upsert("notes_v2/sub/b.md", 0, 0, "alpha nested", None)
+            .unwrap();
+        s.upsert("notesXv2/b.md", 0, 0, "beta", None).unwrap();
+        s.upsert("r%2/inner.md", 0, 0, "target", None).unwrap();
+        s.upsert("rAB2/victim.md", 0, 0, "bystander", None).unwrap();
+        s.upsert("a\\b/x.md", 0, 0, "escaped", None).unwrap();
+        s.upsert("aXb/y.md", 0, 0, "lookalike", None).unwrap();
+        s.upsert("other/c.md", 0, 0, "gamma", None).unwrap();
+        for embedded in [
+            "notes_v2/a.md",
+            "notesXv2/b.md",
+            "rAB2/victim.md",
+            "aXb/y.md",
+        ] {
+            s.upsert_vec(embedded, &[1.0, 0.0]).unwrap();
+        }
+
+        assert!(s.remove("notes_v2").unwrap());
+        assert!(s.remove("r%2").unwrap());
+        assert!(s.remove("a\\b").unwrap());
+
+        assert_eq!(
+            sorted_paths(&s),
+            ["aXb/y.md", "notesXv2/b.md", "other/c.md", "rAB2/victim.md"],
+            "wildcard look-alikes must survive a neighbour's cascade"
+        );
+        // The removed subtrees are gone from the row set and from FTS ...
+        for gone in ["alpha", "target", "escaped"] {
+            assert!(s.search(gone, 5, true).unwrap().is_empty(), "{gone}");
+        }
+        // ... while every look-alike sibling is still searchable.
+        for kept in ["beta", "bystander", "lookalike", "gamma"] {
+            assert_eq!(s.search(kept, 5, true).unwrap().len(), 1, "{kept}");
+        }
+        // The survivors also kept their embeddings, so only the never-embedded
+        // other/c.md is reported as awaiting backfill. A cascade that over-matched
+        // would delete those `files_vec` rows and schedule a needless re-embed.
+        let mut missing = s.paths_without_vec().unwrap();
+        missing.sort();
+        assert_eq!(missing, ["other/c.md"]);
+    }
+
+    #[test]
+    fn escape_like_literal_escapes_wildcards_only() {
+        assert_eq!(escape_like_literal("plain/path.md"), "plain/path.md");
+        assert_eq!(escape_like_literal("a_b"), "a\\_b");
+        assert_eq!(escape_like_literal("a%b"), "a\\%b");
+        assert_eq!(escape_like_literal("a\\b"), "a\\\\b");
+        assert_eq!(like_pattern("a_b"), "%a\\_b%");
     }
 
     #[test]
