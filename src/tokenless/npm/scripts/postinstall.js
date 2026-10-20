@@ -36,7 +36,7 @@ import {
   rmSync,
 } from 'node:fs';
 import { execSync, execFileSync } from 'node:child_process';
-import { join, dirname } from 'node:path';
+import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { platform, arch, homedir } from 'node:os';
@@ -230,7 +230,15 @@ function main() {
       if (err.code !== 'ENOENT') throw err;
     }
 
-    symlinkSync(nativeBinary, linkPath);
+    // Relative to the launcher's own bin directory, never absolute. The
+    // launcher and its platform payload live in the same installation tree, so a
+    // relative link keeps working when that tree moves — a relocated npm prefix,
+    // a staged image layer, a `mv` between build and run. An absolute target
+    // freezes the install-time prefix into the link and leaves both launchers
+    // dangling after the move even though the binaries moved with them and are
+    // still there. Same contract as the anolisa CLI launcher
+    // (distribution/anolisa/npm/scripts/postinstall.js).
+    symlinkSync(relative(binDir, nativeBinary), linkPath);
     chmodSync(linkPath, 0o755);
   }
 

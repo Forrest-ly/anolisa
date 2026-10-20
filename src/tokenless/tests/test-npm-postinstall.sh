@@ -128,12 +128,13 @@ for b in tokenless rtk; do
   chmod +x "$PKG/node_modules/$PLATFORM_PKG/bin/$b"
 done
 
-# run_postinstall <scenario> [ENV=VAL ...]
+# run_postinstall_in <package-dir> <scenario> [ENV=VAL ...]
 OUT=""
 STATUS=0
 ISOLATED_OUT=""
 RUN_MODE="isolated"
-run_postinstall() {
+run_postinstall_in() {
+  local pkg_dir="$1"; shift
   local scenario="$1"; shift
   local home="$TEST_DIR/$scenario/home"
   local node_dir
@@ -141,15 +142,18 @@ run_postinstall() {
   mkdir -p "$home"
   if [ "$RUN_MODE" = "isolated" ]; then
     OUT="$(env -i PATH="$node_dir:/usr/local/bin:/usr/bin:/bin" HOME="$home" "$@" \
-            "$NODE_BIN" "$PKG/scripts/postinstall.js" 2>&1)" && STATUS=0 || STATUS=$?
+            "$NODE_BIN" "$pkg_dir/scripts/postinstall.js" 2>&1)" && STATUS=0 || STATUS=$?
   else
     # A node that is itself a wrapper script needs the environment it was
     # installed into. Isolation is then limited to HOME, and the override
     # variable is pinned empty so an ambient value cannot leak into a scenario.
     OUT="$(HOME="$home" ANOLISA_TOKENLESS_FORCE_ADAPTERS='' "$@" \
-            "$NODE_BIN" "$PKG/scripts/postinstall.js" 2>&1)" && STATUS=0 || STATUS=$?
+            "$NODE_BIN" "$pkg_dir/scripts/postinstall.js" 2>&1)" && STATUS=0 || STATUS=$?
   fi
 }
+
+# run_postinstall <scenario> [ENV=VAL ...] — against the nested-layout fixture.
+run_postinstall() { run_postinstall_in "$PKG" "$@"; }
 
 # Preflight. That the fake package resolves and that this node can run the ESM
 # script at all (cpSync needs >= 16.7) are properties of the environment, not of
@@ -400,10 +404,79 @@ run_postinstall dangling-launchers
 assert_eq "postinstall repairs dangling launchers" "$STATUS" "0"
 for b in tokenless rtk; do
   assert_eq "the $b launcher targets the installed platform package" \
-    "$(readlink "$PKG/bin/$b")" "$PKG/node_modules/$PLATFORM_PKG/bin/$b"
+    "$(readlink "$PKG/bin/$b")" "../node_modules/$PLATFORM_PKG/bin/$b"
   assert_eq "the repaired $b launcher executes" "$("$PKG/bin/$b")" "$b"
 done
 run_postinstall dangling-launchers
 assert_eq "rebuilding repaired launchers is idempotent" "$STATUS" "0"
+
+# =============================================================================
+# 10. The launchers survive moving the installation tree
+# =============================================================================
+# A launcher that records the platform binary's absolute install path dangles as
+# soon as the tree it lives in moves, although the payload moved with it and is
+# still there: `npm install -g --prefix P` followed by a move of P, a staged
+# image layer, an unpacked tarball copied elsewhere. Both launchers have to keep
+# working with no rerun of postinstall, in the nested layout the fixture above
+# uses and in the hoisted one a global install also produces.
+
+# 10a. Nested layout: the platform package under the CLI package's node_modules.
+NESTED_MOVED="$TEST_DIR/relocated-nested/pkg"
+mkdir -p "$(dirname "$NESTED_MOVED")"
+cp -a "$PKG" "$NESTED_MOVED"
+for b in tokenless rtk; do
+  assert_eq "the $b launcher records its target relative to its own bin directory" \
+    "$(readlink "$PKG/bin/$b")" "../node_modules/$PLATFORM_PKG/bin/$b"
+  assert_eq "the copied $b launcher kept that relative link text" \
+    "$(readlink "$NESTED_MOVED/bin/$b")" "../node_modules/$PLATFORM_PKG/bin/$b"
+  assert_eq "the moved $b launcher executes without rerunning postinstall" \
+    "$("$NESTED_MOVED/bin/$b")" "$b"
+done
+
+# 10b. Hoisted layout: the platform package as a sibling of the CLI package.
+HOISTED_PREFIX="$TEST_DIR/hoisted-prefix"
+HOISTED_PKG="$HOISTED_PREFIX/lib/node_modules/anolisa-tokenless"
+HOISTED_PLATFORM="$HOISTED_PREFIX/lib/node_modules/$PLATFORM_PKG"
+mkdir -p "$HOISTED_PKG/scripts" "$HOISTED_PKG/adapters/tokenless/claude-code/scripts" \
+         "$HOISTED_PLATFORM/bin"
+cp "$POSTINSTALL" "$HOISTED_PKG/scripts/postinstall.js"
+printf '{"name":"anolisa-tokenless","version":"%s","type":"module"}\n' "$FAKE_VERSION" \
+  > "$HOISTED_PKG/package.json"
+printf '{"component":"tokenless","version":"%s"}\n' "$FAKE_VERSION" \
+  > "$HOISTED_PKG/adapters/tokenless/manifest.json"
+printf '#!/usr/bin/env bash\n' > "$HOISTED_PKG/adapters/tokenless/claude-code/scripts/install.sh"
+printf '{"name":"%s","version":"%s"}\n' "$PLATFORM_PKG" "$FAKE_VERSION" \
+  > "$HOISTED_PLATFORM/package.json"
+for b in tokenless rtk; do
+  printf '#!/usr/bin/env bash\necho "%s"\n' "$b" > "$HOISTED_PLATFORM/bin/$b"
+  chmod +x "$HOISTED_PLATFORM/bin/$b"
+done
+
+run_postinstall_in "$HOISTED_PKG" hoisted
+assert_eq "postinstall resolves a hoisted platform package" "$STATUS" "0"
+for b in tokenless rtk; do
+  assert_eq "the hoisted $b launcher targets the sibling platform package" \
+    "$(readlink "$HOISTED_PKG/bin/$b")" "../../$PLATFORM_PKG/bin/$b"
+  assert_eq "the hoisted $b launcher executes" "$("$HOISTED_PKG/bin/$b")" "$b"
+done
+
+# Move the complete prefix, the way a relocation does, and run both launchers
+# from where they landed. Nothing is reinstalled in between.
+HOISTED_RELOCATED="$TEST_DIR/hoisted-prefix-relocated"
+mv "$HOISTED_PREFIX" "$HOISTED_RELOCATED"
+for b in tokenless rtk; do
+  assert_eq "the relocated hoisted $b launcher still executes" \
+    "$("$HOISTED_RELOCATED/lib/node_modules/anolisa-tokenless/bin/$b")" "$b"
+done
+mv "$HOISTED_RELOCATED" "$HOISTED_PREFIX"
+
+# The round trip must leave nothing damaged either: the prefix is back where it
+# was and both launchers still resolve to the payload that travelled with it.
+for b in tokenless rtk; do
+  assert_eq "the hoisted $b launcher is unchanged after the prefix moved back" \
+    "$(readlink "$HOISTED_PKG/bin/$b")" "../../$PLATFORM_PKG/bin/$b"
+  assert_eq "the hoisted $b launcher still executes after the prefix moved back" \
+    "$("$HOISTED_PKG/bin/$b")" "$b"
+done
 
 echo "npm-postinstall test passed"
