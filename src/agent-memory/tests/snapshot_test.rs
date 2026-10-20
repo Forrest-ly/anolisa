@@ -119,6 +119,72 @@ fn restore_preserves_meta_dir_and_leaves_no_rollback_artefacts() {
 }
 
 #[test]
+fn repeated_restore_keeps_a_separate_trash_tree_per_restore() {
+    // Regression for GH-4878: two restores of the same snapshot inside one
+    // UTC second shared `.anolisa/trash/<timestamp>-<id>/`. The second
+    // restore's displaced `doc.md` replaced the first's, and a displaced
+    // non-empty directory could not move at all — it stayed behind under
+    // `.anolisa/.<id>.rollback.*`.
+    let (_tmp, svc) = setup();
+    svc.write("doc.md", "baseline", false).unwrap();
+    svc.write("notes/inner.md", "baseline-note", false).unwrap();
+    let snap = svc.mem_snapshot(None).unwrap();
+
+    svc.write("doc.md", "first", true).unwrap();
+    svc.mem_snapshot_restore(&snap.id).unwrap();
+    // Deliberately no sleep: the bug needs both restores in the same second.
+    svc.write("doc.md", "second", true).unwrap();
+    svc.mem_snapshot_restore(&snap.id).unwrap();
+
+    assert_eq!(svc.read("doc.md").unwrap(), "baseline");
+    assert_eq!(svc.read("notes/inner.md").unwrap(), "baseline-note");
+
+    let trash = svc.mount.meta_dir.join("trash");
+    let mut trees: Vec<_> = std::fs::read_dir(&trash)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    trees.sort();
+    assert_eq!(
+        trees.len(),
+        2,
+        "expected one trash tree per restore, got {:?}",
+        trees.iter().map(|p| p.file_name()).collect::<Vec<_>>()
+    );
+
+    // Both displaced versions survive, one per tree.
+    let mut kept: Vec<String> = trees
+        .iter()
+        .map(|t| std::fs::read_to_string(t.join("doc.md")).unwrap())
+        .collect();
+    kept.sort();
+    assert_eq!(kept, vec!["first".to_string(), "second".to_string()]);
+
+    // The directory rollback moved into its own tree instead of colliding.
+    for tree in &trees {
+        assert_eq!(
+            std::fs::read_to_string(tree.join("notes/inner.md")).unwrap(),
+            "baseline-note"
+        );
+    }
+
+    // Nothing stranded in the meta dir.
+    let prefix = format!(".{}.rollback.", snap.id);
+    let leftovers: Vec<_> = std::fs::read_dir(&svc.mount.meta_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "rollback artefacts not moved to trash: {:?}",
+        leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn snapshot_excludes_meta_directory() {
     let (_tmp, svc) = setup();
     svc.write("note.md", "real", false).unwrap();
