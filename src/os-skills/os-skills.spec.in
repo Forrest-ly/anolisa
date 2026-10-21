@@ -24,6 +24,12 @@ workflows, kernel development, security auditing, and system administration.
 # Nothing to build - skills are static assets
 
 %install
+# rpm runs scriptlets without errexit and only propagates the exit status of
+# their last command, so every failure below has to abort the build itself:
+# a partially populated skills tree must never be packaged as a successfully
+# built RPM.
+set -e
+
 rm -rf %{buildroot}
 install -d -m 0755 %{buildroot}%{_datadir}/anolisa/skills
 install -d -m 0755 %{buildroot}%{_datadir}/anolisa/components/os-skills
@@ -31,11 +37,30 @@ install -p -m 0644 component.toml \
     %{buildroot}%{_datadir}/anolisa/components/os-skills/component.toml
 
 # Find each skill directory (identified by containing SKILL.md) and copy it
-# flattened into the target skills directory.
+# flattened into the target skills directory.  The while loop is the last
+# element of the pipeline, so its status is the pipeline status and errexit
+# aborts the scriptlet when a copy fails; without the explicit abort a
+# mid-loop failure used to be masked by the copies that followed it.
+skill_found=$(find . -name 'SKILL.md' | wc -l | tr -d '[:space:]')
 find . -name 'SKILL.md' | sort | while IFS= read -r skillmd; do
     skill_dir=$(dirname "$skillmd")
-    cp -rp "$skill_dir" %{buildroot}%{_datadir}/anolisa/skills/
+    cp -rp "$skill_dir" %{buildroot}%{_datadir}/anolisa/skills/ || {
+        echo "ERROR: failed to copy skill directory '$skill_dir'" >&2
+        exit 1
+    }
 done
+
+# Verify the flattened result: exactly one installed directory per discovered
+# skill.  This also catches two skills that share a directory name, which the
+# flattening copy above would otherwise merge into a single silently
+# incomplete skill.
+skill_installed=$(find %{buildroot}%{_datadir}/anolisa/skills \
+    -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:space:]')
+if [ "$skill_installed" != "$skill_found" ]; then
+    echo "ERROR: installed $skill_installed skill directories but found \
+$skill_found SKILL.md files" >&2
+    exit 1
+fi
 
 # Set permissions
 find %{buildroot}%{_datadir}/anolisa/skills -type d -exec chmod 0755 {} +
