@@ -413,6 +413,66 @@ fn search_category_filter_works() {
     assert!(hits.is_empty(), "expected no hits for unknown category");
 }
 
+/// Regression for GH-4366. `search_category_filter_works` above uses `top_k=10`
+/// with two files, so the SQL `LIMIT` never truncates anything and a
+/// client-side (post-LIMIT) category filter looks correct. Here the window
+/// *is* exhausted by one category: bm25 ranks the six `facts/lesson/` files
+/// that repeat every query term above the six `facts/interest/` files that
+/// mention them once, so filtering after the limit returned zero interest
+/// hits. The filter now runs in SQL, before the limit.
+#[test]
+fn search_category_filter_applies_before_limit() {
+    let (_tmp, svc) = setup();
+    let baseline = svc.index.as_ref().unwrap().count().unwrap();
+
+    svc.mkdir("facts/interest").unwrap();
+    svc.mkdir("facts/lesson").unwrap();
+    for i in 0..6 {
+        svc.write(
+            &format!("facts/lesson/01JLESSON{i}QWERTYUIOP.md"),
+            &format!(
+                "---\ncategory: lesson\ntitle: quantum lattice dynamics {i}\n---\n\n\
+                 quantum lattice dynamics quantum lattice dynamics \
+                 quantum lattice dynamics variant {i}"
+            ),
+            false,
+        )
+        .unwrap();
+        svc.write(
+            &format!("facts/interest/01JINTEREST{i}QWERTY.md"),
+            &format!(
+                "---\ncategory: interest\ntitle: quantum interest {i}\n---\n\n\
+                 The agent noted a quantum lattice once ({i})."
+            ),
+            false,
+        )
+        .unwrap();
+    }
+    assert!(wait_for_index(&svc, baseline + 12));
+
+    // Premise: with no filter the top-5 window is entirely lesson facts.
+    let unfiltered = svc
+        .memory_search("quantum lattice dynamics", 5, None, None, None)
+        .unwrap();
+    assert_eq!(unfiltered.len(), 5, "expected a full top_k window");
+    assert!(
+        unfiltered
+            .iter()
+            .all(|h| h.path.starts_with("facts/lesson/")),
+        "premise broken, the unfiltered top-5 window is not all lesson facts:\n{unfiltered:#?}"
+    );
+
+    // The requested category still fills the window.
+    let hits = svc
+        .memory_search("quantum lattice dynamics", 5, None, Some("interest"), None)
+        .unwrap();
+    assert_eq!(hits.len(), 5, "expected a full top_k of interest hits");
+    assert!(
+        hits.iter().all(|h| h.path.starts_with("facts/interest/")),
+        "category=interest returned other paths:\n{hits:#?}"
+    );
+}
+
 // ---------- vector / hybrid search with an embedding provider ----------
 //
 // Regression for the "Cannot start a runtime from within a runtime" panic
