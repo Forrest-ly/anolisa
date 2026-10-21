@@ -525,6 +525,12 @@ in a mode that clears a stale registration but never creates one. Command rewrit
 the shell tool family the shared hooks classify — OpenCode 1 names its built-in shell tool
 `bash`, OpenCode 2 names it `shell` — instead of a single host spelling.
 
+A registration created by `anolisa adapter enable` is owned by its receipt, so neither the
+bundled installer nor the npm reconcile touches it — removing it from anywhere else would
+leave the receipt describing a link that is no longer there. On a host below the floor, remove
+it with `anolisa adapter disable tokenless opencode`, which deletes the link through the receipt
+that owns it and keeps the adapter state consistent.
+
 OpenCode 2 registers the same three paths as the `tool` hooks `execute.before` and
 `execute.after` plus the `session` hook `context`, which carries the tool declarations of the
 outgoing model request. Because that request declares no marker-authorized recovery path, Core

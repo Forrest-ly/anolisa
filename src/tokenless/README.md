@@ -797,6 +797,12 @@ in a mode that clears a stale registration but never creates one. Command rewrit
 the shell tool family the shared hooks classify — OpenCode 1 names its built-in shell tool
 `bash`, OpenCode 2 names it `shell` — instead of a single host spelling.
 
+A registration created by `anolisa adapter enable` is owned by its receipt, so neither the
+bundled installer nor the npm reconcile touches it — removing it from anywhere else would
+leave the receipt describing a link that is no longer there. On a host below the floor, remove
+it with `anolisa adapter disable tokenless opencode`, which deletes the link through the receipt
+that owns it and keeps the adapter state consistent.
+
 The local plugin uses OpenCode's mutable tool hooks, so compressed output
 replaces the original model-visible response instead of being appended to it.
 
