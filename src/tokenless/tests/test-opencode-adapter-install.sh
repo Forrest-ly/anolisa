@@ -36,6 +36,9 @@ export HOME="$FAKE_HOME"
 export PATH="$FAKE_BIN:$PATH"
 export ANOLISA_ADAPTER_DIR="$ADAPTER_DIR"
 export TOKENLESS_OPENCODE_CONFIG_DIR="$CONFIG_DIR"
+# Never let the suite reach a real anolisa installation: the installer delegates
+# a receipt-owned removal to `anolisa adapter disable` when it can find the CLI.
+export ANOLISA_BIN="$SANDBOX/no-anolisa"
 
 DETECT_SH="$ADAPTER_DIR/opencode/scripts/detect.sh"
 INSTALL_SH="$ADAPTER_DIR/opencode/scripts/install.sh"
@@ -338,6 +341,73 @@ if [ "$recon_rc" -eq 0 ] && [ "$(cksum "$PLUGIN_LINK")" = "$recon_cksum" ]; then
     pass "reconcile mode leaves an unmanaged file alone without failing"
 else
     fail "reconcile mode touched or rejected an unmanaged file (rc=${recon_rc})"
+fi
+rm -f "$PLUGIN_LINK"
+
+# -- Receipt-owned registrations: the installer must not silently desync one ----
+# `anolisa adapter enable` records the link in a receipt this installer can
+# neither read nor write. It therefore hands the removal to the CLI that owns
+# both, and only removes the link itself when that is unavailable or fails --
+# saying so, instead of implying a receipt protection it does not enforce.
+ANOLISA_CALLS="$SANDBOX/anolisa-calls.log"
+cat > "$FAKE_BIN/anolisa" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "$*" >> "$TOKENLESS_TEST_ANOLISA_CALLS"
+if [ -n "${TOKENLESS_TEST_ANOLISA_FAIL:-}" ]; then
+    exit 1
+fi
+# A receipt-consistent disable removes the link together with the claim.
+rm -f "$TOKENLESS_TEST_PLUGIN_LINK"
+exit 0
+STUBEOF
+chmod +x "$FAKE_BIN/anolisa"
+: > "$ANOLISA_CALLS"
+
+ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+cli_rc=0
+ANOLISA_BIN="$FAKE_BIN/anolisa" TOKENLESS_TEST_PLUGIN_LINK="$PLUGIN_LINK" \
+    TOKENLESS_TEST_ANOLISA_CALLS="$ANOLISA_CALLS" TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 \
+    bash "$INSTALL_SH" > "$SANDBOX/out-cli.txt" 2>&1 || cli_rc=$?
+if [ "$cli_rc" -eq 0 ] && [ ! -L "$PLUGIN_LINK" ] &&
+    grep -qx 'adapter disable tokenless opencode' "$ANOLISA_CALLS" &&
+    ! grep -q "does not read or write ANOLISA receipts" "$SANDBOX/out-cli.txt"; then
+    pass "installer delegates a receipt-owned removal to the anolisa CLI"
+else
+    fail "installer did not delegate to the anolisa CLI (rc=${cli_rc})"
+fi
+
+ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+cli_rc=0
+ANOLISA_BIN="$FAKE_BIN/anolisa" TOKENLESS_TEST_ANOLISA_FAIL=1 \
+    TOKENLESS_TEST_PLUGIN_LINK="$PLUGIN_LINK" TOKENLESS_TEST_ANOLISA_CALLS="$ANOLISA_CALLS" \
+    TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 bash "$INSTALL_SH" > "$SANDBOX/out-fail.txt" 2>&1 || cli_rc=$?
+if [ "$cli_rc" -eq 0 ] && [ ! -L "$PLUGIN_LINK" ] &&
+    grep -q "anolisa adapter disable tokenless opencode" "$SANDBOX/out-fail.txt"; then
+    pass "installer removes the link itself and names the stale receipt when the CLI fails"
+else
+    fail "installer did not fall back when the CLI failed (rc=${cli_rc})"
+fi
+
+ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+cli_rc=0
+ANOLISA_BIN="$SANDBOX/no-anolisa" TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 \
+    bash "$INSTALL_SH" > "$SANDBOX/out-nocli.txt" 2>&1 || cli_rc=$?
+if [ "$cli_rc" -eq 0 ] && [ ! -L "$PLUGIN_LINK" ] &&
+    grep -q "still claims it" "$SANDBOX/out-nocli.txt"; then
+    pass "installer reports the receipt boundary when no anolisa CLI is available"
+else
+    fail "installer did not report the receipt boundary (rc=${cli_rc})"
+fi
+
+ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+: > "$ANOLISA_CALLS"
+ANOLISA_DRY_RUN=1 ANOLISA_BIN="$FAKE_BIN/anolisa" TOKENLESS_TEST_PLUGIN_LINK="$PLUGIN_LINK" \
+    TOKENLESS_TEST_ANOLISA_CALLS="$ANOLISA_CALLS" TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 \
+    bash "$INSTALL_SH" > "$SANDBOX/out-dry.txt" 2>&1
+if [ -L "$PLUGIN_LINK" ] && [ ! -s "$ANOLISA_CALLS" ]; then
+    pass "dry-run invokes the CLI nowhere and keeps the registration"
+else
+    fail "dry-run mutated state or invoked the CLI"
 fi
 rm -f "$PLUGIN_LINK"
 

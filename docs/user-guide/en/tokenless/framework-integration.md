@@ -525,11 +525,14 @@ in a mode that clears a stale registration but never creates one. Command rewrit
 the shell tool family the shared hooks classify — OpenCode 1 names its built-in shell tool
 `bash`, OpenCode 2 names it `shell` — instead of a single host spelling.
 
-A registration created by `anolisa adapter enable` is owned by its receipt, so neither the
-bundled installer nor the npm reconcile touches it — removing it from anywhere else would
-leave the receipt describing a link that is no longer there. On a host below the floor, remove
-it with `anolisa adapter disable tokenless opencode`, which deletes the link through the receipt
-that owns it and keeps the adapter state consistent.
+The bundled installer recognizes a managed link by its target alone; it does not read or write
+ANOLISA receipts. It therefore also removes a registration created by `anolisa adapter enable`,
+which would leave that receipt claiming a link that is gone. To keep the link and its receipt
+together it hands the removal to `anolisa adapter disable tokenless opencode` when that CLI is
+reachable — the command is idempotent and clears both — and otherwise removes the link itself and
+reports that the receipt still needs clearing by hand. An `anolisa update` runs none of these
+scripts, so on that path the registration survives the bundle replacement until
+`anolisa adapter disable tokenless opencode` is run.
 
 OpenCode 2 registers the same three paths as the `tool` hooks `execute.before` and
 `execute.after` plus the `session` hook `context`, which carries the tool declarations of the

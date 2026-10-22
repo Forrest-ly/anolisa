@@ -475,9 +475,12 @@ npm 包升级会自动执行这项 reconcile，且运行在「只清理、绝不
 和 Shell 失败证据按共享 Hook 归类的 Shell 工具族匹配（OpenCode 1 的内建 Shell Tool 叫 `bash`，
 OpenCode 2 叫 `shell`），而不是只认某一代宿主的拼写。
 
-由 `anolisa adapter enable` 建立的注册归其 receipt 所有，随包安装脚本与 npm 的 reconcile 都不会触碰它
-—— 从其他位置删除会让 receipt 继续描述一个已不存在的链接。若宿主低于该下限，请用
-`anolisa adapter disable tokenless opencode` 移除：它会通过持有该链接的 receipt 删除，保持适配器状态一致。
+随包安装脚本只按链接目标识别受管链接，它不读取也不写入 ANOLISA receipt。因此它同样会删除由
+`anolisa adapter enable` 建立的注册，而那会让 receipt 继续声明一条已不存在的链接。为了让链接与 receipt
+一起收敛，脚本会在 `anolisa` CLI 可用时把删除动作交给 `anolisa adapter disable tokenless opencode`
+（该命令幂等，会同时清掉两者）；CLI 不可用时则自行删除链接，并明确提示 receipt 仍需手工清理。
+`anolisa update` 不会执行这些脚本，因此走该路径时，注册会在 bundle 被替换后继续存在，
+直到执行 `anolisa adapter disable tokenless opencode`。
 
 OpenCode 2 将同样三条路径注册为 `tool` 域的 `execute.before` / `execute.after` Hook，
 以及 `session` 域的 `context` Hook；后者携带本次请求实际发出的工具声明。由于该请求没有声明

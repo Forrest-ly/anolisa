@@ -52,6 +52,14 @@ OPENCODE_BIN="${OPENCODE_BIN:-}"
 if [ -z "$OPENCODE_BIN" ]; then
     OPENCODE_BIN="$(command -v opencode 2>/dev/null || true)"
 fi
+
+# `anolisa adapter enable` records the plugin link in a receipt this script can
+# neither read nor write; its own CLI is the only supported way to remove link
+# and receipt together. Overridable so tests never reach a real installation.
+ANOLISA_BIN="${ANOLISA_BIN:-}"
+if [ -z "$ANOLISA_BIN" ]; then
+    ANOLISA_BIN="$(command -v anolisa 2>/dev/null || true)"
+fi
 if [ -z "$OPENCODE_BIN" ] || { [ ! -x "$OPENCODE_BIN" ] && ! command -v "$OPENCODE_BIN" >/dev/null 2>&1; }; then
     echo "[${COMPONENT}] opencode CLI not found — skipping ${AGENT} plugin installation."
     exit 0
@@ -86,8 +94,26 @@ if ! opencode_version_supported "$VERSION"; then
         if [ "${ANOLISA_DRY_RUN:-0}" = "1" ]; then
             echo "DRY-RUN: rm ${PLUGIN_LINK}"
         else
-            rm "$PLUGIN_LINK"
+            # Hand the removal to the CLI that owns the receipt when it is
+            # available. `adapter disable` is idempotent, so a registration this
+            # installer created itself is a successful no-op and the removal
+            # below still runs; a receipt is only ever cleared by its owner.
+            cleared_receipt=0
+            if [ -n "$ANOLISA_BIN" ] &&
+                "$ANOLISA_BIN" adapter disable "$COMPONENT" "$AGENT" >/dev/null 2>&1 &&
+                ! is_managed_link; then
+                cleared_receipt=1
+            fi
+            if is_managed_link; then
+                rm "$PLUGIN_LINK"
+            fi
             echo "[${COMPONENT}] ${AGENT}: removed the now-unsupported registration at ${PLUGIN_LINK}."
+            if [ "$cleared_receipt" -eq 0 ]; then
+                echo "[${COMPONENT}] ${AGENT}: this script does not read or write ANOLISA receipts." >&2
+                echo "[${COMPONENT}] ${AGENT}: if 'anolisa adapter enable' created that link, its receipt" >&2
+                echo "[${COMPONENT}] ${AGENT}: still claims it; clear it with:" >&2
+                echo "[${COMPONENT}] ${AGENT}:   anolisa adapter disable ${COMPONENT} ${AGENT}" >&2
+            fi
         fi
     elif [ -e "$PLUGIN_LINK" ] || [ -L "$PLUGIN_LINK" ]; then
         echo "[${COMPONENT}] ${AGENT}: WARNING: leaving unmanaged path untouched: ${PLUGIN_LINK}" >&2
