@@ -313,10 +313,11 @@ impl BM25Store {
     /// `category` restricts results to one fact category and is applied **in
     /// SQL, before `LIMIT`**, on every bm25 path — the MATCH query, its
     /// OR-quoted retry and the short-CJK LIKE fallback. Facts live under
-    /// `facts/<category>/<ulid>.md`, so the filter is a path-prefix `LIKE`.
-    /// Filtering in Rust *after* the limit instead would return zero hits
-    /// whenever another category filled the unfiltered top-k window, which is
-    /// exactly what bm25 term-frequency/length normalization produces.
+    /// `facts/<category>/<ulid>.md`, so the filter is a path-prefix `GLOB`
+    /// (case-sensitive; see `category_glob_pattern`). Filtering in Rust
+    /// *after* the limit instead would return zero hits whenever another
+    /// category filled the unfiltered top-k window, which is exactly what bm25
+    /// term-frequency/length normalization produces.
     pub fn search_scoped(
         &self,
         query: &str,
@@ -1166,25 +1167,39 @@ fn like_pattern(token: &str) -> String {
     s
 }
 
-/// Build the `LIKE` pattern that restricts a search to one fact category.
+/// Build the `GLOB` pattern that restricts a search to one fact category.
 /// Facts are written to `facts/<category>/<ulid>.md` (see
-/// `consolidation::writer`), so a prefix pattern is exact. `%`, `_` and `\` in
-/// the category are backslash-escaped against the caller's `ESCAPE '\'` clause
-/// — the same set `like_pattern` escapes — so a category can neither widen the
-/// prefix nor swallow the trailing separator.
-fn category_like_pattern(category: &str) -> String {
+/// `consolidation::writer`), so a prefix pattern is exact.
+///
+/// `GLOB` and not `LIKE` because SQLite folds ASCII case in `LIKE`
+/// (`'facts/Interest/x.md' LIKE 'facts/interest/%'` is true), while category
+/// matching has always been a case-sensitive comparison — the Rust-side
+/// `filter_by_category` this pushed into SQL used `==` on the second path
+/// component. On Linux one store can hold both `facts/interest/` and
+/// `facts/Interest/`, and conflating them does more than leak a row: the
+/// wrong-case file also spends a `top_k` slot that a requested-category fact
+/// should have filled.
+///
+/// `GLOB` has no `ESCAPE` clause, so its three metacharacters — `*`, `?` and
+/// `[` — are neutralised by wrapping each in a single-character bracket class
+/// (`[*]`, `[?]`, `[[]`), which `GLOB` reads as a literal. `]` and `^` are
+/// literal outside a class and must not be escaped. That leaves a category
+/// unable to widen the prefix or swallow the trailing separator, the same
+/// guarantee the backslash escaping gave `like_pattern`.
+fn category_glob_pattern(category: &str) -> String {
     let mut s = String::with_capacity(category.len() + 8);
     s.push_str("facts/");
     for c in category.chars() {
         match c {
-            '_' | '%' | '\\' => {
-                s.push('\\');
+            '*' | '?' | '[' => {
+                s.push('[');
                 s.push(c);
+                s.push(']');
             }
             other => s.push(other),
         }
     }
-    s.push_str("/%");
+    s.push_str("/*");
     s
 }
 
@@ -1196,8 +1211,8 @@ fn category_filter_sql(category: Option<&str>, placeholder: &str) -> (String, Op
     match category {
         None => (String::new(), None),
         Some(cat) => (
-            format!("AND f.path LIKE {placeholder} ESCAPE '\\'"),
-            Some(category_like_pattern(cat)),
+            format!("AND f.path GLOB {placeholder}"),
+            Some(category_glob_pattern(cat)),
         ),
     }
 }
@@ -1587,11 +1602,148 @@ mod tests {
     }
 
     #[test]
-    fn category_like_pattern_escapes_wildcards() {
-        assert_eq!(category_like_pattern("lesson"), "facts/lesson/%");
-        // `_` and `%` would otherwise match any character / any suffix.
-        assert_eq!(category_like_pattern("a_b%c"), "facts/a\\_b\\%c/%");
-        assert_eq!(category_like_pattern("a\\b"), "facts/a\\\\b/%");
+    fn category_glob_pattern_escapes_wildcards() {
+        assert_eq!(category_glob_pattern("lesson"), "facts/lesson/*");
+        // `*`, `?` and `[` would otherwise widen the prefix or stand in for an
+        // arbitrary character; a bracket class pins each to itself.
+        assert_eq!(category_glob_pattern("a*b"), "facts/a[*]b/*");
+        assert_eq!(category_glob_pattern("a?b"), "facts/a[?]b/*");
+        assert_eq!(category_glob_pattern("a[b"), "facts/a[[]b/*");
+        // `]` and `^` are literal outside a class, and GLOB has no backslash
+        // escape, so neither is touched.
+        assert_eq!(category_glob_pattern("a]b^c"), "facts/a]b^c/*");
+        assert_eq!(category_glob_pattern("a\\b"), "facts/a\\b/*");
+        // A CJK category survives byte-for-byte.
+        assert_eq!(category_glob_pattern("花名"), "facts/花名/*");
+    }
+
+    /// The escaped metacharacters must match literally once they reach SQL, not
+    /// just in the pattern string above.
+    #[test]
+    fn search_category_glob_metacharacters_are_literal() {
+        let mut s = BM25Store::open_in_memory().unwrap();
+        s.upsert(
+            "facts/int?rest/01JMETA0.md",
+            100,
+            10,
+            "quantum lattice dynamics",
+            None,
+        )
+        .unwrap();
+        s.upsert(
+            "facts/intxrest/01JMETA1.md",
+            100,
+            10,
+            "quantum lattice dynamics",
+            None,
+        )
+        .unwrap();
+
+        // `?` matches the literal question mark, and nothing else.
+        let hits = s
+            .search_scoped("quantum lattice dynamics", 10, true, None, Some("int?rest"))
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["facts/int?rest/01JMETA0.md"]);
+
+        // The category that `?` would have wildcarded matches its own literal.
+        let hits = s
+            .search_scoped("quantum lattice dynamics", 10, true, None, Some("intxrest"))
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["facts/intxrest/01JMETA1.md"]);
+    }
+
+    /// Regression for the P2 review on this PR: SQLite `LIKE` folds ASCII case,
+    /// so pushing the filter into SQL as a `LIKE` made `category="interest"`
+    /// match `facts/Interest/` too — the Rust-side `filter_by_category` it
+    /// replaced compared with a case-sensitive `==`. The wrong-case file did not
+    /// merely leak into the results, it occupied a `top_k` slot and displaced a
+    /// fact from the category actually requested.
+    #[test]
+    fn search_category_matching_is_case_sensitive() {
+        let mut s = BM25Store::open_in_memory().unwrap();
+        // Six lowercase-category facts, then one mixed-case sibling that
+        // repeats the query terms so bm25 ranks it above all six.
+        for i in 0..6 {
+            s.upsert(
+                &format!("facts/interest/01JINTEREST{i}.md"),
+                100,
+                10,
+                &format!("quantum lattice note about interest topic {i}"),
+                None,
+            )
+            .unwrap();
+        }
+        s.upsert(
+            "facts/Interest/mixedcase.md",
+            100,
+            10,
+            "quantum lattice quantum lattice quantum lattice",
+            None,
+        )
+        .unwrap();
+
+        // Premise: unfiltered, the mixed-case fact is inside the top-5 window,
+        // so a case-insensitive filter would spend one of those five slots on
+        // it rather than pushing it out before the LIMIT.
+        let all = s
+            .search_scoped("quantum lattice", 5, true, None, None)
+            .unwrap();
+        assert_eq!(all.len(), 5, "expected a full top_k window");
+        assert!(
+            all.iter().any(|h| h.path == "facts/Interest/mixedcase.md"),
+            "premise broken, the mixed-case fact is not in the window: {all:?}"
+        );
+
+        let hits = s
+            .search_scoped("quantum lattice", 5, true, None, Some("interest"))
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            5,
+            "expected five lowercase interest hits: {hits:?}"
+        );
+        assert!(
+            hits.iter().all(|h| h.path.starts_with("facts/interest/")),
+            "case-insensitive category match leaked facts/Interest/: {hits:?}"
+        );
+
+        // And the mixed-case category is reachable on its own terms.
+        let hits = s
+            .search_scoped("quantum lattice", 5, true, None, Some("Interest"))
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["facts/Interest/mixedcase.md"]);
+    }
+
+    /// Same case-sensitivity requirement on the short-CJK `LIKE` fallback path,
+    /// which carries its own `LIMIT` and its own copy of the category filter.
+    #[test]
+    fn search_like_category_matching_is_case_sensitive() {
+        let mut s = BM25Store::open_in_memory().unwrap();
+        s.upsert("facts/interest/01JCJKC0.md", 100, 10, "花名是小云", None)
+            .unwrap();
+        s.upsert("facts/interest/01JCJKC1.md", 100, 10, "花名是大云", None)
+            .unwrap();
+        s.upsert("facts/Interest/mixedcase.md", 100, 10, "花名是老云", None)
+            .unwrap();
+
+        let hits = s
+            .search_scoped("花名", 5, true, None, Some("interest"))
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["facts/interest/01JCJKC0.md", "facts/interest/01JCJKC1.md"],
+            "LIKE fallback conflated facts/Interest/ with facts/interest/"
+        );
+
+        let hits = s
+            .search_scoped("花名", 5, true, None, Some("Interest"))
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["facts/Interest/mixedcase.md"]);
     }
 
     #[test]
