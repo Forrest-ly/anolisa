@@ -238,6 +238,18 @@ fn classify(
     }
 }
 
+/// Whether `rel` — or a directory containing it — is queued for removal in
+/// the same flush. `BM25Store::remove` deletes the exact path *and* every row
+/// under `rel/`, so a queued removal of an ancestor directory invalidates
+/// `rel` just as one for `rel` itself does.
+fn removal_queued(queued_remove: &HashSet<String>, rel: &str) -> bool {
+    !queued_remove.is_empty()
+        && Path::new(rel).ancestors().any(|a| {
+            let seg = a.as_os_str();
+            !seg.is_empty() && queued_remove.contains(seg.to_str().unwrap_or(""))
+        })
+}
+
 fn flush(
     mount: &MountPointLite,
     store: &Arc<Mutex<BM25Store>>,
@@ -281,6 +293,19 @@ fn flush(
     let mut to_remove_files: Vec<String> = Vec::new();
     let mut to_upsert: Vec<(String, i64, u64, String)> = Vec::new();
     let mut to_upsert_vec: Vec<(String, Vec<f32>)> = Vec::new();
+    // The removals this same window queued. `classify` files an unlink under
+    // `pending_remove` and a rename back onto the same path under
+    // `pending_modify`, so a file deleted and restored inside one debounce
+    // window appears in both — and phase 3 executes the removal *after* the
+    // phase 2b snapshot was taken. A dedup guard that trusts that snapshot
+    // would skip the upsert while the row is still deleted, leaving a file
+    // that is readable on disk invisible to search until the next event or a
+    // rescan. A queued removal therefore invalidates the snapshot; see
+    // `removal_queued`. Empty for the events this dedup exists for (an
+    // attribute change queues nothing for removal), where the check
+    // short-circuits and costs nothing. Owned strings, because phase 2a still
+    // appends paths that vanished before this flush to `to_remove`.
+    let queued_remove: HashSet<String> = to_remove.iter().cloned().collect();
 
     // Phase 2a (lock-free): stat every pending path and keep the indexable
     // files together with the `(mtime, size)` the index would record.
@@ -340,7 +365,13 @@ fn flush(
         // The BM25 row is current when both mtime and size match. Size is
         // part of the comparison so a rewrite landing inside the mtime
         // granularity (coarse on some filesystems) is still picked up.
-        let row_current = known.is_some_and(|k| k.mtime_ms == mtime && k.size == size);
+        // A removal queued for the same path in this window overrides that:
+        // phase 3 is about to delete the very row the snapshot describes, so
+        // the snapshot cannot vouch for anything. The file is re-read and
+        // re-indexed, restoring the remove-then-reinsert this flush did before
+        // the dedup landed.
+        let row_current = !removal_queued(&queued_remove, &rel)
+            && known.is_some_and(|k| k.mtime_ms == mtime && k.size == size);
         // A current row with no vector means an earlier embed failed, or the
         // provider was configured after the file was indexed. Heal that here
         // instead of deferring it to the next `full_scan` backfill — i.e. a
@@ -602,11 +633,18 @@ fn is_overflow(e: &notify::Error) -> bool {
 mod tests {
     use super::*;
     use crate::embedding::Embedding;
+    use crate::index::store::mtime_ms_of;
     use crate::ns::Namespace;
     use async_trait::async_trait;
-    use std::fs;
+    use std::fs::{self, FileTimes};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::SystemTime;
+
+    /// Budget for waiting on one watcher flush. Mirrors the 4s the Tier B
+    /// integration tests allow: notify on Linux often delivers Create/Modify
+    /// back-to-back and the 200ms debounce can need a few cycles to drain.
+    const WATCHER_BUDGET_MS: u64 = 4000;
 
     // Keep sibling eviction tests from registering the shared tracing callsite
     // without the capture subscriber: callsite interest is process-global even
@@ -971,5 +1009,134 @@ mod tests {
         let st = stat(&store, "notes/observed/new.md");
         assert!(st.has_vector);
         assert!(st.size > 0);
+    }
+
+    /// Stash `body` at `outside` — which must *not* be under the mount, or the
+    /// watcher would see it — stamped with the mtime the index recorded, so
+    /// that renaming it back onto the indexed path reproduces "same path, same
+    /// `(mtime, size)`": exactly what the phase-2c dedup short-circuits on.
+    fn stage_restore_copy(outside: &Path, body: &str, st: &IndexStat) {
+        fs::write(outside, body).expect("stage copy");
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_millis(st.mtime_ms.max(0) as u64);
+        let copy = fs::OpenOptions::new()
+            .write(true)
+            .open(outside)
+            .expect("open copy");
+        copy.set_times(FileTimes::new().set_modified(mtime))
+            .expect("stamp copy with the indexed mtime");
+        let meta = fs::metadata(outside).expect("stat copy");
+        // Guard the fixture itself: were the stamp lost, the flush would
+        // re-index for the ordinary "metadata moved" reason and the test would
+        // stop covering the branch it names.
+        assert_eq!(mtime_ms_of(&meta), st.mtime_ms, "copy mtime");
+        assert_eq!(meta.len(), st.size, "copy size");
+    }
+
+    /// Block until the watcher has flushed at least once since `barrier` was
+    /// written, i.e. until its row exists. Phase 3 removes before it upserts,
+    /// so a flush that published the barrier has already applied everything
+    /// queued ahead of it — no fixed multiple of the debounce window has to be
+    /// guessed at.
+    fn wait_for_flush_barrier(store: &Arc<Mutex<BM25Store>>, barrier: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(WATCHER_BUDGET_MS);
+        while Instant::now() < deadline {
+            if store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index_stat_for(barrier)
+                .is_some()
+            {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// `classify` files an unlink under `pending_remove` and a rename back
+    /// onto the same path under `pending_modify`, so one debounce window can
+    /// queue a removal *and* a modification for a file that is still there.
+    /// Phase 3 executes the removal after phase 2b took its snapshot, so the
+    /// dedup must not trust that snapshot for such a path: skipping the upsert
+    /// while the row is deleted anyway leaves a file that is readable on disk
+    /// invisible to search until the next event or a rescan. Before the dedup
+    /// landed, phase 3 removed and then reinserted it.
+    #[test]
+    fn queued_removal_of_a_restored_file_does_not_drop_its_row() {
+        let (tmp, mount, store) = setup();
+        let root = mount.root.clone();
+        write(&root, "notes/a.md", "cobaltzebra original content");
+        flush_rels(&mount, &store, None, &["notes/a.md"]);
+        let indexed = stat(&store, "notes/a.md");
+
+        let staged = tmp.path().join("restore.md");
+        stage_restore_copy(&staged, "cobaltzebra original content", &indexed);
+        fs::remove_file(root.join("notes/a.md")).expect("unlink");
+        fs::rename(&staged, root.join("notes/a.md")).expect("restore");
+
+        // Replay what the watcher collected for those two events.
+        let mut pending_modify = HashSet::from([root.join("notes/a.md")]);
+        let mut pending_remove = HashSet::from([root.join("notes/a.md")]);
+        flush(
+            &mount,
+            &store,
+            None,
+            None,
+            &mut pending_modify,
+            &mut pending_remove,
+        )
+        .expect("flush");
+
+        let hits = store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .search("cobaltzebra", 10, false)
+            .expect("search");
+        assert_eq!(hits.len(), 1, "the restored file must still be searchable");
+        assert_eq!(hits[0].path, "notes/a.md");
+        assert_eq!(stat(&store, "notes/a.md").mtime_ms, indexed.mtime_ms);
+    }
+
+    /// The same regression end to end through the real watcher with embedding
+    /// disabled, which is how it was reported: index a file, keep a copy
+    /// outside the mount that preserves its mtime, unlink the indexed file,
+    /// rename the copy straight back. Both events land in one 200 ms debounce
+    /// window. Afterwards the file must be readable *and* still return its
+    /// keyword hit.
+    #[test]
+    fn watcher_keeps_a_file_deleted_and_restored_in_one_debounce_window() {
+        let (tmp, mount, store) = setup();
+        let root = mount.root.clone();
+        write(&root, "notes/a.md", "cobaltzebra original content");
+
+        // No embedding provider, as in the report: nothing but the BM25 row is
+        // at stake, so there is no vector-side healing to mask the loss.
+        let worker = IndexWorker::spawn(mount.clone(), Arc::clone(&store), None).expect("spawn");
+        let indexed = stat(&store, "notes/a.md");
+        let staged = tmp.path().join("restore.md");
+        stage_restore_copy(&staged, "cobaltzebra original content", &indexed);
+
+        // Back-to-back, so both events fall inside one debounce window.
+        fs::remove_file(root.join("notes/a.md")).expect("unlink");
+        fs::rename(&staged, root.join("notes/a.md")).expect("restore");
+
+        write(&root, "notes/barrier.md", "quartz barrier marker");
+        assert!(
+            wait_for_flush_barrier(&store, "notes/barrier.md"),
+            "watcher never flushed the barrier file"
+        );
+        worker.shutdown_blocking();
+
+        assert_eq!(
+            fs::read_to_string(root.join("notes/a.md")).expect("restored file is readable"),
+            "cobaltzebra original content"
+        );
+        let hits = store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .search("cobaltzebra", 10, false)
+            .expect("search");
+        assert_eq!(hits.len(), 1, "the restored file must still be searchable");
+        assert_eq!(hits[0].path, "notes/a.md");
     }
 }
