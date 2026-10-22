@@ -176,31 +176,41 @@ impl Episode {
     }
 }
 
-/// An episode together with the inclusive range of audit entries it was
-/// extracted from. The patterns deliberately overlap, so the range is what
-/// makes "these two episodes describe the same memory" decidable; it is an
-/// extraction detail and is not part of the serialized [`Episode`].
+/// An episode together with the audit entries it actually retained. The
+/// patterns deliberately overlap, so the retained entries are what makes
+/// "these two episodes describe the same memory" decidable; they are an
+/// extraction detail and are not part of the serialized [`Episode`].
+///
+/// This is deliberately *not* the inclusive `first..=last` range the episode
+/// spans. `extract_promote_chain` retains the source read, the scratch write
+/// and the promote — three calls out of a range that can wrap any number of
+/// unrelated tasks in between — so the range claims material the episode does
+/// not carry, and comparing ranges discards that material as a duplicate.
 #[derive(Debug)]
 struct SpannedEpisode {
     episode: Episode,
-    /// Index of the first audit entry the episode covers.
-    start: usize,
-    /// Index of the last audit entry the episode covers.
-    end: usize,
+    /// Indices of the audit entries the episode retained, in ascending order.
+    indices: Vec<usize>,
 }
 
 impl SpannedEpisode {
-    fn new(episode: Episode, start: usize, end: usize) -> Self {
-        Self {
-            episode,
-            start,
-            end,
-        }
+    fn new(episode: Episode, indices: Vec<usize>) -> Self {
+        Self { episode, indices }
     }
 
-    /// True when every entry this episode covers is also covered by `other`.
-    fn is_contained_in(&self, other: &Self) -> bool {
-        other.start <= self.start && self.end <= other.end
+    /// True when this episode retained exactly the audit entries `other`
+    /// retained — two readings of one set of calls, of which only the more
+    /// specific one is worth a fact. Both index lists are ascending, so
+    /// element-wise equality is set equality.
+    ///
+    /// A *proper* subset is not a duplicate. The shorter episode is a pattern
+    /// the longer one does not express — an `error → retry` recovery inside a
+    /// generic task chain reports `Recovered`, while the chain only reports
+    /// `Partial` with an `error_count`, and the Lesson fact records the
+    /// failure without the retry that resolved it — so dropping it would lose
+    /// that sequence.
+    fn retains_same_calls_as(&self, other: &Self) -> bool {
+        self.indices == other.indices
     }
 }
 
@@ -228,20 +238,25 @@ pub fn extract_episodes(
     // Pattern 4: general task chains (≥min_steps consecutive diverse calls)
     episodes.extend(extract_general_chains(entries, session_id, min_steps));
 
-    // Deduplicate overlapping episodes (prefer longer ones). One span of
-    // entries can satisfy two patterns — search → read → edit → read is also
-    // a 4-tool task chain — and every episode becomes its own fact, so an
-    // undeduplicated overlap double-writes the same episodic memory and
-    // spends budget distinct memories should get. Longer chains sort first
-    // (the sort is stable, so equal lengths keep pattern priority: the
-    // specific patterns are extracted before the general one), and any
-    // episode whose entry range is contained in an already-kept range is
-    // dropped. Deduplication runs before the truncate so duplicates cannot
-    // consume `max_episodes` slots.
+    // Deduplicate overlapping episodes (prefer the more specific pattern). One
+    // span of entries can satisfy two patterns — search → read → edit → read
+    // is also a 4-tool task chain — and every episode becomes its own fact, so
+    // an undeduplicated overlap double-writes the same episodic memory and
+    // spends budget distinct memories should get. Two episodes are the same
+    // memory only when they retained the same calls; an episode that merely
+    // sits inside another one's range describes a pattern the other does not
+    // carry, and stays. Longer chains sort first, and the sort is stable, so
+    // equal lengths — which is what two episodes over the same calls always
+    // are — keep pattern priority: the specific patterns are extracted before
+    // the general one. Deduplication runs before the truncate so duplicates
+    // cannot consume `max_episodes` slots.
     episodes.sort_by_key(|e| std::cmp::Reverse(e.episode.chain.len()));
     let mut deduped: Vec<SpannedEpisode> = Vec::with_capacity(episodes.len());
     for candidate in episodes {
-        if !deduped.iter().any(|kept| candidate.is_contained_in(kept)) {
+        if !deduped
+            .iter()
+            .any(|kept| candidate.retains_same_calls_as(kept))
+        {
             deduped.push(candidate);
         }
     }
@@ -304,8 +319,7 @@ fn extract_edit_cycle(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<Span
 
         episodes.push(SpannedEpisode::new(
             Episode::new(session_id, trigger, chain, outcome, error_count, duration),
-            i,
-            l,
+            vec![i, j, k, l],
         ));
 
         i = l + 1; // Skip past this episode
@@ -361,8 +375,9 @@ fn extract_promote_chain(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<S
                     0,
                     duration,
                 ),
-                ri,
-                i,
+                // Only these three calls are retained; everything between
+                // `ri` and `i` belongs to whatever else the session did.
+                vec![ri, wi, i],
             ));
         }
 
@@ -398,8 +413,7 @@ fn extract_error_recovery(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<
                         1,
                         duration,
                     ),
-                    i,
-                    j,
+                    vec![i, j],
                 ));
                 break;
             }
@@ -452,8 +466,7 @@ fn extract_general_chains(
                 let duration = duration_between(&entries[start_idx].ts, &entries[end_idx].ts);
                 episodes.push(SpannedEpisode::new(
                     Episode::new(session_id, trigger, chain, outcome, error_count, duration),
-                    start_idx,
-                    end_idx,
+                    current_chain.clone(),
                 ));
             }
             current_chain.clear();
@@ -491,8 +504,7 @@ fn extract_general_chains(
         let duration = duration_between(&entries[start_idx].ts, &entries[end_idx].ts);
         episodes.push(SpannedEpisode::new(
             Episode::new(session_id, trigger, chain, outcome, error_count, duration),
-            start_idx,
-            end_idx,
+            current_chain.clone(),
         ));
     }
 
@@ -564,6 +576,30 @@ mod tests {
         }
     }
 
+    /// The 8-call sequence from the PR #8305 review: a promote chain that
+    /// retains calls `0, 1, 7` while spanning `0..=7`, so the independent
+    /// task at `3, 4, 5` sits inside the span without sharing a single call
+    /// with the episode that claims it.
+    fn promote_span_entries() -> Vec<OwnedAuditEntry> {
+        vec![
+            make_entry("mem_read", "source/context.md", true, None, Some(120)),
+            make_entry("mem_write", "scratch/draft.md", true, None, Some(150)),
+            // mem_list is chain noise: it separates the two spans below.
+            make_entry("mem_list", "notes/", true, None, Some(2)),
+            make_entry("mem_write", "notes/independent.md", true, None, Some(40)),
+            make_entry("mem_append", "notes/independent.md", true, None, Some(10)),
+            make_entry("mem_read", "notes/other.md", true, None, Some(80)),
+            make_entry("mem_list", "notes/", true, None, Some(2)),
+            make_entry(
+                "mem_promote",
+                "scratch/draft.md -> saved/draft.md",
+                true,
+                None,
+                Some(150),
+            ),
+        ]
+    }
+
     #[test]
     fn detects_edit_verify_cycle() {
         let entries = vec![
@@ -577,9 +613,9 @@ mod tests {
         assert_eq!(episodes[0].episode.chain.len(), 4);
         assert_eq!(episodes[0].episode.outcome, EpisodeOutcome::Success);
         assert_eq!(
-            (episodes[0].start, episodes[0].end),
-            (0, 3),
-            "the span must cover exactly the cycle's four entries"
+            episodes[0].indices,
+            vec![0, 1, 2, 3],
+            "the episode must retain exactly the cycle's four entries"
         );
     }
 
@@ -601,9 +637,9 @@ mod tests {
         assert_eq!(episodes[0].episode.chain.len(), 3);
         assert_eq!(episodes[0].episode.outcome, EpisodeOutcome::Promoted);
         assert_eq!(
-            (episodes[0].start, episodes[0].end),
-            (0, 2),
-            "the span runs from the source read to the promote"
+            episodes[0].indices,
+            vec![0, 1, 2],
+            "the episode retains the source read, the scratch write and the promote"
         );
     }
 
@@ -623,9 +659,9 @@ mod tests {
         assert_eq!(episodes.len(), 1);
         assert_eq!(episodes[0].episode.outcome, EpisodeOutcome::Recovered);
         assert_eq!(
-            (episodes[0].start, episodes[0].end),
-            (0, 1),
-            "the span runs from the failure to the successful retry"
+            episodes[0].indices,
+            vec![0, 1],
+            "the episode retains the failure and the successful retry"
         );
     }
 
@@ -708,11 +744,13 @@ mod tests {
         assert_eq!(triggers[1], "error recovery: mem_read");
     }
 
-    /// A shorter episode whose entries all sit inside a longer kept episode
-    /// is the same material: the longer chain already carries those steps
-    /// (including the failure and its `error_count`).
+    /// A shorter episode nested inside a longer one is NOT the same memory.
+    /// The `error → retry` recovery is a pattern the generic task chain does
+    /// not express: the chain reports `Partial` with an `error_count`, and the
+    /// Lesson fact records the failure alone -- neither carries the recovery
+    /// sequence, so discarding the nested episode loses information.
     #[test]
-    fn extract_episodes_prefers_the_longer_span_when_nested() {
+    fn extract_episodes_keeps_a_recovery_nested_in_a_task_chain() {
         let entries = vec![
             make_entry(
                 "mem_write",
@@ -729,11 +767,82 @@ mod tests {
         let triggers: Vec<_> = episodes.iter().map(|e| e.trigger.clone()).collect();
         assert_eq!(
             episodes.len(),
-            1,
-            "the nested error recovery is part of the task chain: {triggers:?}"
+            2,
+            "the nested recovery is its own memory: {triggers:?}"
         );
         assert_eq!(triggers[0], "task chain: 4 tools");
-        assert_eq!(episodes[0].error_count, 1, "the failure stays visible");
+        assert_eq!(triggers[1], "error recovery: mem_write");
+        assert_eq!(episodes[1].outcome, EpisodeOutcome::Recovered);
+        assert_eq!(
+            episodes[0].error_count, 1,
+            "the failure stays visible in the chain too"
+        );
+    }
+
+    /// The promote chain keeps only the source read, the scratch write and the
+    /// promote itself, so the entries between them can belong to an entirely
+    /// separate task. That task shares no call with the promote episode and
+    /// must survive: deduplication has to compare the calls an episode
+    /// actually retained, never the first..last span it happens to cover.
+    #[test]
+    fn extract_episodes_keeps_a_disjoint_task_inside_a_promote_span() {
+        let entries = promote_span_entries();
+        let episodes = extract_episodes(&entries, "test-sid", 3, 10);
+        let triggers: Vec<_> = episodes.iter().map(|e| e.trigger.clone()).collect();
+        assert_eq!(
+            triggers,
+            vec![
+                "promote: scratch/draft.md -> saved/draft.md".to_string(),
+                "task chain: 3 tools".to_string()
+            ],
+            "the independent task must not be discarded as a duplicate of the promote span"
+        );
+        let calls: Vec<_> = episodes[1]
+            .chain
+            .iter()
+            .map(|s| (s.tool.as_str(), s.input.as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("mem_write", "notes/independent.md"),
+                ("mem_append", "notes/independent.md"),
+                ("mem_read", "notes/other.md"),
+            ],
+            "the surviving task must be the independent one"
+        );
+    }
+
+    /// Same skeleton, with the independent task replaced by a failed write and
+    /// its successful retry. The recovery episode sits inside the promote span
+    /// and inside the general chain's span, yet it is the only record of the
+    /// recovery sequence, so all three episodes must survive.
+    #[test]
+    fn extract_episodes_keeps_a_recovery_inside_a_promote_span() {
+        let mut entries = promote_span_entries();
+        entries[3] = make_entry(
+            "mem_write",
+            "notes/independent.md",
+            false,
+            Some("already exists"),
+            None,
+        );
+        entries[4] = make_entry("mem_write", "notes/independent.md", true, None, Some(40));
+
+        let episodes = extract_episodes(&entries, "test-sid", 3, 10);
+        let triggers: Vec<_> = episodes.iter().map(|e| e.trigger.clone()).collect();
+        assert!(
+            triggers.contains(&"error recovery: mem_write".to_string()),
+            "the recovery episode must survive: {triggers:?}"
+        );
+        assert!(
+            triggers.contains(&"promote: scratch/draft.md -> saved/draft.md".to_string()),
+            "the promote episode must survive: {triggers:?}"
+        );
+        assert!(
+            triggers.contains(&"task chain: 3 tools".to_string()),
+            "the task the recovery belongs to must survive: {triggers:?}"
+        );
     }
 
     /// Deduplication must run before the `max_episodes` truncate, otherwise
