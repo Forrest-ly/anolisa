@@ -343,6 +343,18 @@ function reconcileOpenCodeAdapter(adapterDir) {
         'unsupported host (OpenCode 1.3.4 or newer is required)',
       );
     }
+    // The installer exits 0 after a removal it could not finish receipt-wise and
+    // reports that on stdout, because this call site consumes stdout only. An
+    // npm install has no other channel to tell the user a claim is left behind.
+    if (out.includes('partial cleanup')) {
+      console.warn(
+        'anolisa-tokenless: the OpenCode plugin link was removed for an unsupported host,',
+      );
+      console.warn(
+        'anolisa-tokenless: but an ANOLISA receipt may still claim it. Reconcile with:',
+      );
+      console.warn('anolisa-tokenless:   anolisa adapter disable tokenless opencode');
+    }
   } catch (err) {
     console.warn(
       `anolisa-tokenless: Could not reconcile the opencode adapter registration: ${err.message}`,

@@ -80,6 +80,29 @@ is_managed_link() {
     }
 }
 
+# The config directory the anolisa CLI resolves for OpenCode. It reads
+# OPENCODE_CONFIG_DIR, then XDG_CONFIG_HOME/opencode, then $HOME/.config/opencode
+# -- and never TOKENLESS_OPENCODE_CONFIG_DIR, which is this installer's own
+# highest-priority override.
+cli_config_dir() {
+    if [ -n "${OPENCODE_CONFIG_DIR:-}" ]; then
+        printf '%s' "$OPENCODE_CONFIG_DIR"
+    elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+        printf '%s' "${XDG_CONFIG_HOME}/opencode"
+    else
+        printf '%s' "${HOME:-}/.config/opencode"
+    fi
+}
+
+# Canonicalizing first makes an override that names the same directory through a
+# different variable or path spelling compare equal.
+same_path() {
+    local left right
+    left="$(realpath -m -- "$1" 2>/dev/null || printf '%s' "$1")"
+    right="$(realpath -m -- "$2" 2>/dev/null || printf '%s' "$2")"
+    [ "$left" = "$right" ]
+}
+
 VERSION="$($OPENCODE_BIN --version 2>/dev/null || true)"
 if ! opencode_version_supported "$VERSION"; then
     echo "[${COMPONENT}] ${AGENT}: OpenCode ${VERSION:-unknown} is older than ${MIN_OPENCODE_VERSION}."
@@ -94,12 +117,17 @@ if ! opencode_version_supported "$VERSION"; then
         if [ "${ANOLISA_DRY_RUN:-0}" = "1" ]; then
             echo "DRY-RUN: rm ${PLUGIN_LINK}"
         else
-            # Hand the removal to the CLI that owns the receipt when it is
-            # available. `adapter disable` is idempotent, so a registration this
-            # installer created itself is a successful no-op and the removal
-            # below still runs; a receipt is only ever cleared by its owner.
+            # Hand the removal to the CLI that owns the receipt -- but only for
+            # the link this run selected. `adapter disable` takes a component and
+            # a framework, not a path, so it clears whatever link the receipt
+            # records; when TOKENLESS_OPENCODE_CONFIG_DIR pointed this script at
+            # a different directory, delegating would delete another, still
+            # working registration. `adapter disable` is idempotent, so a
+            # registration this installer created itself is a successful no-op
+            # and the removal below still runs.
             cleared_receipt=0
-            if [ -n "$ANOLISA_BIN" ] &&
+            cli_link="$(cli_config_dir)/plugins/$(basename "$PLUGIN_LINK")"
+            if [ -n "$ANOLISA_BIN" ] && same_path "$PLUGIN_LINK" "$cli_link" &&
                 "$ANOLISA_BIN" adapter disable "$COMPONENT" "$AGENT" >/dev/null 2>&1 &&
                 ! is_managed_link; then
                 cleared_receipt=1
@@ -109,10 +137,13 @@ if ! opencode_version_supported "$VERSION"; then
             fi
             echo "[${COMPONENT}] ${AGENT}: removed the now-unsupported registration at ${PLUGIN_LINK}."
             if [ "$cleared_receipt" -eq 0 ]; then
-                echo "[${COMPONENT}] ${AGENT}: this script does not read or write ANOLISA receipts." >&2
-                echo "[${COMPONENT}] ${AGENT}: if 'anolisa adapter enable' created that link, its receipt" >&2
-                echo "[${COMPONENT}] ${AGENT}: still claims it; clear it with:" >&2
-                echo "[${COMPONENT}] ${AGENT}:   anolisa adapter disable ${COMPONENT} ${AGENT}" >&2
+                # stdout, not stderr: this branch exits 0, and a caller that
+                # captures only stdout (the npm postinstall) must still be able to
+                # report that the cleanup was partial.
+                echo "[${COMPONENT}] ${AGENT}: partial cleanup: the link is removed, but this script"
+                echo "[${COMPONENT}] ${AGENT}: does not read or write ANOLISA receipts, so a receipt may"
+                echo "[${COMPONENT}] ${AGENT}: still claim it. Reconcile with:"
+                echo "[${COMPONENT}] ${AGENT}:   anolisa adapter disable ${COMPONENT} ${AGENT}"
             fi
         fi
     elif [ -e "$PLUGIN_LINK" ] || [ -L "$PLUGIN_LINK" ]; then

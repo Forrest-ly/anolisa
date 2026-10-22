@@ -361,39 +361,69 @@ rm -f "$TOKENLESS_TEST_PLUGIN_LINK"
 exit 0
 STUBEOF
 chmod +x "$FAKE_BIN/anolisa"
-: > "$ANOLISA_CALLS"
 
+# The CLI resolves its config directory from OPENCODE_CONFIG_DIR and never reads
+# TOKENLESS_OPENCODE_CONFIG_DIR, so a delegation is only safe when both name the
+# same directory. The shared case sets both; the divergent case sets only the
+# installer's own override.
+run_installer() {
+    cli_rc=0
+    env "$@" bash "$INSTALL_SH" > "$SANDBOX/out.txt" 2> "$SANDBOX/err.txt" || cli_rc=$?
+}
+
+: > "$ANOLISA_CALLS"
 ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
-cli_rc=0
-ANOLISA_BIN="$FAKE_BIN/anolisa" TOKENLESS_TEST_PLUGIN_LINK="$PLUGIN_LINK" \
-    TOKENLESS_TEST_ANOLISA_CALLS="$ANOLISA_CALLS" TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 \
-    bash "$INSTALL_SH" > "$SANDBOX/out-cli.txt" 2>&1 || cli_rc=$?
+run_installer "ANOLISA_BIN=$FAKE_BIN/anolisa" "OPENCODE_CONFIG_DIR=$CONFIG_DIR" \
+    "TOKENLESS_TEST_PLUGIN_LINK=$PLUGIN_LINK" "TOKENLESS_TEST_ANOLISA_CALLS=$ANOLISA_CALLS" \
+    "TOKENLESS_TEST_OPENCODE_VERSION=1.2.3"
 if [ "$cli_rc" -eq 0 ] && [ ! -L "$PLUGIN_LINK" ] &&
     grep -qx 'adapter disable tokenless opencode' "$ANOLISA_CALLS" &&
-    ! grep -q "does not read or write ANOLISA receipts" "$SANDBOX/out-cli.txt"; then
+    ! grep -q "partial cleanup" "$SANDBOX/out.txt"; then
     pass "installer delegates a receipt-owned removal to the anolisa CLI"
 else
     fail "installer did not delegate to the anolisa CLI (rc=${cli_rc})"
 fi
 
+# A divergent config directory must not delegate: the CLI would clear whatever
+# link its own receipt records, which is a different, still working registration.
+: > "$ANOLISA_CALLS"
 ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
-cli_rc=0
-ANOLISA_BIN="$FAKE_BIN/anolisa" TOKENLESS_TEST_ANOLISA_FAIL=1 \
-    TOKENLESS_TEST_PLUGIN_LINK="$PLUGIN_LINK" TOKENLESS_TEST_ANOLISA_CALLS="$ANOLISA_CALLS" \
-    TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 bash "$INSTALL_SH" > "$SANDBOX/out-fail.txt" 2>&1 || cli_rc=$?
+run_installer "ANOLISA_BIN=$FAKE_BIN/anolisa" "OPENCODE_CONFIG_DIR=$SANDBOX/other config" \
+    "TOKENLESS_TEST_PLUGIN_LINK=$PLUGIN_LINK" "TOKENLESS_TEST_ANOLISA_CALLS=$ANOLISA_CALLS" \
+    "TOKENLESS_TEST_OPENCODE_VERSION=1.2.3"
+if [ "$cli_rc" -eq 0 ] && [ ! -L "$PLUGIN_LINK" ] && [ ! -s "$ANOLISA_CALLS" ]; then
+    pass "installer does not delegate when another config directory is selected"
+else
+    fail "installer delegated across config directories (rc=${cli_rc})"
+fi
+if grep -q "partial cleanup" "$SANDBOX/out.txt" &&
+    grep -q "anolisa adapter disable tokenless opencode" "$SANDBOX/out.txt"; then
+    pass "the unreconciled receipt is reported on stdout, where callers capture it"
+else
+    fail "the receipt-recovery notice did not reach stdout"
+fi
+if grep -q "partial cleanup" "$SANDBOX/err.txt"; then
+    fail "the receipt-recovery notice is still stderr-only"
+else
+    pass "the receipt-recovery notice does not depend on stderr"
+fi
+
+: > "$ANOLISA_CALLS"
+ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+run_installer "ANOLISA_BIN=$FAKE_BIN/anolisa" "OPENCODE_CONFIG_DIR=$CONFIG_DIR" \
+    "TOKENLESS_TEST_ANOLISA_FAIL=1" "TOKENLESS_TEST_PLUGIN_LINK=$PLUGIN_LINK" \
+    "TOKENLESS_TEST_ANOLISA_CALLS=$ANOLISA_CALLS" "TOKENLESS_TEST_OPENCODE_VERSION=1.2.3"
 if [ "$cli_rc" -eq 0 ] && [ ! -L "$PLUGIN_LINK" ] &&
-    grep -q "anolisa adapter disable tokenless opencode" "$SANDBOX/out-fail.txt"; then
+    grep -q "anolisa adapter disable tokenless opencode" "$SANDBOX/out.txt"; then
     pass "installer removes the link itself and names the stale receipt when the CLI fails"
 else
     fail "installer did not fall back when the CLI failed (rc=${cli_rc})"
 fi
 
 ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
-cli_rc=0
-ANOLISA_BIN="$SANDBOX/no-anolisa" TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 \
-    bash "$INSTALL_SH" > "$SANDBOX/out-nocli.txt" 2>&1 || cli_rc=$?
+run_installer "ANOLISA_BIN=$SANDBOX/no-anolisa" "TOKENLESS_TEST_OPENCODE_VERSION=1.2.3"
 if [ "$cli_rc" -eq 0 ] && [ ! -L "$PLUGIN_LINK" ] &&
-    grep -q "still claims it" "$SANDBOX/out-nocli.txt"; then
+    grep -q "partial cleanup" "$SANDBOX/out.txt"; then
     pass "installer reports the receipt boundary when no anolisa CLI is available"
 else
     fail "installer did not report the receipt boundary (rc=${cli_rc})"
@@ -401,9 +431,9 @@ fi
 
 ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
 : > "$ANOLISA_CALLS"
-ANOLISA_DRY_RUN=1 ANOLISA_BIN="$FAKE_BIN/anolisa" TOKENLESS_TEST_PLUGIN_LINK="$PLUGIN_LINK" \
-    TOKENLESS_TEST_ANOLISA_CALLS="$ANOLISA_CALLS" TOKENLESS_TEST_OPENCODE_VERSION=1.2.3 \
-    bash "$INSTALL_SH" > "$SANDBOX/out-dry.txt" 2>&1
+run_installer "ANOLISA_DRY_RUN=1" "ANOLISA_BIN=$FAKE_BIN/anolisa" \
+    "OPENCODE_CONFIG_DIR=$CONFIG_DIR" "TOKENLESS_TEST_PLUGIN_LINK=$PLUGIN_LINK" \
+    "TOKENLESS_TEST_ANOLISA_CALLS=$ANOLISA_CALLS" "TOKENLESS_TEST_OPENCODE_VERSION=1.2.3"
 if [ -L "$PLUGIN_LINK" ] && [ ! -s "$ANOLISA_CALLS" ]; then
     pass "dry-run invokes the CLI nowhere and keeps the registration"
 else
