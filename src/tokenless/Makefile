@@ -348,6 +348,7 @@ test-integration: test-hook-parity test-claude-code-detect test-toon-cleanup tes
                   test-qwenwork-hooks test-headroom-pipeline-worker
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_codex_response_diagnostics.py
+	python3 tests/test_codex_rewrite_hook.py
 	python3 tests/test_hermes_lifecycle.py
 	python3 tests/test_compress_schema_hook.py
 	python3 tests/test_hook_payload_shapes.py
@@ -376,7 +377,7 @@ test-qwenwork-hooks:
 	python3 tests/test_resolve_agent_id.py
 
 test-qwenwork-install:
-	@echo "==> Testing QwenWork macOS local-mode sideloading..."
+	@echo "==> Testing QwenWork macOS sideloading..."
 	python3 tests/test_qwenwork_install.py
 
 # The L1 runner records an `rtk_version` in benchmark_identity.json through a
@@ -394,7 +395,9 @@ test-benchmark-rtk-probe:
 	@echo "==> Testing benchmark RTK version probe..."
 	bash tests/test-benchmark-rtk-version-probe.sh
 
+# Hook counterfactuals need both real binaries to rule out fail-open success.
 test-rtk-integration: test-benchmark-rtk-probe
+	cargo build --locked -p tokenless-cli
 	bash scripts/setup-rtk.sh
 	cargo build --release --locked --manifest-path third_party/rtk/Cargo.toml
 	TOKENLESS_TEST_RTK_BINARY="$(CURDIR)/third_party/rtk/target/release/rtk" \
@@ -452,6 +455,10 @@ test-adapters: build-openclaw-plugin build-dsh-plugin test-npm-package
 	bash tests/test-dsh-adapter.sh
 	@echo "==> Testing qoder adapter installer..."
 	bash tests/test-qoder-adapter-install.sh
+	@echo "==> Testing Claude Code adapter installer..."
+	bash tests/test-claude-code-adapter-install.sh
+	@echo "==> Testing Codex adapter installer..."
+	bash tests/test-codex-adapter-install.sh
 	@echo "==> Testing Qwen Code adapter installer..."
 	python3 tests/test_qwencode_install.py
 	@echo "==> Testing OpenCode adapter..."
@@ -691,7 +698,7 @@ qoder-uninstall:
 
 # Explicit opt-in only; bulk adapter actions must not modify desktop plugins.
 qwenwork-install:
-	@echo "==> Sideloading tokenless for QwenWork (macOS local mode)..."
+	@echo "==> Sideloading tokenless for QwenWork (macOS)..."
 	@bash "$(SHARE_DIR)/qwenwork/scripts/install.sh"
 
 qwenwork-uninstall:
@@ -889,7 +896,7 @@ help:
 	@echo "  hermes-uninstall  Uninstall Hermes Agent plugin"
 	@echo "  qoder-install     Register Qoder CLI plugin"
 	@echo "  qoder-uninstall   Unregister Qoder CLI plugin"
-	@echo "  qwenwork-install  Sideload QwenWork plugin (macOS local mode, opt-in)"
+	@echo "  qwenwork-install  Sideload QwenWork plugin (macOS, opt-in)"
 	@echo "  qwenwork-uninstall Remove the QwenWork sideload"
 	@echo "  test-qwenwork     Test QwenWork installer and shared hooks (no Rust build)"
 	@echo "  claude-code-install   Register Claude Code plugin via claude CLI"

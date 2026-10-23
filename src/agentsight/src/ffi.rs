@@ -622,10 +622,15 @@ fn build_llm_data(call: &LLMCall) -> LlmDataHolder {
         .unwrap_or(0);
     let is_sse: bool = call.metadata.get("is_sse").is_some_and(|s| s == "true");
 
+    // Multi-choice responses (`n > 1`) carry one message per choice and the
+    // last choice is decisive, the same way the interruption detector and the
+    // call builder's turn-terminal probe read it. Reading the first choice
+    // exported a finish reason that disagreed with the classification of the
+    // same call.
     let finish_reason = call
         .response
         .messages
-        .first()
+        .last()
         .and_then(|m| m.finish_reason.as_ref())
         .map(|s| safe_cstring(s));
 
@@ -1003,6 +1008,7 @@ pub unsafe extern "C" fn agentsight_config_load_config(
     json_str: *const c_char,
 ) -> c_int {
     if cfg.is_null() || json_str.is_null() {
+        set_last_error("NULL config or JSON string");
         return -1;
     }
     let c = unsafe { &mut *cfg };
@@ -1347,6 +1353,7 @@ pub extern "C" fn agentsight_version() -> *const c_char {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn agentsight_get_eventfd(h: *mut AgentsightHandle) -> c_int {
     if h.is_null() {
+        set_last_error("NULL handle");
         return -1;
     }
     unsafe { (*h).eventfd }
@@ -1388,6 +1395,7 @@ unsafe fn agentsight_read_inner(
     flags: c_int,
 ) -> c_int {
     if h.is_null() {
+        set_last_error("NULL handle");
         return -1;
     }
     let handle = unsafe { &*h };
@@ -1406,7 +1414,10 @@ unsafe fn agentsight_read_inner(
                 });
                 count += 1;
             }
-            Err(_) => return -1,
+            Err(_) => {
+                set_last_error("event channel closed");
+                return -1;
+            }
         }
     } else {
         drain_eventfd(handle.eventfd);
@@ -1452,6 +1463,7 @@ unsafe fn agentsight_read_v2_inner(
     flags: c_int,
 ) -> c_int {
     if h.is_null() {
+        set_last_error("NULL handle");
         return -1;
     }
     let handle = unsafe { &*h };
@@ -1466,7 +1478,10 @@ unsafe fn agentsight_read_v2_inner(
                 });
                 count += 1;
             }
-            Err(_) => return -1,
+            Err(_) => {
+                set_last_error("event channel closed");
+                return -1;
+            }
         }
     } else {
         drain_eventfd(handle.eventfd);
@@ -2260,6 +2275,35 @@ mod tests {
         );
     }
 
+    /// A multi-choice response (`n > 1`) carries one message per choice. The
+    /// exporter read the first choice, so a C consumer saw `length` for a call
+    /// whose decisive (last) choice finished with `stop` — the same call the
+    /// interruption detector classified from the last choice. Export the last
+    /// choice's finish reason so both views of one call agree.
+    #[test]
+    fn test_build_llm_data_reads_the_last_choice_finish_reason() {
+        use crate::genai::semantic::OutputMessage;
+        let mut call = make_llm_call(None, 1234);
+        call.response.messages = vec![
+            OutputMessage {
+                role: "assistant".to_string(),
+                parts: vec![],
+                name: None,
+                finish_reason: Some("length".to_string()),
+            },
+            OutputMessage {
+                role: "assistant".to_string(),
+                parts: vec![],
+                name: None,
+                finish_reason: Some("stop".to_string()),
+            },
+        ];
+        let holder = build_llm_data(&call);
+        assert!(!holder.c_data.finish_reason.is_null());
+        let reason = unsafe { CStr::from_ptr(holder.c_data.finish_reason) };
+        assert_eq!(reason.to_str().unwrap(), "stop");
+    }
+
     /// Without a recorded scheme — an HTTP/1.1 capture, whose header list
     /// cannot tell plaintext from TLS — the URL keeps the https default.
     #[test]
@@ -2395,5 +2439,170 @@ mod tests {
             crate::config::HttpTarget::Domain(d) => assert_eq!(d, "*.internal.com"),
             _ => panic!("expected Domain"),
         }
+    }
+
+    /// Run `call` on its own thread and report both the code it returned and
+    /// the reason it left readable for the caller.
+    ///
+    /// `LAST_ERROR` is thread-local and sticky, so only a fresh thread shows
+    /// the initial state a real caller starts from — the state the C API
+    /// documents ("NULL when there is no error"). On a reused thread a message
+    /// from an earlier failure would answer the probe even when the call under
+    /// test reported nothing.
+    fn failure_on_a_clean_thread(
+        call: impl FnOnce() -> c_int + Send + 'static,
+    ) -> (c_int, Option<String>) {
+        std::thread::spawn(move || {
+            let code = call();
+            let reason = unsafe {
+                let ptr = agentsight_last_error();
+                (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_string_lossy().into_owned())
+            };
+            (code, reason)
+        })
+        .join()
+        .expect("the probe thread must not panic")
+    }
+
+    #[test]
+    fn a_failed_config_load_names_its_reason() {
+        // A NULL argument is documented as handled ("or null (which is handled
+        // gracefully)"), and the C prototype in docs/design-docs/c-ffi-api.md
+        // sends the caller to agentsight_last_error() for the reason — a bare
+        // -1 leaves a stale message from an earlier call on this thread.
+        let (code, reason) = failure_on_a_clean_thread(|| unsafe {
+            let cfg = agentsight_config_new();
+            let code = agentsight_config_load_config(cfg, ptr::null());
+            agentsight_config_free(cfg);
+            code
+        });
+
+        assert_eq!(code, -1);
+        assert!(
+            reason.is_some(),
+            "a failed load must leave a reason readable, not just -1"
+        );
+    }
+
+    /// A handle whose producer side is already gone, so the read entry points
+    /// meet a closed event channel — the state they answer with -1.
+    fn handle_with_a_closed_channel() -> *mut AgentsightHandle {
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(tx);
+        Box::into_raw(Box::new(AgentsightHandle {
+            rx,
+            budget: QueueBudget::new(0),
+            tx: None,
+            eventfd: -1,
+            running: Arc::new(AtomicBool::new(false)),
+            security_drops: Arc::new(SecurityDropState::default()),
+            thread: None,
+            security_thread: None,
+            config: None,
+            probe_cmd_tx: None,
+        }))
+    }
+
+    #[test]
+    fn a_failed_read_names_its_reason() {
+        // A NULL handle is documented as handled ("or null (which is handled
+        // gracefully)"), and the documented meaning of <0 for this entry point
+        // is just "出错" — agentsight_last_error() is the only place the caller
+        // learns which of the two failures it hit.
+        let (code, reason) = failure_on_a_clean_thread(|| unsafe {
+            agentsight_read(
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                0,
+            )
+        });
+        assert_eq!(code, -1);
+        assert!(
+            reason.is_some(),
+            "a NULL handle must leave a reason readable, not just -1"
+        );
+
+        // The other -1: the pipeline side is gone, so the blocking wait has
+        // nothing left to wait for.
+        let (code, reason) = failure_on_a_clean_thread(|| unsafe {
+            let handle = handle_with_a_closed_channel();
+            let code = agentsight_read(
+                handle,
+                None,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                AGENTSIGHT_READ_BLOCK,
+            );
+            agentsight_free(handle);
+            code
+        });
+        assert_eq!(code, -1);
+        assert!(
+            reason.is_some(),
+            "a closed channel must leave a reason readable, not just -1"
+        );
+    }
+
+    #[test]
+    fn a_failed_read_v2_names_its_reason() {
+        // `agentsight_read_v2` is the same read over the same queue and must
+        // answer the same way.
+        let (code, reason) = failure_on_a_clean_thread(|| unsafe {
+            agentsight_read_v2(
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                0,
+            )
+        });
+        assert_eq!(code, -1);
+        assert!(
+            reason.is_some(),
+            "a NULL handle must leave a reason readable, not just -1"
+        );
+
+        let (code, reason) = failure_on_a_clean_thread(|| unsafe {
+            let handle = handle_with_a_closed_channel();
+            let code = agentsight_read_v2(
+                handle,
+                None,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                AGENTSIGHT_READ_BLOCK,
+            );
+            agentsight_free(handle);
+            code
+        });
+        assert_eq!(code, -1);
+        assert!(
+            reason.is_some(),
+            "a closed channel must leave a reason readable, not just -1"
+        );
+    }
+
+    #[test]
+    fn a_failed_eventfd_lookup_names_its_reason() {
+        // The return value alone cannot separate the two failures this entry
+        // point reports: the documented meaning of <0 is "eventfd is not
+        // supported", which is exactly what a NULL handle would look like to
+        // a caller that reads only the number.
+        let (code, reason) =
+            failure_on_a_clean_thread(|| unsafe { agentsight_get_eventfd(ptr::null_mut()) });
+        assert_eq!(code, -1);
+        assert!(
+            reason.is_some(),
+            "a NULL handle must leave a reason readable, not just -1"
+        );
     }
 }

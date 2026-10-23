@@ -19,6 +19,9 @@ use serde::Serialize;
 
 use agentsight_atif::{AtifTrajectory, Step, StepCategory};
 
+// 将采集用的轻量状态查询与详情查询分离。
+mod source_state;
+
 /// A row of `collected_trajectories` ready for upsert.
 #[derive(Debug, Clone)]
 pub struct TrajectoryRecord {
@@ -250,6 +253,7 @@ impl TrajectoryStore {
             [],
         )?;
         migrate_schema(&conn)?;
+        source_state::initialize(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: path.to_path_buf(),
@@ -277,18 +281,17 @@ impl TrajectoryStore {
 
     /// Returns `(file_size, file_mtime_ns)` recorded for `file_path`, if any.
     /// Drives the incremental scan: unchanged files are skipped.
-    /// Checks the successfully ingested trajectory row first and the per-path
-    /// scan bookkeeping (failed conversions, and ingested paths the session
-    /// row no longer points at) second.
+    /// Per-path scan bookkeeping takes precedence: a failed update may differ
+    /// from the last successful trajectory. Falls back to that trajectory
+    /// when its redundant bookkeeping has been removed by maintenance.
     ///
     /// # Errors
     /// Returns an error on SQL failure or poisoned mutex.
     pub fn get_file_state(&self, file_path: &str) -> Result<Option<(i64, i64)>> {
         let conn = self.lock_conn()?;
-        // First check successfully ingested files.
         let state = conn
             .query_row(
-                "SELECT file_size, file_mtime_ns FROM collected_trajectories
+                "SELECT file_size, file_mtime_ns FROM skipped_files
                  WHERE file_path = ?1",
                 params![file_path],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -297,16 +300,15 @@ impl TrajectoryStore {
         if state.is_some() {
             return Ok(state);
         }
-        // Then check skipped (corrupted) files.
-        let skipped = conn
+        let trajectory = conn
             .query_row(
-                "SELECT file_size, file_mtime_ns FROM skipped_files
+                "SELECT file_size, file_mtime_ns FROM collected_trajectories
                  WHERE file_path = ?1",
                 params![file_path],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        Ok(skipped)
+        Ok(trajectory)
     }
 
     /// Records the file state for a file that failed conversion, preventing
@@ -336,8 +338,9 @@ impl TrajectoryStore {
     /// Returns an error on SQL failure or poisoned mutex.
     pub fn upsert_trajectory(&self, record: &TrajectoryRecord) -> Result<()> {
         let now_ns = now_ns();
-        let conn = self.lock_conn()?;
-        conn.execute(
+        let mut conn = self.lock_conn()?;
+        let transaction = conn.transaction()?;
+        transaction.execute(
             "INSERT INTO collected_trajectories (
                 session_id, schema_version, agent_name, model_name, num_steps,
                 total_prompt_tokens, total_completion_tokens, start_time, end_time,
@@ -382,13 +385,18 @@ impl TrajectoryStore {
         // the row would miss the incremental check and be fully re-read and
         // re-upserted (collected_at_ns churn) on every scan round. Maintenance
         // purges the bookkeeping row again once the trajectory row itself
-        // carries the same path (it serves the check directly).
-        conn.execute(
-            "INSERT INTO skipped_files (file_path, file_size, file_mtime_ns)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(file_path) DO UPDATE SET file_size = ?2, file_mtime_ns = ?3",
-            params![record.file_path, record.file_size, record.file_mtime_ns],
-        )?;
+        // carries the same path and file version (it serves the check directly).
+        if record.source == "hermes" {
+            source_state::record(&transaction, record)?;
+        } else {
+            transaction.execute(
+                "INSERT INTO skipped_files (file_path, file_size, file_mtime_ns)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(file_path) DO UPDATE SET file_size = ?2, file_mtime_ns = ?3",
+                params![record.file_path, record.file_size, record.file_mtime_ns],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -758,12 +766,16 @@ impl TrajectoryStore {
             )
         };
         let removed_skipped_files = self.remove_stale_skipped_files(cutoff_ns)?;
+        let removed_source_states = self.remove_stale_source_session_states(cutoff_ns)?;
         let expired_trajectories = match cutoff_ns {
             Some(cutoff) => self.delete_trajectories_before(cutoff)?,
             None => 0,
         };
         let limit_bytes = policy.max_db_size_mb.saturating_mul(1024 * 1024);
-        if (expired_trajectories > 0 || removed_skipped_files > 0 || limit_bytes > 0)
+        if (expired_trajectories > 0
+            || removed_skipped_files > 0
+            || removed_source_states > 0
+            || limit_bytes > 0)
             && self.checkpoint()? == CheckpointOutcome::Busy
         {
             let snapshot = self.size_snapshot()?;
@@ -804,8 +816,9 @@ impl TrajectoryStore {
     fn delete_trajectories_before(&self, cutoff_ns: i64) -> Result<usize> {
         let mut conn = self.lock_conn()?;
         let transaction = conn.transaction()?;
+        // Evicting the last good trajectory must not overwrite a later failed scan.
         transaction.execute(
-            "INSERT OR REPLACE INTO skipped_files (file_path, file_size, file_mtime_ns)
+            "INSERT OR IGNORE INTO skipped_files (file_path, file_size, file_mtime_ns)
              SELECT file_path, file_size, file_mtime_ns FROM collected_trajectories
              WHERE collected_at_ns < ?1",
             params![cutoff_ns],
@@ -829,8 +842,9 @@ impl TrajectoryStore {
         }
         let limit = ((count as f64 * fraction.clamp(0.0, 1.0)) as i64).max(1);
         let transaction = conn.transaction()?;
+        // Preserve the latest per-path observation while removing old payloads.
         transaction.execute(
-            "INSERT OR REPLACE INTO skipped_files (file_path, file_size, file_mtime_ns)
+            "INSERT OR IGNORE INTO skipped_files (file_path, file_size, file_mtime_ns)
              SELECT file_path, file_size, file_mtime_ns FROM collected_trajectories
              WHERE session_id IN (
                  SELECT session_id FROM collected_trajectories
@@ -855,7 +869,9 @@ impl TrajectoryStore {
             let mut statement = conn.prepare(
                 "SELECT skipped.file_path, skipped.file_mtime_ns,
                         EXISTS(SELECT 1 FROM collected_trajectories AS trajectories
-                               WHERE trajectories.file_path = skipped.file_path)
+                               WHERE trajectories.file_path = skipped.file_path
+                                 AND trajectories.file_size = skipped.file_size
+                                 AND trajectories.file_mtime_ns = skipped.file_mtime_ns)
                  FROM skipped_files AS skipped",
             )?;
             let rows = statement

@@ -109,11 +109,23 @@ fn request_messages(body: &serde_json::Value) -> Option<Vec<serde_json::Value>> 
 /// A host-name substring is not the path: `POST /v1/messages` is Anthropic
 /// even though it never spells "anthropic", and an Anthropic request through a
 /// proxy carries no such word at all. The path-based detection the message
-/// parser uses is authoritative; anything unrecognised stays OpenAI.
+/// parser uses is authoritative, so every provider it names keeps its own
+/// label: Gemini's `:generateContent` path falls through to this counter
+/// whenever its terminal `usageMetadata` was not captured, and mapping it to
+/// OpenAI made the token row disagree with the audit and genai rows for the
+/// same call. The DashScope/Bailian native protocol is the fourth such case:
+/// its path family is not one of the message parser's providers, but the genai
+/// row already labels it `dashscope`, so a native call counted here must not
+/// claim to be OpenAI. Anything else stays OpenAI, which is what an
+/// unrecognised completion path speaks.
 fn manual_provider_from_path(path: &str) -> &'static str {
+    if crate::parser::llm::is_dashscope_native_path(path) {
+        return "dashscope";
+    }
     match crate::analyzer::message::MessageParser::detect_provider(path) {
         Some("anthropic") => "anthropic",
         Some("sysom") => "sysom",
+        Some("gemini") => "gemini",
         _ => "openai",
     }
 }
@@ -155,19 +167,6 @@ pub fn count_request_tokens(
         .unwrap_or(0);
     let mut fold_into_tool_message = tool_definition_tokens;
 
-    // Use apply_chat_template_with_tools to format all messages WITH tools
-    // This ensures the tools instruction text is included in the total count
-    let tools_slice = tools_json.as_deref();
-    let total_tokens =
-        match chat_template.apply_chat_template_with_tools(&template_messages, tools_slice, true) {
-            Ok(formatted) => tokenizer.count(&formatted).unwrap_or(0),
-            Err(e) => {
-                log::warn!("Failed to apply chat template with tools: {e}");
-                // Fallback: count raw content + tools separately
-                0
-            }
-        };
-
     // Count per-message tokens: first calculate raw token counts, then distribute total_tokens by percentage
     // Step 1: Calculate raw token count for each message
     let mut raw_per_message: Vec<(String, usize)> = Vec::new();
@@ -191,6 +190,27 @@ pub fn count_request_tokens(
 
     // Step 2: Calculate total raw tokens and distribute total_tokens by percentage
     let raw_total: usize = raw_per_message.iter().map(|(_, t)| *t).sum();
+
+    // Use apply_chat_template_with_tools to format all messages WITH tools
+    // This ensures the tools instruction text is included in the total count
+    let tools_slice = tools_json.as_deref();
+    let total_tokens =
+        match chat_template.apply_chat_template_with_tools(&template_messages, tools_slice, true) {
+            Ok(formatted) => tokenizer.count(&formatted).unwrap_or(0),
+            Err(e) => {
+                log::warn!("Failed to apply chat template with tools: {e}");
+                // Fallback: count raw content + tools separately. The manual
+                // counter's own fallback sums the serialized messages, and the
+                // drain fallback answers the same way; this arm used to return
+                // a plain 0, so a body the template cannot render (a content
+                // block array, a role-less Responses replay item) recorded a
+                // zero-input breakdown next to a counted output side. Tool
+                // definitions that found no tool-role message to fold into are
+                // added on top, so the fallback also covers the tools the
+                // template never got to render.
+                raw_total + fold_into_tool_message
+            }
+        };
 
     if raw_total > 0 {
         // Distribute total_tokens proportionally based on raw token percentages
@@ -438,6 +458,9 @@ impl Analyzer {
     /// `AnalysisResult::Token` for SSE streams containing token usage,
     /// or `AnalysisResult::Message` for parsed LLM API request/response bodies.
     pub fn analyze_aggregated(&self, result: &AggregatedResult) -> Vec<AnalysisResult> {
+        if let Some(metadata) = context::resource_abandonment(result) {
+            return metadata;
+        }
         if let AggregatedResult::Abandoned { reason, partial } = result {
             let mut results = self.analyze_aggregated(partial);
             results.push(AnalysisResult::Abandoned(*reason));
@@ -655,11 +678,12 @@ impl Analyzer {
     /// provider and is therefore worth message parsing.
     ///
     /// Unlike `GenAIBuilder::build_llm_call`, no `is_sse` exception is needed
-    /// here: this predicate is exactly the OR of the per-provider
-    /// `matches_path` checks that gate `parse_by_path` itself, so any SSE
-    /// stream it rejects could never have produced a parsed message. The
-    /// genai SSE fallback consumes the `HttpRecord` built elsewhere in
-    /// `analyze_aggregated` and is unaffected by this filter.
+    /// here: the predicate is `MessageParser::is_llm_api_path`, i.e.
+    /// `detect_provider(path).is_some()`, which is the same provider set
+    /// `parse_by_path` dispatches on. Any SSE stream it rejects could
+    /// therefore never have produced a parsed message. The genai SSE fallback
+    /// consumes the `HttpRecord` built elsewhere in `analyze_aggregated` and is
+    /// unaffected by this filter.
     fn should_parse_message(result: &AggregatedResult) -> bool {
         match result {
             AggregatedResult::Abandoned { partial, .. } => Self::should_parse_message(partial),
@@ -1363,6 +1387,53 @@ mod tests {
     /// The manual counters labelled every `/v1/messages` call openai, and
     /// `billed_input_tokens` only adds cache counters for Anthropic, so those
     /// records under-reported their cache usage.
+    /// `detect_provider` names four providers; the manual-counter map moved
+    /// only two of them. A Gemini generation path that lost its terminal
+    /// `usageMetadata` falls through to the manual counter, and its record was
+    /// then labelled openai while the audit and the genai row label the same
+    /// path gemini — one call with two identities, and Gemini traffic counted
+    /// under the OpenAI provider.
+    #[test]
+    fn manual_provider_maps_every_detected_provider() {
+        for path in [
+            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            "/v1/projects/p/locations/l/publishers/google/models/gemini-2.5-pro:streamGenerateContent",
+        ] {
+            assert_eq!(
+                crate::analyzer::message::MessageParser::detect_provider(path),
+                Some("gemini"),
+                "{path} must be a detected provider"
+            );
+            assert_eq!(
+                manual_provider_from_path(path),
+                "gemini",
+                "{path} is detected as gemini but the manual counter labels it otherwise"
+            );
+        }
+    }
+
+    /// The native DashScope path family is not one of the message parser's
+    /// providers, but the genai row labels it `dashscope`. A native stream
+    /// whose usage was not captured is counted by the manual counter, which
+    /// used to label it openai — the same two-identities drift as the Gemini
+    /// arm, one protocol further out.
+    #[test]
+    fn manual_provider_names_the_dashscope_native_family() {
+        for path in [
+            "/api/v1/services/aigc/text-generation/generation",
+            "/api/v1/services/aigc/multimodal-generation/generation",
+        ] {
+            assert_eq!(manual_provider_from_path(path), "dashscope", "{path}");
+        }
+        // An OpenAI-compatible completion path through the same host is not
+        // the native protocol and keeps the OpenAI label.
+        assert_eq!(
+            manual_provider_from_path("/compatible-mode/v1/chat/completions"),
+            "openai"
+        );
+    }
+
     #[test]
     fn manual_provider_follows_the_path_not_the_host_name() {
         assert_eq!(manual_provider_from_path("/v1/messages"), "anthropic");

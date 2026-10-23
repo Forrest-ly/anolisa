@@ -15,6 +15,8 @@ from pathlib import Path
 
 FIELDS = (
     "timestamp",
+    "monotonic_timestamp",
+    "cpu_interval_seconds",
     "input_qps",
     "process_alive",
     "cpu_pct",
@@ -28,11 +30,14 @@ FIELDS = (
     "event_channel_budget_bytes",
     "pending_genai_count",
     "pending_genai_bytes",
+    "completion_queue_count",
+    "completion_queue_bytes",
     "pending_connection_count",
     "pending_connection_bytes",
     "eviction_count",
     "ring_buffer_dropped",
     "channel_dropped",
+    "ffi_dropped",
     "completed",
 )
 INTERNAL_FIELDS = {
@@ -42,6 +47,8 @@ INTERNAL_FIELDS = {
     "event_channel_budget_bytes",
     "pending_genai_count",
     "pending_genai_bytes",
+    "completion_queue_count",
+    "completion_queue_bytes",
     "pending_connection_count",
     "pending_connection_bytes",
     "eviction_count",
@@ -56,6 +63,8 @@ PROMETHEUS_FIELDS = {
     "agentsight_event_channel_budget_bytes": "event_channel_budget_bytes",
     "agentsight_pending_genai_count": "pending_genai_count",
     "agentsight_pending_genai_bytes": "pending_genai_bytes",
+    "agentsight_completion_queue_count": "completion_queue_count",
+    "agentsight_completion_queue_bytes": "completion_queue_bytes",
     "agentsight_pending_connection_count": "pending_connection_count",
     "agentsight_pending_connection_bytes": "pending_connection_bytes",
     "agentsight_connection_evictions_total": "eviction_count",
@@ -88,6 +97,8 @@ def read_status(pid: int) -> dict[str, int]:
         if not separator:
             continue
         first = remainder.strip().split(maxsplit=1)[0] if remainder.strip() else ""
+        if key == "State" and first in {"Z", "X", "x"}:
+            return {}
         if key in {"VmRSS", "VmHWM", "VmSize", "Threads"}:
             try:
                 values[key] = int(first)
@@ -96,14 +107,15 @@ def read_status(pid: int) -> dict[str, int]:
     return values
 
 
-def read_cpu_ticks(pid: int) -> int:
-    """Return user plus system CPU ticks for a process."""
+def read_cpu_ticks(pid: int) -> int | None:
+    """Return user plus system CPU ticks, or no measurement after a failed read."""
     try:
         text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         fields = text[text.rfind(")") + 2 :].split()
-        return int(fields[11]) + int(fields[12])
+        user, system = int(fields[11]), int(fields[12])
+        return user + system if user >= 0 and system >= 0 else None
     except (OSError, IndexError, ValueError):
-        return 0
+        return None
 
 
 def fd_count(pid: int) -> int:
@@ -137,6 +149,14 @@ def read_internal_metrics(path: Path | None) -> dict[str, str]:
     result: dict[str, str] = {}
     for line in lines:
         fields = line.split()
+        if len(fields) == 2 and fields[0].split("{", 1)[0] == "agentsight_ffi_dropped_total":
+            try:
+                result["ffi_dropped"] = str(
+                    float(result.get("ffi_dropped", "0")) + float(fields[1])
+                )
+            except ValueError:
+                result["ffi_dropped"] = "nan"
+            continue
         if len(fields) == 2 and fields[0] in PROMETHEUS_FIELDS:
             result[PROMETHEUS_FIELDS[fields[0]]] = fields[1]
             continue
@@ -212,8 +232,7 @@ def safety_violation(
             min_free_disk_gb * GIB,
         ),
         (
-            available_memory is not None
-            and available_memory < min_available_memory_mb * MIB,
+            available_memory is not None and available_memory < min_available_memory_mb * MIB,
             "available_memory",
             available_memory,
             min_available_memory_mb * MIB,
@@ -245,38 +264,32 @@ def write_json(path: Path, value: dict[str, object]) -> None:
     """Atomically save a safety stop record."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary.replace(path)
 
 
 def sample(
     pid: int,
-    previous_ticks: int,
+    previous_ticks: int | None,
     previous_time: float,
     input_qps: float,
     metrics: Path | None,
-) -> tuple[dict[str, object], int, float]:
+) -> tuple[dict[str, object], int | None, float]:
     """Collect one row and the state needed for the next CPU calculation."""
     now = time.monotonic()
     status = read_status(pid)
     alive = bool(status)
-    ticks = read_cpu_ticks(pid) if alive else previous_ticks
+    ticks = read_cpu_ticks(pid) if alive else None
     elapsed = max(now - previous_time, 1e-9)
     cpu = (
-        max(
-            0.0,
-            (ticks - previous_ticks)
-            / os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-            / elapsed
-            * 100,
-        )
-        if alive
+        (ticks - previous_ticks) / os.sysconf(os.sysconf_names["SC_CLK_TCK"]) / elapsed * 100
+        if ticks is not None and previous_ticks is not None and ticks >= previous_ticks
         else None
     )
     row: dict[str, object] = {
         "timestamp": time.time(),
+        "monotonic_timestamp": now,
+        "cpu_interval_seconds": elapsed,
         "input_qps": input_qps,
         "process_alive": int(alive),
         "cpu_pct": f"{cpu:.3f}" if cpu is not None else "",
@@ -306,9 +319,7 @@ def main() -> int:
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--interval", type=float, default=1.0)
-    parser.add_argument(
-        "--duration", type=float, default=0, help="0 means until signalled"
-    )
+    parser.add_argument("--duration", type=float, default=0, help="0 means until signalled")
     parser.add_argument("--input-qps", type=float, default=0)
     parser.add_argument(
         "--start-file", type=Path, help="wait for an agent-load monotonic start barrier"
@@ -342,9 +353,7 @@ def main() -> int:
     if any(value is not None for value in safety_values) and not all(
         value is not None for value in safety_values
     ):
-        raise SystemExit(
-            "load-pid, results-root, and safety-output must be provided together"
-        )
+        raise SystemExit("load-pid, results-root, and safety-output must be provided together")
     if args.load_pid is not None and args.load_pid <= 0:
         raise SystemExit("load-pid must be positive")
     if args.results_root is not None and not args.results_root.is_dir():
@@ -368,12 +377,11 @@ def main() -> int:
     previous_time = started
     previous_ticks = read_cpu_ticks(args.pid)
     last_storage_check: float | None = None
+    first_sample = True
     with open(args.output, "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDS)
         writer.writeheader()
-        while not STOP and (
-            args.duration <= 0 or time.monotonic() - started < args.duration
-        ):
+        while not STOP and (args.duration <= 0 or time.monotonic() - started < args.duration):
             row, previous_ticks, previous_time = sample(
                 args.pid,
                 previous_ticks,
@@ -381,6 +389,11 @@ def main() -> int:
                 args.input_qps,
                 args.metrics_file,
             )
+            if first_sample:
+                # Establish a baseline without treating startup microseconds as a CPU interval.
+                row["cpu_pct"] = ""
+                row["cpu_interval_seconds"] = ""
+                first_sample = False
             writer.writerow(row)
             handle.flush()
             if (

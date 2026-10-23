@@ -28,6 +28,7 @@ use crate::{
 const MIN_RESPONSE_CHARS: usize = 200;
 const RTK_TIMEOUT: Duration = Duration::from_secs(5);
 
+mod native_find;
 mod rtk;
 
 /// Per-call behavior resolved by a transport frontend.
@@ -35,7 +36,7 @@ mod rtk;
 pub struct EntryOptions {
     /// Whether accepted candidates replace the original content.
     pub compression_enabled: bool,
-    /// Whether API search listings may share paths; independent of other domains.
+    /// Whether API search records and non-file path lists may share paths.
     pub search_path_sharing_enabled: bool,
     /// Whether command-output Git diffs may omit context with original recovery. Disabled by default.
     pub diff_compression_enabled: bool,
@@ -345,9 +346,8 @@ fn pre_tool_with_optional_rtk(
     if !request.capabilities.replace_arguments && !request.capabilities.block_and_suggest {
         return Ok(pre_tool_passthrough(request));
     }
-    // RTK ownership would bypass the PostTool domain selected for native
-    // build/test output, so the two optimizers remain mutually exclusive.
-    if is_build_log_owned_command(command) {
+    // Preserve native execution for build logs and path lists owned by PostTool.
+    if is_post_tool_owned_command(command) {
         return Ok(pre_tool_passthrough(request));
     }
     let rtk_path = rtk_path.ok_or(RuntimeError::RtkUnavailable)?;
@@ -402,15 +402,20 @@ fn pre_tool_passthrough(request: &PreToolRequest) -> PreToolResponse {
     }
 }
 
-fn is_build_log_owned_command(command: &str) -> bool {
+fn is_post_tool_owned_command(command: &str) -> bool {
     let mut words = Vec::new();
     let mut word = String::new();
+    // Empty quoted words still consume wrapper arguments.
+    let mut word_started = false;
     let mut quote = None;
     let mut escaped = false;
 
     for character in command.chars() {
         if escaped {
-            word.push(character);
+            if character != '\n' {
+                word_started = true;
+                word.push(character);
+            }
             escaped = false;
             continue;
         }
@@ -427,36 +432,45 @@ fn is_build_log_owned_command(command: &str) -> bool {
             continue;
         }
         if matches!(character, '\'' | '"') {
+            word_started = true;
             quote = Some(character);
         } else if character.is_whitespace() {
-            if !word.is_empty() {
+            if word_started {
                 words.push(std::mem::take(&mut word));
+                word_started = false;
             }
-            if character == '\n' && segment_is_build_log_owned(&words) {
+            if character == '\n' && segment_is_post_tool_owned(&words) {
                 return true;
             }
             if character == '\n' {
                 words.clear();
             }
         } else if matches!(character, '&' | '|' | ';' | '(' | ')') {
-            if !word.is_empty() {
+            if word_started {
                 words.push(std::mem::take(&mut word));
+                word_started = false;
             }
-            if segment_is_build_log_owned(&words) {
+            if segment_is_post_tool_owned(&words) {
                 return true;
             }
             words.clear();
         } else {
+            word_started = true;
             word.push(character);
         }
     }
-    if !word.is_empty() {
+    if word_started {
         words.push(word);
     }
-    segment_is_build_log_owned(&words)
+    segment_is_post_tool_owned(&words)
 }
 
-fn segment_is_build_log_owned(words: &[String]) -> bool {
+fn segment_is_post_tool_owned(words: &[String]) -> bool {
+    // Broader transparent-prefix support is specific to find; build/test routing
+    // retains its existing wrapper contract below.
+    if native_find::invokes_find(words) {
+        return true;
+    }
     let mut index = words
         .iter()
         .position(|word| !is_environment_assignment(word))
@@ -805,7 +819,6 @@ pub(crate) fn post_tool_with_store(
                 stash_enabled: options.stash_enabled,
                 require_reversibility: true,
                 force_json: false,
-                preserve_top_level_shape: !request.capabilities.replace_with_text,
                 allow_toon: true,
                 min_toon_chars: MIN_TOON_CHARS,
                 json: JsonCompressionConfig {
@@ -816,8 +829,7 @@ pub(crate) fn post_tool_with_store(
                 },
             },
             attached_store,
-        )
-        .map_err(|error| RuntimeError::Pipeline(error.to_string()))?;
+        );
         if let Some(count) = run.stash_errors.filter(|count| *count > 0) {
             return Err(RuntimeError::StashWrite { count });
         }
@@ -1323,6 +1335,177 @@ mod tests {
     }
 
     #[test]
+    fn pre_tool_keeps_native_find_commands_without_calling_rtk() {
+        for command in [
+            "find /workspace -name '*.json' 2>/dev/null",
+            "find /workspace -path '*records*document*' 2>/dev/null",
+            "find /workspace -name 'document*'; echo '---'; ls -la /workspace | head",
+            "git status && /usr/bin/find ./data -type f",
+            "env -i find ./data -print0 | xargs -0 cat",
+            "LANG=C command find './project with spaces' -type f",
+            "env -u TEMP /usr/bin/find . -type f",
+            "noglob find . -name '*.json'",
+            "nocorrect /usr/bin/find . -type f",
+            "builtin find . -type f",
+            "command exec noglob nocorrect find . -type f",
+            "noglob env -u TEMP command find . -type f",
+            "env -i nocorrect command exec /usr/bin/find . -type f",
+        ] {
+            let request = PreToolRequest {
+                tool_name: "Bash".into(),
+                arguments: json!({"command": command, "timeout": 30}),
+                command_field: "command".into(),
+                capabilities: PreToolCapabilities {
+                    replace_arguments: true,
+                    block_and_suggest: false,
+                },
+            };
+            // No RTK path or data directory: invoking RTK would fail this call.
+            let response = pre_tool_with_optional_rtk(
+                &request,
+                &Attribution::new("test"),
+                None,
+                None,
+                RTK_TIMEOUT,
+            )
+            .unwrap();
+            assert_eq!(response.action, PreToolAction::Passthrough, "{command}");
+            assert_eq!(response.output_optimization, OutputOptimization::None);
+            assert_eq!(response.arguments, request.arguments);
+        }
+        for command in [
+            "echo 'find . -name *.json'",
+            "printf '%s' find",
+            "rg find README.md",
+            "fd document",
+            "rg --files",
+            "rtk find . -name '*.json'",
+            "noglob echo find",
+            "nocorrect printf '%s' 'find . -type f'",
+            "builtin printf '%s' find",
+            "command exec rtk find . -type f",
+            "noglob cargo test",
+            "nocorrect pytest -q",
+            "command exec cargo test",
+            "command env -i cargo test",
+        ] {
+            assert!(!is_post_tool_owned_command(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn pre_tool_keeps_find_behind_rtk_process_wrappers() {
+        for command in [
+            "timeout 30 find . -type f",
+            "timeout -k 5 -s TERM 30 find . -type f",
+            "timeout --signal=TERM --kill-after=5 30 find . -type f",
+            "timeout -sTERM -k5 --preserve-status --foreground -v --verbose 30 find . -type f",
+            "timeout -- 30 find . -type f",
+            "time find . -type f",
+            "time -p -a -v --append --verbose --portability --quiet find . -type f",
+            "time -f %e -o timing.log find . -type f",
+            "time -f '' find . -type f",
+            "timeout -s '' 30 find . -type f",
+            "nice -n '' find . -type f",
+            "time --format=%e --output=timing.log find . -type f",
+            "time -f%e -otiming.log find . -type f",
+            "time -- find . -type f",
+            "nice -n 10 find . -type f",
+            "nice -n10 find . -type f",
+            "nice --adjustment=10 find . -type f",
+            "nice -5 +10 find . -type f",
+            "nice -- find . -type f",
+            "nohup find . -type f",
+            "nohup -- find . -type f",
+            "/usr/bin/timeout 30 find . -type f",
+            "/usr/bin/time -p /usr/bin/find . -type f",
+            "/usr/bin/nice -n10 /usr/bin/find . -type f",
+            "/usr/bin/nohup /usr/bin/find . -type f",
+            "env FOO=1 timeout 20 find . -type f",
+            "nohup nice -n 5 timeout 30 find . -type f",
+            "noglob env -u TEMP timeout 30 command find . -type f",
+            "uv run find . -type f",
+            "timeout 30 uv run find . -type f",
+            "uv run nohup nice -n 5 find . -type f",
+            "\\\n  find . -type f",
+            "command \\\n  find . -type f",
+            "noglob \\\n  find . -type f",
+            "env \\\n  FOO=1 \\\n  find . -type f",
+            "timeout 30 \\\n  find . -type f",
+            "fi\\\nnd . -type f",
+        ] {
+            let response = pre_tool_with_optional_rtk(
+                &PreToolRequest {
+                    tool_name: "Bash".into(),
+                    arguments: json!({"command": command}),
+                    command_field: "command".into(),
+                    capabilities: PreToolCapabilities {
+                        replace_arguments: true,
+                        block_and_suggest: false,
+                    },
+                },
+                &Attribution::new("test"),
+                None,
+                None,
+                RTK_TIMEOUT,
+            )
+            .unwrap_or_else(|error| panic!("{command:?}: {error}"));
+            assert_eq!(response.action, PreToolAction::Passthrough, "{command}");
+            assert_eq!(response.output_optimization, OutputOptimization::None);
+            assert_eq!(response.arguments["command"], command);
+        }
+        for command in [
+            "timeout 30 rg find README.md",
+            "time echo find",
+            "nohup rtk find . -type f",
+            "timeout 30 rtk find . -type f",
+            "timeout --bogus 30 find .",
+            "time --bogus find .",
+            "nice --bogus find .",
+            "nohup --bogus find .",
+            "timeout 30 cargo build",
+            "nice -n 10 pytest -q",
+            "TIMEOUT 30 find .",
+            "timeout",
+            "timeout -s",
+            "timeout -s TERM",
+            "time -f",
+            "nice -n",
+            "timeout -s find 30 echo find",
+            "timeout -s rtk 30 find .",
+            "time -f find echo find",
+            "uv run echo find",
+            "uv run rtk find .",
+            "'' find . -type f",
+            "command '' find . -type f",
+            "timeout 30 '' find . -type f",
+        ] {
+            assert!(!is_post_tool_owned_command(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn pre_tool_ownership_folds_shell_line_continuations() {
+        for command in [
+            "\\\n  find . -type f",
+            "command \\\n  find . -type f",
+            "noglob \\\n  find . -type f",
+            "env \\\n  FOO=1 \\\n  find . -type f",
+            "timeout 30 \\\n  find . -type f",
+            "fi\\\nnd . -type f",
+            "env \\\n  RUSTFLAGS=-C \\\n  cargo test",
+        ] {
+            assert!(is_post_tool_owned_command(command), "{command:?}");
+        }
+        for command in [
+            "echo 'command \\\n find . -type f'",
+            "printf '%s' \"noglob \\\n find . -type f\"",
+        ] {
+            assert!(!is_post_tool_owned_command(command), "{command:?}");
+        }
+    }
+
+    #[test]
     fn pre_tool_reserves_supported_build_and_test_commands_for_post_tool() {
         let commands = [
             "cargo test --workspace",
@@ -1339,7 +1522,7 @@ mod tests {
         ];
         for command in commands {
             assert!(
-                is_build_log_owned_command(command),
+                is_post_tool_owned_command(command),
                 "expected BuildLog ownership for {command:?}"
             );
         }
@@ -1354,7 +1537,7 @@ mod tests {
             "rg pytest README.md",
         ] {
             assert!(
-                !is_build_log_owned_command(command),
+                !is_post_tool_owned_command(command),
                 "unexpected BuildLog ownership for {command:?}"
             );
         }
@@ -1382,7 +1565,7 @@ mod tests {
             "make -j8",
         ] {
             assert!(
-                is_build_log_owned_command(command),
+                is_post_tool_owned_command(command),
                 "expected BuildLog ownership for {command:?}"
             );
         }
@@ -1393,7 +1576,7 @@ mod tests {
             "env -u RUSTC grep error log",
         ] {
             assert!(
-                !is_build_log_owned_command(command),
+                !is_post_tool_owned_command(command),
                 "unexpected BuildLog ownership for {command:?}"
             );
         }
@@ -2225,6 +2408,48 @@ mod tests {
     }
 
     #[test]
+    fn path_list_routing_keeps_file_and_rtk_guards_and_records_stats() {
+        let input: String = (0..60)
+            .map(|i| {
+                format!("/workspace/project with spaces/long_directory/records/file {i}.json\n")
+            })
+            .collect();
+        let mut request = post_tool_request(&input);
+        request.tool_name = "Bash".into();
+        request.content_origin = ContentOrigin::CommandOutput;
+        let outcome = post_tool_with_store(&request, &options(), None).unwrap();
+        assert_eq!(outcome.response.disposition, Disposition::Applied);
+        assert_eq!(
+            outcome.stats.content_type.as_deref(),
+            Some("search_results")
+        );
+        assert_eq!(
+            outcome.stats.applied_operations,
+            [AppliedOperation::SearchPathSharing]
+        );
+        assert_eq!(outcome.response.recoverability, Recoverability::Lossless);
+        assert!(outcome.response.stash_keys.is_empty());
+
+        for (command, origin, optimization) in [
+            (None, ContentOrigin::FileContent, OutputOptimization::None),
+            (None, ContentOrigin::FileRead, OutputOptimization::None),
+            (
+                Some("cat paths.txt"),
+                ContentOrigin::CommandOutput,
+                OutputOptimization::None,
+            ),
+            (None, ContentOrigin::CommandOutput, OutputOptimization::Rtk),
+        ] {
+            request.command = command.map(str::to_owned);
+            request.content_origin = origin;
+            request.output_optimization = optimization;
+            let outcome = post_tool_with_store(&request, &options(), None).unwrap();
+            assert_eq!(outcome.response.output, input);
+            assert!(outcome.response.applied_operations.is_empty());
+        }
+    }
+
+    #[test]
     fn search_path_sharing_records_stats_and_respects_rtk_ownership() {
         let content = "crates/long_directory/src/file.rs:12:matching source text\n".repeat(20);
         let mut request = post_tool_request(&content);
@@ -2265,7 +2490,11 @@ mod tests {
             assert!(outcome.stats.applied_operations.is_empty());
             assert!(outcome.response.stash_keys.is_empty());
         }
-        let input = serde_json::json!({"debug": "x".repeat(1000), "value": 1}).to_string();
+        let input = format!(
+            "{{\n{}\"debug\": null,\n{}\"value\": 1\n}}",
+            " ".repeat(600),
+            " ".repeat(600)
+        );
         let mut request = post_tool_request(&input);
         request.tool_name = "SearchFiles".into();
         request.content_origin = ContentOrigin::ApiResponse;
@@ -2341,6 +2570,25 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn post_tool_preserves_printed_html_and_reports_file_read_statistics() {
+        let content = format!(
+            "<html><body><main>{}</main></body></html>",
+            "source text ".repeat(200)
+        );
+        let request = PostToolRequest {
+            content_origin: ContentOrigin::CommandOutput,
+            command: Some("cat page.html".into()),
+            ..post_tool_request(&content)
+        };
+        let mut opts = options();
+        opts.html_extraction_enabled = true;
+        let outcome = post_tool_with_store(&request, &opts, None).unwrap();
+        assert_eq!(outcome.stats.content_origin.as_deref(), Some("file_read"));
+        assert_eq!(outcome.response.output, content);
+        assert!(outcome.response.applied_operations.is_empty());
     }
 
     #[test]
@@ -2428,8 +2676,9 @@ mod tests {
     #[test]
     fn post_tool_accepts_lossless_json_and_requires_retrieve_for_truncation() {
         let cleanup = post_tool_request(&format!(
-            r#"{{"debug":"{}","value":"kept"}}"#,
-            "noise".repeat(100)
+            "{{\n{}\"debug\": null,\n{}\"value\": \"kept\"\n}}",
+            " ".repeat(600),
+            " ".repeat(600)
         ));
         let outcome = post_tool_with_store(&cleanup, &options(), None).unwrap();
         assert_eq!(outcome.response.disposition, Disposition::Applied);
@@ -2437,6 +2686,10 @@ mod tests {
         assert_eq!(
             outcome.response.applied_operations,
             vec![AppliedOperation::JsonCleanup]
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&outcome.response.output).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&cleanup.content).unwrap()
         );
 
         let lossy =
@@ -2483,7 +2736,127 @@ mod tests {
     }
 
     #[test]
-    fn post_tool_preserves_numbers_the_parser_cannot_represent() {
+    fn post_tool_preserves_json_values_in_text_and_structured_slots() {
+        let original = json!({
+            "debug": "x".repeat(1000), "trace": null, "traces": [],
+            "stack": {}, "stacktrace": "", "logs": [null, {}, "", [], false, 0],
+            "logging": {"debug": null, "items": [1, null, 2]},
+            "empty": null
+        });
+        for content in [
+            original.to_string(),
+            serde_json::to_string_pretty(&original).unwrap(),
+        ] {
+            for replace_with_text in [false, true] {
+                for recovery in [
+                    tokenless_protocol::RecoveryMethod::None,
+                    tokenless_protocol::RecoveryMethod::Shell,
+                ] {
+                    for have_store in [false, true] {
+                        let concrete = Arc::new(ReadCountingStore::default());
+                        let store: Arc<dyn StashStore> = concrete.clone();
+                        let mut request = post_tool_request(&content);
+                        request.content_origin = ContentOrigin::ApiResponse;
+                        request.capabilities.replace_with_text = replace_with_text;
+                        request.capabilities.recovery = recovery.clone();
+                        let outcome = post_tool_with_store(
+                            &request,
+                            &options(),
+                            have_store.then_some(&store),
+                        )
+                        .unwrap();
+                        let decoded: serde_json::Value = if outcome
+                            .response
+                            .applied_operations
+                            .contains(&AppliedOperation::Toon)
+                        {
+                            toon_format::decode_default(&outcome.response.output).unwrap()
+                        } else {
+                            serde_json::from_str(&outcome.response.output).unwrap()
+                        };
+                        assert_eq!(decoded, original);
+                        assert_eq!(outcome.response.recoverability, Recoverability::Lossless);
+                        assert!(outcome.response.stash_keys.is_empty());
+                        assert_eq!(concrete.writes.load(Ordering::Relaxed), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn post_tool_applies_lossless_json_envelope_unwrapping() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/contract/fixtures/post_tool/double_encoded.json"
+        ))
+        .unwrap();
+        let content = fixture["tool_response"].as_str().unwrap();
+        let inner: String = serde_json::from_str(content).unwrap();
+        let original: Value = serde_json::from_str(&inner).unwrap();
+        for replace_with_text in [false, true] {
+            let concrete = Arc::new(ReadCountingStore::default());
+            let store: Arc<dyn StashStore> = concrete.clone();
+            let mut request = post_tool_request(content);
+            request.content_origin = ContentOrigin::ApiResponse;
+            request.capabilities.replace_with_text = replace_with_text;
+            let outcome = post_tool_with_store(&request, &options(), Some(&store)).unwrap();
+            assert_eq!(outcome.response.disposition, Disposition::Applied);
+            assert_eq!(
+                outcome.response.applied_operations,
+                [AppliedOperation::JsonCleanup]
+            );
+            assert_eq!(outcome.response.recoverability, Recoverability::Lossless);
+            assert_eq!(
+                serde_json::from_str::<Value>(&outcome.response.output).unwrap(),
+                original
+            );
+            assert!(outcome.response.stash_keys.is_empty());
+            assert_eq!(concrete.writes.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn diagnostic_field_bounds_require_recovery_and_preserve_empty_siblings() {
+        let original =
+            json!({"debug": "x".repeat(100_000), "empty": null, "items": [null, {}, [], ""]});
+        for reachable in [false, true] {
+            let store: Arc<dyn StashStore> = Arc::new(InMemoryStore::new());
+            let mut request = post_tool_request(&original.to_string());
+            request.capabilities.replace_with_text = false;
+            if reachable {
+                request.capabilities.recovery = tokenless_protocol::RecoveryMethod::Shell;
+            }
+            let outcome = post_tool_with_store(&request, &options(), Some(&store)).unwrap();
+            if reachable {
+                assert_eq!(outcome.response.disposition, Disposition::Applied);
+                assert_eq!(outcome.response.recoverability, Recoverability::Retrievable);
+                assert_eq!(
+                    outcome.response.applied_operations,
+                    [AppliedOperation::JsonTruncation]
+                );
+                assert_eq!(outcome.response.stash_keys.len(), 1);
+                let recovered = store
+                    .retrieve(&outcome.response.stash_keys[0])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(recovered, original["debug"].as_str().unwrap());
+                let mut output: serde_json::Value =
+                    serde_json::from_str(&outcome.response.output).unwrap();
+                output["debug"] = json!(recovered);
+                assert_eq!(output, original);
+            } else {
+                assert_eq!(
+                    outcome.response.disposition,
+                    Disposition::RecoverabilityUnavailable
+                );
+                assert_eq!(outcome.response.output, request.content);
+                assert!(outcome.response.stash_keys.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn post_tool_retains_numbers_the_parser_cannot_represent() {
         for literal in [
             "18446744073709551617",
             "-9223372036854775809",
@@ -2500,13 +2873,58 @@ mod tests {
                 request.content_origin = ContentOrigin::ApiResponse;
                 request.capabilities.replace_with_text = replace_with_text;
                 let outcome = post_tool_with_store(&request, &options(), None).unwrap();
-                assert_eq!(outcome.response.disposition, Disposition::NoSavings);
+                // One unrepresentable number no longer costs the whole
+                // response its compression: the literal is retained and the
+                // rest of the document is compacted around it.
+                assert_eq!(outcome.response.disposition, Disposition::Applied);
                 assert_eq!(outcome.response.recoverability, Recoverability::Lossless);
-                assert!(outcome.response.applied_operations.is_empty());
+                assert_eq!(
+                    outcome.response.applied_operations,
+                    [AppliedOperation::JsonCleanup]
+                );
                 assert!(outcome.response.stash_keys.is_empty());
-                assert_eq!(outcome.response.output, content);
+                assert!(
+                    outcome
+                        .response
+                        .output
+                        .contains(&format!("\"value\":{literal},")),
+                    "{literal} missing from {}",
+                    outcome.response.output
+                );
+                assert!(outcome.response.output.len() < content.len());
             }
         }
+    }
+
+    #[test]
+    fn html_stash_write_failure_reports_stashwrite_not_pipeline() {
+        // When the stash backend rejects the pre-candidate write, the HTML
+        // domain degrades to the unchanged candidate and counts the failed
+        // write. The lifecycle must then classify the failure as a stash
+        // write (the taxonomy every other domain already uses), never as
+        // the generic Pipeline compressor error that used to fail the call.
+        let page = format!(
+            "<!DOCTYPE html><html><head><title>Doc</title><style>{}</style></head>\
+             <body><main><h1>Title</h1>{}</main></body></html>",
+            "body{margin:0;padding:0}".repeat(64),
+            (0..10)
+                .map(|i| format!("<p>Paragraph {i}: {}</p>", "readable words ".repeat(12)))
+                .collect::<String>()
+        );
+        let request = PostToolRequest {
+            capabilities: PostToolCapabilities {
+                recovery: tokenless_protocol::RecoveryMethod::Shell,
+                ..post_tool_request(&page).capabilities
+            },
+            ..post_tool_request(&page)
+        };
+        let mut opts = options();
+        opts.html_extraction_enabled = true;
+        let failing: Arc<dyn StashStore> = Arc::new(FailingStore);
+        assert!(matches!(
+            post_tool_with_store(&request, &opts, Some(&failing)),
+            Err(RuntimeError::StashWrite { count }) if count == 1
+        ));
     }
 
     fn post_tool_request(content: &str) -> PostToolRequest {

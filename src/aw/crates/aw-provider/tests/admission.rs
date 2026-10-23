@@ -14,7 +14,15 @@ fn document() -> Value {
         .unwrap()
         .as_value()
         .clone();
-    for adapter in ["qoder", "openclaw", "hermes", "qwenpaw", "pi", "claude-sdk"] {
+    for adapter in [
+        "qoder",
+        "openclaw",
+        "hermes",
+        "qwenpaw",
+        "pi",
+        "claude-sdk",
+        "agentscope",
+    ] {
         document["spec"]["agents"][adapter] = json!({
             "adapter": adapter,
             "argv": ["/does-not-exist/agent", "--fixture"]
@@ -129,7 +137,15 @@ fn one_policy_admits_four_explicit_adapter_boundaries_without_running_programs()
     let document = document();
     let config = configuration(&document);
     let providers = providers(&document);
-    for adapter in ["qoder", "openclaw", "hermes", "qwenpaw", "pi", "claude-sdk"] {
+    for adapter in [
+        "qoder",
+        "openclaw",
+        "hermes",
+        "qwenpaw",
+        "pi",
+        "claude-sdk",
+        "agentscope",
+    ] {
         let steps = admit(&config, adapter, &capabilities(adapter), &providers).unwrap();
         assert_eq!(
             preflight(&config, adapter, &capabilities(adapter)).unwrap(),
@@ -189,7 +205,15 @@ fn default_and_explicit_boolean_hooks_admit_without_provider_evidence() {
         document["spec"]["events"]["tool.before"]["steps"][0]["reason_code"] =
             json!("rule_matched");
         let config = configuration(&document);
-        for adapter in ["qoder", "openclaw", "hermes", "qwenpaw", "pi", "claude-sdk"] {
+        for adapter in [
+            "qoder",
+            "openclaw",
+            "hermes",
+            "qwenpaw",
+            "pi",
+            "claude-sdk",
+            "agentscope",
+        ] {
             let steps = admit(&config, adapter, &capabilities(adapter), &BTreeMap::new()).unwrap();
             assert_eq!(
                 steps,
@@ -229,6 +253,12 @@ fn target_and_trusted_adapter_evidence_must_agree() {
     let providers = providers(&document);
     assert!(admit(&config, "missing", &capabilities("qoder"), &providers).is_err());
     assert!(admit(&config, "qoder", &capabilities("openclaw"), &providers).is_err());
+    assert!(preflight(&config, "qoder", &capabilities("unknown-adapter")).is_err());
+    let mut unknown = document.clone();
+    unknown["spec"]["agents"]["qoder"]["adapter"] = json!("unknown-adapter");
+    assert!(CONFIGURATION
+        .parse(&serde_json::to_vec(&unknown).unwrap())
+        .is_err());
     for (version, entrypoint) in [("", "fixture"), ("fixture", ""), (" ", "fixture")] {
         let mut adapter = capabilities("qoder");
         adapter.version = version.into();
@@ -504,7 +534,15 @@ fn native_hooks_require_no_fabricated_provider_evidence() {
             {"id": "raw", "provider": "policy", "native": {}, "on_error": "report"}
         ]);
     }
-    for adapter in ["qoder", "openclaw", "hermes", "qwenpaw", "pi", "claude-sdk"] {
+    for adapter in [
+        "qoder",
+        "openclaw",
+        "hermes",
+        "qwenpaw",
+        "pi",
+        "claude-sdk",
+        "agentscope",
+    ] {
         let steps = admit(
             &configuration(&document),
             adapter,

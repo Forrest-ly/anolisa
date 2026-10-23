@@ -6,13 +6,11 @@
 
 ## AW
 
-- [构建、配置与组件接入](./aw/integration.md)
-- [配置参考](./aw/configuration.md)
-- [四框架使用与运行维护](../../user-guide/zh/user-entrypoint/aw.md)
-
-## Copilot Shell
-
-- [架构](./copilot-shell/architecture.md)
+- [开发与接入文档索引](aw/README.md)
+- [本地编译与打包](aw/building.md)
+- [组件接入教程](aw/integration.md)
+- [配置参考](aw/configuration.md)
+- [用户指南](../../user-guide/zh/aw/index.md)
 
 ## Cosh-ng
 
@@ -27,4 +25,4 @@
 请从**开发入门**开始。它把常见改动映射到代码 owner 和最小相关测试 target，其余页面
 作为专题参考。
 
-仓库级的构建和贡献要求，请继续阅读[从源码构建](../../BUILDING_zh.md)和 [CONTRIBUTING.md](../../../CONTRIBUTING.md)。
+仓库级的构建和贡献要求，请继续阅读[从源码构建](../../user-guide/zh/getting-started/building.md)和 [CONTRIBUTING.md](../../../CONTRIBUTING.md)。

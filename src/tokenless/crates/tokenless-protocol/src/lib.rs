@@ -509,14 +509,15 @@ pub enum AppliedOperation {
     TabularCompaction,
     /// CSV/TSV rows were omitted behind a reference to the original text.
     TabularRowReduction,
-    /// Consecutive search records share a full path without removing source text.
+    /// Search listings share full paths or directory prefixes without dropping records.
     SearchPathSharing,
     /// Unmodified Git diff context was reduced with the original available in Stash.
     DiffReduction,
     /// An HTML page was rendered as Markdown with enumerated non-content elements
     /// removed and the original available in Stash.
     HtmlExtraction,
-    /// Empty and diagnostic JSON fields were removed.
+    /// JSON was serialized compactly, optionally unwrapping one JSON string
+    /// envelope, without omitting payload values.
     JsonCleanup,
     /// A JSON record collection was reduced with retrievable omissions.
     JsonRecordReduction,

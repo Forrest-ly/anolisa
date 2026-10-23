@@ -12,7 +12,7 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
-from targets import TARGETS
+from targets import component_targets
 
 
 def die(message: str) -> None:
@@ -203,6 +203,20 @@ def validate_directory(
     ):
         die(f"SBOM contains invalid or duplicate dependency refs: {sbom}")
     known_refs = set(references)
+    root_dependency = next((item for item in dependencies if item["ref"] == artifact_id), None)
+    root_targets = root_dependency.get("dependsOn") if root_dependency else None
+    root_children = {
+        item["bom-ref"]
+        for item in component.get("components", [])
+        if isinstance(item, dict) and isinstance(item.get("bom-ref"), str)
+    }
+    if (
+        not isinstance(root_targets, list)
+        or not root_targets
+        or any(not isinstance(value, str) for value in root_targets)
+        or not root_children.issubset(root_targets)
+    ):
+        die(f"SBOM archive root is not connected to its components: {sbom}")
     for dependency in dependencies:
         depends_on = dependency.get("dependsOn")
         if dependency.get("ref") not in known_refs:
@@ -223,6 +237,7 @@ def main() -> int:
     parser.add_argument("--layout", choices=("flat", "actions"), required=True)
     parser.add_argument("--os", dest="target_os")
     parser.add_argument("--arch", dest="target_arch")
+    parser.add_argument("--tokenless-source-root", type=Path)
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.component):
         parser.error("component must be a lowercase release component name")
@@ -241,13 +256,13 @@ def main() -> int:
     if args.target_os or args.target_arch:
         parser.error("actions layout does not accept --os or --arch")
 
-    component_targets = TARGETS.get(args.component)
-    if component_targets is None:
+    selected_targets = component_targets(args.component, args.tokenless_source_root)
+    if not selected_targets:
         parser.error(f"component has no prebuilt target matrix: {args.component}")
     expected_directories = {
         f"{args.component}-prebuilt-{args.version}-"
         f"{target['target-os']}-{target['target-arch']}"
-        for target in component_targets
+        for target in selected_targets
     }
     try:
         entries = list(root.iterdir())
@@ -261,7 +276,8 @@ def main() -> int:
             "unexpected Actions Artifacts; "
             f"missing={missing or 'none'} extra={extra or 'none'}"
         )
-    for target in component_targets:
+    artifact_component = "sec-core" if args.component == "agent-sec-core" else args.component
+    for target in selected_targets:
         target_os = target["target-os"]
         target_arch = target["target-arch"]
         directory = (
@@ -269,9 +285,11 @@ def main() -> int:
             / f"{args.component}-prebuilt-{args.version}-{target_os}-{target_arch}"
         )
         validate_directory(
-            directory, args.component, args.version, target_os, target_arch
+            directory, artifact_component, args.version, target_os, target_arch
         )
-    print(f"Verified {4 * len(component_targets)} {args.component} prebuilt release assets under {root}")
+    print(
+        f"Verified {4 * len(selected_targets)} {args.component} prebuilt release assets under {root}"
+    )
     return 0
 
 

@@ -83,7 +83,7 @@ agentsight/
 
 **Linux**：完整 eBPF 追踪（probes → parser → aggregator → storage）。若 `features.trajectory_collection.enabled` 开启，同时运行轨迹采集器。
 
-**Linux 无特权环境**：`--no-ebpf` 跳过探针，仅运行轨迹采集器，使无特权沙箱与容器同样可以采集轨迹。该参数会强制启用轨迹采集，不受 `features.trajectory_collection.enabled` 影响，因为此模式下它是唯一的数据来源。依赖 eBPF 的数据 —— Token 计量、审计事件、中断检测 —— 在此模式下不可用。
+**Linux 无特权环境**：`--no-ebpf` 跳过探针，仅运行轨迹采集器，使无特权沙箱与容器同样可以采集轨迹。采集器支持 Claude Agent SDK/Claude Code、Qoder、Codex 和 Cursor JSONL 会话，以及 Hermes `state.db`；非标准 SDK 配置目录通过 `CLAUDE_CONFIG_DIR` 暴露，多租户工作区根目录通过 `features.trajectory_collection.scan_dirs` 指定。该参数会强制启用轨迹采集，不受 `features.trajectory_collection.enabled` 影响，因为此模式下它是唯一的数据来源。依赖 eBPF 的数据 —— Token 计量、审计事件、中断检测 —— 在此模式下不可用。
 
 **macOS**：仅轨迹采集 — 扫描本地 JSONL 会话文件（Claude Code、Qoder、Codex、Cursor），转换为 ATIF v1.7 格式，存入 `trajectories.db`。无 eBPF。
 
@@ -250,13 +250,21 @@ npm run dev          # 在 http://localhost:3004 启动 webpack-dev-server
 
 完成后，运行 `make build-frontend && cargo build --release` 将更新后的 UI 嵌入二进制。
 
-### 内存 benchmark（Linux）
+### 资源 benchmark（Linux）
 
-[`scripts/benchmark/single_run/memory_run.sh`](scripts/benchmark/single_run/memory_run.sh)
-可指定 Agent 数量和输出 tok/s 来测量 AgentSight RSS，默认 32 个 Agent、每路 100 tok/s、60 秒。
-脚本会打印平均/峰值 RSS、整机内存占比和负载/采集校验，并通过
+[`scripts/benchmark/single_run/resource_run.sh`](scripts/benchmark/single_run/resource_run.sh)
+可指定 Agent 数量和输出 tok/s 来测量 AgentSight RSS 和 CPU，默认 32 个 Agent、每路 100 tok/s、60 秒。
+脚本会打印平均/峰值 RSS、整机内存占比、平均/P95/峰值 CPU（100% = 一个逻辑核）和负载/采集校验，
+协作式 CPU 调度默认开启，目标为一个逻辑核的 25%，可能延迟投递；
+`--cpu-budget-percent N` 可覆盖配置中的目标（`0` 关闭）。
+正式负载窗口与尾部收流分别统计，并通过
 `--ab --baseline REF --candidate REF` 支持 Git A/B 对比。`--ring-buffer-mb N` 可指定 Ring Buffer 大小；探针计数发现丢事件时，对比结果判为无效。采集需要 root 或 eBPF capabilities，
 脚本默认请求 sudo。一键命令、工作区快照和报告说明见 [benchmark 使用指南](scripts/docs/BENCHMARK_USAGE_zh.md)。
+
+添加 `--ffi` 可构建并测量最小 C FFI consumer；`--ffi-api typed|v2` 选择 typed 回调（默认）
+或 JSON envelope 回调。`--candidate-lib PATH` 和 `--baseline-lib PATH` 支持已有动态库。
+测量包含 AgentSight 线程、FFI 数据转换、凭证转发及少量 C 宿主基础开销。
+FFI 就绪和采集校验直接使用回调凭证，不依赖 SQLite 存储。
 
 
 ## 快速开始
@@ -345,7 +353,7 @@ Dashboard 访问信息时需要使用 `sudo`。启动前台 tracer 前也要先�
 如需在 Kubernetes 中进行节点级采集，使用 `src/agentsight/packaging/` 下的
 DaemonSet 清单与运行时镜像（`k8s/daemonset.yaml` 与 `docker/Dockerfile`）。
 前置条件与验证步骤见
-[部署指南](../../docs/user-guide/zh/agent-observability/agentsight/deployment.md#kubernetes-daemonset节点级)。
+[部署指南](../../docs/user-guide/zh/agentsight/deployment.md#kubernetes-daemonset节点级)。
 
 ### 从源码构建
 
@@ -446,7 +454,7 @@ AgentSight 通过 `agentsight.json` 配置文件进行统一管理（默认路�
 通过 checkpoint gate 后才按容量淘汰；物理占用超过阈值时，以逻辑占用降至 90% 为目标。自动维护不执行
 `VACUUM`，释放页留在 freelist 供后续写入复用。Dashboard 设置页会展示策略、容量、覆盖范围与 worker
 健康状态，但不返回数据库路径。详见
-[配置指南](../../docs/user-guide/zh/agent-observability/agentsight/configuration.md#sqlite-存储策略)。
+[配置指南](../../docs/user-guide/zh/agentsight/configuration.md#sqlite-存储策略)。
 
 ### 功能开关（`features`）
 
@@ -477,7 +485,7 @@ AgentSight 通过 `agentsight.json` 配置文件进行统一管理（默认路�
 | `pending_genai_max_count` | 1,000 | 等待 session_id 的最大事件数 |
 | `pending_genai_max_bytes_mb` | 16 | 等待 session_id 的最大字节数 |
 | `pid_cache_size` | 1,024 | PID → agent_name 的 LRU 缓存大小 |
-| `connection_capacity` | 32 | HTTP 连接缓存条目数；至少设为预计并发连接数，并重启采集 |
+| `connection_capacity` | 128 | HTTP 连接缓存条目数；至少设为预计并发连接数，并重启采集 |
 | `max_connection_body_mb` | 8 | 单 HTTP 连接 body 缓冲上限 |
 | `connection_idle_timeout_secs` | 60 | SQLite pending snapshot 的空闲软超时 |
 | `connection_hard_timeout_secs` | 300 | 空闲硬超时：输出不完整记录并释放状态；0 关闭该超时 |
@@ -488,10 +496,13 @@ AgentSight 通过 `agentsight.json` 配置文件进行统一管理（默认路�
 | `ring_buffer_mb` | 64 | eBPF Ring Buffer 大小（必须为 2 的幂） |
 
 仅投递语义事件时，SSE delta 会增量归约，原始 TLS buffer 在流结束前即可释放。
-强制移除连接时会输出带原因的不完整记录。Probe 与 FFI 队列同时执行条数和字节限额，
+最近 5 秒活跃的在途连接受容量驱逐保护，包括请求组装和等待响应阶段；所有条目均受保护时拒绝新连接，
+标记 `abandon_reason=capacity_rejected`。HTTP/1 调用完成后仅保留连接标识与时间，将名额保留 5 秒，
+供下一次 keep-alive 请求复用，不保留 payload。资源移除仅输出有界元数据，包含 `incomplete=true` 和
+`metadata_only=true`；硬字节上限仍可强制回收。Probe 与 FFI 队列同时执行条数和字节限额，
 并记录被拒绝的事件数。这些预算约束保留的 payload；评估进程 RSS 时，
 还应计入 ring buffer、解码器工作内存及 allocator 开销。超时、raw 捕获与过载语义见
-[配置参考](../../docs/user-guide/zh/agent-observability/agentsight/configuration.md#运行时上限)。
+[配置参考](../../docs/user-guide/zh/agentsight/configuration.md#运行时上限)。
 
 配置 schema v5 随包提供上述默认值。启动升级时会备份并整体替换旧配置，自定义规则与设置需从备份恢复。
 实现说明见 [HTTP payload 所有权与内存限额](docs/design/payload-memory_zh.md)。
@@ -530,6 +541,11 @@ AgentSight 通过 `agentsight.json` 配置文件进行统一管理（默认路�
 
 > 此配置下 idle 状态 RSS 约 24–30 MB，有事件流量时约 35–40 MB。
 
+## ATIF 导出
+
+使用 `scripts/batch-analyze.py --export-atif DIRECTORY` 可在本地保存转换后的 Claude/Qoder ATIF，无需启动分析器。
+用法和限制见 [CLI 参考](../../docs/user-guide/zh/agentsight/cli-reference.md)。
+
 ## 支持的 LLM 提供商
 
 Token 解析支持多种 LLM API 格式：
@@ -539,6 +555,11 @@ Token 解析支持多种 LLM API 格式：
 - Google Gemini
 - 通义千问 Qwen（支持原生 Chat Template）
 
+## 批量分析并发
+
+批处理脚本可显式启用 `--jobs 1..8`（默认 1），限制并发调用数，并按原始顺序输出结果。
+用法和限制见 [CLI 参考](../../docs/user-guide/zh/agentsight/cli-reference.md)。
+
 ## 项目起源
 
 本项目源于 [https://github.com/eunomia-bpf/agentsight.git](https://github.com/eunomia-bpf/agentsight.git)。
@@ -547,4 +568,4 @@ Token 解析支持多种 LLM API 格式：
 
 Apache License 2.0 — 详见 [LICENSE](../../LICENSE)。
 
-可通过可选的 `tokenless_api` 配置记录远程 Tokenless 统计数据，详见[配置](../../docs/user-guide/zh/agent-observability/agentsight/configuration.md#tokenless-统计-api)。
+可通过可选的 `tokenless_api` 配置记录远程 Tokenless 统计数据，详见[配置](../../docs/user-guide/zh/agentsight/configuration.md#tokenless-统计-api)。

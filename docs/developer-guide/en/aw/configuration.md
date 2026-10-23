@@ -4,15 +4,15 @@
 
 This reference describes the fields accepted by the current configuration
 validator. For a starter file, current availability and the intended Agent
-workflow, begin with the [user guide](../../../user-guide/en/user-entrypoint/aw.md).
+workflow, begin with the [user guide](../../../user-guide/en/aw/index.md).
 
 The [bundled schema](https://github.com/agentic-os-org/ANOLISA/blob/main/src/aw/crates/aw-config/schemas/configuration-v1alpha1.schema.json)
 defines the public shape. Rust validation also checks references and relationships
 between fields. The local Host performs Provider discovery and admission; the
 selected Adapter performs its native preparation checks before binding. Qoder
 requires CLI >=1.1.64 and records the probed version instead of an exact-release gate; OpenClaw,
-QwenPaw, Hermes, Pi and Claude SDK retain their adapter-specific version or revision
-restrictions.
+QwenPaw, Hermes, Pi, Claude SDK and AgentScope SDK retain their adapter-specific
+version or revision restrictions. AgentScope SDK requires exactly 2.0.6.
 For a working four-framework example, start with the [integration walkthrough](integration.md).
 
 ## Document fields
@@ -31,7 +31,7 @@ All fields below are inside `spec` unless stated otherwise.
 | `execution.guarantee` | Only `native_hook`; no OS, final or protected guarantee |
 | `execution.default_event_budget_ms` | Required positive shared event budget, not a fresh budget for each step |
 | `audit.enabled`, `audit.payload` | This revision requires `true` and `metadata_only`; the service persists execution metadata |
-| `agents.<id>.adapter` | `qwenpaw`, `qoder`, `openclaw`, `hermes`, `pi` or `claude-sdk`; recognition is not runtime certification |
+| `agents.<id>.adapter` | `qwenpaw`, `qoder`, `openclaw`, `hermes`, `pi`, `claude-sdk` or `agentscope`; recognition is not runtime certification |
 | `agents.<id>.argv` | Nonempty executable/argument array; first element must be nonempty; no implicit shell or interpolation |
 | `agents.<id>.qoder.sequential` | Optional boolean for `adapter: qoder`; marks generated native groups as sequential; false does not override other matching groups |
 | `providers.<id>.protocol` | Defaults to invoke-only `aw-hook/v1alpha1`; explicit `aw-provider/v1alpha1` retains structured messages, `native-hook/v1alpha1` retains native callback bytes |
@@ -75,7 +75,7 @@ correlation internally. Nonzero exit, timeout, incomplete stdin, invalid or
 oversized output remains a failure governed by `on_error`. Stdout is capped at
 32 bytes as well as the configured output ceiling. Existing explicitly declared
 structured and native protocols keep their behavior. See the
-[boolean script example](../../../user-guide/en/user-entrypoint/aw.md#boolean-policy-commands).
+[boolean script example](native-agents.md#boolean-policy-commands).
 
 ## Native commands and runtime support
 
@@ -100,8 +100,9 @@ with `observe` or a single final structured `replace_result`, plus native steps
 at these points. Boolean/native steps cannot request result replacement. Qoder CLI maps them to
 `PreToolUse` and successful `PostToolUse`; failed tools are not yet connected.
 Other recognized events, exact selectors, guards and stronger execution guarantees
-are not runtime support. Qoder, OpenClaw, QwenPaw, Hermes, Pi and Claude SDK have launch Adapters; their supported versions, entrypoints and
-after-event coverage are listed in the [user guide](../../../user-guide/en/user-entrypoint/aw.md).
+are not runtime support. Qoder, OpenClaw, QwenPaw, Hermes, Pi, Claude SDK and explicit AgentScope 2.0.6 factories have launch Adapters;
+their supported versions, entrypoints and
+after-event coverage are listed in the [native Agent reference](native-agents.md).
 
 ## Events, effects and tool selection
 
@@ -163,7 +164,17 @@ reported explicitly. Parsing alone does not perform that admission.
 The parser accepts one UTF-8 YAML or JSON document, bounded to 4 MiB before and
 after expansion and nesting depth 32. Duplicate keys, non-string mapping keys,
 custom YAML tags, merge keys, non-finite numbers and multiple documents fail.
-Ordinary aliases are expanded within those limits. Diagnostics include field
+Ordinary aliases are expanded within those limits. JSON input follows the same
+YAML scalar resolution: an exponent spelling such as `1e3` arrives as
+float-typed `1000.0`, which the schema's integer type accepts. A JSON starter
+document mirrors the YAML starter at
+[aw.minimal.json](https://github.com/agentic-os-org/ANOLISA/blob/main/src/aw/crates/aw-config/examples/aw.minimal.json).
+Decimal integer scalars outside both the signed and unsigned 128-bit ranges are
+rejected rather than rounded into floats, including scalars tagged `!!float`.
+Use exponent/decimal notation for floating-point values and quoted strings for
+exact large identifiers. This does not expand the existing integer value range.
+
+Diagnostics include field
 paths or source locations and constraints without echoing field values.
 
 This alpha configuration is separate from existing capability wire records and

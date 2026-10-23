@@ -12,9 +12,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from campaign_evaluation import numeric_measurement
+
 # Campaign evidence uses the same percentile calculation as a single run.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "single_run"))
-from benchmark_stats import percentile
+from benchmark_stats import numeric, percentile
 
 VERSIONS = ("baseline", "optimized")
 RECOVERY_PHASES = ("stable", "overload", "recover")
@@ -103,11 +105,13 @@ def continuous_recovery(
     *,
     higher_is_better: bool,
     max_gap_seconds: float = 2.5,
+    started_at: float | None = None,
 ) -> float | None:
     """Return time to the first uninterrupted recovered window."""
     if reference is None or not samples:
         return None
     ordered = sorted(samples)
+    origin = ordered[0][0] if started_at is None else started_at
     threshold = reference * (1 - tolerance if higher_is_better else 1 + tolerance)
     recovered_at: float | None = None
     previous: float | None = None
@@ -118,28 +122,38 @@ def continuous_recovery(
         ):
             recovered_at = None
         if passes and recovered_at is None:
-            recovered_at = sample_time
+            # k6 buckets may start just before the fractional phase timestamp.
+            recovered_at = max(sample_time, origin)
         if passes and sample_time - recovered_at >= window_seconds:
-            return recovered_at - ordered[0][0]
+            return recovered_at - origin
         previous = sample_time
     return None
 
 
 def resource_samples(run_path: Path, field: str) -> list[tuple[float, float]]:
     """Read one process or internal metric from the recovery CSV."""
+    return _resource_series(run_path, (field,))[field]
+
+
+def _resource_series(
+    run_path: Path, fields: tuple[str, ...]
+) -> dict[str, list[tuple[float, float]]]:
+    samples: dict[str, list[tuple[float, float]]] = {field: [] for field in fields}
     path = run_path.parent / "measurement" / "metrics.csv"
     if not path.exists():
         path = path.with_suffix(path.suffix + ".gz")
     if not path.exists():
-        return []
-    samples = []
+        return samples
     opener = gzip.open if path.suffix == ".gz" else Path.open
     with opener(path, mode="rt", encoding="utf-8", newline="") as handle:
         for row in csv.DictReader(handle):
             sample_time = timestamp(row.get("timestamp"))
-            value = finite_float(row.get(field))
-            if sample_time is not None and value is not None:
-                samples.append((sample_time, value))
+            if sample_time is None:
+                continue
+            for field in fields:
+                value = finite_float(row.get(field))
+                if value is not None:
+                    samples[field].append((sample_time, value))
     return samples
 
 
@@ -173,8 +187,16 @@ def load_samples(run_path: Path) -> dict[str, list[tuple[float, float]]]:
                 requests[second] += value
             elif item.get("metric") == "benchmark_latency":
                 latencies[second].append(value)
+    throughput = []
+    previous_second: int | None = None
+    for second in sorted(requests):
+        if previous_second is not None and second > previous_second + 1:
+            # One zero breaks continuity without allocating a potentially huge gap.
+            throughput.append((float(previous_second + 1), 0.0))
+        throughput.append((float(second), requests[second]))
+        previous_second = second
     return {
-        "effective_qps": [(float(key), requests[key]) for key in sorted(requests)],
+        "effective_qps": throughput,
         "latency_p99_ms": [
             (float(key), float(percentile(latencies[key], 0.99)))
             for key in sorted(latencies)
@@ -212,11 +234,22 @@ def recovery_outcome(
             "seconds": {},
         }
     stable = summary_of_phase(phases, "stable")
-    recover_path = phases["recover"][0]
+    recover_path, recover_run = phases["recover"]
+    started_at = numeric(recover_run.get("started_at_unix"))
+    if started_at is None:
+        return {
+            "verdict": "INCONCLUSIVE",
+            "missing": ["recover.started_at_unix"],
+            "failed": [],
+            "seconds": {},
+        }
     recover = summary_of_phase(phases, "recover")
     tolerance = settings["tolerance_ratio"]
     window = settings["recovery_window_seconds"]
     load = load_samples(recover_path)
+    resources = _resource_series(
+        recover_path, ("rss_mb", "channel_length", "connection_cache_bytes")
+    )
     specifications = {
         "effective_qps": (
             nested(stable, "effective_qps"),
@@ -230,19 +263,19 @@ def recovery_outcome(
         ),
         "rss_mb": (
             nested(stable, "resources", "rss_mb", "avg"),
-            resource_samples(recover_path, "rss_mb"),
+            resources["rss_mb"],
             False,
         ),
     }
     optional_specifications = {
         "channel_length": (
             nested(stable, "resources", "channel_length", "avg"),
-            resource_samples(recover_path, "channel_length"),
+            resources["channel_length"],
             False,
         ),
         "connection_cache_bytes": (
             nested(stable, "resources", "connection_cache_bytes", "avg"),
-            resource_samples(recover_path, "connection_cache_bytes"),
+            resources["connection_cache_bytes"],
             False,
         ),
     }
@@ -265,6 +298,7 @@ def recovery_outcome(
             tolerance,
             window,
             higher_is_better=higher_is_better,
+            started_at=started_at,
         )
         for name, (reference, samples, higher_is_better) in specifications.items()
     }
@@ -276,7 +310,7 @@ def recovery_outcome(
     ]
     quality_checks = {
         "trace_completeness": (
-            nested(recover, "trace_completeness"),
+            numeric_measurement(nested(recover, "trace_completeness")),
             thresholds["min_trace_completeness"],
         ),
     }
@@ -354,18 +388,22 @@ def fault_outcome(
     for name in ("server_healthy_after", "process_alive_before", "process_alive_after"):
         if value.get(name) is not True:
             failed.append(name)
+    if "sse_truncation_verified" not in value:
+        missing.append("sse_truncation_verified")
+    elif value["sse_truncation_verified"] is not True:
+        failed.append("sse_truncation_verified")
     summary = run.get("summary", {})
     checks = {
         "http_success_rate": (
-            nested(summary, "http_success_rate"),
+            numeric_measurement(nested(summary, "http_success_rate")),
             thresholds["min_http_success_rate"],
         ),
         "trace_completeness": (
-            nested(summary, "trace_completeness"),
+            numeric_measurement(nested(summary, "trace_completeness")),
             thresholds["min_trace_completeness"],
         ),
         "token_accuracy": (
-            nested(summary, "token_accuracy"),
+            numeric_measurement(nested(summary, "token_accuracy")),
             thresholds["min_token_accuracy"],
         ),
         "process_survived": (nested(summary, "process_survived"), True),

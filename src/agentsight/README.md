@@ -83,7 +83,7 @@ Start tracing of AI agent activity.
 
 **Linux**: Full eBPF-based tracing (probes → parser → aggregator → storage). Also runs trajectory collector if `features.trajectory_collection.enabled` is set.
 
-**Linux without privileges**: `--no-ebpf` skips the probes and runs the trajectory collector alone, so unprivileged sandboxes and containers still collect trajectories. The flag implies trajectory collection regardless of `features.trajectory_collection.enabled`, since it is the only remaining data source. Data derived from eBPF — token metering, audit events, interruption detection — is unavailable in this mode.
+**Linux without privileges**: `--no-ebpf` skips the probes and runs the trajectory collector alone, so unprivileged sandboxes and containers still collect trajectories. The collector supports Claude Agent SDK/Claude Code, Qoder, Codex, and Cursor JSONL sessions plus Hermes `state.db`; expose a non-standard SDK config through `CLAUDE_CONFIG_DIR`, or supply per-tenant workspace roots through `features.trajectory_collection.scan_dirs`. The flag implies trajectory collection regardless of `features.trajectory_collection.enabled`, since it is the only remaining data source. Data derived from eBPF — token metering, audit events, interruption detection — is unavailable in this mode.
 
 **macOS**: Trajectory collection only — scans local JSONL session files (Claude Code, Qoder, Codex, Cursor), converts to ATIF v1.7, and stores in `trajectories.db`. No eBPF.
 
@@ -250,16 +250,24 @@ npm run dev          # starts webpack-dev-server on http://localhost:3004
 
 When finished, run `make build-frontend && cargo build --release` to embed the updated UI.
 
-### Memory Benchmarking (Linux)
+### Resource Benchmarking (Linux)
 
-[`scripts/benchmark/single_run/memory_run.sh`](scripts/benchmark/single_run/memory_run.sh)
-measures AgentSight RSS with configurable Agent count and output tok/s, defaulting
-to 32 Agents, 100 tok/s each, and 60 seconds. It prints average/peak RSS, host RAM
-shares and load/capture checks, and supports Git A/B comparisons with
+[`scripts/benchmark/single_run/resource_run.sh`](scripts/benchmark/single_run/resource_run.sh)
+measures AgentSight RSS and CPU with configurable Agent count and output tok/s,
+defaulting to 32 Agents, 100 tok/s each, and 60 seconds. It prints average/peak RSS,
+host RAM shares, average/P95/peak CPU (100% = one logical CPU), and load/capture
+checks. Cooperative CPU pacing defaults to 25% of one logical CPU with delayed delivery;
+`--cpu-budget-percent N` overrides the configured target (`0` disables pacing). Load-window and response-drain statistics are separate. It supports Git A/B comparisons with
 `--ab --baseline REF --candidate REF`. `--ring-buffer-mb N` sets the ring buffer
 size; reported probe drops invalidate the comparison. Tracing requires root or eBPF capabilities;
 the script requests sudo by default. See the [benchmark usage guide](scripts/docs/BENCHMARK_USAGE.md)
 for one-command examples, working-tree snapshots and reports.
+
+Add `--ffi` to build and measure a minimal C FFI consumer instead of the CLI.
+`--ffi-api typed|v2` selects typed callbacks (default) or JSON envelope callbacks;
+`--candidate-lib PATH` and `--baseline-lib PATH` accept prebuilt shared libraries.
+The measurement includes AgentSight threads, FFI conversion, receipt forwarding and the small C host baseline.
+FFI readiness and capture validation use callback receipts independently of SQLite storage.
 
 ## Quick Start
 
@@ -350,7 +358,7 @@ starting a foreground tracer.
 For node-wide collection in Kubernetes, use the DaemonSet manifest and runtime
 image under `src/agentsight/packaging/` (`k8s/daemonset.yaml` and
 `docker/Dockerfile`). See the
-[deployment guide](../../docs/user-guide/en/agent-observability/agentsight/deployment.md#kubernetes-daemonset-node-wide)
+[deployment guide](../../docs/user-guide/en/agentsight/deployment.md#kubernetes-daemonset-node-wide)
 for prerequisites and verification.
 
 ### Build from Source
@@ -458,7 +466,7 @@ per-database locks coordinate `trace` and `serve`. Cleanup removes expired recor
 before size pruning, and targets 90% logical usage after physical allocation crosses the limit;
 automatic maintenance never runs `VACUUM` and leaves freed pages reusable. The Dashboard Settings
 page shows policy, capacity, coverage, and worker health without exposing database paths. See the
-[configuration guide](../../docs/user-guide/en/agent-observability/agentsight/configuration.md#sqlite-storage-policies).
+[configuration guide](../../docs/user-guide/en/agentsight/configuration.md#sqlite-storage-policies).
 
 ### Feature Flags (`features`)
 
@@ -489,7 +497,7 @@ Configure buffer caps to prevent unbounded memory growth:
 | `pending_genai_max_count` | 1,000 | Max pending events awaiting session_id |
 | `pending_genai_max_bytes_mb` | 16 | Max bytes for pending events |
 | `pid_cache_size` | 1,024 | PID → agent_name LRU cache size |
-| `connection_capacity` | 32 | HTTP connection cache entries; use at least the expected concurrency and restart tracing |
+| `connection_capacity` | 128 | HTTP connection cache entries; use at least the expected concurrency and restart tracing |
 | `max_connection_body_mb` | 8 | Per-connection HTTP body buffer cap |
 | `connection_idle_timeout_secs` | 60 | Soft inactivity timeout for pending SQLite snapshots |
 | `connection_hard_timeout_secs` | 300 | Finalize inactive calls as incomplete and release them; 0 disables the timeout |
@@ -500,10 +508,16 @@ Configure buffer caps to prevent unbounded memory growth:
 | `ring_buffer_mb` | 64 | eBPF Ring Buffer size (must be power of 2) |
 
 Semantic-only delivery reduces SSE deltas and releases raw TLS buffers during the stream.
-Forced connection removal reports an incomplete call with an abandonment reason.
+In-flight connections active within the last 5 seconds are protected from capacity eviction,
+including request assembly and response waiting; when all
+entries are protected, new connections are rejected with `abandon_reason=capacity_rejected`.
+Completed HTTP/1 connections reserve their slot for 5 seconds using only an identifier and
+timestamp, allowing the next keep-alive request to reuse it without retaining payloads.
+Resource removals report bounded metadata with `incomplete=true` and `metadata_only=true`.
+Hard byte limits still permit forced reclamation.
 Probe and FFI queues enforce byte limits alongside their slot limits and count rejected events.
 These budgets cover retained payloads; process RSS also includes the ring buffer, decoder working
-memory and allocator overhead. See the [configuration reference](../../docs/user-guide/en/agent-observability/agentsight/configuration.md#runtime-limits)
+memory and allocator overhead. See the [configuration reference](../../docs/user-guide/en/agentsight/configuration.md#runtime-limits)
 for timeout, raw capture and overload behavior.
 
 Configuration schema v5 ships these defaults. Startup upgrades back up and replace older config
@@ -545,6 +559,11 @@ For resource-constrained environments, disable non-essential features and reduce
 
 > With this config: idle RSS ~24–30 MB, with event traffic ~35–40 MB.
 
+## ATIF export
+
+Use `scripts/batch-analyze.py --export-atif DIRECTORY` to save converted Claude/Qoder ATIF locally without invoking an analyzer.
+See the [CLI reference](../../docs/user-guide/en/agentsight/cli-reference.md) for usage and limits.
+
 ## Supported LLM Providers
 
 Token parsing supports multiple LLM API formats:
@@ -554,6 +573,11 @@ Token parsing supports multiple LLM API formats:
 - Google Gemini
 - Qwen (with native chat template support)
 
+## Batch concurrency
+
+The batch script accepts opt-in `--jobs 1..8` (default 1), with bounded concurrent invocations and ordered output.
+See the [CLI reference](../../docs/user-guide/en/agentsight/cli-reference.md) for usage and limits.
+
 ## Origins
 
 This project is derived from [https://github.com/eunomia-bpf/agentsight.git](https://github.com/eunomia-bpf/agentsight.git).
@@ -562,4 +586,4 @@ This project is derived from [https://github.com/eunomia-bpf/agentsight.git](htt
 
 Apache License 2.0 — see [LICENSE](../../LICENSE) for details.
 
-Remote Tokenless statistics can be recorded through the optional `tokenless_api` configuration; see [configuration](../../docs/user-guide/en/agent-observability/agentsight/configuration.md#tokenless-statistics-api).
+Remote Tokenless statistics can be recorded through the optional `tokenless_api` configuration; see [configuration](../../docs/user-guide/en/agentsight/configuration.md#tokenless-statistics-api).

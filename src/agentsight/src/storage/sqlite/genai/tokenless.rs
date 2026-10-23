@@ -161,11 +161,17 @@ impl GenAISqliteStore {
             .map(|row| {
                 let (cache_id, source, payload) = row?;
                 let mut record: Value = serde_json::from_str(&payload)?;
+                // A stored payload is external data; `Value::index_mut` panics
+                // on a non-object, so reject the shape instead of aborting the
+                // query thread.
+                let Some(object) = record.as_object_mut() else {
+                    return Err(TokenlessRecordError::Invalid("record is not a JSON object"));
+                };
                 // List responses must not disclose cached content implicitly.
                 for field in ["before_text", "after_text", "before_output", "after_output"] {
-                    record[field] = Value::Null;
+                    object.insert(field.to_string(), Value::Null);
                 }
-                record["content_included"] = Value::Bool(false);
+                object.insert("content_included".to_string(), Value::Bool(false));
                 Ok(SavedTokenlessRecord {
                     cache_id,
                     source,
@@ -285,6 +291,12 @@ impl GenAISqliteStore {
         rows.next()?
             .map(|row| {
                 let record: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
+                // `record_json` is external data. A top-level array or scalar
+                // used to reach the redaction path and `associated_session`,
+                // both of which index by string and panic on a non-object.
+                if !record.is_object() {
+                    return Err(TokenlessRecordError::Invalid("record is not a JSON object"));
+                }
                 Ok(SavedTokenlessRecord {
                     cache_id,
                     source: row.get(0)?,
@@ -767,6 +779,136 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn applied_stats_respect_the_requested_time_range() {
+        // The client-configured savings path bounds the applied records by the
+        // dashboard request window; the reader filters on the stored
+        // timestamp_ns. Two records for the same tool, one month apart — a
+        // one-month window keeps only its own record.
+        let dir = std::env::temp_dir().join(format!("stats-window-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let store = GenAISqliteStore::new_with_path(
+            &dir.join("genai.db"),
+            PeriodicStoragePolicy::default(),
+        )
+        .unwrap();
+        for (id, when, before) in [
+            (1, "2026-01-01T00:00:00Z", 10),
+            (2, "2026-03-01T00:00:00Z", 20),
+        ] {
+            let record = json!({"id":id,"timestamp":when,"session_id":"source-session",
+                "tool_use_id":"tool","mode":"active","before_tokens":before,"after_tokens":2,
+                "content_included":false});
+            store
+                .save_tokenless_records("source", std::slice::from_ref(&record))
+                .unwrap();
+        }
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO genai_events
+            (event_type,call_id,session_id,start_timestamp_ns,tool_call_ids,event_json)
+            VALUES ('llm_call','call','local',1,'[\"tool\"]','{}')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .tokenless_applied_stats("source", &["tool"], 0, i64::MAX, None)
+                .unwrap()
+                .len(),
+            2
+        );
+        let march = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+        let april = chrono::DateTime::parse_from_rfc3339("2026-04-01T00:00:00Z")
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+        let rows = store
+            .tokenless_applied_stats("source", &["tool"], march, april, None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].before_tokens, 20,
+            "only the March record is in range"
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn list_rejects_a_non_object_record_without_panicking() {
+        // record_json is external data. Valid JSON that is not an object (a
+        // top-level array or scalar) used to hit `Value::index_mut`, which
+        // panics instead of returning the error this query already models.
+        let dir = std::env::temp_dir().join(format!("stats-shape-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let store = GenAISqliteStore::new_with_path(
+            &dir.join("genai.db"),
+            PeriodicStoragePolicy::default(),
+        )
+        .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO tokenless_statistics
+                 (source,record_id,record_timestamp,timestamp_ns,content_included,record_json)
+                 VALUES ('fixture',1,'2026-01-01T00:00:00Z',1,0,'[]')",
+                [],
+            )
+            .unwrap();
+
+        let result = store.list_tokenless_records(0, i64::MAX, None, None, 10, None);
+
+        assert!(matches!(result, Err(TokenlessRecordError::Invalid(_))));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn detail_rejects_a_non_object_record_without_panicking() {
+        // The detail path redacts fields through `Value::index_mut` and
+        // associates the record by string key. Neither is valid for a stored
+        // top-level array or scalar, and both panicked before the shape check.
+        let dir = std::env::temp_dir().join(format!("stats-detail-shape-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let store = GenAISqliteStore::new_with_path(
+            &dir.join("genai.db"),
+            PeriodicStoragePolicy::default(),
+        )
+        .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO tokenless_statistics
+                 (source,record_id,record_timestamp,timestamp_ns,content_included,record_json)
+                 VALUES ('fixture',1,'2026-01-01T00:00:00Z',1,0,'[]')",
+                [],
+            )
+            .unwrap();
+
+        match store.tokenless_record(1) {
+            Err(TokenlessRecordError::Invalid(_)) => {}
+            Ok(Some(mut saved)) => {
+                // What the detail handler does; `IndexMut` panics for a
+                // non-object document. Reaching it means the shape check is
+                // missing, so reproduce the panic instead of passing it on.
+                saved.record["before_text"] = Value::Null;
+                panic!("a non-object stored record reached the redaction path");
+            }
+            other => panic!("unexpected detail lookup result: {other:?}"),
+        }
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

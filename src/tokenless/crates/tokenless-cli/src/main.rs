@@ -424,7 +424,9 @@ fn get_db_path_with(paths: &DatabasePathResolver) -> Result<PathBuf, String> {
     if let Some(env_path) = state_path_override("TOKENLESS_STATS_DB", "DSH_TOKENLESS_STATS_DB") {
         match validate_db_path(Path::new(&env_path), home, data_dir.ok()) {
             Ok(path) => return Ok(path),
-            Err(reason) => eprintln!("[tokenless] ignoring TOKENLESS_STATS_DB: {reason}"),
+            Err(reason) => warn_soft(&format!(
+                "[tokenless] ignoring TOKENLESS_STATS_DB: {reason}"
+            )),
         }
     }
     let data_dir = data_dir.map_err(str::to_string)?;
@@ -467,7 +469,7 @@ fn try_open_recorder(paths: &DatabasePathResolver) -> Option<StatsRecorder> {
     match open_recorder_with(paths) {
         Ok(recorder) => Some(recorder),
         Err((message, _)) => {
-            warn_stats(&format!(
+            warn_soft(&format!(
                 "[tokenless-stats] WARNING: failed to open stats recorder: {message}"
             ));
             None
@@ -475,18 +477,98 @@ fn try_open_recorder(paths: &DatabasePathResolver) -> Option<StatsRecorder> {
     }
 }
 
-/// Best-effort stderr warning whose own write failure cannot fail the
+/// Best-effort stderr notice whose own write failure cannot fail the
 /// command. `eprintln!` panics when writing to stderr fails (a full
-/// filesystem behind redirected logs), which turned the fail-soft stats
-/// warning into exit 101 while the compression output itself was fine.
+/// filesystem behind redirected logs, a closed or EPIPE'd descriptor),
+/// which turned every fail-soft notice into exit 101 while the command's
+/// own output was fine: the stats warnings, the rejected-path and
+/// stash-disabled fallbacks, and the no-savings, passthrough, dry-run and
+/// mode-mismatch notices all sit on paths that otherwise succeed.
 /// Write errors are discarded: there is no fallback channel, and
-/// failing the command here is the regression to avoid.
-fn warn_stats(message: &str) {
+/// failing the command here is the regression to avoid. `main`'s fatal
+/// `Error:` printer goes through [`report_fatal`] instead — it is on
+/// the failure path, where the exit code itself is the contract.
+fn warn_soft(message: &str) {
     use std::io::Write;
     let mut stderr = std::io::stderr();
     let _ = stderr.write_all(message.as_bytes());
     let _ = stderr.write_all(b"\n");
     let _ = stderr.flush();
+}
+
+/// Write one line of success-path output to stdout without panicking when the
+/// write fails.
+///
+/// `println!` panics on a write error, so a command whose work was already
+/// done answered 101 with a panic message on stderr instead of the status it
+/// had earned - a full filesystem behind a redirect, or a consumer that
+/// stopped reading. ktuner settled this shape under the same name: a broken
+/// pipe means the consumer left while the work was finished, so the command
+/// ends gracefully and keeps its exit code; any other write error fails it
+/// through the operation-failure code the CLI already reports for a failed
+/// write. The bytes are what `println!` wrote: the payload plus one LF.
+fn write_stdout(payload: &str) -> Result<(), (String, i32)> {
+    let mut stdout = io::stdout().lock();
+    stdout_result(
+        stdout
+            .write_all(payload.as_bytes())
+            .and_then(|()| stdout.write_all(b"\n"))
+            .and_then(|()| stdout.flush()),
+    )
+}
+
+/// `write_stdout` without the trailing LF, for a payload the caller has
+/// already shaped. Flushed before returning so the bytes reach the consumer
+/// while the command is still in the write - `retrieve` / `compress-toon` must
+/// reproduce their payload byte-for-byte because the documented detection
+/// contract compares that stdout against the input. Same broken-pipe policy,
+/// same operation-error shape.
+///
+/// A confirmation prompt must not go through here - see `write_prompt_raw`.
+fn write_stdout_raw(payload: &str) -> Result<(), (String, i32)> {
+    let mut stdout = io::stdout().lock();
+    stdout_result(
+        stdout
+            .write_all(payload.as_bytes())
+            .and_then(|()| stdout.flush()),
+    )
+}
+
+/// `write_stdout_raw` for a prompt that gates a destructive action: same bytes,
+/// same flush ahead of the stdin read that follows it, but a write that did not
+/// land fails the command instead of ending it gracefully.
+///
+/// The broken-pipe policy exists because the output it covers was already
+/// earned: the consumer left once the work was done. A confirmation prompt is
+/// the inverse shape - the destructive work has not happened yet, and happens
+/// only if the user answers a question they must actually have seen. Answering
+/// EPIPE with `Ok(())` reported an undelivered prompt as delivered, so
+/// `stats clear` went on to block on stdin and, once something typed `y`,
+/// cleared every record and exited 0 with an empty stderr. Every prompt write
+/// failure - a closed pipe as much as a full device - therefore fails the
+/// command before it waits for an answer it cannot act on.
+fn write_prompt_raw(payload: &str) -> Result<(), (String, i32)> {
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(payload.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(stdout_write_error)
+}
+
+/// Map a stdout write result onto the CLI's error contract: a broken pipe is a
+/// pipeline condition and ends the command gracefully, any other failure is an
+/// operation error.
+fn stdout_result(result: io::Result<()>) -> Result<(), (String, i32)> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(stdout_write_error(error)),
+    }
+}
+
+/// The single body and code the CLI reports for a stdout write that failed.
+fn stdout_write_error(error: io::Error) -> (String, i32) {
+    (format!("Failed to write output: {error}"), 1)
 }
 
 /// Resolve the stash database path under a trusted state root.
@@ -507,13 +589,15 @@ fn get_stash_db_path_with(
     if let Some(p) = override_path.filter(|s| !s.is_empty()) {
         match validate_db_path(Path::new(p), home, data_dir.ok()) {
             Ok(valid) => return Ok(valid),
-            Err(reason) => eprintln!("[tokenless] rejecting --stash-db {p}: {reason}"),
+            Err(reason) => warn_soft(&format!("[tokenless] rejecting --stash-db {p}: {reason}")),
         }
     }
     if let Some(env_path) = state_path_override("TOKENLESS_STASH_DB", "DSH_TOKENLESS_STASH_DB") {
         match validate_db_path(Path::new(&env_path), home, data_dir.ok()) {
             Ok(path) => return Ok(path),
-            Err(reason) => eprintln!("[tokenless] ignoring TOKENLESS_STASH_DB: {reason}"),
+            Err(reason) => warn_soft(&format!(
+                "[tokenless] ignoring TOKENLESS_STASH_DB: {reason}"
+            )),
         }
     }
     let data_dir = data_dir.map_err(str::to_string)?;
@@ -549,7 +633,7 @@ fn open_stash_store_with(
     match open_stash_store_or_err_with(paths, override_path) {
         Ok(store) => Some(store),
         Err(e) => {
-            eprintln!("[tokenless] stash disabled: {e}");
+            warn_soft(&format!("[tokenless] stash disabled: {e}"));
             None
         }
     }
@@ -631,11 +715,11 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             if let Response::PostTool(response) = &outcome.response.response
                 && response.disposition == Disposition::NoSavings
             {
-                eprintln!("tokenless: compression did not reduce size, outputting original");
+                warn_soft("tokenless: compression did not reduce size, outputting original");
             }
 
             let response_json = outcome.response.to_json().map_err(|e| (e.to_string(), 1))?;
-            println!("{response_json}");
+            write_stdout(&response_json)?;
 
             record_compression(
                 &request.attribution,
@@ -690,9 +774,9 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             let before_tokens = estimate_tokens(&input);
             let after_tokens = estimate_tokens(&after_compact);
             let output_text = if after_tokens >= before_tokens {
-                eprintln!(
+                warn_soft(&format!(
                     "tokenless: schema compression did not reduce size ({before_tokens} -> {after_tokens} est. tokens), outputting original"
-                );
+                ));
                 // Discarded compressed output never reaches the LLM, so roll
                 // back stash keys created during this compress — otherwise
                 // markers live only in `after_compact` and orphan stash rows.
@@ -706,10 +790,10 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             let stash_errors = stash.as_ref().map(|_| compressor.stash_errors());
             let stash_size = stash.as_ref().map(|s| s.len());
             if matches!(stash_errors, Some(e) if e > 0) {
-                eprintln!(
+                warn_soft(&format!(
                     "[tokenless] stash: {} stash operation(s) failed; truncated entries are not retrievable (check stash db health)",
                     stash_errors.expect("checked Some above")
-                );
+                ));
             }
 
             let mode = resolve_mode(compression_on, before_tokens, after_tokens);
@@ -718,7 +802,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             } else {
                 input.clone()
             };
-            println!("{emit_text}");
+            write_stdout(&emit_text)?;
 
             record_compression_stats(
                 &config,
@@ -795,21 +879,21 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             // deletes; a non-zero count means the stash path is broken and
             // retrievals will miss.
             if matches!(result.stash_errors, Some(errors) if errors > 0) {
-                eprintln!(
+                warn_soft(&format!(
                     "[tokenless] stash: {} stash operation(s) failed; truncated entries are not retrievable (check stash db health)",
                     result.stash_errors.expect("checked Some above")
-                );
+                ));
             }
             if result.disposition == Disposition::NoSavings {
-                eprintln!(
+                warn_soft(&format!(
                     "tokenless: response compression did not reduce size ({} -> {} est. tokens), outputting original",
                     result.before_tokens, result.after_tokens
-                );
+                ));
             }
 
             let mode = resolve_mode(compression_on, result.before_tokens, result.after_tokens);
             let output_text = stats_after_text(&result, &input);
-            println!("{}", result.output);
+            write_stdout(&result.output)?;
 
             record_compression_stats(
                 &config,
@@ -843,11 +927,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             let payload = retrieve_recorded(store.as_ref(), &hash, recorder.as_ref(), "cli")
                 .map_err(|error| (error.to_string(), 1))?;
             // Byte-exact restore: do not append a trailing newline.
-            let mut out = io::stdout().lock();
-            out.write_all(payload.as_bytes())
-                .map_err(|e| (format!("failed to write retrieved payload: {e}"), 1))?;
-            out.flush()
-                .map_err(|e| (format!("failed to flush retrieved payload: {e}"), 1))?;
+            write_stdout_raw(&payload)?;
         }
         Commands::Stats(stats_cmd) => {
             match stats_cmd {
@@ -892,9 +972,9 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                         warn_mode_mismatch("baseline", &baseline, CompressionMode::DryRun);
                         warn_mode_mismatch("tokenless", &tokenless, CompressionMode::Active);
                         if json {
-                            println!("{}", format_compare_json(&baseline, &tokenless));
+                            write_stdout(&format_compare_json(&baseline, &tokenless))?;
                         } else {
-                            println!("{}", format_compare(&baseline, &tokenless));
+                            write_stdout(&format_compare(&baseline, &tokenless))?;
                         }
                         return Ok(());
                     }
@@ -905,20 +985,18 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                         .retrieve_totals()
                         .map_err(|e| (format!("Failed to query retrieve events: {e}"), 1))?;
                     if json {
-                        println!(
-                            "{}",
-                            tokenless_stats::format_summary_json(&records, None, Some(&retrieve))
-                        );
+                        write_stdout(&tokenless_stats::format_summary_json(
+                            &records,
+                            None,
+                            Some(&retrieve),
+                        ))?;
                     } else {
-                        println!(
-                            "{}",
-                            format_summary(
-                                &records,
-                                Some("Tokenless Statistics Summary"),
-                                None,
-                                Some(&retrieve)
-                            )
-                        );
+                        write_stdout(&format_summary(
+                            &records,
+                            Some("Tokenless Statistics Summary"),
+                            None,
+                            Some(&retrieve),
+                        ))?;
                     }
                 }
                 StatsCommands::List { limit } => {
@@ -926,7 +1004,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     let records = recorder
                         .all_records(Some(limit))
                         .map_err(|e| (format!("Failed to query records: {e}"), 1))?;
-                    println!("{}", format_list(&records, limit));
+                    write_stdout(&format_list(&records, limit))?;
                 }
                 StatsCommands::Show { id } => {
                     let recorder = open_recorder()?;
@@ -934,7 +1012,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                         .record_by_id(id)
                         .map_err(|e| (format!("Failed to query record: {e}"), 1))?
                         .ok_or_else(|| (format!("Record not found: {id}"), 1))?;
-                    println!("{}", format_show(&record));
+                    write_stdout(&format_show(&record))?;
                 }
                 StatsCommands::Diff {
                     id,
@@ -987,33 +1065,34 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     if json {
                         let output = serde_json::to_string_pretty(&report)
                             .map_err(|e| (format!("Failed to serialize diff report: {e}"), 1))?;
-                        println!("{output}");
+                        write_stdout(&output)?;
                     } else {
                         let color = !no_color
                             && std::env::var_os("NO_COLOR").is_none()
                             && io::stdout().is_terminal();
-                        println!("{}", format_diff_report(&report, color));
+                        write_stdout(&format_diff_report(&report, color))?;
                     }
                 }
                 StatsCommands::Clear { yes } => {
                     let recorder = open_recorder()?;
                     if !yes {
-                        print!("Are you sure you want to clear all statistics? [y/N] ");
-                        let _ = io::stdout().flush();
+                        // The prompt gates the destructive clear below, so an
+                        // undelivered one fails here instead of waiting on stdin.
+                        write_prompt_raw("Are you sure you want to clear all statistics? [y/N] ")?;
                         let mut input = String::new();
                         if io::stdin().read_line(&mut input).unwrap_or(0) == 0 {
-                            println!("Cancelled.");
+                            write_stdout("Cancelled.")?;
                             return Ok(());
                         }
                         if !input.trim().eq_ignore_ascii_case("y") {
-                            println!("Cancelled.");
+                            write_stdout("Cancelled.")?;
                             return Ok(());
                         }
                     }
                     recorder
                         .clear()
                         .map_err(|e| (format!("Failed to clear: {e}"), 1))?;
-                    println!("Statistics cleared.");
+                    write_stdout("Statistics cleared.")?;
                 }
                 StatsCommands::Status => {
                     let stats_env_set = std::env::var("TOKENLESS_STATS_ENABLED")
@@ -1037,7 +1116,9 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     } else {
                         "default"
                     };
-                    println!("Stats recording: {stats_state} (via {stats_source})");
+                    write_stdout(&format!(
+                        "Stats recording: {stats_state} (via {stats_source})"
+                    ))?;
 
                     let sls_state = if config.is_sls_enabled() {
                         "ENABLED"
@@ -1051,15 +1132,15 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     } else {
                         "default"
                     };
-                    println!("SLS recording:   {sls_state} (via {sls_source})");
+                    write_stdout(&format!("SLS recording:   {sls_state} (via {sls_source})"))?;
                 }
                 StatsCommands::Enable => {
                     persist_stats_enabled(true)?;
-                    println!("Stats recording enabled.");
+                    write_stdout("Stats recording enabled.")?;
                 }
                 StatsCommands::Disable => {
                     persist_stats_enabled(false)?;
-                    println!("Stats recording disabled.");
+                    write_stdout("Stats recording disabled.")?;
                 }
             }
         }
@@ -1096,16 +1177,16 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                 })?;
             match result.disposition {
                 Disposition::Passthrough => {
-                    eprintln!(
+                    warn_soft(&format!(
                         "tokenless: payload under the {min_toon_chars}-character TOON minimum ({} chars), skipping encoding and outputting original JSON",
                         input.chars().count()
-                    );
+                    ));
                 }
                 Disposition::NoSavings => {
-                    eprintln!(
+                    warn_soft(&format!(
                         "tokenless: TOON encoding did not reduce size ({} -> {} est. tokens), outputting original JSON",
                         result.before_tokens, result.after_tokens
-                    );
+                    ));
                 }
                 _ => {}
             }
@@ -1116,13 +1197,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             // runs must reproduce the input verbatim. `println!` would append
             // a LF (added for inputs without one, doubled for inputs with
             // one) and break that comparison.
-            {
-                let mut stdout = io::stdout().lock();
-                stdout
-                    .write_all(result.output.as_bytes())
-                    .and_then(|()| stdout.flush())
-                    .map_err(|e| (format!("Failed to write output: {e}"), 1))?;
-            }
+            write_stdout_raw(&result.output)?;
 
             // Recorded `after` = the predicted TOON result (or original when
             // TOON did not reduce size), so dry-run captures the prediction.
@@ -1151,7 +1226,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                 .map_err(|e| (format!("Serialization error: {e}"), 2))?;
             let output = output.trim_end().to_string();
             if !output.is_empty() {
-                println!("{output}");
+                write_stdout(&output)?;
             }
         }
         Commands::EnvCheck {
@@ -1197,9 +1272,9 @@ fn resolve_mode(
     if compression_on {
         CompressionMode::Active
     } else {
-        eprintln!(
+        warn_soft(&format!(
             "tokenless: dry-run mode (compression disabled) — emitted original, predicted {before_tokens} -> {after_tokens} est. tokens"
-        );
+        ));
         CompressionMode::DryRun
     }
 }
@@ -1234,12 +1309,12 @@ fn warn_mode_mismatch(label: &str, records: &[StatsRecord], expected: Compressio
     }
     let mismatched = records.iter().filter(|r| r.mode != expected).count();
     if mismatched > 0 {
-        eprintln!(
+        warn_soft(&format!(
             "tokenless: warning — {} session has {} record(s) not in {} mode (comparison may be inaccurate)",
             label,
             mismatched,
             expected.as_str()
-        );
+        ));
     }
 }
 
@@ -1336,7 +1411,7 @@ fn record_compression_stats(
         && let Some(recorder) = try_open_recorder(database_paths)
         && let Err(e) = recorder.record(&record)
     {
-        warn_stats(&format!(
+        warn_soft(&format!(
             "[tokenless-stats] WARNING: failed to record stats entry: {e}"
         ));
     }
@@ -1348,9 +1423,24 @@ fn record_compression_stats(
     }
 }
 
+/// Print a fatal error without letting the print replace the exit status.
+///
+/// `eprintln!` panics when writing to stderr fails (a full filesystem
+/// behind redirected logs, a closed descriptor), and a panic on this path
+/// would trade the code `run()` chose - 2 for rejected input, 1 for an
+/// operation failure - for 101. The status is the machine-readable verdict
+/// a caller reads and the message is only its detail, so the write error is
+/// discarded: there is no fallback channel. The bytes are unchanged
+/// whenever stderr accepts them.
+fn report_fatal(message: &str) {
+    let mut stderr = io::stderr();
+    let _ = writeln!(stderr, "Error: {message}");
+    let _ = stderr.flush();
+}
+
 fn main() {
     if let Err((msg, code)) = run() {
-        eprintln!("Error: {msg}");
+        report_fatal(&msg);
         process::exit(code);
     }
 }
