@@ -94,12 +94,22 @@ cli_config_dir() {
     fi
 }
 
-# Canonicalizing first makes an override that names the same directory through a
-# different variable or path spelling compare equal.
-same_path() {
+# Canonicalize a directory without touching anything below it.
+canonical_dir() {
+    realpath -m -- "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+# Compare two *registration* paths: canonicalize the containing directory, then
+# re-append the file name. Resolving the link itself would be wrong here, because
+# every OpenCode registration points at the one shared bundle, so
+# `A/plugins/tokenless.js` and `B/plugins/tokenless.js` canonicalize to the same
+# `plugin.js` and a run scoped to B would clear A. Canonicalizing the directory
+# still folds an alias or a different spelling of the same directory into one
+# path, which is the equality that actually matters.
+same_registration_path() {
     local left right
-    left="$(realpath -m -- "$1" 2>/dev/null || printf '%s' "$1")"
-    right="$(realpath -m -- "$2" 2>/dev/null || printf '%s' "$2")"
+    left="$(canonical_dir "$(dirname -- "$1")")/$(basename -- "$1")"
+    right="$(canonical_dir "$(dirname -- "$2")")/$(basename -- "$2")"
     [ "$left" = "$right" ]
 }
 
@@ -127,7 +137,7 @@ if ! opencode_version_supported "$VERSION"; then
             # and the removal below still runs.
             cleared_receipt=0
             cli_link="$(cli_config_dir)/plugins/$(basename "$PLUGIN_LINK")"
-            if [ -n "$ANOLISA_BIN" ] && same_path "$PLUGIN_LINK" "$cli_link" &&
+            if [ -n "$ANOLISA_BIN" ] && same_registration_path "$PLUGIN_LINK" "$cli_link" &&
                 "$ANOLISA_BIN" adapter disable "$COMPONENT" "$AGENT" >/dev/null 2>&1 &&
                 ! is_managed_link; then
                 cleared_receipt=1

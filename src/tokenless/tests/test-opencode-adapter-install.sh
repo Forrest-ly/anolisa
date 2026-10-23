@@ -408,6 +408,27 @@ else
     pass "the receipt-recovery notice does not depend on stderr"
 fi
 
+# Two config directories whose links point at the *same* shared bundle: the
+# registration paths differ, so a run scoped to one must not clear the other.
+# Resolving the link itself would canonicalize both to the one plugin.js and let
+# the delegation reach a registration this run never selected.
+OTHER_CONFIG_DIR="$SANDBOX/other config root/opencode"
+OTHER_LINK="$OTHER_CONFIG_DIR/plugins/tokenless.js"
+mkdir -p "$OTHER_CONFIG_DIR/plugins"
+: > "$ANOLISA_CALLS"
+ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+ln -s "$PLUGIN_SOURCE" "$OTHER_LINK"
+run_installer "ANOLISA_BIN=$FAKE_BIN/anolisa" "OPENCODE_CONFIG_DIR=$OTHER_CONFIG_DIR" \
+    "TOKENLESS_TEST_PLUGIN_LINK=$OTHER_LINK" "TOKENLESS_TEST_ANOLISA_CALLS=$ANOLISA_CALLS" \
+    "TOKENLESS_TEST_OPENCODE_VERSION=1.2.3"
+if [ "$cli_rc" -eq 0 ] && [ ! -s "$ANOLISA_CALLS" ] &&
+    [ ! -L "$PLUGIN_LINK" ] && [ -L "$OTHER_LINK" ]; then
+    pass "a shared bundle does not make two registrations the same path"
+else
+    fail "installer cleared a registration in another config directory (rc=${cli_rc} calls=$(wc -l < "$ANOLISA_CALLS"))"
+fi
+rm -f "$OTHER_LINK"
+
 : > "$ANOLISA_CALLS"
 ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
 run_installer "ANOLISA_BIN=$FAKE_BIN/anolisa" "OPENCODE_CONFIG_DIR=$CONFIG_DIR" \
