@@ -152,6 +152,35 @@ fn is_query_length_marker(tail: &str) -> bool {
     }
 }
 
+/// The audit `path` in the form persisted memory may quote it.
+///
+/// [`is_sanitized_query_path`] answers "is this a marker"; this answers "what
+/// may a fact say about the call". Episodic extraction and the lesson rule copy
+/// a record's `path` into facts, and FactWriter persists those under `facts/`,
+/// where the index picks them up: whatever is quoted becomes searchable memory
+/// content, and an episodic fact is written at a confidence above the one
+/// `memory_session_context` injects into later prompts. Quoting a marker
+/// verbatim wrote `bm25:len=14` into `facts/episodic/` and `embed:len=9` into
+/// the lesson of a failed embedding — the length describes the audit record,
+/// not the call. The mode does describe the call, so that is what survives.
+///
+/// Every other record is quoted as it stands: `mem_grep`'s directory, a
+/// `mem_promote` pair, and a legacy row that really recorded a query
+/// (`bm25:packet:len=14`) are the call's own input, not a marker.
+pub fn quotable_path<'a>(tool: &str, path: &'a str) -> &'a str {
+    if tool != "memory_search" || !is_sanitized_query_path(path) {
+        return path;
+    }
+    // No mode in SANITIZED_QUERY_MODES contains a colon, so on a path that is
+    // a marker the last colon is the one the writer put between mode and
+    // length — and a legacy query's own colons are never reached, because such
+    // a row is not a marker.
+    match path.rsplit_once(':') {
+        Some((mode, _)) => mode,
+        None => path,
+    }
+}
+
 /// Append-only JSONL logger with a held file handle.
 ///
 /// Each `log()` call writes to a persistent `File` handle guarded by a
@@ -323,6 +352,43 @@ mod tests {
             assert!(
                 is_sanitized_query_path(&path),
                 "{path} is a sanitized marker and must be recognized as one"
+            );
+        }
+    }
+
+    #[test]
+    fn quotable_path_drops_the_length_and_keeps_the_mode() {
+        // The mode says which retriever ran, so an episodic fact can still
+        // name the call; the length only described the audit record.
+        for mode in SANITIZED_QUERY_MODES {
+            let path = sanitized_query_path(mode, "rust ownership");
+            assert_eq!(
+                quotable_path("memory_search", &path),
+                *mode,
+                "{path} must be quoted as its mode alone"
+            );
+        }
+    }
+
+    #[test]
+    fn quotable_path_leaves_every_other_record_alone() {
+        for (tool, path) in [
+            ("mem_read", "notes/a.md"),
+            ("mem_grep", "notes/kconfig"),
+            ("mem_promote", "notes/a.md -> facts/x.md"),
+            // A legacy row that recorded the query, including one whose query
+            // itself ends in a `len=<digits>`-looking segment.
+            ("memory_search", "bm25:rust ownership"),
+            ("memory_search", "bm25:packet:len=14"),
+            // Not a marker: no mode prefix, no length, not a search at all.
+            ("memory_search", ""),
+            ("memory_search", "len=14"),
+            ("mem_edit", "notes/bm25:len=14"),
+        ] {
+            assert_eq!(
+                quotable_path(tool, path),
+                path,
+                "{tool} {path:?} must be quoted as it stands"
             );
         }
     }

@@ -313,10 +313,15 @@ fn rule_lesson(entries: &[OwnedAuditEntry], session_id: &str) -> Vec<Consolidate
         .filter(|e| !e.ok && e.error.is_some())
         .map(|e| {
             let error = e.error.as_deref().unwrap_or("(unknown error)");
-            let path = if e.path.is_empty() {
+            // The lesson quotes the record's path into a fact that is persisted
+            // and indexed, so it goes through the audit format's reader: a
+            // failed embedding logs `embed:len=<N>`, and that marker is not a
+            // path.
+            let quoted = crate::audit::quotable_path(&e.tool, &e.path);
+            let path = if quoted.is_empty() {
                 "(no path)".to_string()
             } else {
-                e.path.clone()
+                quoted.to_string()
             };
 
             // Categorize the error.
@@ -546,6 +551,36 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].category, FactCategory::Lesson);
         assert!(facts[0].content.contains("文件不存在"));
+    }
+
+    #[test]
+    fn rule4_does_not_quote_the_search_length_marker() {
+        // A failed embedding logs `embed:len=<N>` (tools/memory_search.rs) and
+        // rule_lesson quotes the record's path into the fact it persists.
+        let entries = vec![
+            make_entry(
+                "memory_search",
+                "embed:len=9",
+                false,
+                Some("embedding failed: no provider"),
+            ),
+            make_entry("mem_read", "notes/missing.md", false, Some("no such file")),
+        ];
+        let facts = rule_lesson(&entries, "sid");
+        assert_eq!(facts.len(), 2, "premise: one lesson per failure");
+        let search_lesson = &facts[0];
+        assert_eq!(search_lesson.title, "其他 错误: embed");
+        assert!(
+            !search_lesson.content.contains("len="),
+            "length marker quoted into a lesson: {}",
+            search_lesson.content
+        );
+        // A real path is still quoted in full.
+        assert!(
+            facts[1].content.contains("notes/missing.md"),
+            "content: {}",
+            facts[1].content
+        );
     }
 
     #[test]
