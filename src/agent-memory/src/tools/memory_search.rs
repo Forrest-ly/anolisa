@@ -13,10 +13,13 @@ const TOOL: &str = "memory_search";
 /// - `"hybrid"`: reciprocal rank fusion of BM25 + vector results.
 ///
 /// `category` filters results to a specific fact category (e.g. "lesson",
-/// "interest"). When empty, all categories are included. On the bm25 paths the
-/// filter is applied in SQL before the `top_k` limit, so a category that ranks
-/// below the unfiltered window still fills it; the vector/hybrid paths have no
-/// SQL to push it into and still filter afterwards (see `filter_by_category`).
+/// "interest"). When empty, all categories are included. The filter is applied
+/// inside the index, not here: on the bm25 paths it is pushed into SQL before
+/// the `top_k` limit, so a category that ranks below the unfiltered window
+/// still fills it, and the vector/hybrid paths — which score in Rust and have
+/// no SQL to push it into — filter the ranked list in the store instead. On
+/// every path it runs before search-access bookkeeping, so a hit the category
+/// discards is never counted as an access and cannot keep its file warm.
 ///
 /// Every audit path this function writes is a [`sanitized_query_path`] marker
 /// whose mode must stay listed in `audit::SANITIZED_QUERY_MODES` — that list is
@@ -121,7 +124,7 @@ pub fn memory_search(
                     // silently degrades to BM25 so that callers (auto-recall,
                     // corpus supplement) can safely request hybrid without
                     // checking config first. Uses search_scoped for consistent
-                    // agent scope filtering.
+                    // agent scope and category filtering.
                     tracing::debug!(
                         "{mode} requested but no embedding provider — falling back to bm25"
                     );
@@ -163,11 +166,10 @@ pub fn memory_search(
             })?;
 
             let hits = if mode == "vector" {
-                index.search_vec(&embedding.vector, top_k.max(1))?
+                index.search_vec(&embedding.vector, top_k.max(1), category)?
             } else {
-                index.search_hybrid(query, &embedding.vector, top_k.max(1))?
+                index.search_hybrid(query, &embedding.vector, top_k.max(1), category)?
             };
-            let hits = filter_by_category(hits, category);
             let tokens = hits
                 .iter()
                 .map(|h| h.snippet.len() as u64 / 4 + h.path.len() as u64 / 4)
@@ -185,27 +187,4 @@ pub fn memory_search(
             "unknown search mode '{unknown}'; expected bm25, vector, or hybrid"
         ))),
     }
-}
-
-/// Filter search hits by category, based on the path prefix.
-/// Facts are stored under facts/<category>/<ulid>.md.
-///
-/// Only the vector/hybrid paths use this now: `search_vec` scores a full-table
-/// scan in Rust and `search_hybrid` fuses two such lists, so neither has a SQL
-/// `WHERE` to push the filter into yet. Both truncate to `top_k` before this
-/// runs, so a `category` filter can still come back short — or empty — when
-/// other categories own the window: the same truncation defect the bm25 paths
-/// now avoid by filtering in SQL. Closing it here means plumbing `category`
-/// into `search_vec` / `search_hybrid_inner`.
-fn filter_by_category(
-    hits: Vec<crate::index::SearchHit>,
-    category: Option<&str>,
-) -> Vec<crate::index::SearchHit> {
-    let Some(cat) = category else { return hits };
-    hits.into_iter()
-        .filter(|h| {
-            // Path like "facts/lesson/ulid.md" → category is the second component.
-            h.path.split('/').nth(1) == Some(cat)
-        })
-        .collect()
 }
