@@ -152,7 +152,7 @@ fn readonly_system_batches_skip_without_weakening_explicit_writes() {
         "readonly_system_skill"
     );
     assert!(!readonly.join(".skill-meta").exists());
-    assert_eq!(service.managed_skills().unwrap().len(), 1);
+    assert!(!state.join("managed-skills.json").exists());
     assert!(!run(&executor, json!({"command":"scan", "skillDir":readonly})).success);
     // The same EROFS storage outside the default location remains a batch error.
     let ordinary = share.join("anolisa/skills/readonly");

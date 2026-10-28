@@ -195,13 +195,23 @@ impl Directory {
         bytes: &[u8],
         replace: bool,
     ) -> Result<File, SkillSecError> {
+        self.write_atomic_mode(name, bytes, replace, 0o644)
+    }
+
+    pub(crate) fn write_atomic_mode(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        replace: bool,
+        mode: rustix::fs::RawMode,
+    ) -> Result<File, SkillSecError> {
         validate_name(name)?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RECORD_BYTES {
             return Err(SkillSecError::Invalid("ledger record exceeds 8 MiB".into()));
         }
         let temporary = nonce(".record-")?;
         let result = (|| {
-            let file = self.write_new(&temporary, bytes, 0o644)?;
+            let file = self.write_new(&temporary, bytes, mode)?;
             renameat_with(
                 &self.file,
                 temporary.as_str(),

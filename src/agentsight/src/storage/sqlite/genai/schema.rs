@@ -26,12 +26,15 @@ pub(super) enum PruneTable {
     Resources,
     /// Evaluation results owned by the same physical database.
     Evaluations,
+    /// Saved metadata and explicitly fetched Tokenless content.
+    Tokenless,
 }
 
 impl GenAISqliteStore {
     /// Initialize database tables
     pub(super) fn init_tables(&self) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        super::tokenless::init_tables(&conn)?;
         // This migration must run before any index that references the added
         // column: on databases created before conversation_id existed,
         // creating the index first aborts the batch and the `?` below returns
@@ -221,6 +224,29 @@ impl GenAISqliteStore {
         // v10: distinguish semantic input totals from legacy raw provider input
         ensure_col!("input_tokens_includes_cache", "INTEGER NOT NULL DEFAULT 0");
 
+        // v11: reclassify legacy analyzer rows (#2750, #7271). Builds before
+        // the CallKind::Analyzer split persisted the cosh-ng personal-analyzer
+        // background summary as 'recap'; with the session predicate now
+        // admitting recap-only sessions, those rows would resurface as
+        // 0-token noise sessions on hosts that already have data. The fixed
+        // prompt is written to user_query on every row, so a prefix match is
+        // sufficient. Idempotent: after the first pass it matches zero rows.
+        // Guarded on user_query because hand-built pre-v1 databases (see the
+        // legacy-migration test) predate that base column.
+        if existing_cols.contains("user_query") {
+            let reclassified = conn.execute(
+                "UPDATE genai_events SET call_kind = 'analyzer' \
+                 WHERE call_kind = 'recap' \
+                 AND user_query LIKE 'Summarize only grounded work into the supplied JSON schema%'",
+                [],
+            )?;
+            if reclassified > 0 {
+                log::info!(
+                    "Migrated genai_events: reclassified {reclassified} legacy analyzer recap rows"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -333,6 +359,7 @@ impl GenAISqliteStore {
         let cutoff_i64 = i64::try_from(cutoff_ns).unwrap_or(i64::MAX);
         let mut deleted = 0;
         for table in [
+            PruneTable::Tokenless,
             PruneTable::Events,
             PruneTable::Resources,
             PruneTable::Evaluations,
@@ -367,6 +394,26 @@ impl GenAISqliteStore {
         if pct == 0.0 {
             return Ok(0);
         }
+        let Some((table, count)) = self.prune_candidate()? else {
+            return Ok(0);
+        };
+        let delete_count = prune_count(count, pct);
+        let mut deleted = 0;
+        let target = usize::try_from(delete_count)?;
+        while deleted < target {
+            let batch = self.delete_maintenance_batch(table, None, target - deleted)?;
+            if batch == 0 {
+                break;
+            }
+            deleted += batch;
+            self.yield_maintenance();
+        }
+        Ok(deleted)
+    }
+
+    pub(super) fn prune_candidate(
+        &self,
+    ) -> Result<Option<(PruneTable, i64)>, Box<dyn std::error::Error>> {
         let conn = self.conn.lock().unwrap_or_else(|error| error.into_inner());
         let (event_count, event_bytes): (i64, i64) = conn.query_row(
             // Read stored byte lengths without loading and decoding every large
@@ -394,6 +441,12 @@ impl GenAISqliteStore {
             };
 
         let candidates = [
+            {
+                let (count, bytes): (i64,i64) = conn.query_row(
+                    "SELECT COUNT(*),COALESCE(SUM(octet_length(record_json)),0) FROM tokenless_statistics", [],
+                    |row| Ok((row.get(0)?,row.get(1)?)))?;
+                (bytes.max(count), PruneTable::Tokenless, count)
+            },
             (
                 event_bytes.max(event_count),
                 PruneTable::Events,
@@ -410,26 +463,11 @@ impl GenAISqliteStore {
                 evaluation_count,
             ),
         ];
-        let Some((_, table, count)) = candidates
+        let selected = candidates
             .into_iter()
             .filter(|(_, _, count)| *count > 0)
-            .max_by_key(|(bytes, _, _)| *bytes)
-        else {
-            return Ok(0);
-        };
-        let delete_count = prune_count(count, pct);
-        drop(conn);
-        let mut deleted = 0;
-        let target = usize::try_from(delete_count)?;
-        while deleted < target {
-            let batch = self.delete_maintenance_batch(table, None, target - deleted)?;
-            if batch == 0 {
-                break;
-            }
-            deleted += batch;
-            self.yield_maintenance();
-        }
-        Ok(deleted)
+            .max_by_key(|(bytes, _, _)| *bytes);
+        Ok(selected.map(|(_, table, count)| (table, count)))
     }
 
     /// Delete one bounded transaction, allowing one oversized row to make progress.
@@ -451,6 +489,14 @@ impl GenAISqliteStore {
             return Ok(0);
         }
         let (select, delete, cutoff) = match table {
+            PruneTable::Tokenless => (
+                "SELECT cache_id, COALESCE(octet_length(record_json), 0)
+                 FROM tokenless_statistics WHERE ?1 IS NULL OR timestamp_ns < ?1
+                 ORDER BY timestamp_ns, cache_id LIMIT ?2",
+                "DELETE FROM tokenless_statistics WHERE cache_id = ?1
+                 AND (?2 IS NULL OR timestamp_ns < ?2)",
+                expired_before,
+            ),
             PruneTable::Events => (
                 "SELECT id, COALESCE(octet_length(event_json), 0)
                     + COALESCE(octet_length(input_messages), 0)
@@ -535,7 +581,23 @@ impl GenAISqliteStore {
         }
     }
 
-    fn maintenance_checkpoint(&self) -> Result<CheckpointOutcome, Box<dyn std::error::Error>> {
+    /// Copy WAL frames in the worker without waiting for the capture writer.
+    pub(crate) fn checkpoint_passive(
+        &self,
+    ) -> Result<CheckpointOutcome, Box<dyn std::error::Error>> {
+        if self.capture_has_priority() {
+            return Ok(CheckpointOutcome::Busy);
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| format!("GenAI passive checkpoint mutex poisoned: {error}"))?;
+        agentsight_sqlite_lifecycle::checkpoint_passive(&conn).map_err(Into::into)
+    }
+
+    pub(super) fn maintenance_checkpoint(
+        &self,
+    ) -> Result<CheckpointOutcome, Box<dyn std::error::Error>> {
         let _timer = crate::runtime_metrics::StageTimer::start("genai_maintenance_checkpoint");
         if self.capture_has_priority() {
             return Ok(CheckpointOutcome::Busy);
@@ -549,11 +611,7 @@ impl GenAISqliteStore {
             .map_err(|error| format!("GenAI maintenance mutex poisoned: {error}"))?;
         // Copy the bulk of the WAL without excluding the live writer. Only
         // attempt truncation after every frame was copied; its busy timeout is zero.
-        let (busy, frames, copied): (i64, i64, i64) =
-            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
-        if busy != 0 || copied < frames {
+        if agentsight_sqlite_lifecycle::checkpoint_passive(&conn)? == CheckpointOutcome::Busy {
             return Ok(CheckpointOutcome::Busy);
         }
         checkpoint_truncate(&conn).map_err(Into::into)

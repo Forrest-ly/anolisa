@@ -153,7 +153,7 @@ impl Aggregator {
                 ParsedMessage::Request(r) => Some(r.source_event.as_ref()),
                 ParsedMessage::Response(r) => Some(r.source_event.as_ref()),
                 ParsedMessage::RawData(event) => Some(event.as_ref()),
-                ParsedMessage::SseEvent(event) => Some(event.source_event()),
+                ParsedMessage::SseEvent(event) => Some(event.capture_event()),
                 ParsedMessage::Http2Frames(frames) => {
                     frames.first().map(|f| f.source_event.as_ref())
                 }
@@ -165,7 +165,10 @@ impl Aggregator {
             .iter()
             .any(|message| matches!(message, ParsedMessage::SseEvent(_)));
         let handled = response_event.and_then(|event| {
-            if self.http.accepts_response_bytes(event) || self.http.accepts_compact_sse_bytes(event)
+            if self.http.discard_retired_sse(event) {
+                Some(None)
+            } else if self.http.accepts_response_bytes(event)
+                || self.http.accepts_compact_sse_bytes(event)
             {
                 Some(self.http.process_raw_body_data(event))
             } else if captured_sse && self.http.accepts_unmatched_sse(event) {
@@ -188,9 +191,11 @@ impl Aggregator {
             self.enforce_bytes_budget();
             results.extend(self.http.take_ready());
             results.extend(self.http2.take_ready());
+            self.publish_connection_metrics();
             for result in &results {
                 export_trace_events(result);
             }
+            timer.record_outputs(results.len());
             return results;
         }
 
@@ -222,6 +227,8 @@ impl Aggregator {
         results.extend(self.http.take_ready());
         results.extend(self.http2.take_ready());
 
+        self.publish_connection_metrics();
+
         // Export chrome trace if enabled
         for r in &results {
             export_trace_events(r);
@@ -241,11 +248,15 @@ impl Aggregator {
         &mut self,
         event: &crate::probes::sslsniff::SslEvent,
     ) -> Option<Vec<AggregatedResult>> {
+        if self.http.discard_retired_sse(event) {
+            return Some(Vec::new());
+        }
         if !self.http.accepts_compact_sse_bytes(event) {
             return None;
         }
         let complete = self.http.process_raw_body_data(event);
         self.enforce_bytes_budget();
+        self.publish_connection_metrics();
         let mut results = self.http.take_ready();
         results.extend(self.http2.take_ready());
         results.extend(complete);
@@ -310,6 +321,13 @@ impl Aggregator {
         self.http.drain_dead_pid_connections()
     }
 
+    /// Complete a live-tracked pid's partially-assembled responses (#7553).
+    ///
+    /// Delegates to the HTTP aggregator; see the HTTP-level documentation.
+    pub(crate) fn complete_pid_partial_responses(&mut self, pid: u32) -> Vec<AggregatedResult> {
+        self.http.complete_pid_partial_responses(pid)
+    }
+
     /// Snapshot in-flight HTTP connections that exceeded the idle timeout.
     ///
     /// Used to persist evidence for manually interrupted streams where the
@@ -336,6 +354,7 @@ impl Aggregator {
         self.http.drain_pending(reason);
         self.http2.abandon_pending(reason);
         self.enforce_bytes_budget();
+        self.publish_connection_metrics();
         let mut results = self.http.take_ready();
         results.extend(self.http2.take_ready());
         results
@@ -346,6 +365,7 @@ impl Aggregator {
         self.http.tick(now);
         self.http2.tick(now);
         self.enforce_bytes_budget();
+        self.publish_connection_metrics();
         let mut results = self.http.take_ready();
         results.extend(self.http2.take_ready());
         results
@@ -355,8 +375,8 @@ impl Aggregator {
         while self.bytes_budget != 0
             && self.connection_metrics().connection_cache_bytes > self.bytes_budget
         {
-            let h1 = self.http.oldest_activity();
-            let h2 = self.http2.oldest_activity();
+            let h1 = self.http.eviction_priority();
+            let h2 = self.http2.eviction_priority();
             let removed = match (h1, h2) {
                 (Some(a), Some(b)) if a <= b => self.http.abandon_oldest(),
                 (Some(_), None) => self.http.abandon_oldest(),
@@ -367,6 +387,9 @@ impl Aggregator {
                 break;
             }
         }
+    }
+
+    fn publish_connection_metrics(&self) {
         let metrics = self.connection_metrics();
         metrics::gauge!("agentsight_http_conn_active").set(metrics.pending_connection_count as f64);
         metrics::gauge!("agentsight_http_conn_retained_bytes")
@@ -397,6 +420,141 @@ mod tests {
             is_handshake: false,
             ssl_ptr,
         }
+    }
+
+    /// Regression for issue #7553: a non-streaming Anthropic `/v1/messages`
+    /// exchange served as **HTTP/1.0** (Python `BaseHTTPRequestHandler`).
+    /// The response headers and the JSON body arrive as two separate reads;
+    /// the body read does not start with `HTTP`, so the parser emits it as
+    /// `RawData` and only the aggregator's raw-body path can complete the
+    /// pair. Reverting any of that would strand the call as a pending row.
+    #[test]
+    fn http10_nonstream_anthropic_response_completes_from_split_reads() {
+        let parser = Parser::new();
+        let mut aggregator = Aggregator::new();
+        let conn = ConnectionId {
+            pid: 4242,
+            ssl_ptr: 0x4321,
+        };
+
+        let body = br#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-x","content":[{"type":"redacted_thinking","data":"_enc_"},{"type":"text","text":"the visible answer"}],"usage":{"input_tokens":15,"output_tokens":25}}"#;
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        aggregator.process_result(parser.parse_ssl_event(Rc::new(ssl_event(
+            conn.pid,
+            conn.ssl_ptr,
+            request.as_bytes(),
+            1,
+        ))));
+        aggregator.process_result(parser.parse_ssl_event(Rc::new(ssl_event(
+            conn.pid,
+            conn.ssl_ptr,
+            body,
+            1,
+        ))));
+
+        // Response headers (HTTP/1.0, body sent as a separate TLS record).
+        let head =
+            b"HTTP/1.0 200 OK\r\nServer: BaseHTTP/0.6 Python/3.11.11\r\nContent-Type: application/json\r\nContent-Length: 198\r\n\r\n";
+        let out1 = aggregator.process_result(parser.parse_ssl_event(Rc::new(ssl_event(
+            conn.pid,
+            conn.ssl_ptr,
+            head,
+            0,
+        ))));
+        assert!(
+            out1.is_empty(),
+            "headers-only read must not complete the pair before the body arrives"
+        );
+
+        // The body read carries no HTTP head: parser falls back to RawData.
+        let out2 = aggregator.process_result(parser.parse_ssl_event(Rc::new(ssl_event(
+            conn.pid,
+            conn.ssl_ptr,
+            body,
+            0,
+        ))));
+        let mut completed = 0;
+        for result in out2.into_iter().chain(out1) {
+            if let AggregatedResult::HttpComplete(pair) = result {
+                completed += 1;
+                assert_eq!(pair.response.status_code(), 200);
+                let text = pair.response.body_string();
+                assert!(text.contains("\"input_tokens\":15"), "body: {text}");
+            }
+        }
+        assert_eq!(completed, 1, "the split HTTP/1.0 response must complete");
+    }
+
+    /// Regression for issue #7553: an application that never reads its
+    /// declared response body (e.g. a probe that only inspects the status)
+    /// leaves the connection `ResponsePending` forever. The clean-exit
+    /// partial-completion path must surface the call from whatever bytes
+    /// arrived instead of stranding it as a pending row.
+    #[test]
+    fn clean_exit_completes_response_pending_without_body() {
+        let parser = Parser::new();
+        let mut aggregator = Aggregator::new();
+        let conn = ConnectionId {
+            pid: 4242,
+            ssl_ptr: 0x4321,
+        };
+
+        let body = br#"{"id":"msg_1","usage":{"input_tokens":15,"output_tokens":25}}"#;
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        aggregator.process_result(parser.parse_ssl_event(Rc::new(ssl_event(
+            conn.pid,
+            conn.ssl_ptr,
+            request.as_bytes(),
+            1,
+        ))));
+        aggregator.process_result(parser.parse_ssl_event(Rc::new(ssl_event(
+            conn.pid,
+            conn.ssl_ptr,
+            body,
+            1,
+        ))));
+
+        // Headers only — the application never reads the body, so no further
+        // read events ever arrive and the pair cannot complete normally.
+        let head =
+            b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: 74\r\n\r\n";
+        assert!(
+            aggregator
+                .process_result(parser.parse_ssl_event(Rc::new(ssl_event(
+                    conn.pid,
+                    conn.ssl_ptr,
+                    head,
+                    0,
+                ))))
+                .is_empty(),
+            "headers alone must not complete the pair in the live path"
+        );
+
+        // Clean exit: the partial-completion sweep finishes the call.
+        let completed = aggregator
+            .http_mut()
+            .complete_pid_partial_responses(conn.pid);
+        assert_eq!(completed.len(), 1, "the partial response must complete");
+        match &completed[0] {
+            AggregatedResult::HttpComplete(pair) => {
+                assert_eq!(pair.connection_id, conn);
+                assert_eq!(pair.response.status_code(), 200);
+            }
+            other => panic!("expected HttpComplete, got {other:?}"),
+        }
+        // The sweep is one-shot: a second pass finds nothing left to complete.
+        assert!(
+            aggregator
+                .http_mut()
+                .complete_pid_partial_responses(conn.pid)
+                .is_empty()
+        );
     }
 
     /// End-to-end regression for the write-direction chunked terminator: a
@@ -977,6 +1135,56 @@ mod tests {
     }
 
     #[test]
+    fn shared_bytes_reclaim_oldest_when_all_http_versions_are_protected() {
+        let mut aggregator = Aggregator::new();
+        let parser = Parser::new();
+        for (rw, bytes) in [
+            (
+                1,
+                b"POST /v1/messages HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}".as_slice(),
+            ),
+            (
+                0,
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n".as_slice(),
+            ),
+        ] {
+            assert!(
+                aggregator
+                    .process_result(parser.parse_ssl_event(Rc::new(ssl_event(7, 2, bytes, rw))))
+                    .is_empty()
+            );
+        }
+        let headers = hpack::Encoder::new().encode([
+            (b":method".as_slice(), b"POST".as_slice()),
+            (b":path".as_slice(), b"/v1/messages".as_slice()),
+        ]);
+        assert!(
+            feed_http2(
+                &mut aggregator,
+                vec![test_frame(1, 1, 5, headers, test_event(7, 1, 1, 100))]
+            )
+            .is_empty()
+        );
+        aggregator.bytes_budget = aggregator.connection_metrics().connection_cache_bytes - 1;
+        aggregator.enforce_bytes_budget();
+        assert!(matches!(
+            &aggregator.http.take_ready()[..],
+            [AggregatedResult::Abandoned {
+                reason: super::super::RemoveReason::OverBudget,
+                ..
+            }]
+        ));
+        assert!(
+            !aggregator
+                .http
+                .is_sse_active(&ConnectionId { pid: 7, ssl_ptr: 2 })
+        );
+        assert!(aggregator.http2.take_ready().is_empty());
+        assert_eq!(aggregator.http2.active_stream_count(), 1);
+        assert!(aggregator.connection_metrics().connection_cache_bytes <= aggregator.bytes_budget);
+    }
+
+    #[test]
     fn http2_multiline_sse_survives_both_completion_and_abandonment() {
         for complete in [false, true] {
             let mut aggregator = Aggregator::new();
@@ -1023,5 +1231,114 @@ mod tests {
             assert_eq!(token.output_tokens, 3);
             assert!(!aggregator.has_pending());
         }
+    }
+
+    /// A response that arrives on a connection with no prior request (probe
+    /// artefact) completes via the ResponseOnly arm of the clean-exit sweep.
+    #[test]
+    fn clean_exit_completes_response_only_partial() {
+        let parser = Parser::new();
+        let mut aggregator = Aggregator::new();
+        let conn = ConnectionId {
+            pid: 5150,
+            ssl_ptr: 0x9999,
+        };
+
+        // Response headers with no preceding request on this connection.
+        let head =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n";
+        assert!(
+            aggregator
+                .process_result(parser.parse_ssl_event(Rc::new(ssl_event(
+                    conn.pid,
+                    conn.ssl_ptr,
+                    head,
+                    0,
+                ))))
+                .is_empty()
+        );
+
+        let completed = aggregator
+            .http_mut()
+            .complete_pid_partial_responses(conn.pid);
+        assert_eq!(completed.len(), 1, "response-only pair must complete");
+        assert!(matches!(
+            &completed[0],
+            AggregatedResult::ResponseOnly { response, .. } if response.status_code() == 200
+        ));
+    }
+    /// A pid may hold a completable ResponsePending connection *and* sibling
+    /// connections in other states (in-flight request, active SSE). The
+    /// clean-exit sweep must complete the former and leave the latter in place
+    /// for the exit drain to persist — dropping them would silently discard
+    /// pending/interrupted evidence.
+    #[test]
+    fn clean_exit_sweep_preserves_sibling_connections_of_other_states() {
+        let parser = Parser::new();
+        let mut aggregator = Aggregator::new();
+
+        // Sibling 1: ResponsePending — headers captured, body never read.
+        let p1 = ConnectionId {
+            pid: 6160,
+            ssl_ptr: 0xaaaa,
+        };
+        let body = br#"{"ok":true}"#;
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        assert!(
+            aggregator
+                .process_result(parser.parse_ssl_event(Rc::new(ssl_event(
+                    p1.pid,
+                    p1.ssl_ptr,
+                    request.as_bytes(),
+                    1
+                ))))
+                .is_empty()
+        );
+        let head =
+            b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n";
+        assert!(
+            aggregator
+                .process_result(
+                    parser.parse_ssl_event(Rc::new(ssl_event(p1.pid, p1.ssl_ptr, head, 0)))
+                )
+                .is_empty()
+        );
+
+        // Sibling 2: RequestBodyPending — a chunked request whose body never
+        // completed (no request evidence, but still exit-drain material).
+        let p2 = ConnectionId {
+            pid: 6160,
+            ssl_ptr: 0xbbbb,
+        };
+        let chunked = "POST /v1/chat/completions HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(
+            aggregator
+                .process_result(parser.parse_ssl_event(Rc::new(ssl_event(
+                    p2.pid,
+                    p2.ssl_ptr,
+                    chunked.as_bytes(),
+                    1
+                ))))
+                .is_empty()
+        );
+
+        // Clean-exit sweep: completes sibling 1, leaves sibling 2 alone.
+        let completed = aggregator.http_mut().complete_pid_partial_responses(p1.pid);
+        assert_eq!(completed.len(), 1, "the ResponsePending pair must complete");
+
+        // Sibling 2 must still be present for the exit drain.
+        let drained = aggregator.http_mut().drain_dead_pid_connections();
+        assert_eq!(
+            drained.len(),
+            1,
+            "sibling non-ResponsePending connections must survive the sweep"
+        );
+        assert_eq!(
+            drained[0].id.ssl_ptr, p2.ssl_ptr,
+            "sibling evidence survives"
+        );
     }
 }

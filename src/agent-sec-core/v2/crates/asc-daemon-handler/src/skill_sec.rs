@@ -166,7 +166,7 @@ mod tests {
             json!({"command":"rotate-keys"}),
         ))
         .unwrap();
-        assert_eq!(rotation["result"]["errorType"], "PermissionDenied");
+        assert_eq!(rotation["result"]["errorType"], "NotImplementedError");
         let invalid = serde_json::to_value(handler.handle(
             id(),
             peer,

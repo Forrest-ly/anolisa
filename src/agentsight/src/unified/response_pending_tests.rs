@@ -3,6 +3,7 @@
 use super::*;
 use crate::aggregator::{AggregatedResult, ConnectionState};
 use crate::config::RuntimeLimits;
+use crate::parser::Parser;
 use crate::probes::sslsniff::SslEvent;
 use crate::storage::sqlite::PendingOrigin;
 
@@ -292,7 +293,11 @@ fn busy_local_completions_survive_retry_and_deliver_each_external_record_once() 
         let error = super::delivery::complete_local_genai(&output, &store, &exporters).unwrap_err();
         assert!(super::delivery::is_retryable_sqlite_write(error.as_ref()));
         expected.push(serde_json::to_value(&output.events[0]).unwrap());
-        assert!(queue.queue_local_completion(output, &store, &limits));
+        assert!(
+            queue
+                .queue_local_completion(output, &store, &limits)
+                .is_ok()
+        );
     }
     assert_eq!(queue.len(), 5);
     assert!(queue.bytes > 0 && queue.bytes <= limits.pending_genai_max_bytes);
@@ -381,11 +386,13 @@ fn busy_local_completions_survive_retry_and_deliver_each_external_record_once() 
 #[test]
 fn local_write_retries_share_session_count_and_byte_limits() {
     let dir = super::tests::unique_tmp_dir("local-write-limits");
-    let store = GenAISqliteStore::new_with_path(
-        &dir.join("genai_events.db"),
-        crate::config::PeriodicStoragePolicy::default(),
-    )
-    .unwrap();
+    let store = Arc::new(
+        GenAISqliteStore::new_with_path(
+            &dir.join("genai_events.db"),
+            crate::config::PeriodicStoragePolicy::default(),
+        )
+        .unwrap(),
+    );
     let mapper = ResponseSessionMapper::new();
     let mut queue = PendingGenAiQueue::default();
     let (output, _) = delivery_fixture("session-wait", &mapper, true);
@@ -400,19 +407,31 @@ fn local_write_retries_share_session_count_and_byte_limits() {
         ..Default::default()
     };
     let (output, _) = delivery_fixture("local-retry", &mapper, false);
-    assert!(queue.queue_local_completion(output, &store, &limits));
+    assert!(
+        queue
+            .queue_local_completion(output, &store, &limits)
+            .is_ok()
+    );
     let bytes = queue.bytes;
     let (output, _) = delivery_fixture("count-overflow", &mapper, false);
-    assert!(!queue.queue_local_completion(output, &store, &limits));
+    assert!(
+        queue
+            .queue_local_completion(output, &store, &limits)
+            .is_err()
+    );
     let (output, _) = delivery_fixture("byte-overflow", &mapper, false);
-    assert!(!queue.queue_local_completion(
-        output,
-        &store,
-        &RuntimeLimits {
-            pending_genai_max_bytes: bytes,
-            ..Default::default()
-        }
-    ));
+    assert!(
+        queue
+            .queue_local_completion(
+                output,
+                &store,
+                &RuntimeLimits {
+                    pending_genai_max_bytes: bytes,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+    );
     assert_eq!(queue.len(), 2);
     assert_eq!(queue.bytes, bytes);
     queue.resync();
@@ -439,7 +458,11 @@ fn local_write_retry_does_not_loop_on_non_lock_failures() {
     let error = super::delivery::complete_local_genai(&output, &store, &[]).unwrap_err();
     assert!(!super::delivery::is_retryable_sqlite_write(error.as_ref()));
     let mut queue = PendingGenAiQueue::default();
-    assert!(queue.queue_local_completion(output, &store, &RuntimeLimits::default()));
+    assert!(
+        queue
+            .queue_local_completion(output, &store, &RuntimeLimits::default())
+            .is_ok()
+    );
     assert!(
         queue
             .retry_local_completion(&store, &mapper, std::time::Instant::now(), true)
@@ -477,7 +500,7 @@ fn delivery_fixture(
     (output, pending)
 }
 
-fn feed(aggregator: &mut Aggregator, rw: i32, bytes: &[u8]) -> Vec<AggregatedResult> {
+pub(super) fn feed(aggregator: &mut Aggregator, rw: i32, bytes: &[u8]) -> Vec<AggregatedResult> {
     let event = SslEvent {
         source: 0,
         timestamp_ns: 1_000_000_000,
@@ -905,4 +928,144 @@ fn drain_fallback_counts_dashscope_native_parameter_tools() {
         counted > baseline,
         "the native tool definitions must reach the template: {counted} vs {baseline}"
     );
+}
+/// The #7553 clean-exit completion path: a headers-only response that the
+/// application never reads must land as a usable `complete` row through
+/// `complete_pid_partial_responses` + `persist_drained_pending`.
+#[test]
+fn persist_drained_pending_completes_headers_only_response() {
+    let dir = super::tests::unique_tmp_dir("persist-drained");
+    let store = Arc::new(
+        GenAISqliteStore::new_with_path(
+            &dir.join("genai_events.db"),
+            crate::config::PeriodicStoragePolicy::default(),
+        )
+        .unwrap(),
+    );
+
+    let mut aggregator = Aggregator::new();
+    let body = serde_json::json!({
+        "id": "msg_7553", "type": "message", "role": "assistant",
+        "model": "claude-x",
+        "content": [{"type": "text", "text": "the visible answer"}],
+        "usage": {"input_tokens": 15, "output_tokens": 25}
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    assert!(feed(&mut aggregator, 1, request.as_bytes()).is_empty());
+    // Headers only: the application never reads the declared body.
+    assert!(
+        feed(
+            &mut aggregator,
+            0,
+            b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: 74\r\n\r\n"
+        )
+        .is_empty()
+    );
+
+    // Clean-exit sweep completes the pair from the captured headers.
+    let completed = aggregator.http_mut().complete_pid_partial_responses(PID);
+    assert_eq!(completed.len(), 1, "the partial response must complete");
+
+    let analysis = Analyzer::new().analyze_aggregated(&completed[0]);
+    let (output, pending) = GenAIBuilder::new().build_with_pending(
+        &analysis,
+        &ResponseSessionMapper::new(),
+        &HashMap::new(),
+    );
+    assert!(
+        !output.events.is_empty(),
+        "the drained pair must build events"
+    );
+    let mut pending = pending.expect("drained call carries pending info");
+
+    let exporters: Vec<Box<dyn GenAIExporter>> = vec![Box::new(Arc::clone(&store))];
+    super::persist_drained_genai_events(
+        Some(&mut pending),
+        &output.events,
+        Some(store.as_ref()),
+        &exporters,
+        None,
+    );
+
+    let conn = rusqlite::Connection::open(dir.join("genai_events.db")).unwrap();
+    let (status, in_tok, out_tok, origin): (String, i64, i64, String) = conn
+        .query_row(
+            "SELECT status, COALESCE(input_tokens,-1), COALESCE(output_tokens,-1), pending_origin FROM genai_events",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "complete", "the drained call must land complete");
+    assert_eq!(origin, "clean_exit_partial", "provenance must be stamped");
+    // The body was never captured (the app never read it), so tokens stay 0 —
+    // the regression being fixed is the row vanishing, not the token count.
+    assert_eq!((in_tok, out_tok), (0, 0));
+}
+
+/// finish_partial must reject an unusable (truncated) header block so the
+/// entry stays on the request-evidence path instead of emitting a broken row.
+#[test]
+fn finish_partial_rejects_truncated_headers() {
+    let mut aggregator = Aggregator::new();
+    let request = "POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n";
+    assert!(feed(&mut aggregator, 1, request.as_bytes()).is_empty());
+    // Truncated header block: no terminating blank line ever arrives.
+    assert!(feed(&mut aggregator, 0, b"HTTP/1.0 200 OK\r\nContent-Type: appl").is_empty());
+
+    let completed = aggregator.http_mut().complete_pid_partial_responses(PID);
+    assert!(
+        completed.is_empty(),
+        "a truncated header block must not produce a row"
+    );
+    // The entry stays on the evidence path: the dead-PID drain still sees it.
+    let drained = aggregator.http_mut().drain_dead_pid_connections();
+    assert_eq!(drained.len(), 1, "request evidence must be preserved");
+}
+
+/// finish_partial must accept buffered body bytes for a dead connection whose
+/// framing never completed, clamping the body to the accumulated bytes.
+#[test]
+fn finish_partial_accepts_buffered_partial_body() {
+    let mut aggregator = Aggregator::new();
+    let body = "{\"id\":\"x\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}";
+    let request = format!(
+        "POST /v1/messages HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    assert!(feed(&mut aggregator, 1, request.as_bytes()).is_empty());
+    // Full response in one read — completes in the live path, so instead feed
+    // headers and body split with the body truncated mid-stream.
+    assert!(
+        feed(
+            &mut aggregator,
+            0,
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        .is_empty()
+    );
+    assert!(
+        feed(
+            &mut aggregator,
+            0,
+            format!("{:x}\r\n{}\r\n", body.len(), body).as_bytes()
+        )
+        .is_empty()
+    );
+
+    // Chunked without the terminal chunk: framing never completes.
+    let completed = aggregator.http_mut().complete_pid_partial_responses(PID);
+    assert_eq!(completed.len(), 1, "buffered body must be surfaced");
+    if let AggregatedResult::HttpComplete(pair) = &completed[0] {
+        let text = pair.response.body_string();
+        assert!(
+            text.contains("\"input_tokens\":7"),
+            "buffered body bytes must be preserved: {text}"
+        );
+    } else {
+        panic!("expected HttpComplete");
+    }
 }

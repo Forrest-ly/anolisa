@@ -321,6 +321,14 @@ failed item 导致 `success=false, exit_code=1`，但 `error_type` 为空，因�
 verdict 值域严格为 `pass/warn/deny/error`；finding severity 只为 `warn/deny`。built-in
 regex rules 当前可能只产生 pass/warn，但 deny 是 custom/LLM rule 的合法值，不能删除。
 
+regex 模式扫描 Python 时，除 Python 规则外，还从 `os.system`、`os.popen` 以及受支持的
+`subprocess` 执行 API 中提取在第一个参数位置通过位置参数或对应关键字参数传入的直接
+字符串命令，并复用 Bash 规则扫描该命令。关键字参数按 API 的 Python 签名匹配：`os.system` 使用
+`command`，`os.popen`、`subprocess.getoutput` 和 `subprocess.getstatusoutput` 使用 `cmd`，
+其余受支持的 `subprocess` API 使用 `args`。结果保留 Bash 规则原生的 `rule_id`、severity、
+描述和 evidence，顶层 `language` 仍为 `python`。变量、拼接字符串、带前缀字符串、argv
+列表、别名调用和其它动态表达式不执行 Shell 规则复用。
+
 ### 7.3 Success/error
 
 | 情况 | success | exit_code | error_type |
@@ -715,7 +723,7 @@ V2 使用 fancy-regex，回溯上限 1,000,000、循环预算 200 ms；不承诺
 接受结构正确的大整数/深层 JSON；身份证统一 decimal 校验并支持全角 X，银行卡排除全零。
 2.0.1 与保留的 Python 检测器同步要求完整卡号表达式、支持网络的前缀/长度组合及 Luhn；
 非常规分组及不合法表达式内部的局部匹配被拒绝。格式范围和边界见
-[PII 用户指南](../../../../docs/user-guide/zh/agent-security/agent-sec-core/pii-checker.md#支持的银行卡格式)。
+[PII 用户指南](../../../../docs/user-guide/zh/agent-sec-core/pii-checker.md#支持的银行卡格式)。
 其他检测类型、置信度和脱敏格式保留，变化由共享卡号语料及独立质量用例定义。
 
 差分和限制由 capability 的 `tests/compatibility.rs`、`tests/custom_rules.rs`、冻结 142 个
@@ -740,7 +748,17 @@ audit 根据 valid 退出；analyze 完整风险结果退出 0、覆盖不足 1�
 status/version/exitCode 和错误类别；不复制源码、findings、路径、人工理由、导入证据或密钥。
 
 [批准替代] key/status 使用系统密钥身份，不包含用户公钥路径、口令或历史 keyring；init-keys 和
---passphrase 不保留。init --no-baseline 只建密钥，force-keys 与 rotate-keys 为 root-only。
+--passphrase 不保留。init --no-baseline 只建密钥且保持幂等；force-keys 与 rotate-keys 不支持，
+CLI 在目录发现前非零退出，RPC 在解析 Skill 根目录及业务副作用前返回 NotImplementedError、
+exitCode 1。不再维护换钥事务；managed-skills.json 和 key-rotation.json 不读写、不检测、
+不迁移，也不删除。正常初始化、密钥权限及完整性校验、单 Skill 回滚恢复及其校验顺序保留。
+
+[批准替代] 成功 scan/certify/noop 将 canonical 精确路径记入 daemon 实际使用的系统配置
+managedSkillDirs。普通目录已被模式覆盖时不重复添加；SkillFS 映射目录保存精确项，以供重启后
+直接解析而不遍历 FUSE。该项同时授予普通目录访问权限；移除挂载或关闭默认目录发现后，
+仍须移除该配置项并重启 daemon 才撤销。
+保存失败追加 warnings，不丢弃扫描 findings 或激活结果。启动、status 和聚合操作共用配置发现，
+不再通过私有登记表补充无法发现目录的全局恢复覆盖。show 对映射 Skill 的已有账本仍验证并报告风险。
 完整输出仍通过 Rust CLI 提供，CLI 不执行任何本地能力回退。每次最多两个 SkillSec 执行，
 满载返回 Busy 并经过相同 finalizer；同 Skill 的写操作继续由 Service 锁串行化。
 

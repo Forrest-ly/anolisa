@@ -19,7 +19,7 @@ pub struct SkillWorker {
 }
 
 impl SkillWorker {
-    /// Starts once after recovery. Discovery and scanning never block socket admission.
+    /// Starts once. Discovery, per-Skill recovery and scanning never block socket admission.
     ///
     /// # Errors
     /// Rejects repeated startup, poisoned state and thread creation failures.
@@ -294,6 +294,7 @@ pub(super) fn start(
                             {
                                 break 'commands;
                             }
+                            report_warnings(&outcome.data["output"]);
                             if !outcome.success
                                 || outcome.data["output"]["activationPending"] == true
                             {
@@ -314,6 +315,23 @@ pub(super) fn start(
                 });
             }
         })?)
+}
+
+fn report_warnings(output: &Value) {
+    let has_warnings = |value: &Value| {
+        value["warnings"]
+            .as_array()
+            .is_some_and(|warnings| !warnings.is_empty())
+    };
+    if has_warnings(output)
+        || output["results"]
+            .as_array()
+            .is_some_and(|results| results.iter().any(has_warnings))
+    {
+        tracing::warn!(
+            "SkillSec background processing reported warnings; check managedSkillDirs configuration and permissions"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -481,6 +499,123 @@ mod tests {
                 .unwrap()
                 .contains("\"verdict\":\"pass\"")
         );
+    }
+
+    #[test]
+    fn startup_repairs_committed_deny_and_block_before_scanning() {
+        use asc_capability_skill_sec::{
+            DecisionAction, SkillSecService, executor::SkillSecExecutor, scanner::ScannerRegistry,
+        };
+
+        struct Events;
+        impl SecurityEventSink for Events {
+            fn write(&self, _: &SecurityEvent) {}
+        }
+        for missing_latest in [false, true] {
+            for blocked in [false, true] {
+                let (_temporary, config, service, root) = restart_fixture();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let latest = root.io_dir.join(".skill-meta/latest.json");
+                let stale = std::fs::read(&latest).unwrap();
+                if blocked {
+                    service
+                        .decide(&root, DecisionAction::Block, None, None, deadline)
+                        .unwrap();
+                } else {
+                    service
+                        .certify(
+                            &root,
+                            "external-review",
+                            None,
+                            &json!([{ "rule": "review", "level": "deny", "message": "review" }]),
+                            deadline,
+                        )
+                        .unwrap();
+                }
+                let committed = std::fs::read(&latest).unwrap();
+                if missing_latest {
+                    std::fs::remove_file(&latest).unwrap();
+                } else {
+                    std::fs::write(&latest, stale).unwrap();
+                }
+                let restarted =
+                    Arc::new(SkillSecService::new(config, ScannerRegistry::default()).unwrap());
+                drop(service);
+                let executor = SkillSecExecutor::new(restarted.clone());
+                let discovery = executor.clone();
+                let queue = Arc::new(Queue::default());
+                let worker = start(
+                    queue.clone(),
+                    application(executor, Arc::new(Events)),
+                    move || discovery.discover(deadline),
+                )
+                .unwrap();
+                while queue.status()["processed"] != 1 && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                queue.stop();
+                worker.join().unwrap();
+                assert_eq!(queue.status()["processed"], 1);
+                assert_eq!(queue.status()["failed"], 0);
+                assert_eq!(std::fs::read(&latest).unwrap(), committed);
+                let activation = restarted.activate(&root, deadline).unwrap();
+                assert_eq!(
+                    activation["exposureState"],
+                    if blocked { "hidden" } else { "pending" }
+                );
+                assert!(activation["activeVersionId"].is_null());
+                let status = restarted.check(&root, deadline).unwrap();
+                assert_eq!(status["versionId"], "v000001");
+                if blocked {
+                    assert_eq!(status["userDecision"]["action"], "block");
+                } else {
+                    assert_eq!(status["status"], "deny");
+                    assert_eq!(status["findings"][0]["rule"], "review");
+                }
+            }
+        }
+    }
+
+    fn restart_fixture() -> (
+        tempfile::TempDir,
+        asc_capability_skill_sec::SkillSecConfig,
+        Arc<asc_capability_skill_sec::SkillSecService>,
+        asc_capability_skill_sec::SkillRoot,
+    ) {
+        use asc_capability_skill_sec::{
+            ManagedSkillDir, ScanOptions, SkillRoot, SkillSecConfig, SkillSecService,
+            scanner::ScannerRegistry,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().canonicalize().unwrap();
+        let state = base.join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let skill = base.join("skill");
+        std::fs::create_dir(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: fixture\ndescription: local fixture\n---\nUse local files.\n",
+        )
+        .unwrap();
+        let config = SkillSecConfig {
+            state_dir: state,
+            managed_skill_dirs: vec![ManagedSkillDir::new(&skill).unwrap()],
+            default_skill_dirs: Vec::new(),
+        };
+        let service =
+            Arc::new(SkillSecService::new(config.clone(), ScannerRegistry::default()).unwrap());
+        let root = SkillRoot::direct(skill).unwrap();
+        service
+            .scan(
+                &root,
+                &ScanOptions::default(),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        (temporary, config, service, root)
     }
 
     #[test]
@@ -713,5 +848,29 @@ mod tests {
             ),
             Err(SkillFsError::Unavailable(_))
         ));
+    }
+    #[test]
+    fn background_warning_log_does_not_expose_sensitive_error_details() {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut file = tempfile::tempfile().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(file.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let output = json!({"status":"scanned","warnings":["Skill was processed but managedSkillDirs could not be saved: PRIVATE_CONFIG_PATH"]});
+            report_warnings(&output);
+            report_warnings(&json!({"results":[output]}));
+        });
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut logs = String::new();
+        file.read_to_string(&mut logs).unwrap();
+        assert_eq!(
+            logs.matches("check managedSkillDirs configuration and permissions")
+                .count(),
+            2
+        );
+        assert!(!logs.contains("PRIVATE_CONFIG_PATH"));
     }
 }

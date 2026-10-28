@@ -1,5 +1,9 @@
 //! Explicit system configuration, independent of caller HOME and environment variables.
 
+mod file;
+pub(crate) use file::remember;
+pub use file::{prepare_private_state, read_system_config};
+
 use crate::{SkillIdentity, SkillSecError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -88,6 +92,17 @@ impl ManagedSkillDir {
             root: SkillIdentity::new(base)?,
             scope,
         })
+    }
+
+    /// Rejects identities whose literal names would become wildcard authorization.
+    pub(crate) fn exact(identity: &SkillIdentity) -> Result<Self, SkillSecError> {
+        let pattern = Self::new(identity.path())?;
+        if pattern.scope != Scope::Exact {
+            return Err(SkillSecError::Invalid(
+                "Skill identity cannot be saved as an exact managedSkillDirs entry".into(),
+            ));
+        }
+        Ok(pattern)
     }
 
     /// Matches path components, excluding hidden descendants of wildcard roots.

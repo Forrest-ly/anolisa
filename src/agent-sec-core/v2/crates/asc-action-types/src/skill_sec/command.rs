@@ -19,7 +19,7 @@ pub enum SkillSecCommand {
         /// False corresponds to CLI --no-baseline.
         #[serde(default = "yes")]
         baseline: bool,
-        /// Root-only trust reset, identical to rotate-keys when keys exist.
+        /// Unsupported compatibility input; rejected before initialization.
         #[serde(default)]
         force_keys: bool,
         /// Exact additional roots explicitly supplied by the caller, never parent globs.
@@ -132,7 +132,7 @@ pub enum SkillSecCommand {
         /// Canonical root selected by daemon discovery.
         skill_dir: SkillIdentity,
     },
-    /// Replace the current system key; requires kernel UID zero.
+    /// Unsupported compatibility request; never replaces the system key.
     RotateKeys {},
 }
 

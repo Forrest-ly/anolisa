@@ -25,7 +25,7 @@ pub(crate) enum SkillLedgerCommand {
         /// Initialize only the key.
         #[arg(long)]
         no_baseline: bool,
-        /// Root-only key rotation; old records must establish trust again.
+        /// Unsupported compatibility flag; key rotation is not available.
         #[arg(long)]
         force_keys: bool,
         /// Comma-separated built-in scanners.
@@ -107,7 +107,7 @@ pub(crate) enum SkillLedgerCommand {
     },
     /// Retry publishing the selected activation.
     Activate { skill_dir: PathBuf },
-    /// Rotate the system signing key as root; no historical key fallback is retained.
+    /// Unsupported compatibility command; key rotation is not available.
     RotateKeys,
 }
 
@@ -125,12 +125,7 @@ impl SkillLedgerCommand {
                 selection,
                 force,
                 scanners,
-            } => {
-                let mut params = selection.params("scan")?;
-                params["force"] = json!(force);
-                params["scanners"] = json!(names(scanners.as_deref()));
-                params
-            }
+            } => selection.scan_params(*force, scanners.as_deref())?,
             Self::Analyze { skill_dir, format } => {
                 if !format.eq_ignore_ascii_case("json") {
                     return Err(InputError::AnalyzeInput {
@@ -204,7 +199,9 @@ impl SkillLedgerCommand {
             Self::Activate { skill_dir } => {
                 json!({"command":"activate","skillDir":absolute(skill_dir)?})
             }
-            Self::RotateKeys => json!({"command":"rotate-keys"}),
+            Self::RotateKeys => {
+                return Err(InputError::SkillSec("key rotation is not supported".into()));
+            }
         };
         serde_json::from_value::<asc_action_types::SkillSecCommand>(params.clone())
             .map_err(|error| InputError::SkillSec(error.to_string()))?;
@@ -250,6 +247,13 @@ impl SkillLedgerCommand {
 }
 
 impl Selection {
+    fn scan_params(&self, force: bool, scanners: Option<&str>) -> Result<Value, InputError> {
+        let mut params = self.params("scan")?;
+        params["force"] = json!(force);
+        params["scanners"] = json!(names(scanners));
+        Ok(params)
+    }
+
     fn params(&self, command: &str) -> Result<Value, InputError> {
         if self.all == self.skill_dir.is_some() {
             return Err(InputError::SkillSec(
@@ -268,6 +272,9 @@ fn init_params(
     scanners: Option<&str>,
     skill_dirs: &[PathBuf],
 ) -> Result<Value, InputError> {
+    if force_keys {
+        return Err(InputError::SkillSec("force-keys is not supported".into()));
+    }
     let mut roots = Vec::new();
     if !no_baseline {
         roots.extend(
@@ -369,7 +376,7 @@ mod tests {
     #[test]
     fn aggregate_commands_leave_discovery_to_daemon_and_keep_explicit_init_roots() {
         for args in [vec!["init"], vec!["scan", "--all"], vec!["check", "--all"]] {
-            let argv: Vec<_> = [vec!["agent-sec-cli", "skill-ledger"], args].concat();
+            let argv: Vec<_> = [vec!["agent-sec-cli", "skillsec"], args].concat();
             assert_eq!(
                 Cli::parse_from(argv).unwrap().request().unwrap().params["skillDirs"],
                 json!([])
@@ -377,7 +384,7 @@ mod tests {
         }
         let request = Cli::parse_from([
             "agent-sec-cli",
-            "skill-ledger",
+            "skillsec",
             "init",
             "--skill-dir",
             "/explicit/skill",
@@ -395,7 +402,7 @@ mod tests {
         let prepare = || {
             Cli::parse_from([
                 "agent-sec-cli",
-                "skill-ledger",
+                "skillsec",
                 "export",
                 "/skill",
                 "--output",
@@ -426,8 +433,7 @@ mod tests {
 
     #[test]
     fn cli_prepares_current_commands_and_rejects_retired_or_conflicting_inputs() {
-        let cli =
-            Cli::parse_from(["agent-sec-cli", "skill-ledger", "init", "--no-baseline"]).unwrap();
+        let cli = Cli::parse_from(["agent-sec-cli", "skillsec", "init", "--no-baseline"]).unwrap();
         let request = cli.request().unwrap();
         assert_eq!(request.params["baseline"], false);
         assert_eq!(request.params["skillDirs"], json!([]));
@@ -438,12 +444,12 @@ mod tests {
             vec!["check", "/skill", "--all"],
             vec!["decide", "/skill", "--action", "allow", "--clear"],
         ] {
-            let argv: Vec<_> = [vec!["agent-sec-cli", "skill-ledger"], arguments].concat();
+            let argv: Vec<_> = [vec!["agent-sec-cli", "skillsec"], arguments].concat();
             assert!(Cli::parse_from(argv).map_or(true, |cli| cli.request().is_err()));
         }
         let cli = Cli::parse_from([
             "agent-sec-cli",
-            "skill-ledger",
+            "skillsec",
             "scan",
             "/skill",
             "--scanners",

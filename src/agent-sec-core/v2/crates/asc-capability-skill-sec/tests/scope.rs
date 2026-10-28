@@ -55,6 +55,13 @@ fn service_with_defaults(
     )
 }
 fn run(executor: &SkillSecExecutor, command: Value) -> asc_action_types::ActionOutcome {
+    run_as(executor, command, 1001)
+}
+fn run_as(
+    executor: &SkillSecExecutor,
+    command: Value,
+    caller_uid: u32,
+) -> asc_action_types::ActionOutcome {
     executor.execute(
         &ExecutionControl {
             deadline: Instant::now() + Duration::from_secs(10),
@@ -62,7 +69,7 @@ fn run(executor: &SkillSecExecutor, command: Value) -> asc_action_types::ActionO
         },
         &SkillSecRequest {
             command: serde_json::from_value(command).unwrap(),
-            caller_uid: 1001,
+            caller_uid,
         },
     )
 }
@@ -226,7 +233,7 @@ fn all_explicit_business_commands_reject_outside_scope_before_resolution_or_side
 }
 
 #[test]
-fn stale_registration_does_not_authorize_requests_or_recovery_after_restart() {
+fn removed_configuration_does_not_authorize_requests_or_recovery_after_restart() {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
     let old = skill(base.join("old"));
@@ -241,7 +248,7 @@ fn stale_registration_does_not_authorize_requests_or_recovery_after_restart() {
     );
     let before = fs::read(old.join(".skill-meta/activation.json")).unwrap();
     let restarted = service(&base, &[new]);
-    assert_eq!(restarted.managed_skills().unwrap(), vec![identity(&old)]);
+    assert!(!base.join("state/managed-skills.json").exists());
     let executor = SkillSecExecutor::new(restarted);
     assert_eq!(
         run(&executor, json!({"command":"show","skillDir":old})).error_type,
@@ -288,82 +295,6 @@ fn wildcard_never_follows_a_symlink_to_an_unapproved_directory() {
 }
 
 #[test]
-fn interrupted_rotation_exception_cannot_authorize_a_new_baseline() {
-    for resume in [
-        json!({"command":"rotate-keys"}),
-        json!({"command":"init","forceKeys":true,"baseline":false}),
-    ] {
-        let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().canonicalize().unwrap();
-        let old = skill(base.join("old"));
-        let first = SkillSecExecutor::new(service(&base, std::slice::from_ref(&old)));
-        assert!(
-            run(
-                &first,
-                json!({"command":"certify","skillDir":old,"scanner":"fixture","findings":[]})
-            )
-            .success
-        );
-        let fingerprint =
-            run(&first, json!({"command":"status"})).data["output"]["keys"]["fingerprint"].clone();
-        let intent_path = base.join("state/key-rotation.json");
-        let intent =
-            serde_json::to_vec(&json!({"previous_fingerprint":fingerprint, "skills":[old]}))
-                .unwrap();
-        fs::write(&intent_path, &intent).unwrap();
-        fs::set_permissions(&intent_path, fs::Permissions::from_mode(0o600)).unwrap();
-        let key_path = base.join("state/signing-key.pk8");
-        let key = fs::read(&key_path).unwrap();
-        let activation_path = old.join(".skill-meta/activation.json");
-        let activation = fs::read(&activation_path).unwrap();
-        let narrowed = service(&base, &[base.join("new")]);
-        let environment = Arc::new(NeverResolve(AtomicUsize::new(0)));
-        let executor =
-            SkillSecExecutor::new(narrowed.clone()).with_environment(environment.clone());
-        for (uid, command) in [
-            (1001, json!({"command":"rotate-keys"})),
-            (
-                1001,
-                json!({"command":"init","forceKeys":true,"baseline":false}),
-            ),
-            (
-                0,
-                json!({"command":"init","forceKeys":true,"baseline":true}),
-            ),
-        ] {
-            let outcome = executor.execute(
-                &ExecutionControl {
-                    deadline: Instant::now() + Duration::from_secs(10),
-                    cancelled: false,
-                },
-                &SkillSecRequest {
-                    command: serde_json::from_value(command).unwrap(),
-                    caller_uid: uid,
-                },
-            );
-            assert_eq!(outcome.error_type, "PermissionDenied", "{outcome:?}");
-        }
-        assert_eq!(environment.0.load(Ordering::SeqCst), 0);
-        assert_eq!(fs::read(&intent_path).unwrap(), intent);
-        assert_eq!(fs::read(&key_path).unwrap(), key);
-        assert_eq!(fs::read(&activation_path).unwrap(), activation);
-        let outcome = SkillSecExecutor::new(narrowed).execute(
-            &ExecutionControl {
-                deadline: Instant::now() + Duration::from_secs(10),
-                cancelled: false,
-            },
-            &SkillSecRequest {
-                command: serde_json::from_value(resume).unwrap(),
-                caller_uid: 0,
-            },
-        );
-        assert!(outcome.success, "{outcome:?}");
-        assert!(!intent_path.exists());
-        assert_ne!(fs::read(&key_path).unwrap(), key);
-    }
-}
-
-#[test]
 fn configured_unregistered_skill_is_shown_as_managed_without_registration() {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
@@ -376,7 +307,7 @@ fn configured_unregistered_skill_is_shown_as_managed_without_registration() {
     assert!(outcome.success, "{outcome:?}");
     assert_eq!(outcome.data["output"]["managed"], true);
     assert_eq!(outcome.data["output"]["latestStatus"], "none");
-    assert!(service.managed_skills().unwrap().is_empty());
+    assert!(!base.join("state/managed-skills.json").exists());
     assert!(!root.join(".skill-meta").exists());
 }
 
@@ -478,7 +409,7 @@ fn partial_discovery_keeps_results_reports_failure_and_never_audits_pass() {
             );
         }
     }
-    // Rotation with baseline discovery errors must leave the existing key untouched.
+    // Unsupported replacement is rejected before partial baseline discovery.
     let service = service_with_defaults(&base, &[], &[good, blocked]);
     let deadline = Instant::now() + Duration::from_secs(10);
     let before = service.key_status(deadline).unwrap();
@@ -518,7 +449,7 @@ fn entirely_failed_discovery_does_not_create_keys() {
 }
 
 #[test]
-fn default_budget_does_not_truncate_explicit_or_registered_skills() {
+fn default_budget_does_not_truncate_explicit_or_remembered_skills() {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
     let parent = base.join("skills");
@@ -545,12 +476,9 @@ fn default_budget_does_not_truncate_explicit_or_registered_skills() {
     ));
     assert_eq!(explicit.skills.len(), 1025);
     assert!(explicit.errors.is_empty());
-    let registry = base.join("state/managed-skills.json");
-    fs::write(&registry, serde_json::to_vec(&skills).unwrap()).unwrap();
-    fs::set_permissions(&registry, fs::Permissions::from_mode(0o600)).unwrap();
-    let registered = discover(service_with_defaults(&base, &[], &[pattern]));
-    assert_eq!(registered.skills.len(), 1025);
-    assert!(registered.errors.is_empty());
+    let remembered = discover(service_with_defaults(&base, &skills, &[pattern]));
+    assert_eq!(remembered.skills.len(), 1025);
+    assert!(remembered.errors.is_empty());
 }
 
 #[test]
@@ -703,4 +631,36 @@ fn startup_scan_is_internal_and_preserves_deny_verdict() {
         panic!("expected completed projection")
     };
     assert_eq!(result["verdict"], "deny");
+}
+
+#[test]
+fn rotation_requests_are_rejected_before_resolution_or_writes() {
+    for initialized in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let root = skill(base.join("skill"));
+        let service = service(&base, std::slice::from_ref(&root));
+        if initialized {
+            service.initialize().unwrap();
+        }
+        let key = fs::read(base.join("state/signing-key.pk8")).ok();
+        let environment = Arc::new(NeverResolve(AtomicUsize::new(0)));
+        let executor = SkillSecExecutor::new(service).with_environment(environment.clone());
+        for uid in [0, 1001] {
+            for command in [
+                json!({"command":"rotate-keys"}),
+                json!({"command":"init","forceKeys":true,"baseline":false}),
+                json!({"command":"init","forceKeys":true,"baseline":true,"skillDirs":[root]}),
+            ] {
+                let outcome = run_as(&executor, command, uid);
+                assert_eq!(outcome.error_type, "NotImplementedError", "{outcome:?}");
+                assert_eq!(outcome.exit_code, 1);
+                assert_eq!(fs::read(base.join("state/signing-key.pk8")).ok(), key);
+            }
+        }
+        assert_eq!(environment.0.load(Ordering::SeqCst), 0);
+        assert!(!root.join(".skill-meta").exists());
+        assert!(!base.join("state/key-rotation.json").exists());
+        assert!(!base.join("state/managed-skills.json").exists());
+    }
 }

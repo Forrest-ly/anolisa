@@ -18,6 +18,11 @@
 //! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 
+#[cfg(test)]
+#[path = "unified/capture_runtime_tests.rs"]
+mod capture_runtime_tests;
+#[path = "unified/completion.rs"]
+mod completion;
 #[path = "unified/delivery.rs"]
 mod delivery;
 #[path = "unified/maintenance.rs"]
@@ -36,7 +41,7 @@ use std::time::Duration;
 use agentsight_sqlite_lifecycle::LifecycleError;
 use agentsight_trajectory_collector::TrajectoryStore;
 
-use crate::aggregator::Aggregator;
+use crate::aggregator::{AggregatedResult, Aggregator};
 use crate::analyzer::Analyzer;
 use crate::config::AgentsightConfig;
 use crate::database::{
@@ -50,13 +55,31 @@ use crate::genai::{GenAIBuilder, GenAIExporter, LogtailExporter};
 use crate::interruption::{
     DetectorConfig, InterruptionDetector, ProcessExitStatus, recover_oom_events,
 };
-use crate::parser::Parser;
-use crate::probes::{ChannelWatermarks, FileWatchEvent, FileWriteEvent, Probes, ProbesPoller};
+use crate::pipeline_core::PipelineCore;
+use crate::probes::{ChannelWatermarks, FileWatchEvent, FileWriteEvent};
+#[cfg(not(test))]
+use crate::probes::{Probes, ProbesPoller};
 use crate::response_map::ResponseSessionMapper;
 use crate::runtime_metrics::{MetricsFileExporter, RuntimeMetrics, record_event_received};
 use crate::storage::sqlite::{GenAISqliteStore, InterruptionStore};
 use crate::storage::{SqliteConfig, Storage, TimePeriod, TokenQuery, TokenQueryResult};
 use crate::tokenizer::LlmTokenizer;
+#[cfg(test)]
+use capture_runtime_tests::{TestPoller as ProbesPoller, TestProbes as Probes};
+
+/// Minimal SSL-attach surface used by [`AgentSight::attach_if_agent_name_unknown`].
+///
+/// Implemented for the real probe manager and, in tests, for stubs so the
+/// "unknown agent name" decision can be exercised without kernel probes.
+pub(crate) trait SslProbe {
+    fn attach_ssl(&mut self, pid: i32);
+}
+
+impl SslProbe for Probes {
+    fn attach_ssl(&mut self, pid: i32) {
+        let _ = self.attach_process(pid);
+    }
+}
 
 /// Main AgentSight struct for tracing AI agent activity
 ///
@@ -70,12 +93,8 @@ use crate::tokenizer::LlmTokenizer;
 pub struct AgentSight {
     /// BPF probes manager
     probes: Probes,
-    /// Message parser (unified)
-    parser: Parser,
-    /// Event aggregator (unified)
-    aggregator: Aggregator,
-    /// Unified analyzer
-    analyzer: Analyzer,
+    /// Probe-independent parsing, correlation, and analysis.
+    core: PipelineCore,
     /// GenAI semantic builder
     genai_builder: GenAIBuilder,
     /// Pluggable GenAI event exporters (JSONL, SLS, etc.)
@@ -103,6 +122,8 @@ pub struct AgentSight {
     response_mapper: ResponseSessionMapper,
     /// Pending GenAI events awaiting session resolution or retrying a local write.
     pending_genai: PendingGenAiQueue,
+    /// Own raw completions and their shared CPU admission budget before analysis.
+    completions: completion::CompletionScheduler,
     /// Calls exported with a fallback session_id after the deferral window
     /// timed out, keyed by pid, awaiting a late FileWrite mapping for
     /// retroactive session fix-up (issue #2059).
@@ -442,7 +463,7 @@ impl AgentSight {
             // ensure_default_agents_config handles both cases:
             // - File missing: creates it with the embedded default.
             // - File exists: checks schema_version; if outdated, backs up and
-            //   overwrites with the current default.
+            //   shallow-merges user top-level sections over the current defaults.
             let load_result = match crate::config::ensure_default_agents_config(&path) {
                 Ok(()) => config.load_from_file(&path),
                 Err(e) => Err(e),
@@ -607,6 +628,10 @@ impl AgentSight {
                 result.pid,
                 agent_name.as_deref().unwrap_or("unknown"),
             );
+            // Best-effort attach for processes without a recognized agent name:
+            // the first TLS connection may arrive before a later connection
+            // scan identifies the agent.
+            Self::attach_if_agent_name_unknown(&mut probes, agent_name.as_deref(), result.pid);
         }
         if !conn_results.is_empty() {
             log::info!(
@@ -825,6 +850,12 @@ impl AgentSight {
         };
 
         let mut maintenance_jobs = Vec::new();
+        let cpu_budget = (config.runtime_limits.cpu_budget_percent != 0)
+            .then(|| {
+                crate::utils::cpu_budget::CpuBudget::new(config.runtime_limits.cpu_budget_percent)
+            })
+            .transpose()?
+            .map(Arc::new);
         // Global capacity budget shared by every maintenance job: each job
         // re-evaluates its effective size limit right before running.
         let storage_budget = Arc::new(crate::storage_budget::StorageBudget::new(
@@ -839,18 +870,38 @@ impl AgentSight {
             let target = database_manager.open_read_write(DatabaseId::Primary, |db_path| {
                 Self::create_storage(db_path, &config)
             })?;
+            storage.use_managed_checkpoints()?;
+            target.use_managed_checkpoints()?;
             let budget = Arc::clone(&storage_budget);
             let own_limit_mb = config.storage.primary.max_db_size_mb;
-            maintenance_jobs.push(database_manager.maintenance_job(
+            let paced = cpu_budget.is_some();
+            let mut cursor = crate::storage::MaintenanceCursor::default();
+            let mut pass_limit: Option<u64> = None;
+            maintenance_jobs.push(database_manager.maintenance_job_with_checkpoints(
                 DatabaseId::Primary,
                 Duration::from_secs(config.storage.primary.check_interval_secs),
-                move || {
-                    let limit_mb = budget.effective_limit_mb(DatabaseId::Primary, own_limit_mb);
-                    target
-                        .maintain_with_limit_bytes(limit_mb.saturating_mul(1024 * 1024))
-                        .map_err(|error| {
-                            LifecycleError::MaintenanceJobFailed(format!("primary: {error:#}"))
-                        })
+                cpu_budget.clone(),
+                move |cleanup| {
+                    let result = if cleanup {
+                        let limit_mb = *pass_limit.get_or_insert_with(|| {
+                            budget.effective_limit_mb(DatabaseId::Primary, own_limit_mb)
+                        });
+                        if paced {
+                            target.maintain_step(limit_mb.saturating_mul(1024 * 1024), &mut cursor)
+                        } else {
+                            target
+                                .maintain_with_limit_bytes(limit_mb.saturating_mul(1024 * 1024))
+                                .map(|_| true)
+                        }
+                    } else {
+                        target.checkpoint_passive().map(|_| true)
+                    };
+                    if cleanup && matches!(result, Ok(true)) {
+                        pass_limit = None;
+                    }
+                    result.map_err(|error| {
+                        LifecycleError::MaintenanceJobFailed(format!("primary: {error:#}"))
+                    })
                 },
             )?);
         }
@@ -860,14 +911,35 @@ impl AgentSight {
             let target = database_manager.open_read_write(DatabaseId::GenAi, |path| {
                 GenAISqliteStore::open_maintenance_existing(path, config.storage.genai, capture)
             })?;
+            capture.use_managed_checkpoints().map_err(|error| {
+                anyhow::anyhow!("Failed to configure GenAI capture checkpoints: {error}")
+            })?;
             let budget = Arc::clone(&storage_budget);
             let own_limit_mb = config.storage.genai.max_db_size_mb;
-            maintenance_jobs.push(database_manager.maintenance_job(
+            let paced = cpu_budget.is_some();
+            let mut cursor = crate::storage::sqlite::genai::MaintenanceCursor::default();
+            let mut pass_limit: Option<u64> = None;
+            maintenance_jobs.push(database_manager.maintenance_job_with_checkpoints(
                 DatabaseId::GenAi,
                 Duration::from_secs(config.storage.genai.check_interval_secs),
-                move || {
-                    let limit_mb = budget.effective_limit_mb(DatabaseId::GenAi, own_limit_mb);
-                    target.maintain_with_limit_mb(limit_mb).map_err(|error| {
+                cpu_budget.clone(),
+                move |cleanup| {
+                    let result = if cleanup {
+                        let limit_mb = *pass_limit.get_or_insert_with(|| {
+                            budget.effective_limit_mb(DatabaseId::GenAi, own_limit_mb)
+                        });
+                        if paced {
+                            target.maintain_step(limit_mb, &mut cursor)
+                        } else {
+                            target.maintain_with_limit_mb(limit_mb).map(|_| true)
+                        }
+                    } else {
+                        target.checkpoint_passive().map(|_| true)
+                    };
+                    if cleanup && matches!(result, Ok(true)) {
+                        pass_limit = None;
+                    }
+                    result.map_err(|error| {
                         LifecycleError::MaintenanceJobFailed(format!("genai: {error}"))
                     })
                 },
@@ -918,6 +990,12 @@ impl AgentSight {
         }
         database_manager.start_maintenance(maintenance_jobs)?;
 
+        // Configure the metrics exporter before any auxiliary thread starts:
+        // a failure here used to return after those threads were spawned, and
+        // their clones of `running` stayed true forever.
+        let metrics_exporter = MetricsFileExporter::from_env()
+            .context("failed to configure AgentSight runtime metrics export")?;
+
         // Start auxiliary threads only after every fallible database target and
         // the maintenance worker are ready, so constructor errors cannot leave
         // detached workers observing a permanently-true running flag.
@@ -940,8 +1018,6 @@ impl AgentSight {
             Arc::clone(&resource_targets),
             Arc::clone(&running),
         );
-        let metrics_exporter = MetricsFileExporter::from_env()
-            .context("failed to configure AgentSight runtime metrics export")?;
 
         // Trajectory collector (Qoder/QoderWork JSONL → ATIF → trajectories.db).
         // Feature-gated (default off); the thread shares `running` as stop flag.
@@ -973,15 +1049,7 @@ impl AgentSight {
 
         Ok(AgentSight {
             probes,
-            // The configured header cap governs which HTTP/1 messages the
-            // parser accepts; messages beyond the cap fall to the raw-data
-            // path instead of being parsed. The aggregator gets the same cap
-            // so its re-parse sites (1xx chains, byte assembly) never hold
-            // assembled messages to a limit the parser already accepted.
-            parser: Parser::with_max_headers(config.max_headers),
-            aggregator: Aggregator::with_limits(config.connection_capacity, &config.runtime_limits)
-                .with_http_max_headers(config.max_headers),
-            analyzer,
+            core: PipelineCore::new(&config, analyzer),
             genai_builder: GenAIBuilder::new(),
             genai_exporters,
             genai_sqlite_store,
@@ -1003,6 +1071,7 @@ impl AgentSight {
                 ResponseSessionMapper::disabled()
             },
             pending_genai: PendingGenAiQueue::default(),
+            completions: completion::CompletionScheduler::new(cpu_budget),
             // RETRO_FIXUP_CAPACITY is a non-zero constant, so the unwrap is
             // guaranteed unreachable.
             retro_session_fixup: lru::LruCache::new(
@@ -1069,6 +1138,23 @@ impl AgentSight {
     pub fn attach_process(&mut self, pid: u32, agent_name: &str) {
         Self::register_resource_targets(&self.resource_targets, pid, agent_name);
         Self::attach_process_internal(&mut self.probes, pid, agent_name);
+    }
+
+    /// Attach SSL probes best-effort when the process has no recognized agent
+    /// name yet.
+    ///
+    /// `Probes::attach_process` already logs the degrade path and registers the
+    /// pid for global uprobe coverage, so a failure is not fatal here.  The
+    /// decision lives in this helper so it stays unit-testable without live
+    /// eBPF probes: the surrounding scan loops still need a real `Probes`.
+    fn attach_if_agent_name_unknown<P: SslProbe>(
+        probes: &mut P,
+        agent_name: Option<&str>,
+        pid: u32,
+    ) {
+        if agent_name.is_none() {
+            probes.attach_ssl(pid as i32);
+        }
     }
 
     fn register_resource_targets(
@@ -1322,9 +1408,11 @@ impl AgentSight {
                 );
                 if let Err(e) = self.probes.attach_process(dns_event.pid as i32) {
                     log::warn!("[UDP-DNS] Failed to attach to pid={}: {}", dns_event.pid, e);
-                } else if let Some(agent_name) =
-                    Self::conn_scan_agent_name(&self.scanner, dns_event.pid)
-                {
+                }
+                // Resolve/register the agent name regardless of the attach
+                // result so the resource target is recorded even when the
+                // uprobe attach degrades.
+                if let Some(agent_name) = Self::conn_scan_agent_name(&self.scanner, dns_event.pid) {
                     self.pid_agent_name_cache
                         .put(dns_event.pid, agent_name.clone());
                     if let Ok(mut targets) = self.resource_targets.write() {
@@ -1368,18 +1456,7 @@ impl AgentSight {
             return Some(self.event_count);
         }
 
-        if let Event::Ssl(ref ssl) = event {
-            if let Some(results) = self.aggregator.process_sse_capture(ssl) {
-                self.process_aggregated_results(results);
-                return Some(self.event_count);
-            }
-        }
-        // Parse the event
-        let result = self.parser.parse_event(event);
-
-        // Process messages through aggregator
-        let aggregated_results = self.aggregator.process_result(result);
-
+        let aggregated_results = self.core.process_event(event);
         self.process_aggregated_results(aggregated_results);
 
         Some(self.event_count)
@@ -1405,9 +1482,14 @@ impl AgentSight {
                     let agent_name = agent.agent_info.name.clone();
                     self.pid_agent_name_cache.put(*pid, agent_name.clone());
                     self.attach_process(*pid, &agent_name);
+                    return;
                 }
+                // Unknown process: attach best-effort so a first TLS connection
+                // is captured before any scan classifies it.
+                Self::attach_if_agent_name_unknown(&mut self.probes, None, *pid);
             }
             ProcMonEvent::Exit { pid, exit_code, .. } => {
+                self.flush_completions_for_pid(*pid);
                 if let Ok(mut targets) = self.resource_targets.write() {
                     targets.remove(pid);
                 }
@@ -1418,10 +1500,10 @@ impl AgentSight {
                     self.handle_agent_crash_detection(*pid, &agent_name, *exit_code);
                 } else {
                     self.flush_deferred_genai_for_pid(*pid);
-                    let removed = self.aggregator.drain_connections_for_pid(*pid);
-                    self.aggregator.queue_removed(removed);
+                    let removed = self.core.aggregator_mut().drain_connections_for_pid(*pid);
+                    self.core.aggregator_mut().queue_removed(removed);
                 }
-                let results = self.aggregator.tick(std::time::Instant::now());
+                let results = self.core.tick(std::time::Instant::now());
                 self.process_aggregated_results(results);
             }
         }
@@ -1477,9 +1559,11 @@ impl AgentSight {
             }
         }
 
+        self.flush_completions();
         // On shutdown, flush all remaining pending events with fallback session_id
-        let abandoned = self.aggregator.drain_pending();
+        let abandoned = self.core.drain_pending();
         self.process_aggregated_results(abandoned);
+        self.flush_completions();
         self.flush_all_pending_genai();
         self.export_final_runtime_metrics();
 
@@ -1498,8 +1582,10 @@ impl AgentSight {
             log::warn!("Agent resource sampler panicked during shutdown");
         }
         // Flush all pending GenAI events before exit
-        let abandoned = self.aggregator.drain_pending();
+        self.flush_completions();
+        let abandoned = self.core.drain_pending();
         self.process_aggregated_results(abandoned);
+        self.flush_completions();
         self.flush_all_pending_genai();
         self.export_final_runtime_metrics();
         // Checkpoint genai_events.db WAL so -wal/-shm are cleaned up on exit
@@ -1540,7 +1626,8 @@ impl AgentSight {
     /// `pub(crate)` because `FfiEventSender` is a crate-internal type and the
     /// only caller lives in this crate's FFI layer.
     pub(crate) fn set_ffi_sender(&mut self, sender: FfiEventSender) {
-        self.aggregator
+        self.core
+            .aggregator_mut()
             .set_compact_sse(!sender.raw_https_enabled() && !self.runtime_limits.retain_raw_sse);
         self.ffi_sender = Some(sender);
     }
@@ -1578,6 +1665,16 @@ impl AgentSight {
     /// method updates it via `complete_pending` and avoids double-writing by
     /// skipping the SQLite exporter in the fan-out.
     fn complete_and_export_deferred_genai(&mut self, events: crate::genai::DeferredPayload) {
+        let budget = self.completions.budget.clone();
+        let _permit = budget.as_ref().and_then(|budget| {
+            match budget.acquire(crate::utils::cpu_budget::WorkClass::Capture) {
+                Ok(permit) => Some(permit),
+                Err(error) => {
+                    log::error!("CPU pacing failed during deferred delivery: {error}");
+                    None
+                }
+            }
+        });
         let events = events.into_events();
         complete_deferred_genai(
             &events,
@@ -1653,7 +1750,7 @@ impl AgentSight {
                                     llm_call.agent_name.as_deref(),
                                     Some(llm_call.pid),
                                     llm_call.end_timestamp_ns as i64,
-                                    &recent,
+                                    recent.as_deref(),
                                 ) {
                                     let _ = istore.insert(&loop_event);
                                     log::warn!(
@@ -1763,8 +1860,24 @@ impl AgentSight {
             }
         }
 
-        // 1. Drain in-flight connections for this PID from the aggregator
-        let drained = self.aggregator.drain_connections_for_pid(pid);
+        // 1. Drain in-flight connections for this PID from the aggregator.
+        // Before that: on a clean exit, complete the pid's in-flight
+        // responses whose headers were captured but whose declared body never
+        // arrived (#7553 — e.g. an HTTP client that inspects only the status
+        // and never reads the body). Routing them through the normal build
+        // path lands usable `complete` rows; a crashed process skips this and
+        // keeps the interrupted-evidence drain below untouched.
+        if ProcessExitStatus::decode(raw_exit_code).is_clean() {
+            for pair in self
+                .core
+                .aggregator_mut()
+                .complete_pid_partial_responses(pid)
+            {
+                self.complete_drained_pair(&pair);
+            }
+        }
+
+        let drained = self.core.aggregator_mut().drain_connections_for_pid(pid);
 
         // 2. Persist drained connections as pending calls
         if let Some(ref store) = self.genai_sqlite_store {
@@ -1788,7 +1901,7 @@ impl AgentSight {
             }
         }
 
-        self.aggregator.queue_removed(drained);
+        self.core.aggregator_mut().queue_removed(drained);
 
         // 3. Query all pending calls for this PID (including any persisted earlier)
         let Some(pending_calls) =
@@ -1835,15 +1948,17 @@ impl AgentSight {
         let builder = &self.genai_builder;
         let mapper = &self.response_mapper;
         let cache = &self.pid_agent_name_cache;
-        self.aggregator.snapshot_idle_connections(|id, request| {
-            let mut pending = builder.build_pending_from_request(request, id, mapper, cache)?;
-            pending.pending_origin = crate::storage::sqlite::PendingOrigin::IdleDrain;
-            if let Err(error) = store.insert_pending(&pending) {
-                log::warn!("[IdleDrain] Failed to persist pending call: {error}");
-                return None;
-            }
-            Some(())
-        });
+        self.core
+            .aggregator_mut()
+            .snapshot_idle_connections(|id, request| {
+                let mut pending = builder.build_pending_from_request(request, id, mapper, cache)?;
+                pending.pending_origin = crate::storage::sqlite::PendingOrigin::IdleDrain;
+                if let Err(error) = store.insert_pending(&pending) {
+                    log::warn!("[IdleDrain] Failed to persist pending call: {error}");
+                    return None;
+                }
+                Some(())
+            });
     }
 
     /// Drain aggregator connections whose PID is no longer alive and persist
@@ -1855,12 +1970,12 @@ impl AgentSight {
         }
         self.last_drain_check = std::time::Instant::now();
 
-        let drained = self.aggregator.drain_dead_pid_connections();
+        let drained = self.core.aggregator_mut().drain_dead_pid_connections();
         if drained.is_empty() {
             return;
         }
         if self.genai_sqlite_store.is_none() {
-            self.aggregator.queue_removed(drained);
+            self.core.aggregator_mut().queue_removed(drained);
             return;
         }
 
@@ -2041,7 +2156,7 @@ impl AgentSight {
             }
         }
 
-        self.aggregator.queue_removed(drained);
+        self.core.aggregator_mut().queue_removed(drained);
 
         // ── OOM detection for dead PIDs ──────────────────────────────────────
         // After persisting pending calls for dead PIDs, check if any were OOM-killed.
@@ -2198,6 +2313,34 @@ impl AgentSight {
         }
     }
 
+    /// Build and persist a completed aggregation from the dead-pid / clean-exit
+    /// paths (#7553).
+    ///
+    /// Mirrors the immediate-completion branch of the event loop, but never
+    /// re-enters the deferral queue: the owning pid is gone, so the FileWrite
+    /// that could resolve a deferred session mapping can never arrive. The
+    /// session_id falls back to the response_id-derived id, exactly like the
+    /// deferred-timeout flush.
+    fn complete_drained_pair(&mut self, agg_result: &AggregatedResult) {
+        let analysis_results = self.core.analyze_aggregated(agg_result);
+        let (output, mut pending_info) = self.genai_builder.build_with_pending(
+            &analysis_results,
+            &self.response_mapper,
+            &self.pid_agent_name_cache,
+        );
+        if output.events.is_empty() {
+            return;
+        }
+        persist_drained_genai_events(
+            pending_info.as_mut(),
+            &output.events,
+            self.genai_sqlite_store.as_deref(),
+            &self.genai_exporters,
+            self.ffi_sender.as_ref(),
+        );
+        self.detect_and_store_interruptions(&output.events);
+    }
+
     /// Immediately flush deferred GenAI events belonging to an exited process.
     ///
     /// The deferral window only exists to wait for a FileWrite event to
@@ -2219,17 +2362,17 @@ impl AgentSight {
 
     /// Get reference to aggregator
     pub fn aggregator(&self) -> &Aggregator {
-        &self.aggregator
+        self.core.aggregator()
     }
 
     /// Get mutable reference to aggregator
     pub fn aggregator_mut(&mut self) -> &mut Aggregator {
-        &mut self.aggregator
+        self.core.aggregator_mut()
     }
 
     /// Get reference to analyzer
     pub fn analyzer(&self) -> &Analyzer {
-        &self.analyzer
+        self.core.analyzer()
     }
 
     /// Get reference to storage
@@ -2293,7 +2436,14 @@ impl AgentSight {
     /// If pending GenAI queue exceeds count or byte limits, flush the oldest
     /// entries with the fallback session_id to prevent unbounded memory growth.
     fn enforce_pending_genai_limits(&mut self) {
-        for events in self.pending_genai.enforce_limits(&self.runtime_limits) {
+        let mut limits = self.runtime_limits;
+        limits.pending_genai_max_bytes = limits
+            .pending_genai_max_bytes
+            .saturating_sub(self.completions.bytes);
+        limits.pending_genai_max_count = limits
+            .pending_genai_max_count
+            .saturating_sub(self.completions.len());
+        for events in self.pending_genai.enforce_limits(&limits) {
             self.complete_and_export_deferred_genai(events);
         }
     }
@@ -2336,7 +2486,7 @@ impl AgentSight {
 
     fn runtime_metrics(&self) -> Result<RuntimeMetrics> {
         let channel = self.probes.channel_watermarks();
-        let connections = self.aggregator.connection_metrics();
+        let connections = self.core.aggregator().connection_metrics();
         Ok(RuntimeMetrics {
             event_channel_bytes: channel.in_flight_bytes as u64,
             event_channel_budget_bytes: channel.budget_bytes as u64,
@@ -2344,8 +2494,13 @@ impl AgentSight {
             channel_dropped: self.probes.channel_dropped() as u64,
             ring_buffer_dropped: self.probes.ring_buffer_dropped()?,
             connection_cache_bytes: connections.connection_cache_bytes as u64,
-            pending_genai_count: self.pending_genai.len() as u64,
-            pending_genai_bytes: self.pending_genai.bytes as u64,
+            pending_genai_count: (self.pending_genai.len() + self.completions.len()) as u64,
+            pending_genai_bytes: self
+                .pending_genai
+                .bytes
+                .saturating_add(self.completions.bytes) as u64,
+            completion_queue_count: self.completions.len() as u64,
+            completion_queue_bytes: self.completions.bytes as u64,
             pending_connection_count: connections.pending_connection_count as u64,
             pending_connection_bytes: connections.pending_connection_bytes as u64,
             eviction_count: connections.eviction_count,
@@ -2698,6 +2853,63 @@ fn detail_error_key(ie: &crate::interruption::InterruptionEvent) -> Option<Strin
         .map(str::to_owned)
 }
 
+/// Persist and export one drained pair's built events (#7553).
+///
+/// Extracted from `complete_drained_pair` so the clean-exit completion path
+/// is unit-testable without constructing a full `AgentSight`.
+fn persist_drained_genai_events(
+    mut info: Option<&mut crate::storage::sqlite::PendingCallInfo>,
+    events: &[GenAISemanticEvent],
+    store: Option<&GenAISqliteStore>,
+    exporters: &[Box<dyn GenAIExporter>],
+    ffi_sender: Option<&FfiEventSender>,
+) {
+    // Stamp the provenance so dashboards can tell "fully captured" apart from
+    // "partial body completed at process exit" (#7716 review). This is the
+    // only path that persists a #7553 drained pair.
+    if let Some(info) = info.as_deref_mut() {
+        info.pending_origin = crate::storage::sqlite::PendingOrigin::CleanExitPartial;
+    }
+    match (info, store) {
+        (Some(info), Some(store)) => {
+            if let Err(e) = store.insert_pending(info) {
+                log::warn!(
+                    "Failed to insert drained pending call {}: {}",
+                    info.call_id,
+                    e
+                );
+            }
+            for event in events {
+                if let Err(e) = store.complete_pending(event) {
+                    log::warn!("Failed to complete drained pending call: {e}");
+                }
+            }
+            // SQLite already has the events; only the other exporters need them.
+            for exporter in exporters {
+                if exporter.name() != "sqlite" {
+                    exporter.export(events);
+                }
+            }
+            if let Some(sender) = ffi_sender {
+                for event in events {
+                    if let GenAISemanticEvent::LLMCall(call) = event {
+                        sender.send_llm(call.clone());
+                    }
+                }
+            }
+        }
+        // No SQLite store (or no pending info): fall back to plain export,
+        // which suppresses exporters under FFI mode exactly like the live path.
+        _ => {
+            if ffi_sender.is_none() {
+                for exporter in exporters {
+                    exporter.export(events);
+                }
+            }
+        }
+    }
+}
+
 /// Store one detected interruption: message-matched dedup, the insert, the
 /// logtail export, the per-call `genai_events` stamp, and the RetryStorm
 /// threshold.
@@ -3046,6 +3258,10 @@ fn watermark_report(marks: ChannelWatermarks, pending_genai: usize) -> (bool, St
     report.push_str(&format!(", pending_genai {pending_genai} entries"));
     (needs_attention, report)
 }
+
+#[cfg(test)]
+#[path = "unified/attach_early_tests.rs"]
+mod attach_early_tests;
 
 #[cfg(test)]
 mod response_pending_tests;

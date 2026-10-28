@@ -11,12 +11,20 @@ use crate::config::default_cmdline_rules;
 use crate::discovery::matcher::{CmdlineGlobMatcher, ProcessContext};
 use std::borrow::Cow;
 
-/// LLM call classification: Main (normal), Recap (compaction/summary), WebSearch.
+/// LLM call classification: Main (normal), Recap (compaction/summary),
+/// Analyzer (cosh-ng background analyzer), WebSearch.
+///
+/// Analyzer is split from Recap (#2750, #7271): the cosh-ng personal analyzer
+/// runs as a standalone background session whose rows are row-identical to a
+/// qwen in-session recap once the main call is missed. Giving it its own kind
+/// lets the session predicate admit recap-only user sessions while keeping
+/// analyzer-only background sessions hidden.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(super) enum CallKind {
     Main,
     Recap,
+    Analyzer,
     WebSearch,
 }
 
@@ -25,6 +33,7 @@ impl CallKind {
         match self {
             CallKind::Main => "main",
             CallKind::Recap => "recap",
+            CallKind::Analyzer => "analyzer",
             CallKind::WebSearch => "web_search",
         }
     }
@@ -96,11 +105,13 @@ pub(super) fn classify_call_kind(request: &LLMRequest) -> CallKind {
         {
             return CallKind::Recap;
         }
-        // Cosh-shell personal analyzer background summary (#2750): fixed
-        // prompt from cosh-ng recommendation/personal_analyzer.rs; runs in a
-        // setsid child process, must not surface as a user session.
+        // Cosh-shell personal analyzer background summary (#2750, #7271):
+        // fixed prompt from cosh-ng recommendation/personal_analyzer.rs; runs
+        // in a setsid child process with its own session_id. Split from Recap
+        // so the session predicate can admit recap-only user sessions while
+        // analyzer-only background sessions stay hidden.
         if text.starts_with("Summarize only grounded work into the supplied JSON schema") {
-            return CallKind::Recap;
+            return CallKind::Analyzer;
         }
         // QwenCode memory extraction subagent
         if text.starts_with("Managed memory has TWO directories") {
@@ -184,10 +195,15 @@ pub(super) fn classify_call_kind_from_raw(
             && first_user_text.contains("Do NOT call any tools"))
         || first_user_text.starts_with("Managed memory has TWO directories")
         || first_user_text.starts_with("[SUGGESTION MODE:")
-        // Cosh-shell personal analyzer background summary (#2750)
-        || first_user_text.starts_with("Summarize only grounded work into the supplied JSON schema")
     {
         "recap"
+    } else if first_user_text
+        .starts_with("Summarize only grounded work into the supplied JSON schema")
+    {
+        // Cosh-shell personal analyzer background summary (#2750, #7271):
+        // own kind so recap-only user sessions can materialize while
+        // analyzer-only background sessions stay hidden.
+        "analyzer"
     } else if first_user_text.contains("Perform a web search for the query:") {
         "web_search"
     } else {
@@ -246,6 +262,11 @@ impl GenAIBuilder {
     /// - Plain string: `"content": "text"`.
     /// - Array of content blocks with type `text` / `input_text` / `output_text`:
     ///   `"content": [{"type":"input_text","text":"..."}]`.
+    /// - The DashScope/Bailian native multimodal shape, whose blocks carry no
+    ///   `type` at all: `"content": [{"text":"..."},{"image":"..."}]`. The
+    ///   native response path and `parse_request_body` already accept any
+    ///   block with a `text` field, so the drain path must too; a typed
+    ///   non-text block (`{"type":"image","text":...}`) is still ignored.
     pub(super) fn extract_message_text(message: &serde_json::Value) -> Option<String> {
         let c = message.get("content")?;
         if let Some(s) = c.as_str() {
@@ -256,13 +277,11 @@ impl GenAIBuilder {
         if let Some(arr) = c.as_array() {
             let text: String = arr
                 .iter()
-                .filter_map(|item| {
-                    let ty = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    if matches!(ty, "text" | "input_text" | "output_text") {
+                .filter_map(|item| match item.get("type").and_then(|t| t.as_str()) {
+                    None | Some("text" | "input_text" | "output_text") => {
                         item.get("text").and_then(|t| t.as_str())
-                    } else {
-                        None
                     }
+                    Some(_) => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -284,10 +303,18 @@ impl GenAIBuilder {
     /// as provider `unknown` — while the audit labels the same path `gemini`
     /// through `MessageParser::detect_provider`, so one call had two
     /// identities.
+    ///
+    /// The bare spacings the row gate admits (`/chat/completions`,
+    /// `/completions`, which is what a gateway whose base URL carries no
+    /// `/v1` requests) are admitted here for the same reason: the deep parse
+    /// accepts them, so a bare-path call whose body never parsed must not fall
+    /// through to the token record and end up `unknown`.
     pub(super) fn extract_provider_from_path(&self, path: &str) -> Option<String> {
         if path.contains("anthropic") || path.contains("/v1/messages") {
             Some("anthropic".to_string())
-        } else if path.contains("/v1/chat/completions")
+        } else if path.contains("/chat/completions")
+            || path.contains("/completions")
+            || path.contains("/v1/chat/completions")
             || path.contains("/v1/completions")
             || path.contains("/v1/responses")
         {
@@ -747,9 +774,11 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_cosh_personal_analyzer_recap() {
+    fn test_classify_cosh_personal_analyzer_analyzer() {
         // cosh-shell personal analyzer background summary: fixed prompt from
-        // cosh-ng recommendation/personal_analyzer.rs build_fixed_prompt (#2750).
+        // cosh-ng recommendation/personal_analyzer.rs build_fixed_prompt
+        // (#2750). Own kind (#7271): must not surface as a user session even
+        // when recap-only sessions materialize.
         let req = make_llm_request(vec![InputMessage {
             role: "user".to_string(),
             parts: vec![MessagePart::Text {
@@ -757,7 +786,7 @@ mod tests {
             }],
             name: None,
         }]);
-        assert_eq!(classify_call_kind(&req), CallKind::Recap);
+        assert_eq!(classify_call_kind(&req), CallKind::Analyzer);
     }
 
     #[test]
@@ -851,6 +880,33 @@ mod tests {
             Some("sysom".to_string())
         );
         assert_eq!(builder.extract_provider_from_path("/unknown"), None);
+    }
+
+    /// The row gate (`parser::llm::is_llm_api_path`) and the deep parse
+    /// (`MessageParser::detect_provider`) both admit the bare spellings a
+    /// gateway whose base URL carries no `/v1` requests. This map did not, so
+    /// a bare-path call whose body never parsed — a truncated capture — had no
+    /// provider left except the token record, and fell through to `unknown`
+    /// while the audit row for the same call said openai.
+    #[test]
+    fn test_extract_provider_from_path_bare_spellings() {
+        let builder = GenAIBuilder::new();
+        for path in [
+            "/chat/completions",
+            "/completions",
+            "https://gw.internal/chat/completions",
+        ] {
+            assert_eq!(
+                crate::analyzer::message::MessageParser::detect_provider(path),
+                Some("openai"),
+                "{path} is a detected provider"
+            );
+            assert_eq!(
+                builder.extract_provider_from_path(path),
+                Some("openai".to_string()),
+                "{path} is detected as openai but the genai row labels it otherwise"
+            );
+        }
     }
 
     /// Native protocol calls used to fall through to `"unknown"` (streaming) or
@@ -1392,9 +1448,9 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_classify_recap_cosh_personal_analyzer() {
+    fn test_raw_classify_analyzer_cosh_personal_analyzer() {
         let first_user = "Summarize only grounded work into the supplied JSON schema. List every business entity mentioned by a summary or prompt in that item's entities field.\nSCHEMA:\n{}";
-        assert_eq!(classify_call_kind_from_raw(&None, first_user), "recap");
+        assert_eq!(classify_call_kind_from_raw(&None, first_user), "analyzer");
     }
 
     #[test]
@@ -1457,6 +1513,7 @@ mod tests {
     fn test_call_kind_as_str() {
         assert_eq!(CallKind::Main.as_str(), "main");
         assert_eq!(CallKind::Recap.as_str(), "recap");
+        assert_eq!(CallKind::Analyzer.as_str(), "analyzer");
         assert_eq!(CallKind::WebSearch.as_str(), "web_search");
     }
 
@@ -1627,6 +1684,24 @@ mod tests {
     fn test_extract_message_text_empty() {
         let msg = serde_json::json!({"role": "user", "content": ""});
         assert_eq!(GenAIBuilder::extract_message_text(&msg), None);
+    }
+
+    /// DashScope/Bailian native multimodal blocks carry no `type`:
+    /// `[{"text": "…"}, {"image": "https://…"}]`. The native response path
+    /// reads any block with a `text` field, and `parse_request_body` does the
+    /// same for requests, but the drain extractor required an explicit text
+    /// type — so a drained native call lost its `user_query` and was keyed
+    /// apart from its own turn.
+    #[test]
+    fn test_extract_message_text_dashscope_native_type_less_blocks() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": [{"text": "描述这张图"}, {"image": "https://x/y.png"}]
+        });
+        assert_eq!(
+            GenAIBuilder::extract_message_text(&msg),
+            Some("描述这张图".to_string())
+        );
     }
 
     #[test]

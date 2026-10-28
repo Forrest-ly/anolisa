@@ -53,9 +53,9 @@ pub enum SkillSecError {
     /// Bounded shared-daemon admission is exhausted.
     #[error("SkillSec is busy; retry after an in-flight operation completes")]
     Busy,
-    /// Rotation must finish before ordinary ledger access resumes.
-    #[error("SkillSec key rotation is pending; administrator must resume rotation")]
-    RotationPending,
+    /// A retained command is explicitly unsupported.
+    #[error("unsupported SkillSec operation: {0}")]
+    Unsupported(String),
     /// A request exhausted its execution deadline before completing.
     #[error("SkillSec execution deadline exceeded")]
     Timeout,

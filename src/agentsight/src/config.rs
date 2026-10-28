@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 // ==================== Default Constants ====================
 
 /// Default LRU cache capacity for HTTP connections
-pub const DEFAULT_CONNECTION_CAPACITY: usize = 32;
+pub const DEFAULT_CONNECTION_CAPACITY: usize = 128;
 
 /// Default poll timeout for ring buffer polling (milliseconds)
 pub const DEFAULT_POLL_TIMEOUT_MS: u64 = 100;
@@ -682,7 +682,7 @@ pub struct JsonTrajectoryCollectionFeature {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub scan_interval_secs: Option<u64>,
-    /// Optional override of the projects directories to scan.
+    /// 可选的会话根目录、Claude 工作区父目录或 Hermes 数据库位置。
     #[serde(default)]
     pub scan_dirs: Option<Vec<String>>,
 }
@@ -691,6 +691,8 @@ pub struct JsonTrajectoryCollectionFeature {
 #[derive(serde::Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct JsonRuntimeLimits {
+    /// Cooperative process CPU target: 100 means one logical CPU, 0 disables pacing.
+    pub cpu_budget_percent: Option<u8>,
     /// HTTP connection LRU entries; configure at least the expected concurrent connections.
     pub connection_capacity: Option<usize>,
     pub event_channel_capacity: Option<usize>,
@@ -833,7 +835,7 @@ fn extract_rules(parsed: &JsonFullConfig) -> (Vec<CmdlineRule>, Vec<HttpsRule>, 
 /// boundaries take the same one-mark rule, so a marked config parses as the
 /// config it is. Only the first mark is the format's: a second one is data
 /// and still fails the parse.
-fn strip_leading_bom(content: &str) -> &str {
+pub(crate) fn strip_leading_bom(content: &str) -> &str {
     content.strip_prefix('\u{feff}').unwrap_or(content)
 }
 
@@ -852,9 +854,10 @@ pub fn parse_json_rules(
 ///
 /// - If the file does not exist, creates it with the embedded default.
 /// - If the file exists but `schema_version` is missing or older than
-///   `CURRENT_SCHEMA_VERSION`, backs up the old file and replaces it with the
-///   embedded default.
-/// - If the file exists and `schema_version` matches, leaves it untouched.
+///   `CURRENT_SCHEMA_VERSION`, backs up the old file and shallow-merges its
+///   top-level settings into the embedded default.
+/// - If the file exists and `schema_version` matches or exceeds the current
+///   version, leaves it untouched.
 pub fn ensure_default_agents_config(path: &Path) -> anyhow::Result<()> {
     if !path.exists() {
         if let Some(parent) = path.parent() {
@@ -883,15 +886,37 @@ pub fn ensure_default_agents_config(path: &Path) -> anyhow::Result<()> {
     // *valid* JSON whose schema_version is outdated; silently overwriting an
     // invalid file masks the parse error and breaks the documented fallback
     // contract (see issue #1502).
-    if serde_json::from_str::<serde_json::Value>(content).is_err() {
-        return Ok(());
-    }
+    let user: serde_json::Value = match serde_json::from_str(content) {
+        Ok(user) => user,
+        Err(_) => return Ok(()),
+    };
 
     let on_disk_version = extract_schema_version(content);
 
     if on_disk_version >= Some(CURRENT_SCHEMA_VERSION) {
         return Ok(());
     }
+
+    // Overlay user top-level keys on the defaults so existing customizations
+    // survive while newly introduced sections are added.
+    let mut base: serde_json::Value = serde_json::from_str(DEFAULT_AGENTS_JSON)
+        .context("Embedded DEFAULT_AGENTS_JSON is invalid")?;
+
+    if let (Some(base_obj), Some(user_obj)) = (base.as_object_mut(), user.as_object()) {
+        for (key, value) in user_obj {
+            if key == "schema_version" {
+                continue;
+            }
+            base_obj.insert(key.clone(), value.clone());
+        }
+        base_obj.insert(
+            "schema_version".to_string(),
+            serde_json::Value::Number(CURRENT_SCHEMA_VERSION.into()),
+        );
+    }
+
+    let merged =
+        serde_json::to_string_pretty(&base).context("Failed to serialize merged agents config")?;
 
     let backup = {
         let ts = std::time::SystemTime::now()
@@ -902,10 +927,10 @@ pub fn ensure_default_agents_config(path: &Path) -> anyhow::Result<()> {
     };
     std::fs::copy(path, &backup)
         .with_context(|| format!("Failed to back up {path:?} to {backup:?}"))?;
-    std::fs::write(path, DEFAULT_AGENTS_JSON)
-        .with_context(|| format!("Failed to replace outdated config at {path:?}"))?;
+    std::fs::write(path, &merged)
+        .with_context(|| format!("Failed to write merged config to {path:?}"))?;
     log::info!(
-        "Config schema_version {on_disk_version:?} < {CURRENT_SCHEMA_VERSION}, replaced it with defaults at {path:?} (backup at {backup:?})"
+        "Config schema_version {on_disk_version:?} < {CURRENT_SCHEMA_VERSION}, merged user config with defaults at {path:?} (backup at {backup:?})"
     );
     Ok(())
 }
@@ -1001,11 +1026,11 @@ pub struct FeatureFlags {
     pub token_consumption_enabled: bool,
     /// SLS Logtail export.
     pub sls_logtail_enabled: bool,
-    /// Qoder/QoderWork trajectory collection (scan + ATIF convert + persist).
+    /// Local JSONL and Hermes trajectory collection (scan + ATIF + persist).
     pub trajectory_collection_enabled: bool,
     /// Seconds between two trajectory scan rounds.
     pub trajectory_scan_interval_secs: u64,
-    /// Optional override of the trajectory projects directories to scan.
+    /// 可选的会话根目录、Claude 工作区父目录或 Hermes 数据库位置。
     pub trajectory_scan_dirs: Option<Vec<String>>,
     /// Whether a model may be asked to label collected trajectories.
     ///
@@ -1057,6 +1082,8 @@ impl Default for BatchConfig {
 /// Resource limits to prevent in-memory buffering leaks.
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeLimits {
+    /// Cooperative process CPU target as a percentage of one logical CPU; 0 disables pacing.
+    pub cpu_budget_percent: u8,
     /// Bounded channel capacity between probes and the event loop.
     pub event_channel_capacity: usize,
     /// Policy when the event channel is full.
@@ -1091,9 +1118,13 @@ pub struct RuntimeLimits {
     pub ring_buffer_mb: usize,
 }
 
+/// Default cooperative CPU target as a percentage of one logical CPU.
+pub const DEFAULT_CPU_BUDGET_PERCENT: u8 = 25;
+
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
+            cpu_budget_percent: DEFAULT_CPU_BUDGET_PERCENT,
             event_channel_capacity: DEFAULT_EVENT_CHANNEL_CAPACITY,
             event_channel_policy: ChannelPolicy::Backpressure,
             event_channel_max_bytes: DEFAULT_EVENT_CHANNEL_MAX_BYTES,
@@ -1109,6 +1140,43 @@ impl Default for RuntimeLimits {
             retain_raw_sse: false,
             ring_buffer_mb: DEFAULT_RING_BUFFER_MB,
         }
+    }
+}
+
+#[cfg(test)]
+mod cpu_budget_tests {
+    use super::*;
+
+    #[test]
+    fn cpu_pacing_defaults_to_25_and_preserves_explicit_overrides() {
+        let mut config = AgentsightConfig::default();
+        assert_eq!(config.runtime_limits.cpu_budget_percent, 25);
+        for json in [r#"{}"#, r#"{"runtime_limits":{}}"#] {
+            config.load_from_json(json).unwrap();
+            assert_eq!(config.runtime_limits.cpu_budget_percent, 25);
+        }
+        for percent in [0, 25, 40, 100] {
+            config
+                .load_from_json(&format!(
+                    r#"{{"runtime_limits":{{"cpu_budget_percent":{percent}}}}}"#
+                ))
+                .unwrap();
+            assert_eq!(config.runtime_limits.cpu_budget_percent, percent);
+        }
+        config
+            .load_from_json(r#"{"runtime_limits":{"connection_capacity":32}}"#)
+            .unwrap();
+        assert_eq!(config.runtime_limits.cpu_budget_percent, 25);
+        assert!(
+            config
+                .load_from_json(r#"{"runtime_limits":{"cpu_budget_percent":101}}"#)
+                .is_err()
+        );
+        assert!(
+            config
+                .load_from_json(r#"{"runtime_limits":{"cpu_budget_percent":-1}}"#)
+                .is_err()
+        );
     }
 }
 
@@ -1594,7 +1662,14 @@ impl AgentsightConfig {
                 })
                 .transpose()
             };
+            let cpu_budget_percent = limits
+                .cpu_budget_percent
+                .unwrap_or(DEFAULT_CPU_BUDGET_PERCENT);
+            if cpu_budget_percent > 100 {
+                return Err("runtime_limits.cpu_budget_percent must be between 0 and 100".into());
+            }
             self.runtime_limits = RuntimeLimits {
+                cpu_budget_percent,
                 event_channel_capacity: limits
                     .event_channel_capacity
                     .unwrap_or(DEFAULT_EVENT_CHANNEL_CAPACITY),
@@ -1837,7 +1912,7 @@ mod tests {
 
     #[test]
     fn test_default_constants() {
-        assert_eq!(DEFAULT_CONNECTION_CAPACITY, 32);
+        assert_eq!(DEFAULT_CONNECTION_CAPACITY, 128);
         assert_eq!(DEFAULT_POLL_TIMEOUT_MS, 100);
         assert_eq!(DEFAULT_MIN_DUR_US, 10_000);
         assert_eq!(DEFAULT_MAX_HEADERS, 64);
@@ -1868,7 +1943,7 @@ mod tests {
             config.storage.primary_path(),
             default_base_path().join(PRIMARY_DB_NAME)
         );
-        assert_eq!(config.connection_capacity, 32);
+        assert_eq!(config.connection_capacity, 128);
         assert_eq!(config.poll_timeout_ms, 100);
         assert_eq!(config.min_duration_us, 10_000);
         assert_eq!(config.max_headers, 64);
@@ -2949,26 +3024,65 @@ mod tests {
     }
 
     #[test]
-    fn ensure_default_agents_config_replaces_outdated_config() {
+    fn ensure_default_agents_config_preserves_user_cmdline_rules_on_merge() {
         let dir = unique_temp_dir();
         let path = dir.join("agentsight.json");
         let user_config = r#"{
-            "schema_version": 2,
+            "schema_version": 1,
             "cmdline": {
                 "allow": [
                     {"rule": ["*mycustomagent*"], "agent_name": "MyCustomAgent"}
-                ]
-            }
+                ],
+                "deny": [{"rule": ["*noisy*"]}]
+            },
+            "https": [{"rule": ["custom.api.example.com"]}]
         }"#;
         std::fs::write(&path, user_config).unwrap();
         ensure_default_agents_config(&path).unwrap();
         let result = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(result, DEFAULT_AGENTS_JSON);
-        assert!(!result.contains("MyCustomAgent"));
+        assert!(
+            result.contains("MyCustomAgent"),
+            "user cmdline rule lost during migration: {result}"
+        );
+        assert!(
+            result.contains("custom.api.example.com"),
+            "user https rule lost during migration: {result}"
+        );
+        assert!(
+            result.contains("*noisy*"),
+            "user deny rule lost during migration: {result}"
+        );
+        let migrated: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            migrated["schema_version"].as_u64().unwrap() as u32,
+            CURRENT_SCHEMA_VERSION
+        );
     }
 
     #[test]
-    fn ensure_default_agents_config_replacement_contains_storage_section() {
+    fn ensure_default_agents_config_adds_missing_sections_on_merge() {
+        let dir = unique_temp_dir();
+        let path = dir.join("agentsight.json");
+        let minimal_v1 = r#"{
+            "cmdline": {"allow": [{"rule": ["*test*"], "agent_name": "Test"}]}
+        }"#;
+        std::fs::write(&path, minimal_v1).unwrap();
+        ensure_default_agents_config(&path).unwrap();
+        let result = std::fs::read_to_string(&path).unwrap();
+        let migrated: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            migrated.get("features").is_some(),
+            "features section not added from default"
+        );
+        assert!(
+            migrated.get("runtime_limits").is_some(),
+            "runtime_limits section not added from default"
+        );
+        assert!(result.contains("Test"), "user rule lost");
+    }
+
+    #[test]
+    fn ensure_default_agents_config_merged_config_contains_storage_section() {
         let dir = unique_temp_dir();
         let path = dir.join("agentsight.json");
         std::fs::write(&path, r#"{"schema_version": 2}"#).unwrap();

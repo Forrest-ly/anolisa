@@ -429,20 +429,18 @@ def test_daemon_restart_preserves_existing_trust(
     assert restarted.request("skill-ledger", "status")["keys"]["fingerprint"] == before
 
 
-def test_admin_rotation_requires_recertification(hook_case: HookCase) -> None:
+def test_unsupported_rotation_preserves_hook_trust(hook_case: HookCase) -> None:
     _prepare(hook_case, "pass")
-    host, skill, daemon, _, directory = hook_case
+    _, skill, daemon, _, _ = hook_case
     before = daemon.request("skill-ledger", "status")["keys"]["fingerprint"]
-    daemon.request("skill-ledger", "rotate-keys")
-    _risk(host, _invoke(hook_case, policy="block")[0])
-    assert daemon.request("skill-ledger", "status")["keys"]["fingerprint"] != before
-    daemon.request(
-        "skill-ledger",
-        "certify",
-        str(skill),
-        "--findings",
-        str(directory / "findings.json"),
-    )
+    manifest = skill / ".skill-meta/latest.json"
+    committed = manifest.read_bytes()
+    for arguments in (("rotate-keys",), ("init", "--force-keys")):
+        rejected = daemon.cli("skill-ledger", *arguments)
+        assert rejected.returncode != 0
+        assert "not supported" in rejected.stderr
+    assert daemon.request("skill-ledger", "status")["keys"]["fingerprint"] == before
+    assert manifest.read_bytes() == committed
     _allowed(_invoke(hook_case, policy="block")[0])
 
 
@@ -487,7 +485,7 @@ def test_unresponsive_socket_preserves_timeout_policy(hook_case: HookCase) -> No
 @pytest.mark.parametrize(
     "hook_case", ["qwen", "cosh", "hermes", "openclaw"], indirect=True
 )
-def test_out_of_scope_show_preserves_error_policy_without_registration(
+def test_out_of_scope_show_preserves_error_policy_without_config_changes(
     hook_case: HookCase, start_daemon: Callable[..., Any]
 ) -> None:
     _, skill, daemon, env, _ = hook_case
@@ -496,6 +494,8 @@ def test_out_of_scope_show_preserves_error_policy_without_registration(
     assert daemon.process.returncode == 0
     restricted = start_daemon(name="restricted.sock", skillsec_roots=[])
     restricted.request("skill-ledger", "init", "--no-baseline")
+    config = restricted.socket_path.with_suffix(".skillsec.json")
+    before = config.read_bytes()
     env["AGENT_SEC_DAEMON_SOCKET"] = str(restricted.socket_path)
     result = restricted.cli("skill-ledger", "show", str(skill))
     assert result.returncode == 1
@@ -506,9 +506,7 @@ def test_out_of_scope_show_preserves_error_policy_without_registration(
     _allowed(output)
     assert "skill-ledger" in stderr
     assert not (skill / ".skill-meta").exists()
-    assert not (
-        restricted.socket_path.with_suffix(".state") / "managed-skills.json"
-    ).exists()
+    assert config.read_bytes() == before
 
 
 @pytest.mark.parametrize(
