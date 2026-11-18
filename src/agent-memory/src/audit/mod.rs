@@ -23,6 +23,19 @@ pub struct AuditEntry {
     pub path: String,
     /// Whether the call succeeded.
     pub ok: bool,
+    /// Whether this call actually changed content git tracks under the mount.
+    ///
+    /// `false` marks the *preview* form of a tool that otherwise mutates —
+    /// `mem_import` with `dry_run = true` is the only one the crate has today.
+    /// A preview still belongs in the audit trail, so the row is written; what
+    /// it must not do is advance HEAD. It wrote nothing, so an auto-commit
+    /// triggered by it could only capture pending work belonging to some other
+    /// call and file it under this one's message.
+    ///
+    /// Defaults to `true` and is omitted from the serialized row unless it is
+    /// `false`, so historical lines and existing readers are unaffected.
+    #[serde(default = "default_mutated", skip_serializing_if = "is_true")]
+    pub mutated: bool,
     /// Bytes read or written, when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
@@ -45,6 +58,7 @@ impl AuditEntry {
             tool,
             path: String::new(),
             ok: true,
+            mutated: true,
             bytes: None,
             tokens: None,
             error: None,
@@ -59,6 +73,14 @@ impl AuditEntry {
 
     pub fn ok(mut self, v: bool) -> Self {
         self.ok = v;
+        self
+    }
+
+    /// Record that this call changed no tracked content — the preview form of
+    /// a mutating tool. The entry still reaches the audit log; the auto-commit
+    /// gate in `git_repo` skips it.
+    pub fn mutated(mut self, v: bool) -> Self {
+        self.mutated = v;
         self
     }
 
@@ -77,6 +99,16 @@ impl AuditEntry {
         self.ok = false;
         self
     }
+}
+
+/// `AuditEntry::mutated` defaults to `true`: a call mutates unless the tool
+/// says otherwise, so forgetting the flag cannot silently drop a commit.
+fn default_mutated() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 /// Every mode prefix [`sanitized_query_path`] is called with: the `match mode`

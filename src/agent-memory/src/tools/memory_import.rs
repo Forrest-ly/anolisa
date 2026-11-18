@@ -229,13 +229,18 @@ pub fn memory_import(
         tracing::warn!("import errors: {:?}", report.errors);
     }
 
+    // A dry run reports what *would* happen and writes nothing, so it must
+    // not bump HEAD either: `import_single` returns before touching disk and
+    // `remove_all_memories` is gated on `!dry_run`. The preview still belongs
+    // in the audit log — `mutated(false)` only keeps it out of git history.
     svc.audit_log(
         AuditEntry::new("mem_import")
             .path(format!(
                 "{} imported, {} skipped",
                 report.imported, report.skipped
             ))
-            .bytes(json_data.len() as u64),
+            .bytes(json_data.len() as u64)
+            .mutated(!dry_run),
     );
 
     // Append error details if any

@@ -6,7 +6,11 @@
 //!   the repo's own `.gitignore`.
 //! - When `auto_commit = true`, a successful call to any tool classified as
 //!   mutating (`WRITE_TOOLS` below) performs a best-effort inline commit of
-//!   the whole mount. Failures surface at `warn!` and never block the tool.
+//!   the whole mount. Two kinds of entry never commit: a failed call, and the
+//!   preview form of a mutating tool (`AuditEntry::mutated == false`, e.g.
+//!   `mem_import` with `dry_run = true`). Both are still audited — neither
+//!   wrote anything a commit could describe. Failures surface at `warn!` and
+//!   never block the tool.
 //! - `mem_log` returns recent commits; `mem_revert` restores a path's
 //!   working-tree content from HEAD without changing the index or history.
 
@@ -27,7 +31,10 @@ pub struct GitConfig {
     /// turned into git repos behind the user's back.
     #[serde(default)]
     pub enabled: bool,
-    /// Auto-commit after every successful audit entry.
+    /// Commit after a successful call to a tool listed in `WRITE_TOOLS`.
+    /// Reads, writers whose only output lands in the gitignored `.anolisa/`
+    /// meta dir, failed calls and preview (`mutated = false`) calls never
+    /// bump HEAD.
     #[serde(default = "default_auto_commit")]
     pub auto_commit: bool,
 }
@@ -340,6 +347,14 @@ impl GitHandle {
         if !entry.ok {
             return; // don't commit on failed tool calls
         }
+        if !entry.mutated {
+            // Preview form of a mutating tool (`mem_import` with
+            // `dry_run = true`). It wrote nothing, so `commit_all`'s
+            // `add_all(["*"])` could only sweep up pending work that belongs
+            // to some other call and file it under this one's message — the
+            // exact misattribution the allowlist exists to prevent.
+            return;
+        }
         // Only commit for write-side tools; reads shouldn't bump HEAD.
         if !is_write_tool(entry.tool) {
             // A name in neither list is a tool nobody classified. Skipping it
@@ -399,8 +414,11 @@ impl GitHandle {
 ///
 /// Membership rule: a name belongs here iff a successful call can create,
 /// modify or delete a path git tracks — anything under the mount root except
-/// the `.anolisa/` meta dir that [`init`] gitignores. Everything else the crate
-/// audits is listed in [`NON_COMMITTING_TOOLS`], and the test
+/// the `.anolisa/` meta dir that [`init`] gitignores. A tool with a preview
+/// call shape (`mem_import` with `dry_run = true`) belongs here all the same,
+/// because its real calls do mutate; the preview marks its own audit entry
+/// `mutated = false` so that one shape stays out of history. Everything else
+/// the crate audits is listed in [`NON_COMMITTING_TOOLS`], and the test
 /// `classified_tool_names_cover_every_audited_tool` fails on a name that
 /// appears in neither list, so a new tool has to be classified deliberately.
 /// An unclassified mutating tool is not a cosmetic miss: its writes reach disk
@@ -608,6 +626,60 @@ mod tests {
         handle.auto_commit_for(&AuditEntry::new("mem_write").error("boom".to_string()));
 
         assert_eq!(log(tmp.path(), 100, None).unwrap().len(), baseline);
+    }
+
+    #[test]
+    fn preview_write_tool_does_not_commit_or_sweep_pending_work() {
+        let tmp = seeded_repo();
+        let handle = auto_commit_handle(tmp.path());
+        // Pending work nobody has decided to commit yet.
+        std::fs::write(tmp.path().join("pending.md"), "not ready").unwrap();
+        let baseline = log(tmp.path(), 100, None).unwrap().len();
+
+        handle.auto_commit_for(&AuditEntry::new("mem_import").mutated(false));
+
+        assert_eq!(
+            log(tmp.path(), 100, None).unwrap().len(),
+            baseline,
+            "a preview call wrote nothing, so it must not bump HEAD"
+        );
+        let repo = Repository::open(tmp.path()).unwrap();
+        assert!(
+            repo.head()
+                .unwrap()
+                .peel_to_tree()
+                .unwrap()
+                .get_path(Path::new("pending.md"))
+                .is_err(),
+            "a preview call must not sweep unrelated pending work into HEAD"
+        );
+    }
+
+    #[test]
+    fn preview_flag_survives_audit_serialization() {
+        // Historical rows have no `mutated` key and must read back as `true`,
+        // or a mount upgraded in place would stop committing entirely.
+        let legacy: AuditEntry =
+            serde_json::from_str(r#"{"ts":"t","tool":"mem_write","path":"a.md","ok":true}"#)
+                .unwrap();
+        assert!(legacy.mutated);
+
+        let json = serde_json::to_string(&AuditEntry::new("mem_write")).unwrap();
+        assert!(
+            !json.contains("mutated"),
+            "a mutating call must not add a new key to the log row: {json}"
+        );
+
+        let preview_row = r#"{"ts":"t","tool":"mem_import","ok":true,"mutated":false}"#;
+        let preview: AuditEntry = serde_json::from_str(preview_row).unwrap();
+        assert!(!preview.mutated);
+
+        let preview_json = serde_json::to_string(&AuditEntry::new("mem_import").mutated(false))
+            .expect("audit entry serializes");
+        assert!(
+            preview_json.contains(r#""mutated":false"#),
+            "a preview must be visible in the log row: {preview_json}"
+        );
     }
 
     /// Tool names the crate audits, collected from source: every `const TOOL`

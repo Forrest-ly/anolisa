@@ -275,6 +275,33 @@ fn assert_committed(svc: &MemoryService, tool: &str) {
     );
 }
 
+/// Stronger form: the attributed commit must actually *cover* `path`.
+///
+/// `commit_all` stages the whole workdir, so a commit merely named after a
+/// tool could in principle carry only somebody else's content and still
+/// satisfy [`assert_committed`]. `mem_log`'s path filter answers from a real
+/// tree diff (`commit_touches_path`), so requiring the tool's commit to appear
+/// there pins "attributed to the tool" down to "contains the tool's own write".
+fn assert_committed_path(svc: &MemoryService, tool: &str, path: &str) {
+    assert_committed(svc, tool);
+    let covering = summaries_for_path(svc, path);
+    assert!(
+        covering
+            .iter()
+            .any(|s| s == tool || s.starts_with(&format!("{tool} "))),
+        "no commit attributed to {tool} covers {path}; commits touching {path}: {covering:?}"
+    );
+}
+
+/// Commit summaries whose diff touches `path`, newest first.
+fn summaries_for_path(svc: &MemoryService, path: &str) -> Vec<String> {
+    svc.mem_log(100, Some(path))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.summary)
+        .collect()
+}
+
 #[test]
 fn mem_import_bumps_head() {
     use agent_memory::tools::memory_export::{ExportFilter, memory_export};
@@ -290,7 +317,7 @@ fn mem_import_bumps_head() {
 
     memory_import(&svc, &archive, ImportStrategy::Merge, false).unwrap();
     assert_eq!(svc.read("notes/keep.md").unwrap(), "portable memory");
-    assert_committed(&svc, "mem_import");
+    assert_committed_path(&svc, "mem_import", "notes/keep.md");
 }
 
 #[test]
@@ -312,10 +339,10 @@ fn task_save_and_close_bump_head() {
     )
     .unwrap();
     assert!(svc.mount.root.join("tasks/task-git-1.md").exists());
-    assert_committed(&svc, "memory_task_save");
+    assert_committed_path(&svc, "memory_task_save", "tasks/task-git-1.md");
 
     memory_task_close(&svc, "task-git-1", Some("landed")).unwrap();
-    assert_committed(&svc, "memory_task_close");
+    assert_committed_path(&svc, "memory_task_close", "tasks/task-git-1.md");
 }
 
 #[test]
@@ -327,7 +354,7 @@ fn index_refresh_bumps_head() {
     let n = agent_memory::tools::memory_index::refresh_index(&svc).unwrap();
     assert!(n > 0, "expected MEMORY.md to list the new note");
     assert!(svc.mount.root.join("MEMORY.md").exists());
-    assert_committed(&svc, "mem_index_refresh");
+    assert_committed_path(&svc, "mem_index_refresh", "MEMORY.md");
 }
 
 #[test]
@@ -346,5 +373,105 @@ fn consolidated_facts_bump_head() {
         "expected consolidation to write at least one fact"
     );
     assert!(svc.mount.root.join("facts").is_dir());
-    assert_committed(&svc, "consolidate");
+    // `facts/facts.jsonl` is appended on every fact written, so it is the one
+    // consolidation output whose path is stable enough to assert against.
+    assert_committed_path(&svc, "consolidate", "facts/facts.jsonl");
+}
+
+/// A `dry_run` import reports what *would* happen and writes nothing, so it
+/// must not advance HEAD either. Before `AuditEntry::mutated` this produced a
+/// commit whose message read `mem_import 0 imported, 0 skipped` while the tree
+/// it recorded was somebody else's pending file — the same misattribution the
+/// allowlist exists to prevent, reintroduced through a read-only call shape.
+#[test]
+fn dry_run_import_leaves_head_and_pending_work_alone() {
+    use agent_memory::tools::memory_export::{ExportFilter, memory_export};
+    use agent_memory::tools::memory_import::{ImportStrategy, memory_import};
+
+    let (_tmp, svc) = setup(true, true);
+    svc.write("notes/keep.md", "portable memory", false)
+        .unwrap();
+    let archive = memory_export(&svc, &ExportFilter::default()).unwrap();
+
+    // Pending work the user has not decided to commit yet — exactly the state
+    // `assert_revert_scope` above establishes and protects.
+    std::fs::write(svc.mount.root.join("pending.md"), "not ready").unwrap();
+    let before = summaries(&svc);
+
+    let out = memory_import(&svc, &archive, ImportStrategy::Merge, true).unwrap();
+
+    assert!(
+        out.starts_with("[DRY RUN]"),
+        "expected a preview result, got {out:?}"
+    );
+    assert_eq!(
+        summaries(&svc),
+        before,
+        "a preview import must not create a commit"
+    );
+    let repo = git2::Repository::open(&svc.mount.root).unwrap();
+    assert!(
+        repo.head()
+            .unwrap()
+            .peel_to_tree()
+            .unwrap()
+            .get_path(std::path::Path::new("pending.md"))
+            .is_err(),
+        "a preview import must not sweep unrelated pending work into HEAD"
+    );
+    assert_eq!(svc.read("pending.md").unwrap(), "not ready");
+
+    // The preview is still an audited call: dropping it from the log to avoid
+    // the commit would trade one regression for another.
+    let audit = std::fs::read_to_string(svc.mount.audit_log_path()).unwrap();
+    assert!(
+        audit.lines().any(|line| {
+            line.contains("\"tool\":\"mem_import\"") && line.contains("\"mutated\":false")
+        }),
+        "the preview must stay in the audit log, flagged as non-mutating:\n{audit}"
+    );
+
+    // And the real call shape still commits.
+    svc.remove("notes/keep.md", false).unwrap();
+    memory_import(&svc, &archive, ImportStrategy::Merge, false).unwrap();
+    assert_committed_path(&svc, "mem_import", "notes/keep.md");
+}
+
+/// Each write tool's commit must carry its own output, not leave it pending
+/// for the next allowlisted call to sweep into a commit named after an
+/// unrelated path.
+#[test]
+fn a_tool_commit_does_not_carry_an_earlier_tools_output() {
+    use agent_memory::tools::memory_task::memory_task_save;
+
+    let (_tmp, svc) = setup(true, true);
+    memory_task_save(
+        &svc,
+        "ship the git gate",
+        Some("in-progress"),
+        Some(10),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("task-sweep"),
+    )
+    .unwrap();
+    svc.write("notes/after.md", "a later, unrelated write", false)
+        .unwrap();
+
+    let touching_task = summaries_for_path(&svc, "tasks/task-sweep.md");
+    assert!(
+        touching_task
+            .iter()
+            .any(|s| s.starts_with("memory_task_save")),
+        "the task save must be committed by its own commit: {touching_task:?}"
+    );
+    assert!(
+        !touching_task
+            .iter()
+            .any(|s| s.starts_with("mem_write notes/after.md")),
+        "the later mem_write commit swept up the task file: {touching_task:?}"
+    );
 }
